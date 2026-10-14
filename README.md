@@ -1,8 +1,11 @@
 # Fusion Windows
 
 Stage 1 provides portable C++20 FusionCore, deterministic test-only FusionMock,
-and executable RG-0 tests. It has no end-user Windows input behavior. Independent
-review is required before integration; later stages are not implemented.
+and executable RG-0 tests. Stage 2 adds a minimal semantic Mock Backend and an
+explicit Host-side boundary (`fusion::Host`) that translate backend semantic intent
+into existing FusionCore operations, plus end-to-end Stage 2 tests. It has no
+end-user Windows input behavior. Independent review is required before integration;
+later stages are not implemented.
 
 Current architecture authority is
 [fusion-controller D072](https://github.com/choicky/fusion-controller/blob/main/docs/windows-architecture.md),
@@ -14,7 +17,7 @@ reviewed at `b116c65e1b903dff98ba2813bad7987293383fc9`.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure
-clang-format --dry-run --Werror include/fusion/core.hpp src/core.cpp tests/mock.hpp tests/mock.cpp tests/rg0.cpp
+clang-format --dry-run --Werror include/fusion/core.hpp include/fusion/host.hpp src/core.cpp tests/mock.hpp tests/mock.cpp tests/mock_backend.hpp tests/mock_backend.cpp tests/rg0.cpp tests/stage2.cpp
 ```
 
 CMake 3.20+, a C++20 compiler, and CTest are sufficient. There are no external
@@ -61,6 +64,33 @@ effects separately from core accounting. Its synchronous reference workload
 computes expected effect order directly, then compares all six response-order
 permutations against the scheduled core model. It contains no engine or TSF
 implementation.
+
+## Stage 2 — Mock Backend and Host boundary
+
+`tests/mock_backend.*` is a Stage 2 test abstraction distinct from FusionMock: it
+assigns deterministic semantics to symbolic inputs (`preedit:` STATE, `commit:`
+EFFECT intent, `reject:` failure after ownership, everything else a genuine PASS)
+and holds no correctness policy, no causal state machine and no engine. FusionMock
+remains the scheduler/fault harness for delivery timing (delay, duplicate, stale).
+
+`fusion::Host` (`include/fusion/host.hpp`) is the minimal explicit Host-side
+boundary: it translates a backend `Intent` into existing FusionCore operations
+(consume STATE, propose an EFFECT at the current consumed-STATE watermark, open one
+execution ticket, settle with the observed edit, reject/cancel/reconcile, and probe
+the PASS barrier). Every method delegates a single transition to `Core` and returns
+Core's verdict. It adds no second ledger, ownership authority, document
+materialization, reliability state machine or wire protocol. The document authority
+(the test harness) still performs the real edit and reports the observed
+`EditResult`/`Readback` between an opened ticket and its completion. `Core` itself
+is unchanged by Stage 2.
+
+`tests/stage2.cpp` drives stimulus → Mock Backend → Host → FusionCore → document
+observation end-to-end and reuses the FusionMock terminal/uniqueness oracles. It
+exercises STATE, EFFECT, genuine PASS, the PASS barrier, delayed response, illegal
+reorder, duplicate response, stale cross-context response, backend restart/reset,
+post-ownership rejection and indeterminate irreversible mutation, confirming the
+semantic path does not bypass the RG-0 invariants. Run them with
+`ctest --test-dir build -R stage2`.
 
 P0-A/P0-B/P0-D, recovery UX, permanent identifiers, final protocol/IPC/Host
 topology, key classification, timing thresholds, candidate renderer and
