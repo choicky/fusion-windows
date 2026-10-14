@@ -1,0 +1,128 @@
+#pragma once
+
+// Stage 2.5 real TSF text service (development proof slice).
+//
+// Thin native TSF/COM shell per D072 §1-§3: Windows hard policy, key ownership,
+// Windows context identity, causal barriers via the existing FusionCore, real
+// edit-session projection/materialization, bounded causal ledger linkage, link
+// health, plus development diagnostics. All semantic decisions go through the
+// existing fusion::Host / FusionCore and the existing Mock Backend — this shell
+// adds no second engine, ledger, decoder or materializer.
+
+#include "mock_backend.hpp"
+#include "tsf/com_ptr.hpp"
+#include "tsf/semantic.hpp"
+
+#include <msctf.h>
+#include <windows.h>
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace fusion::tsf {
+
+struct ContextEntry {
+  ~ContextEntry() {
+    if (composition) {
+      composition->Release();
+    }
+    if (context) {
+      context->Release();
+    }
+    if (document_mgr) {
+      document_mgr->Release();
+    }
+  }
+  ITfDocumentMgr *document_mgr = nullptr; // ref-held; null for detached contexts
+  ComRef<IUnknown> identity;
+  ITfContext *context = nullptr; // ref-held identity key
+  std::uint64_t generation = 1;  // bumped when the entry is destroyed
+  ITfComposition *composition = nullptr;
+  SemanticController semantic;
+  bool async_in_flight = false;
+
+  ContextEntry(std::uint64_t context_id, std::size_t capacity, fusion::test::MockBackend &backend,
+               ITfDocumentMgr *dim, ITfContext *pic);
+};
+
+class TextService final : public ITfTextInputProcessor,
+                          public ITfKeyEventSink,
+                          public ITfThreadMgrEventSink,
+                          public ITfCompositionSink {
+public:
+  static constexpr std::size_t kLedgerCapacity = 64; // development bound
+
+  TextService();
+  ~TextService();
+
+  // IUnknown
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override;
+  STDMETHODIMP_(ULONG) AddRef() override;
+  STDMETHODIMP_(ULONG) Release() override;
+
+  // ITfTextInputProcessor
+  STDMETHODIMP Activate(ITfThreadMgr *ptim, TfClientId tid) override;
+  STDMETHODIMP Deactivate() override;
+
+  // ITfKeyEventSink
+  STDMETHODIMP OnSetFocus(BOOL fForeground) override;
+  STDMETHODIMP OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) override;
+  STDMETHODIMP OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) override;
+  STDMETHODIMP OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) override;
+  STDMETHODIMP OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) override;
+  STDMETHODIMP OnPreservedKey(ITfContext *pic, REFGUID rguid, BOOL *pfEaten) override;
+
+  // ITfThreadMgrEventSink
+  STDMETHODIMP OnInitDocumentMgr(ITfDocumentMgr *pdim) override;
+  STDMETHODIMP OnUninitDocumentMgr(ITfDocumentMgr *pdim) override;
+  STDMETHODIMP OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *pdimPrevFocus) override;
+  STDMETHODIMP OnPushContext(ITfContext *pic) override;
+  STDMETHODIMP OnPopContext(ITfContext *pic) override;
+
+  // ITfCompositionSink
+  STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition *pComposition) override;
+
+  // --- internal API used by the edit-session objects ---
+  ContextEntry *find_entry(ITfContext *pic);
+  std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
+  ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
+  bool hard_policy_allows(ContextEntry &entry);
+  fusion::EditResult apply_state_text(ContextEntry &entry, TfEditCookie ec,
+                                      const std::wstring &text, bool &mutated);
+  // Returns the fusion EditResult observed by the real mutation, and whether an
+  // effect mutation happened (verified by readback) for reconcile purposes.
+  fusion::EditResult apply_effect_text(ContextEntry &entry, TfEditCookie ec,
+                                       const std::wstring &text, bool &mutated);
+  bool end_composition(ContextEntry &entry, TfEditCookie ec);
+  bool clear_composition_text(ContextEntry &entry, TfEditCookie ec);
+  bool request_sync_session(ContextEntry &entry, ITfEditSession *session, HRESULT &outer,
+                            HRESULT &inner);
+  void schedule_async_pump(ContextEntry &entry);
+  ITfThreadMgr *thread_mgr() { return thread_mgr_.get(); }
+  TfClientId client_id() const { return client_id_; }
+  void note_async_done(ContextEntry &entry, bool progress);
+  fusion::test::MockBackend &backend() { return backend_; }
+
+private:
+  ContextEntry *resolve_or_create_entry(ITfContext *pic);
+  void handle_pass_key(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
+  void handle_owned_state(ContextEntry &entry, const SemanticDecision &decision);
+  void handle_owned_effect(ContextEntry &entry, const SemanticDecision &decision);
+  void handle_reject_cleanup(ContextEntry &entry);
+  void destroy_all_entries();
+
+  std::atomic<ULONG> ref_count_{1};
+  ComRef<ITfThreadMgr> thread_mgr_;
+  TfClientId client_id_ = TF_CLIENTID_NULL;
+  DWORD thread_event_cookie_ = 0;
+  fusion::test::MockBackend backend_;
+  std::vector<std::shared_ptr<ContextEntry>> entries_;
+  std::uint64_t next_context_id_ = 1;
+  std::uint64_t next_generation_ = 1;
+  bool handling_key_ = false; // reentrancy guard (D072 §7.5)
+};
+
+} // namespace fusion::tsf
