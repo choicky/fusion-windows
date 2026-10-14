@@ -1,1 +1,15 @@
+# Out-of-source build directories (the documented `cmake -S . -B build` path)
 /build*/
+
+# Accidental in-source CMake/CTest artifacts. Only appear if configured without
+# `-B`; never project source, so anchoring them at the repository root is narrow.
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/cmake_install.cmake
+/Testing/
+/compile_commands.json
+
+# Local editor scratch (vim swap / backup); never project content.
+*.swp
+*~

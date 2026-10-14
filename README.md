@@ -1,15 +1,43 @@
 # Fusion Windows
 
-Stage 1 provides portable C++20 FusionCore, deterministic test-only FusionMock,
-and executable RG-0 tests. Stage 2 adds a minimal semantic Mock Backend and an
-explicit Host-side boundary (`fusion::Host`) that translate backend semantic intent
-into existing FusionCore operations, plus end-to-end Stage 2 tests. It has no
-end-user Windows input behavior. Independent review is required before integration;
-later stages are not implemented.
+Windows product implementation for the Fusion Enhanced IME line. Today it is a
+portable, sans-IO C++20 correctness core (`FusionCore`), a deterministic test-only
+scheduler and fault harness (`FusionMock`), and a minimal semantic Mock Backend with
+an explicit Host-side boundary (`fusion::Host`) that translates backend semantic
+intent into existing FusionCore operations. There is no end-user Windows input
+behavior yet; independent review is required before integration.
 
-Current architecture authority is
-[fusion-controller D072](https://github.com/choicky/fusion-controller/blob/main/docs/windows-architecture.md),
-reviewed at `b116c65e1b903dff98ba2813bad7987293383fc9`.
+**Current implementation snapshot.** Stage 1 (portable FusionCore + deterministic
+simulator + executable RG-0 tests) and Stage 2 (minimal semantic Mock Backend +
+`fusion::Host` boundary + end-to-end Stage 2 tests) are implemented and merged into
+`main`. The next stage is **Stage 2.5** (Real TSF + Mock Backend), which is not
+implemented; later stages are not implemented. Current Windows stage status is
+authoritative in D072 §22/§25 and is not duplicated here.
+
+## Project authority
+
+Normative cross-platform requirements, decisions, roadmap and architecture live in
+`fusion-controller`, not in this repository:
+
+- Windows architecture authority —
+  [fusion-controller D072 / windows-architecture.md](https://github.com/choicky/fusion-controller/blob/main/docs/windows-architecture.md)
+- Branch governance authority —
+  [fusion-controller D076 / branch-policy.md](https://github.com/choicky/fusion-controller/blob/main/docs/branch-policy.md)
+- Repository-local execution rules — [AGENTS.md](AGENTS.md)
+
+`fusion-windows` owns the Windows product implementation, its tests, and this
+repository entry point only.
+
+## Repository structure
+
+- `include/fusion/core.hpp` — portable FusionCore public model (Key/Kind/Result/Ticket, …).
+- `include/fusion/host.hpp` — Stage 2 `fusion::Host` Host-side boundary (backend `Intent` → Core operations).
+- `src/core.cpp` — FusionCore implementation.
+- `tests/mock.{hpp,cpp}` — deterministic FusionMock scheduler, fault harness and oracles.
+- `tests/mock_backend.{hpp,cpp}` — Stage 2 semantic Mock Backend (a test abstraction).
+- `tests/rg0.cpp` — Stage 1 RG-0 invariant tests.
+- `tests/stage2.cpp` — Stage 2 end-to-end tests (stimulus → Mock Backend → Host → Core).
+- `CMakeLists.txt` — C++20 library plus CTest targets.
 
 ## Local validation
 
