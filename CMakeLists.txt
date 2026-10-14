@@ -11,36 +11,85 @@ else()
   target_compile_options(FusionCore PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 
+add_library(FusionHost INTERFACE)
+target_include_directories(FusionHost INTERFACE include)
+target_link_libraries(FusionHost INTERFACE FusionCore)
+target_compile_features(FusionHost INTERFACE cxx_std_20)
+
+# Stage 2 semantic Mock Backend. It stays a test abstraction; the Stage 2.5 TSF
+# shell links the same source as its semantic oracle (no second backend).
+add_library(MockBackend tests/mock_backend.cpp)
+target_link_libraries(MockBackend PUBLIC FusionHost)
+target_include_directories(MockBackend PUBLIC tests)
+
+if(WIN32 AND MSVC)
+  add_executable(FusionTsfProfile tools/tsf/profile.cpp)
+  target_link_libraries(FusionTsfProfile PRIVATE ole32)
+  # Stage 2.5 real TSF/COM development shell (x64; see README for registration).
+  add_library(FusionTsf SHARED
+    src/tsf/guids.cpp
+    src/tsf/key_map.cpp
+    src/tsf/diag.cpp
+    src/tsf/semantic.cpp
+    src/tsf/service.cpp
+    src/tsf/register.cpp
+    src/tsf/dll.cpp
+    src/tsf/fusiontsf.def)
+  target_include_directories(FusionTsf PRIVATE include src tests "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  configure_file(src/tsf/build_identity.hpp.in generated/tsf/build_identity.hpp @ONLY)
+  target_compile_features(FusionTsf PRIVATE cxx_std_20)
+  set_target_properties(FusionTsf PROPERTIES CXX_EXTENSIONS OFF)
+  target_compile_options(FusionTsf PRIVATE /W4 /WX /utf-8)
+  target_compile_definitions(FusionTsf PRIVATE UNICODE _UNICODE)
+  target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
-  add_library(FusionHost INTERFACE)
-  target_include_directories(FusionHost INTERFACE include)
-  target_link_libraries(FusionHost INTERFACE FusionCore)
-  target_compile_features(FusionHost INTERFACE cxx_std_20)
-
   add_library(FusionMock tests/mock.cpp)
   target_link_libraries(FusionMock PUBLIC FusionCore)
   target_include_directories(FusionMock PUBLIC tests)
   add_executable(rg0 tests/rg0.cpp)
   target_link_libraries(rg0 PRIVATE FusionMock)
 
-  add_library(MockBackend tests/mock_backend.cpp)
-  target_link_libraries(MockBackend PUBLIC FusionHost)
-  target_include_directories(MockBackend PUBLIC tests)
   add_executable(stage2 tests/stage2.cpp)
   target_link_libraries(stage2 PRIVATE MockBackend FusionMock)
+
+  # Stage 2.5 adapter logic (key map + semantic controller) is platform-free.
+  add_executable(tsf tests/tsf_semantic.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+  target_link_libraries(tsf PRIVATE MockBackend FusionMock)
+  target_include_directories(tsf PRIVATE src)
+  if(MSVC)
+    target_compile_options(tsf PRIVATE /utf-8)
+  endif()
 
   if(NOT MSVC)
     target_compile_options(FusionMock PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_compile_options(rg0 PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_compile_options(MockBackend PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_compile_options(stage2 PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_compile_options(tsf PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
+  add_executable(tsf_orchestration tests/tsf_orchestration.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+  target_link_libraries(tsf_orchestration PRIVATE MockBackend FusionMock)
+  target_include_directories(tsf_orchestration PRIVATE src)
+  if(MSVC)
+    target_compile_options(tsf_orchestration PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(tsf_orchestration PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  foreach(test routing cleanup termination)
+    add_test(NAME tsf_orchestration_${test} COMMAND tsf_orchestration ${test})
+  endforeach()
   foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference)
     add_test(NAME rg0_${test} COMMAND rg0 ${test})
   endforeach()
   foreach(test state_path effect_path pass pass_barrier delay reorder duplicate stale restart
                reject indeterminate bound)
     add_test(NAME stage2_${test} COMMAND stage2 ${test})
+  endforeach()
+  foreach(test classification typing pass_paths fail_open reject backspace async_fallback
+               drain_before_pass cancelled_recovery composition_terminated context_fence ordering repaired_boundaries)
+    add_test(NAME tsf_${test} COMMAND tsf ${test})
   endforeach()
 endif()

@@ -265,6 +265,17 @@ Pass Core::probe_pass() const {
   return Pass::Clear;
 }
 
+std::optional<Key> Core::record_cancelled_recovery() {
+  if (!alive_ || records_.size() >= capacity_ ||
+      sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  Key key{binding_, ++sequence_};
+  records_.push_back(
+      Record{key, Kind::Effect, Terminal::Cancelled, false, false, false, 0, std::nullopt});
+  return key;
+}
+
 Result Core::acknowledge(Key key) {
   auto *r = find(key);
   if (!r) {

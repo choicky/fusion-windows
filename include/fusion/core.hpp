@@ -71,6 +71,9 @@ public:
   Pass probe_pass() const;
   // Retirement requires explicit caller acknowledgement; uncertainty is retained.
   Result acknowledge(Key key);
+  // Caller explicitly cancels a physical recovery key. This bounded terminal
+  // admission grants no execution permission and does not restore readiness.
+  std::optional<Key> record_cancelled_recovery();
   const std::vector<Record> &records() const { return records_; }
   std::uint64_t consumed_state() const { return consumed_state_; }
   std::size_t capacity() const { return capacity_; }

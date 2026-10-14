@@ -1,0 +1,2 @@
+#pragma once
+namespace fusion::tsf { inline constexpr char kBuildIdentity[] = "@FUSION_BUILD_ID@"; }
