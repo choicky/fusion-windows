@@ -11,6 +11,7 @@
 
 #include "mock_backend.hpp"
 #include "tsf/com_ptr.hpp"
+#include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
 
 #include <msctf.h>
@@ -42,6 +43,9 @@ struct ContextEntry {
   std::uint64_t generation = 1;  // bumped when the entry is destroyed
   ITfComposition *composition = nullptr;
   SemanticController semantic;
+  CleanupIntent cleanup;
+  ComRef<IUnknown> cleanup_identity;
+  SelfEnd self_end;
   bool async_in_flight = false;
 
   ContextEntry(std::uint64_t context_id, std::size_t capacity, fusion::test::MockBackend &backend,
@@ -101,6 +105,7 @@ public:
   bool request_sync_session(ContextEntry &entry, ITfEditSession *session, HRESULT &outer,
                             HRESULT &inner);
   void schedule_async_pump(ContextEntry &entry);
+  void schedule_cleanup(ContextEntry &entry);
   ITfThreadMgr *thread_mgr() { return thread_mgr_.get(); }
   TfClientId client_id() const { return client_id_; }
   void note_async_done(ContextEntry &entry, bool progress);
@@ -109,6 +114,8 @@ public:
 private:
   ContextEntry *resolve_or_create_entry(ITfContext *pic);
   void handle_pass_key(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
+  void drain_prior_effect(ContextEntry &entry);
+  void cancel_current_key(ContextEntry &entry, BOOL *pfEaten);
   void handle_owned_state(ContextEntry &entry, const SemanticDecision &decision);
   void handle_owned_effect(ContextEntry &entry, const SemanticDecision &decision);
   void handle_reject_cleanup(ContextEntry &entry);

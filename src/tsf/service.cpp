@@ -126,6 +126,10 @@ public:
       diagf("FENCE", "kind=state stale-entry key.seq=%" PRIu64, key_.sequence);
       return S_OK;
     }
+    if (entry->cleanup.pending()) {
+      service_->schedule_cleanup(*entry);
+      return S_OK;
+    }
     bool mutated = false;
     if (!entry->semantic.state_applicable(key_)) {
       entry->semantic.enqueue_state(key_, narrow(text_));
@@ -195,6 +199,10 @@ public:
       diagf("FENCE", "kind=effect stale-entry key.seq=%" PRIu64, key_.sequence);
       return S_OK;
     }
+    if (entry->cleanup.pending()) {
+      service_->schedule_cleanup(*entry);
+      return S_OK;
+    }
     // D072 §8/README: the single execution ticket opens only now — after grant
     // and revalidation, immediately before the real document mutation.
     auto ticket = entry->semantic.open_effect(key_);
@@ -229,8 +237,10 @@ private:
 class CleanupEditSession final : public ITfEditSession {
 public:
   CleanupEditSession(TextService &service, ContextEntry &entry, std::uint64_t generation)
-      : service_(&service), entry_(&entry), generation_(generation) {
+      : service_(&service), entry_(&entry), generation_(generation),
+        serial_(entry.cleanup.serial()) {
     hold_ = service.hold_entry(&entry);
+    identity_ = qi<IUnknown>(entry.composition, IID_IUnknown);
     service.AddRef();
   }
   ~CleanupEditSession() { service_->Release(); }
@@ -264,13 +274,25 @@ public:
       diagf("FENCE", "kind=cleanup stale-entry");
       return S_OK;
     }
-    if (!service_->clear_composition_text(*entry, ec) || !service_->end_composition(*entry, ec)) {
-      diagf("CLEANUP_FAILED", "cid=%" PRIu64, entry->semantic.context_id());
-      return E_FAIL;
-    }
-    entry->semantic.note_composition_terminated();
-    diagf("CLEANUP_DONE", "cid=%" PRIu64, entry->semantic.context_id());
-    return S_OK;
+    const auto current = qi<IUnknown>(entry->composition, IID_IUnknown);
+    if (!identity_ || current.get() != identity_.get())
+      return S_OK; // never clear a replacement composition
+    const auto result = entry->cleanup.execute(serial_, generation_, identity_.get(), [&] {
+      if (!service_->clear_composition_text(*entry, ec))
+        return false;
+      const auto after_clear = qi<IUnknown>(entry->composition, IID_IUnknown);
+      if (entry->generation != generation_ ||
+          (after_clear && after_clear.get() != identity_.get()) ||
+          !service_->end_composition(*entry, ec))
+        return false;
+      entry->semantic.note_composition_terminated();
+      return true;
+    });
+    if (!result)
+      return S_OK;
+    diagf(*result ? "CLEANUP_DONE" : "CLEANUP_FAILED", "cid=%" PRIu64,
+          entry->semantic.context_id());
+    return *result ? S_OK : E_FAIL;
   }
 
 private:
@@ -279,6 +301,8 @@ private:
   TextService *service_;
   ContextEntry *entry_;
   std::uint64_t generation_;
+  std::uint64_t serial_;
+  ComRef<IUnknown> identity_;
 };
 
 // Async fallback pump: executes queued work after a refused synchronous
@@ -320,6 +344,11 @@ public:
     ContextEntry *entry = service_->find_entry_alive(entry_, generation_);
     if (entry == nullptr) {
       diagf("FENCE", "kind=async-pump stale-entry");
+      return S_OK;
+    }
+    if (entry->cleanup.pending()) {
+      service_->note_async_done(*entry, false);
+      service_->schedule_cleanup(*entry);
       return S_OK;
     }
     const auto &pending = entry->semantic.pending();
@@ -528,7 +557,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (handling_key_) {
     // Preserve routing to K for explicit recovery; T itself takes no ownership.
     if (auto *entry = find_entry(pic))
-      *pfEaten = entry->semantic.pass_probe() != fusion::Pass::Clear;
+      *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear;
     return S_OK;
   }
   ContextEntry *entry = resolve_or_create_entry(pic);
@@ -541,8 +570,8 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   const bool mapped =
       action.type == KeyAction::Type::AppendChar ||
       (action.type != KeyAction::Type::Pass && !entry->semantic.raw_buffer().empty());
-  *pfEaten =
-      entry->semantic.pass_probe() != fusion::Pass::Clear || (mapped && hard_policy_allows(*entry));
+  *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
+             (mapped && hard_policy_allows(*entry));
   diagf("TEST_KEY", "vk=0x%03llX predicted=%d", static_cast<unsigned long long>(wparam), *pfEaten);
   return S_OK;
 }
@@ -594,7 +623,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
     // nest ownership handling.
     diagf("REENTRANT_KEY", "vk=0x%03llX", static_cast<unsigned long long>(wparam));
     if (auto *current = find_entry(pic);
-        current && current->semantic.pass_probe() != fusion::Pass::Clear) {
+        current &&
+        (current->cleanup.pending() || current->semantic.pass_probe() != fusion::Pass::Clear)) {
       const auto cancelled = current->semantic.cancel_pass_recovery();
       diagf("CANCELLED_RECOVERY", "reentrant key.seq=%" PRIu64, cancelled.sequence);
       *pfEaten = TRUE;
@@ -620,10 +650,16 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
         policy_allows ? 1 : 0, ctrl ? 1 : 0, alt ? 1 : 0, win ? 1 : 0);
 
   entry->semantic.retire_terminals();
-  if (entry->semantic.pass_probe() != fusion::Pass::Clear) {
-    SemanticDecision recovery;
-    recovery.symbolic = "recovery-boundary";
-    handle_pass_key(*entry, recovery, pfEaten);
+  if (entry->cleanup.pending()) {
+    schedule_cleanup(*entry);
+    cancel_current_key(*entry, pfEaten);
+    entry->semantic.retire_terminals();
+    handling_key_ = false;
+    return S_OK;
+  }
+  if (!continue_current_key([&] { return entry->semantic.pass_probe(); },
+                            [&] { drain_prior_effect(*entry); },
+                            [&] { cancel_current_key(*entry, pfEaten); })) {
     entry->semantic.retire_terminals();
     handling_key_ = false;
     return S_OK;
@@ -719,12 +755,20 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
                                                   ITfComposition *pComposition) {
   (void)ecWrite;
   for (auto &entry : entries_) {
-    if (entry->composition != nullptr && entry->composition == pComposition) {
+    const auto callback_identity = qi<IUnknown>(pComposition, IID_IUnknown);
+    const auto live_identity = qi<IUnknown>(entry->composition, IID_IUnknown);
+    if (callback_identity && callback_identity.get() == live_identity.get()) {
+      if (entry->self_end.terminated(entry->generation, callback_identity.get(), [&] {
+            entry->semantic.note_composition_terminated();
+            entry->cleanup.reconciled();
+          })) {
+        diagf("COMPOSITION_SELF_END", "cid=%" PRIu64, entry->semantic.context_id());
+        return S_OK;
+      }
       // External authority event (D072 §9): reconcile the projection; queued
       // and pending work reaches explicit terminals, never silent loss.
       entry->composition->Release();
       entry->composition = nullptr;
-      entry->semantic.note_composition_terminated();
       diagf("COMPOSITION_TERMINATED", "cid=%" PRIu64, entry->semantic.context_id());
       break;
     }
@@ -986,7 +1030,12 @@ bool TextService::end_composition(ContextEntry &entry, TfEditCookie ec) {
   }
   ComRef<ITfComposition> ending(entry.composition);
   ending->AddRef();
+  const auto identity = qi<IUnknown>(ending.get(), IID_IUnknown);
+  if (!identity || entry.self_end.identity)
+    return false;
+  entry.self_end = SelfEnd{entry.generation, identity.get()};
   const HRESULT hr = ending->EndComposition(ec);
+  entry.self_end = {};
   if (FAILED(hr)) {
     diagf("COMPOSITION_END_FAILED", "hr=0x%08lX", static_cast<unsigned long>(hr));
     return false;
@@ -1054,8 +1103,7 @@ void TextService::note_async_done(ContextEntry &entry, bool progress) {
 // Key routing
 // ---------------------------------------------------------------------------
 
-void TextService::handle_pass_key(ContextEntry &entry, const SemanticDecision &decision,
-                                  BOOL *pfEaten) {
+void TextService::drain_prior_effect(ContextEntry &entry) {
   const fusion::Pass probe = entry.semantic.pass_probe();
   if (probe != fusion::Pass::Clear) {
     if (probe == fusion::Pass::DrainRequired) {
@@ -1080,18 +1128,17 @@ void TextService::handle_pass_key(ContextEntry &entry, const SemanticDecision &d
       diagf("PASS_FENCE", "probe=%d", static_cast<int>(probe));
     }
   }
+}
+
+void TextService::handle_pass_key(ContextEntry &entry, const SemanticDecision &decision,
+                                  BOOL *pfEaten) {
+  drain_prior_effect(entry);
   if (entry.semantic.finish_pass()) {
     // Genuine PASS: projection cleanup only (never a semantic materializer).
     if (entry.composition != nullptr) {
-      auto *session = new CleanupEditSession(*this, entry, entry.generation);
-      HRESULT outer = E_FAIL;
-      HRESULT inner = E_FAIL;
-      const bool executed = request_sync_session(entry, session, outer, inner);
-      session->Release();
-      if (!executed) {
-        const auto cancelled = entry.semantic.cancel_pass_recovery();
-        diagf("CANCELLED_RECOVERY", "cleanup key.seq=%" PRIu64, cancelled.sequence);
-        *pfEaten = TRUE;
+      handle_reject_cleanup(entry); // projection-only cleanup, same bounded fallback
+      if (entry.cleanup.pending()) {
+        cancel_current_key(entry, pfEaten);
         return;
       }
     }
@@ -1099,6 +1146,10 @@ void TextService::handle_pass_key(ContextEntry &entry, const SemanticDecision &d
     *pfEaten = FALSE;
     return;
   }
+  cancel_current_key(entry, pfEaten);
+}
+
+void TextService::cancel_current_key(ContextEntry &entry, BOOL *pfEaten) {
   // D072 §7.3: the key cannot lawfully pass; explicit CANCELLED recovery.
   const fusion::Key cancelled = entry.semantic.cancel_pass_recovery();
   if (cancelled.sequence != 0) {
@@ -1157,17 +1208,42 @@ void TextService::handle_owned_effect(ContextEntry &entry, const SemanticDecisio
 }
 
 void TextService::handle_reject_cleanup(ContextEntry &entry) {
-  if (entry.composition == nullptr) {
+  if (entry.composition == nullptr)
     return;
+  if (!entry.cleanup.pending()) {
+    entry.cleanup_identity = qi<IUnknown>(entry.composition, IID_IUnknown);
+    if (!entry.cleanup_identity)
+      return;
+    entry.cleanup.retain(entry.generation, entry.cleanup_identity.get());
   }
+  if (!entry.cleanup.request())
+    return;
+  const auto serial = entry.cleanup.serial();
   auto *session = new CleanupEditSession(*this, entry, entry.generation);
-  HRESULT outer = E_FAIL;
-  HRESULT inner = E_FAIL;
+  HRESULT outer = E_FAIL, inner = E_FAIL;
   const bool executed = request_sync_session(entry, session, outer, inner);
   session->Release();
   if (!executed) {
-    diagf("CLEANUP_DEFERRED", "outer=0x%08lX", static_cast<unsigned long>(outer));
+    entry.cleanup.refused(serial);
+    diagf("CLEANUP_DEFERRED", "outer=0x%08lX inner=0x%08lX", static_cast<unsigned long>(outer),
+          static_cast<unsigned long>(inner));
+    schedule_cleanup(entry);
   }
+}
+
+void TextService::schedule_cleanup(ContextEntry &entry) {
+  if (!entry.cleanup.request())
+    return;
+  const auto serial = entry.cleanup.serial();
+  auto *session = new CleanupEditSession(*this, entry, entry.generation);
+  HRESULT inner = E_FAIL;
+  const HRESULT outer =
+      entry.context->RequestEditSession(client_id_, session, TF_ES_ASYNC | TF_ES_READWRITE, &inner);
+  session->Release();
+  if (!async_admitted(outer, inner))
+    entry.cleanup.refused(serial); // intent remains; next real key provides another opportunity
+  diagf("CLEANUP_ASYNC_REQUEST", "outer=0x%08lX inner=0x%08lX", static_cast<unsigned long>(outer),
+        static_cast<unsigned long>(inner));
 }
 
 } // namespace fusion::tsf
