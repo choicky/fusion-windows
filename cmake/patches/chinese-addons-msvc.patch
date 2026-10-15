@@ -1,0 +1,53 @@
+diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
+index 7047c16..f7dff03 100644
+--- a/im/pinyin/pinyin.cpp
++++ b/im/pinyin/pinyin.cpp
+@@ -928,6 +928,7 @@ PinyinEngine::PinyinEngine(Instance *instance)
+         auto file =
+             standardPath.open(StandardPathsType::PkgData, "pinyin/user.history",
+                               StandardPathsMode::User);
++        if (!file.isValid()) { break; }
+ 
+         try {
+             IFDStreamBuf buffer(file.fd());
+@@ -1035,7 +1036,7 @@ void PinyinEngine::loadSymbols(const UnixFD &file) {
+     }
+ }
+ 
+-void PinyinEngine::loadDict(const std::string &fullPath,
++void PinyinEngine::loadDict(const std::filesystem::path &fullPath,
+                             std::list<std::unique_ptr<TaskToken>> &taskTokens) {
+     if (fullPath.empty()) {
+         return;
+@@ -2616,3 +2617,5 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
+ }
+ 
+ } // namespace fcitx
++
++
+diff --git a/im/pinyin/pinyin.h b/im/pinyin/pinyin.h
+index 3023307..10ab756 100644
+--- a/im/pinyin/pinyin.h
++++ b/im/pinyin/pinyin.h
+@@ -12,6 +12,7 @@
+ #include "workerthread.h"
+ #include <cstddef>
+ #include <cstdint>
++#include <filesystem>
+ #include <fcitx-config/configuration.h>
+ #include <fcitx-config/enum.h>
+ #include <fcitx-config/iniparser.h>
+@@ -497,7 +498,7 @@ private:
+     void loadExtraDict();
+     void loadCustomPhrase();
+     void loadSymbols(const UnixFD &file);
+-    void loadDict(const std::string &fullPath,
++    void loadDict(const std::filesystem::path &fullPath,
+                   std::list<std::unique_ptr<TaskToken>> &taskTokens);
+     void saveCustomPhrase();
+ 
+@@ -534,3 +535,4 @@ private:
+ } // namespace fcitx
+ 
+ #endif // _PINYIN_PINYIN_H_
++

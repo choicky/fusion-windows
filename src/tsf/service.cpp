@@ -44,17 +44,33 @@ void diagf(const char *name, const char *fmt, ...) {
   diag::event(name, buffer);
 }
 
-std::wstring widen(const std::string &text) { return std::wstring(text.begin(), text.end()); }
-
-std::string narrow(const std::wstring &text) {
-  std::string out;
-  out.reserve(text.size());
-  for (wchar_t ch : text) {
-    out.push_back(static_cast<char>(ch)); // Stage 2.5 vocabulary is ASCII-only
-  }
-  return out;
+std::wstring widen(const std::string &text) {
+  if (text.empty())
+    return {};
+  const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                        static_cast<int>(text.size()), nullptr, 0);
+  if (count <= 0)
+    return {};
+  std::wstring result(static_cast<std::size_t>(count), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                          result.data(), count) != count)
+    return {};
+  return result;
 }
-
+std::string narrow(const std::wstring &text) {
+  if (text.empty())
+    return {};
+  const int count =
+      WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                          nullptr, 0, nullptr, nullptr);
+  if (count <= 0)
+    return {};
+  std::string result(static_cast<std::size_t>(count), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                          result.data(), count, nullptr, nullptr) != count)
+    return {};
+  return result;
+}
 const char *route_name(SemanticDecision::Route route) {
   switch (route) {
   case SemanticDecision::Route::Pass:
@@ -398,8 +414,8 @@ private:
 // ContextEntry
 // ---------------------------------------------------------------------------
 
-ContextEntry::ContextEntry(std::uint64_t context_id, std::size_t capacity,
-                           fusion::test::MockBackend &backend, ITfDocumentMgr *dim, ITfContext *pic)
+ContextEntry::ContextEntry(std::uint64_t context_id, std::size_t capacity, ServiceBackend &backend,
+                           ITfDocumentMgr *dim, ITfContext *pic)
     : document_mgr(dim), context(pic), semantic(context_id, capacity + 1, backend, 1) {
   if (document_mgr) {
     document_mgr->AddRef();
@@ -465,6 +481,16 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   if (ptim == nullptr) {
     return E_INVALIDARG;
   }
+#ifdef FUSION_WITH_FCITX5
+  if (!backend_) {
+    try {
+      backend_ = make_fcitx_backend();
+    } catch (const std::exception &error) {
+      diagf("FCITX_START_FAILED", "%s", error.what());
+      return E_FAIL;
+    }
+  }
+#endif
   thread_mgr_ = ComRef<ITfThreadMgr>(ptim);
   thread_mgr_->AddRef();
   client_id_ = tid;
@@ -567,9 +593,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
       classify_key(static_cast<std::uint32_t>(wparam), (GetKeyState(VK_CONTROL) & 0x8000) != 0,
                    (GetKeyState(VK_MENU) & 0x8000) != 0,
                    (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0);
-  const bool mapped =
-      action.type == KeyAction::Type::AppendChar ||
-      (action.type != KeyAction::Type::Pass && !entry->semantic.raw_buffer().empty());
+  const bool mapped = entry->semantic.predicts_owned(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
   diagf("TEST_KEY", "vk=0x%03llX predicted=%d", static_cast<unsigned long long>(wparam), *pfEaten);
@@ -668,6 +692,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   diagf("BACKEND", "symbolic=%s intent=%d route=%s eaten=%d", decision.symbolic.c_str(),
         static_cast<int>(decision.intent), route_name(decision.route), decision.eaten ? 1 : 0);
 
+  if (decision.backend_session_id)
+    diagf("FCITX_BATCH", "session=%" PRIu64 " stimulus=%" PRIu64 " ops=%zu",
+          decision.backend_session_id, decision.stimulus_id, decision.operation_count);
   switch (decision.route) {
   case SemanticDecision::Route::Pass:
     handle_pass_key(*entry, decision, pfEaten);
@@ -830,8 +857,12 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
       dim = nullptr;
     }
   }
+#ifdef FUSION_WITH_FCITX5
+  if (!backend_ || !backend_->healthy())
+    return nullptr;
+#endif
   auto entry =
-      std::make_shared<ContextEntry>(next_context_id_++, kLedgerCapacity, backend_, dim, pic);
+      std::make_shared<ContextEntry>(next_context_id_++, kLedgerCapacity, backend(), dim, pic);
   if (dim)
     dim->Release(); // ContextEntry retains its own reference; release GetFocus's.
   entry->generation = next_generation_++;

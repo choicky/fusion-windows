@@ -1,0 +1,285 @@
+diff --git a/cmake/Fcitx5CompilerSettings.cmake b/cmake/Fcitx5CompilerSettings.cmake
+index 542f294..81de845 100644
+--- a/cmake/Fcitx5CompilerSettings.cmake
++++ b/cmake/Fcitx5CompilerSettings.cmake
+@@ -5,10 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_C_STANDARD_REQUIRED TRUE)
+ set(CMAKE_C_STANDARD 99)
+ 
++if(NOT MSVC)
+ set(CMAKE_C_FLAGS "-Wall -Wextra ${CMAKE_C_FLAGS}")
+ set(CMAKE_CXX_FLAGS "-Wall -Wextra ${CMAKE_CXX_FLAGS}")
++endif()
+ 
+-if(NOT APPLE AND NOT EMSCRIPTEN)
++if(NOT APPLE AND NOT EMSCRIPTEN AND NOT MSVC)
+     set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--no-undefined -Wl,--as-needed ${CMAKE_SHARED_LINKER_FLAGS}")
+     set(CMAKE_MODULE_LINKER_FLAGS "-Wl,--no-undefined -Wl,--as-needed ${CMAKE_MODULE_LINKER_FLAGS}")
+ endif()
+@@ -44,3 +46,4 @@ if("${_isSystemPlatformLibDir}" STREQUAL "-1" AND "${_isSystemCxxLibDir}" STREQU
+     set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}")
+     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+ endif("${_isSystemPlatformLibDir}" STREQUAL "-1" AND "${_isSystemCxxLibDir}" STREQUAL "-1")
++
+diff --git a/src/lib/fcitx-utils/fs.cpp b/src/lib/fcitx-utils/fs.cpp
+index d79d767..a737434 100644
+--- a/src/lib/fcitx-utils/fs.cpp
++++ b/src/lib/fcitx-utils/fs.cpp
+@@ -272,7 +272,7 @@ int64_t modifiedTime(const std::filesystem::path &path) {
+     std::error_code ec;
+     auto time = std::filesystem::last_write_time(path, ec);
+     auto systime =
+-        !ec ? std::filesystem::file_time_type::clock::to_sys(time)
++        !ec ? std::chrono::clock_cast<std::chrono::system_clock>(time)
+             : std::chrono::time_point<std::chrono::system_clock>::min();
+     auto timeInSeconds =
+         std::chrono::time_point_cast<std::chrono::seconds>(systime);
+@@ -291,3 +291,4 @@ UniqueFilePtr openFD(UnixFD &fd, const char *modes) {
+ }
+ 
+ } // namespace fcitx::fs
++
+diff --git a/src/lib/fcitx-utils/handlertable_details.h b/src/lib/fcitx-utils/handlertable_details.h
+index 4cb44eb..2883b94 100644
+--- a/src/lib/fcitx-utils/handlertable_details.h
++++ b/src/lib/fcitx-utils/handlertable_details.h
+@@ -54,7 +54,7 @@ class ListHandlerTableEntry : public HandlerTableEntry<T> {
+ 
+ public:
+     using node_getter_type =
+-        struct IntrusiveListMemberNodeGetter<ListHandlerTableEntry,
++        IntrusiveListMemberNodeGetter<ListHandlerTableEntry,
+                                              &ListHandlerTableEntry::node_>;
+ 
+     template <typename... Args>
+@@ -74,12 +74,12 @@ private:
+     table_type *table_;
+     Key key_;
+     IntrusiveListNode node_;
+-    friend struct IntrusiveListMemberNodeGetter<MultiHandlerTableEntry,
++    friend IntrusiveListMemberNodeGetter<MultiHandlerTableEntry,
+                                                 &MultiHandlerTableEntry::node_>;
+ 
+ public:
+     using node_getter_type =
+-        struct IntrusiveListMemberNodeGetter<MultiHandlerTableEntry,
++        IntrusiveListMemberNodeGetter<MultiHandlerTableEntry,
+                                              &MultiHandlerTableEntry::node_>;
+     MultiHandlerTableEntry(table_type *table, Key key, T handler)
+         : HandlerTableEntry<T>(std::move(handler)), table_(table),
+@@ -170,3 +170,4 @@ private:
+ } // namespace fcitx
+ 
+ #endif // _FCITX_UTILS_HANDLERTABLE_DETAILS_H_
++
+diff --git a/src/lib/fcitx-utils/misc_p.h b/src/lib/fcitx-utils/misc_p.h
+index 7958f22..e3268e0 100644
+--- a/src/lib/fcitx-utils/misc_p.h
++++ b/src/lib/fcitx-utils/misc_p.h
+@@ -10,6 +10,7 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+@@ -28,6 +29,7 @@
+ 
+ #ifdef _WIN32
+ #include <io.h>
++#include <windows.h>
+ #include <namedpipeapi.h>
+ #include <windows.h>
+ #endif
+@@ -341,3 +343,5 @@ static inline uint32_t FromLittleEndian32(const T *d) {
+ } // namespace fcitx
+ 
+ #endif // _FCITX_UTILS_MISC_P_H_
++
++
+diff --git a/src/lib/fcitx-utils/standardpaths_p_win.cpp b/src/lib/fcitx-utils/standardpaths_p_win.cpp
+index c9d6942..82600b3 100644
+--- a/src/lib/fcitx-utils/standardpaths_p_win.cpp
++++ b/src/lib/fcitx-utils/standardpaths_p_win.cpp
+@@ -14,6 +14,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <vector>
++#include <windows.h>
+ #include <fileapi.h>
+ #include <initguid.h>
+ #include <knownfolders.h>
+@@ -194,7 +195,7 @@ std::vector<std::filesystem::path> builtinPath(
+ std::filesystem::path getTempPath() {
+     std::wstring ret;
+     using GetTempPathPrototype =
+-        DWORD WINAPI (*)(DWORD nBufferLength, LPWSTR lpBuffer);
++        DWORD (WINAPI *)(DWORD nBufferLength, LPWSTR lpBuffer);
+     // We try to resolve GetTempPath2 and use that, otherwise fall back to
+     // GetTempPath:
+     static GetTempPathPrototype getTempPathW = []() {
+@@ -379,3 +380,5 @@ StandardPathsPrivate::fcitxPath(const char *path,
+ }
+ 
+ } // namespace fcitx
++
++
+diff --git a/src/lib/fcitx-utils/utf8.h b/src/lib/fcitx-utils/utf8.h
+index 8c4e563..04d4036 100644
+--- a/src/lib/fcitx-utils/utf8.h
++++ b/src/lib/fcitx-utils/utf8.h
+@@ -102,6 +102,7 @@ inline bool isValidChar(uint32_t c) {
+ /// INVALID_CHAR or NOT_ENOUGH_SPACE
+ template <typename Iter>
+ inline uint32_t getChar(Iter iter, Iter end) {
++    if (iter == end) { return NOT_ENOUGH_SPACE; }
+     const char *c = &(*iter);
+     return fcitx_utf8_get_char_validated(c, std::distance(iter, end), nullptr);
+ }
+@@ -114,6 +115,7 @@ inline uint32_t getChar(const T &s) {
+ 
+ template <typename Iter>
+ inline Iter getNextChar(Iter iter, Iter end, uint32_t *chr) {
++    if (iter == end) { *chr = NOT_ENOUGH_SPACE; return end; }
+     const char *c = &(*iter);
+     int plen = 0;
+     *chr = fcitx_utf8_get_char_validated(c, std::distance(iter, end), &plen);
+@@ -348,3 +350,4 @@ std::wstring UTF8ToUTF16(std::string_view str);
+ } // namespace fcitx::utf8
+ 
+ #endif // _FCITX_UTILS_UTF8_H_
++
+diff --git a/src/lib/fcitx/addoninstance.h b/src/lib/fcitx/addoninstance.h
+index 919c4eb..4b4e8ce 100644
+--- a/src/lib/fcitx/addoninstance.h
++++ b/src/lib/fcitx/addoninstance.h
+@@ -169,12 +169,12 @@ private:
+ #define FCITX_ADDON_EXPORT __attribute__((visibility("default")))
+ #endif
+ 
+-#define FCITX_ADDON_DECLARE_FUNCTION(NAME, FUNCTION, SIGNATURE...)             \
++#define FCITX_ADDON_DECLARE_FUNCTION(NAME, FUNCTION, ...)             \
+     namespace fcitx {                                                          \
+     template <>                                                                \
+     struct AddonFunctionSignature<fcitxMakeMetaString(#NAME "::" #FUNCTION)> { \
+         using type =                                                           \
+-            std::remove_reference_t<decltype(std::declval<SIGNATURE>())>;      \
++            std::remove_reference_t<decltype(std::declval<__VA_ARGS__>())>;      \
+     };                                                                         \
+     namespace I##NAME {                                                        \
+         struct FUNCTION {                                                      \
+@@ -252,3 +252,4 @@ private:
+     ::fcitx::AddonInstance *_##NAME##_ = nullptr;
+ 
+ #endif // _FCITX_ADDONINSTANCE_H_
++
+diff --git a/src/lib/fcitx/event.h b/src/lib/fcitx/event.h
+index 6953b0a..66adc9d 100644
+--- a/src/lib/fcitx/event.h
++++ b/src/lib/fcitx/event.h
+@@ -31,9 +31,9 @@ class InputContext;
+ class FocusGroup;
+ 
+ enum class ResetReason {
+-    ChangeByInactivate FCITXCORE_DEPRECATED,
+-    LostFocus FCITXCORE_DEPRECATED,
+-    SwitchIM FCITXCORE_DEPRECATED,
++    ChangeByInactivate [[deprecated]],
++    LostFocus [[deprecated]],
++    SwitchIM [[deprecated]],
+     Client
+ };
+ 
+@@ -647,7 +647,7 @@ public:
+               EventType::InputContextInputMethodDeactivated, name, context) {}
+ };
+ 
+-#define FCITX_DEFINE_SIMPLE_EVENT(NAME, TYPE, ARGS...)                         \
++#define FCITX_DEFINE_SIMPLE_EVENT(NAME, TYPE, ...)                         \
+     struct FCITXCORE_EXPORT NAME##Event : public InputContextEvent {           \
+         NAME##Event(InputContext *ic)                                          \
+             : InputContextEvent(ic, EventType::TYPE) {}                        \
+@@ -811,3 +811,4 @@ FCITX_DEFINE_EVENT_TYPE(VirtualKeyboardVisibilityChangedEvent,
+ } // namespace fcitx
+ 
+ #endif // _FCITX_EVENT_H_
++
+diff --git a/src/lib/fcitx/instance.cpp b/src/lib/fcitx/instance.cpp
+index 11f0c0c..f30fa37 100644
+--- a/src/lib/fcitx/instance.cpp
++++ b/src/lib/fcitx/instance.cpp
+@@ -795,39 +795,40 @@ Instance::Instance(int argc, char **argv) {
+             CheckInputMethodChanged imChangedRAII(ic, d);
+             auto origKey = keyEvent.origKey().normalize();
+ 
+-            struct {
++            struct KeyHandler {
+                 const KeyList &list;
+                 std::function<bool()> check;
+                 std::function<void(bool)> trigger;
+-            } keyHandlers[] = {
+-                {.list = d->globalConfig_.triggerKeys(),
+-                 .check = [this]() { return canTrigger(); },
+-                 .trigger =
++            };
++            KeyHandler keyHandlers[] = {
++                {d->globalConfig_.triggerKeys(),
++                 [this]() { return canTrigger(); },
++                 
+                      [this, ic](bool totallyReleased) {
+                          return trigger(ic, totallyReleased);
+                      }},
+-                {.list = d->globalConfig_.altTriggerKeys(),
+-                 .check = [this, ic]() { return canAltTrigger(ic); },
+-                 .trigger = [this, ic](bool) { return altTrigger(ic); }},
+-                {.list = d->globalConfig_.activateKeys(),
+-                 .check = [ic, d]() { return d->canActivate(ic); },
+-                 .trigger = [this, ic](bool) { return activate(ic); }},
+-                {.list = d->globalConfig_.deactivateKeys(),
+-                 .check = [ic, d]() { return d->canDeactivate(ic); },
+-                 .trigger = [this, ic](bool) { return deactivate(ic); }},
+-                {.list = d->globalConfig_.enumerateForwardKeys(),
+-                 .check = [this, ic]() { return canEnumerate(ic); },
+-                 .trigger = [this, ic](bool) { return enumerate(ic, true); }},
+-                {.list = d->globalConfig_.enumerateBackwardKeys(),
+-                 .check = [this, ic]() { return canEnumerate(ic); },
+-                 .trigger = [this, ic](bool) { return enumerate(ic, false); }},
+-                {.list = d->globalConfig_.enumerateGroupForwardKeys(),
+-                 .check = [this]() { return canChangeGroup(); },
+-                 .trigger = [ic, d, origKey](
++                {d->globalConfig_.altTriggerKeys(),
++                 [this, ic]() { return canAltTrigger(ic); },
++                  [this, ic](bool) { return altTrigger(ic); }},
++                {d->globalConfig_.activateKeys(),
++                 [ic, d]() { return d->canActivate(ic); },
++                  [this, ic](bool) { return activate(ic); }},
++                {d->globalConfig_.deactivateKeys(),
++                 [ic, d]() { return d->canDeactivate(ic); },
++                  [this, ic](bool) { return deactivate(ic); }},
++                {d->globalConfig_.enumerateForwardKeys(),
++                 [this, ic]() { return canEnumerate(ic); },
++                  [this, ic](bool) { return enumerate(ic, true); }},
++                {d->globalConfig_.enumerateBackwardKeys(),
++                 [this, ic]() { return canEnumerate(ic); },
++                  [this, ic](bool) { return enumerate(ic, false); }},
++                {d->globalConfig_.enumerateGroupForwardKeys(),
++                 [this]() { return canChangeGroup(); },
++                  [ic, d, origKey](
+                                 bool) { d->navigateGroup(ic, origKey, true); }},
+-                {.list = d->globalConfig_.enumerateGroupBackwardKeys(),
+-                 .check = [this]() { return canChangeGroup(); },
+-                 .trigger =
++                {d->globalConfig_.enumerateGroupBackwardKeys(),
++                 [this]() { return canChangeGroup(); },
++                 
+                      [ic, d, origKey](bool) {
+                          d->navigateGroup(ic, origKey, false);
+                      }},
+@@ -2702,3 +2703,6 @@ Instance::xkbStateMask(const std::string &display) const {
+ const char *Instance::version() { return FCITX_VERSION_STRING; }
+ 
+ } // namespace fcitx
++
++
++

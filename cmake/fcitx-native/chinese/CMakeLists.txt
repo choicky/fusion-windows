@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(FusionNativeChinese LANGUAGES C CXX)
+include(../common.cmake)
+find_package(Fcitx5Core CONFIG REQUIRED)
+find_package(LibIMEPinyin CONFIG REQUIRED)
+add_subdirectory("${FUSION_UPSTREAM_DIR}/fcitx5-chinese-addons" chinese)

@@ -59,7 +59,7 @@ HRESULT write_com_registration() {
   if (status != ERROR_SUCCESS) {
     return HRESULT_FROM_WIN32(status);
   }
-  status = set_registry_value(clsid_key, nullptr, L"Fusion Stage 2.5 TSF Text Service (dev)");
+  status = set_registry_value(clsid_key, nullptr, L"Fusion Stage 3B TSF Text Service (Real Fcitx5 PoC)");
   HKEY server_key = nullptr;
   if (status == ERROR_SUCCESS) {
     status = RegCreateKeyExW(clsid_key, L"InprocServer32", 0, nullptr, 0, KEY_SET_VALUE, nullptr,
@@ -88,7 +88,7 @@ HRESULT delete_com_registration() {
                                                                    : HRESULT_FROM_WIN32(status);
 }
 
-const wchar_t *kProfileDescription = L"Fusion Stage 2.5 (Mock Backend, development)";
+const wchar_t *kProfileDescription = L"Fusion Stage 3B (Real Fcitx5 Backend PoC)";
 
 } // namespace
 

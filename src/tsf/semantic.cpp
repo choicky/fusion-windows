@@ -10,9 +10,11 @@ SemanticController::SemanticController(std::uint64_t context_id, std::size_t cap
                                        fusion::test::MockBackend &backend,
                                        std::size_t recovery_reserve)
     : recovery_reserve_(recovery_reserve), id_(context_id), lifetime_(1),
-      core_(Binding{context_id, 1, 1}, capacity), host_(core_), backend_(backend) {}
+      core_(Binding{context_id, 1, 1}, capacity), host_(core_), backend_(&backend) {}
 
 SemanticDecision SemanticController::begin_key(const KeyAction &action, bool policy_allows) {
+  if (real_backend_)
+    return begin_real_key(action, policy_allows);
   SemanticDecision decision;
   // Raw-buffer projection first; the Mock Backend consumes the symbolic input.
   // Buffer edits are reverted if ownership admission fails, so a fail-open key
@@ -70,7 +72,7 @@ SemanticDecision SemanticController::begin_key(const KeyAction &action, bool pol
         action.type == KeyAction::Type::Reject) &&
        original_buffer.empty());
   if (unowned) {
-    decision.intent = backend_.respond(symbolic).intent;
+    decision.intent = backend_->respond(symbolic).intent;
     decision.route = SemanticDecision::Route::Pass;
     decision.eaten = false;
     return decision;
@@ -93,7 +95,7 @@ SemanticDecision SemanticController::begin_key(const KeyAction &action, bool pol
   }
   decision.key = owned;
   decision.eaten = true;
-  const fusion::test::Response response = backend_.respond(symbolic);
+  const fusion::test::Response response = backend_->respond(symbolic);
   decision.intent = response.intent;
   decision.text = response.text;
 
@@ -117,6 +119,139 @@ SemanticDecision SemanticController::begin_key(const KeyAction &action, bool pol
     buffer_ = original_buffer;
     break; // unexpected PASS after ownership is a failure terminal
   }
+  return decision;
+}
+
+SemanticController::SemanticController(std::uint64_t context_id, std::size_t capacity,
+                                       Backend &backend, std::size_t recovery_reserve)
+    : recovery_reserve_(recovery_reserve), id_(context_id), lifetime_(1),
+      core_(Binding{context_id, 1, 1}, capacity), host_(core_), real_backend_(&backend) {
+  backend_ready_ = backend.bind(core_.binding());
+}
+
+bool SemanticController::predicts_owned(const KeyAction &action) const {
+  if (real_backend_ && (!backend_ready_ || !real_backend_->healthy()))
+    return false;
+  if (real_backend_ && action.type == KeyAction::Type::AppendChar && action.ch >= '0' &&
+      action.ch <= '9')
+    return !buffer_.empty();
+  if (real_backend_ && action.type == KeyAction::Type::Pass && action.virtual_key == kVkReturn &&
+      !action.modified)
+    return !buffer_.empty();
+  return action.type == KeyAction::Type::AppendChar ||
+         (action.type != KeyAction::Type::Pass && !buffer_.empty());
+}
+
+SemanticDecision SemanticController::begin_real_key(const KeyAction &action, bool policy_allows) {
+  if (backend_reset_pending_) {
+    backend_ready_ = real_backend_->reset(core_.binding());
+    backend_reset_pending_ = false;
+  }
+  SemanticDecision decision;
+  if (!policy_allows || !backend_ready_ || !real_backend_->healthy()) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  switch (action.type) {
+  case KeyAction::Type::AppendChar:
+    stimulus.type = BackendStimulus::Type::Character;
+    stimulus.character = action.ch;
+    break;
+  case KeyAction::Type::Commit:
+    stimulus.type = BackendStimulus::Type::Space;
+    break;
+  case KeyAction::Type::Backspace:
+    stimulus.type = BackendStimulus::Type::Backspace;
+    break;
+  case KeyAction::Type::Reject:
+    stimulus.type = BackendStimulus::Type::Escape;
+    break;
+  case KeyAction::Type::Pass:
+    if (action.virtual_key != kVkReturn || action.modified)
+      return decision;
+    stimulus.type = BackendStimulus::Type::Return;
+    break;
+  }
+  // Windows PoC classification admits ownership BEFORE observing Fcitx. In
+  // particular, Fcitx's consumed bit cannot turn an admitted key into PASS.
+  const bool owns = predicts_owned(action);
+  const bool effect_class =
+      action.type == KeyAction::Type::Commit ||
+      (action.type == KeyAction::Type::Pass && action.virtual_key == kVkReturn) ||
+      (action.type == KeyAction::Type::AppendChar && action.ch >= '0' && action.ch <= '9');
+  if (owns) {
+    const bool capacity_allows = core_.records().size() + recovery_reserve_ < core_.capacity();
+    decision.key = core_.own(effect_class ? Kind::Effect : Kind::State, capacity_allows);
+    if (!decision.key) {
+      decision.route = SemanticDecision::Route::FailOpen;
+      return decision;
+    }
+    decision.eaten = true;
+  }
+  const auto batch = real_backend_->send(stimulus);
+  decision.symbolic = "fcitx:" + std::to_string(static_cast<int>(stimulus.type));
+  decision.backend_session_id = batch.backend_session_id;
+  decision.stimulus_id = batch.stimulus_id;
+  decision.operation_count = batch.operations.size();
+  bool valid = batch.backend_session_id == real_backend_->session_id() &&
+               batch.binding == stimulus.binding && batch.stimulus_id == stimulus.stimulus_id &&
+               batch.disposition != BackendBatch::Disposition::Reject;
+  std::string preedit = buffer_;
+  std::string commit;
+  unsigned commits = 0;
+  bool changed_preedit = false;
+  for (const auto &operation : batch.operations) {
+    switch (operation.type) {
+    case BackendOperation::Type::SetPreedit:
+      preedit = operation.text;
+      changed_preedit = true;
+      break;
+    case BackendOperation::Type::CommitText:
+      commit = operation.text;
+      ++commits;
+      break;
+    case BackendOperation::Type::CandidateSnapshot:
+      break; // no Stage 3B candidate renderer
+    case BackendOperation::Type::ForwardKey:
+      valid = false;
+      break; // never synthesize product replay
+    }
+  }
+  valid = valid && commits <= 1;
+  if (!owns && valid && batch.disposition == BackendBatch::Disposition::Forward && commits == 0 &&
+      (!changed_preedit || preedit == buffer_))
+    return decision;
+  if (owns && valid && batch.disposition == BackendBatch::Disposition::Consumed) {
+    if (effect_class && commits == 1 && (!changed_preedit || preedit.empty())) {
+      decision.intent = Intent::Commit;
+      decision.route = SemanticDecision::Route::Effect;
+      decision.text = std::move(commit);
+      return decision;
+    }
+    if (!effect_class && commits == 0 && changed_preedit) {
+      decision.intent = Intent::Preedit;
+      decision.route = SemanticDecision::Route::State;
+      decision.text = preedit;
+      buffer_ = std::move(preedit);
+      state_dependency_ = decision.key->sequence;
+      return decision;
+    }
+  }
+  // POC-LOCAL unsupported/mismatched batch: explicit failure/recovery. Never
+  // silently discard a commit then report genuine PASS, and never issue an edit.
+  if (decision.key) {
+    (void)host_.reject(*decision.key);
+    decision.route = SemanticDecision::Route::Reject;
+  } else {
+    decision.key = core_.record_cancelled_recovery();
+    decision.route = SemanticDecision::Route::CancelledRecovery;
+    decision.eaten = true;
+  }
+  decision.intent = Intent::Reject;
+  backend_ready_ = real_backend_->reset(core_.binding());
+  buffer_.clear();
+  state_dependency_ = 0;
   return decision;
 }
 
@@ -272,6 +407,8 @@ void SemanticController::note_composition_reset() {
 }
 
 void SemanticController::note_composition_terminated() {
+  if (real_backend_)
+    backend_reset_pending_ = true; // defer Host work until outside EditSession
   buffer_.clear();
   state_dependency_ = 0;
   // External termination is an authority event: queued work reaches explicit
@@ -289,11 +426,16 @@ void SemanticController::note_composition_terminated() {
 }
 
 Result SemanticController::replace_context(std::uint64_t context_id) {
+  const Binding previous = core_.binding();
   const std::uint64_t next_lifetime = lifetime_ + 1;
   Result result = core_.replace_context(Binding{context_id, next_lifetime, 1});
   if (result == Result::Accepted) {
     // Replacement fences readiness; a fresh binding must rebind explicitly.
     (void)core_.rebind();
+    if (real_backend_) {
+      real_backend_->unbind(previous);
+      backend_ready_ = real_backend_->bind(core_.binding());
+    }
     lifetime_ = next_lifetime;
     id_ = context_id;
     state_dependency_ = 0;
@@ -304,6 +446,10 @@ Result SemanticController::replace_context(std::uint64_t context_id) {
 }
 
 void SemanticController::destroy() {
+  if (real_backend_) {
+    real_backend_->unbind(core_.binding());
+    backend_ready_ = false;
+  }
   core_.destroy_context();
   buffer_.clear();
   clear_pending();

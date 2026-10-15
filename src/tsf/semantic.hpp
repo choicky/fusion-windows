@@ -16,6 +16,7 @@
 // the fallback queue (enqueue_*) until a later session settles it, and a PASS
 // key cannot overtake unresolved work (finish_pass).
 
+#include "fusion/backend.hpp"
 #include "fusion/core.hpp"
 #include "fusion/host.hpp"
 #include "mock_backend.hpp"
@@ -40,6 +41,9 @@ struct SemanticDecision {
   Route route = Route::Pass;
   bool eaten = false;   // TSF pfEaten answer for the physical key
   std::string symbolic; // input handed to the Mock Backend (oracle trace)
+  std::uint64_t backend_session_id = 0;
+  std::uint64_t stimulus_id = 0;
+  std::size_t operation_count = 0;
   Intent intent = Intent::Pass;
   std::string text; // STATE/EFFECT text to materialize, when routed
   std::optional<Key> key;
@@ -56,6 +60,10 @@ class SemanticController {
 public:
   SemanticController(std::uint64_t context_id, std::size_t capacity,
                      fusion::test::MockBackend &backend, std::size_t recovery_reserve = 0);
+
+  SemanticController(std::uint64_t context_id, std::size_t capacity, Backend &backend,
+                     std::size_t recovery_reserve = 0);
+  bool predicts_owned(const KeyAction &action) const;
 
   // Key-callback entry point: classification -> hard policy -> ownership
   // admission -> Mock Backend response -> routing. See SemanticDecision.
@@ -121,7 +129,12 @@ private:
   std::uint64_t lifetime_;
   Core core_;
   Host host_;
-  fusion::test::MockBackend &backend_;
+  fusion::test::MockBackend *backend_ = nullptr;
+  Backend *real_backend_ = nullptr;
+  bool backend_ready_ = false;
+  bool backend_reset_pending_ = false;
+  std::uint64_t next_stimulus_ = 1;
+  SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
   std::string buffer_;
   std::vector<PendingWork> pending_;
 };
