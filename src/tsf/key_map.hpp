@@ -30,6 +30,8 @@ struct KeyAction {
   };
   Type type = Type::Pass;
   char ch = '\0'; // valid only for AppendChar
+  std::uint32_t virtual_key = 0;
+  bool modified = false;
 };
 
 // Pure classification of one physical key-down. Modifier combinations and every

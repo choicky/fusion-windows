@@ -24,6 +24,11 @@
 #include <vector>
 
 namespace fusion::tsf {
+#ifdef FUSION_WITH_FCITX5
+using ServiceBackend = fusion::Backend;
+#else
+using ServiceBackend = fusion::test::MockBackend;
+#endif
 
 struct ContextEntry {
   ~ContextEntry() {
@@ -48,7 +53,7 @@ struct ContextEntry {
   SelfEnd self_end;
   bool async_in_flight = false;
 
-  ContextEntry(std::uint64_t context_id, std::size_t capacity, fusion::test::MockBackend &backend,
+  ContextEntry(std::uint64_t context_id, std::size_t capacity, ServiceBackend &backend,
                ITfDocumentMgr *dim, ITfContext *pic);
 };
 
@@ -109,7 +114,13 @@ public:
   ITfThreadMgr *thread_mgr() { return thread_mgr_.get(); }
   TfClientId client_id() const { return client_id_; }
   void note_async_done(ContextEntry &entry, bool progress);
-  fusion::test::MockBackend &backend() { return backend_; }
+  ServiceBackend &backend() {
+#ifdef FUSION_WITH_FCITX5
+    return *backend_;
+#else
+    return backend_;
+#endif
+  }
 
 private:
   ContextEntry *resolve_or_create_entry(ITfContext *pic);
@@ -125,7 +136,11 @@ private:
   ComRef<ITfThreadMgr> thread_mgr_;
   TfClientId client_id_ = TF_CLIENTID_NULL;
   DWORD thread_event_cookie_ = 0;
+#ifdef FUSION_WITH_FCITX5
+  std::unique_ptr<Backend> backend_;
+#else
   fusion::test::MockBackend backend_;
+#endif
   std::vector<std::shared_ptr<ContextEntry>> entries_;
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;

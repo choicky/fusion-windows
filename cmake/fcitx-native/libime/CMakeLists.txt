@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(FusionNativeLibime LANGUAGES C CXX)
+include(../common.cmake)
+add_subdirectory("${FUSION_UPSTREAM_DIR}/libime" libime)
+# Pinned KenLM predates C++17; retain its source and MSVC ABI.
+set_target_properties(kenlm libime_slm_build_binary PROPERTIES CXX_STANDARD 14)
+target_compile_options(libime_slm_build_binary PRIVATE /Zc:strictStrings-)
+target_sources(libime_slm_build_binary PRIVATE "${FUSION_UPSTREAM_DIR}/libime/src/libime/core/kenlm/util/getopt.c")
+find_package(getopt CONFIG REQUIRED)
+foreach(tool libime_prediction libime_pinyindict libime_history libime_tabledict libime_migrate_fcitx4_table libime_migrate_fcitx4_pinyin)
+  target_compile_options(${tool} PRIVATE /FIgetopt.h)
+  target_link_libraries(${tool} getopt::getopt_shared)
+endforeach()

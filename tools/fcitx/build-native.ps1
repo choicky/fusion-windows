@@ -1,0 +1,114 @@
+param(
+  [ValidateSet('Debug','Release')][string]$Configuration='Debug',
+  [string]$WorkRoot=(Join-Path $env:USERPROFILE 'worktmp\fusion-windows\stage3-real-backend-poc'),
+  [string]$VsDevCmd='C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat'
+)
+$ErrorActionPreference='Stop'
+$taskRepoRoot=(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$taskSupport=Join-Path $taskRepoRoot 'cmake\fcitx-native'
+$WorkRoot=[IO.Path]::GetFullPath($WorkRoot)
+New-Item -ItemType Directory -Force $WorkRoot | Out-Null
+function Invoke-Native([string]$Executable,[string[]]$Arguments) {
+  & $Executable @Arguments
+  if($LASTEXITCODE -ne 0) {throw "$Executable failed with exit $LASTEXITCODE"}
+}
+# Import only build-tool environment variables; never print a process environment.
+$taskEnvironment=& $env:ComSpec /d /c ('call "'+$VsDevCmd+'" -arch=x64 -host_arch=x64 >nul && set')
+if($LASTEXITCODE -ne 0) {throw 'Visual Studio environment initialization failed'}
+$taskAllowed=@('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion','VSCMD_ARG_HOST_ARCH','VSCMD_ARG_TGT_ARCH','VSCMD_VER','VisualStudioVersion')
+foreach($taskLine in $taskEnvironment) {
+  if($taskLine -match '^([^=]+)=(.*)$' -and $taskAllowed -contains $Matches[1]) {Set-Item -LiteralPath ('Env:'+$Matches[1]) -Value $Matches[2]}
+}
+& $env:ComSpec /d /c 'chcp 65001 >nul'
+function Get-PinnedSource([string]$Name,[string]$Url,[string]$Commit,[string]$Parent) {
+  $taskPath=Join-Path $Parent $Name
+  if(-not (Test-Path -LiteralPath (Join-Path $taskPath '.git'))) {
+    if(Test-Path -LiteralPath $taskPath) {throw "Existing non-repository directory: $taskPath"}
+    Invoke-Native 'git' @('clone','--no-checkout',$Url,$taskPath) | Out-Host
+    Invoke-Native 'git' @('-C',$taskPath,'fetch','--depth','1','origin',$Commit) | Out-Host
+    Invoke-Native 'git' @('-C',$taskPath,'checkout','--detach',$Commit) | Out-Host
+  }
+  $taskRemote=(& git -C $taskPath remote get-url origin).Trim()
+  if($LASTEXITCODE -ne 0 -or $taskRemote -ne $Url) {throw "Unexpected origin at $taskPath"}
+  $taskHead=(& git -C $taskPath rev-parse HEAD).Trim()
+  if($LASTEXITCODE -ne 0 -or $taskHead -ne $Commit) {throw "Preserve and inspect unexpected source HEAD at $taskPath"}
+  return $taskPath
+}
+$taskSourceRoot=Join-Path $WorkRoot 'upstream'
+New-Item -ItemType Directory -Force $taskSourceRoot | Out-Null
+$taskCore=Get-PinnedSource 'fcitx5' 'https://github.com/fcitx/fcitx5.git' 'a7f2528773ebfec98a20c49b6eea2333110b1c88' $taskSourceRoot
+$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/fcitx/fcitx5-chinese-addons.git' '61474bd3aa9fca26d1c31df93343035697e9f265' $taskSourceRoot
+$taskLibime=Get-PinnedSource 'libime' 'https://github.com/fcitx/libime.git' '171edcf137001e8eb8274f53ec010058cda70b09' $taskSourceRoot
+Invoke-Native 'git' @('-C',$taskLibime,'submodule','update','--init','--depth','1')
+$taskLibimeDiff=& git -C $taskLibime status --porcelain
+if($taskLibimeDiff) {throw 'LibIME must remain unmodified'}
+function Apply-NativePatch([string]$Source,[string]$Patch) {
+  & git -C $Source apply --reverse --check $Patch 2>$null
+  if($LASTEXITCODE -eq 0) {return}
+  Invoke-Native 'git' @('-C',$Source,'apply','--check',$Patch)
+  Invoke-Native 'git' @('-C',$Source,'apply',$Patch)
+}
+Apply-NativePatch $taskCore (Join-Path $taskRepoRoot 'cmake\patches\fcitx5-msvc.patch')
+Apply-NativePatch $taskChinese (Join-Path $taskRepoRoot 'cmake\patches\chinese-addons-msvc.patch')
+$taskDeps=Join-Path $WorkRoot 'deps'
+New-Item -ItemType Directory -Force $taskDeps | Out-Null
+$taskVcpkg=Get-PinnedSource 'vcpkg' 'https://github.com/microsoft/vcpkg.git' '20ceb8adbf0504d4b0d5e4058a32f9d4fc896391' $taskDeps
+if(-not(Test-Path -LiteralPath (Join-Path $taskVcpkg 'vcpkg.exe'))) {Invoke-Native (Join-Path $taskVcpkg 'bootstrap-vcpkg.bat') @('-disableMetrics')}
+# Verified PoC-local override: current ports build with the existing VS CMake
+# 4.3.1. Do not download a replacement CMake/Ninja installation.
+$taskCmakeVersion=(& cmake --version | Select-Object -First 1)
+if($taskCmakeVersion -match '4\.3\.1') {
+  $taskTools=Join-Path $taskVcpkg 'scripts\vcpkg-tools.json'
+  $taskToolData=Get-Content -LiteralPath $taskTools -Raw | ConvertFrom-Json
+  foreach($taskTool in $taskToolData.tools) {if($taskTool.name -eq 'cmake' -and $taskTool.os -eq 'windows') {$taskTool.version='4.3.1'}}
+  $taskToolData | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $taskTools -Encoding UTF8
+}
+Invoke-Native (Join-Path $taskVcpkg 'vcpkg.exe') @('install','libuv:x64-windows','pthreads:x64-windows','gettext[tools]:x64-windows','ecm:x64-windows','boost-iostreams[core]:x64-windows','zstd:x64-windows','pkgconf:x64-windows','getopt-win32:x64-windows','dirent:x64-windows','boost-ptr-container:x64-windows','boost-bimap:x64-windows','boost-multi-index:x64-windows','boost-unordered:x64-windows','boost-container:x64-windows','--disable-metrics')
+$taskSuffix=$Configuration.ToLowerInvariant()
+$taskPrefix=Join-Path $WorkRoot ('runtime-'+$taskSuffix)
+$taskBuildRoot=Join-Path $WorkRoot ('native-build\'+$Configuration)
+$taskToolchain=Join-Path $taskVcpkg 'scripts\buildsystems\vcpkg.cmake'
+$taskCommon=@('-G','Ninja',('-DCMAKE_BUILD_TYPE='+$Configuration),('-DCMAKE_TOOLCHAIN_FILE='+$taskToolchain),('-DCMAKE_INSTALL_PREFIX='+$taskPrefix),('-DCMAKE_PREFIX_PATH='+$taskPrefix),('-DFUSION_UPSTREAM_DIR='+$taskSourceRoot))
+$taskCoreBuild=Join-Path $taskBuildRoot 'core'
+Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'core'),'-B',$taskCoreBuild)+$taskCommon+@('-DENABLE_SERVER=OFF','-DENABLE_KEYBOARD=OFF','-DENABLE_X11=OFF','-DENABLE_WAYLAND=OFF','-DENABLE_DBUS=OFF','-DENABLE_ENCHANT=OFF','-DENABLE_EMOJI=OFF','-DENABLE_LIBUUID=OFF','-DENABLE_TEST=OFF','-DENABLE_TESTING_ADDONS=OFF','-DENABLE_DL=OFF','-DBUILD_SHARED_FCITX_ADDON=OFF','-DBUILD_SPELL_DICT=OFF','-DENABLE_XDGAUTOSTART=OFF','-DEVENT_LOOP_BACKEND=libuv'))
+Invoke-Native 'cmake' @('--build',$taskCoreBuild,'--parallel','8')
+Invoke-Native 'cmake' @('--install',$taskCoreBuild)
+$taskLibimeBuild=Join-Path $taskBuildRoot 'libime'
+Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'libime'),'-B',$taskLibimeBuild)+$taskCommon+@('-DENABLE_DATA=OFF','-DENABLE_TEST=OFF','-DENABLE_TOOLS=ON'))
+Invoke-Native 'cmake' @('--build',$taskLibimeBuild,'--parallel','8')
+Invoke-Native 'cmake' @('--install',$taskLibimeBuild)
+$taskChineseBuild=Join-Path $taskBuildRoot 'chinese'
+Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'chinese'),'-B',$taskChineseBuild)+$taskCommon+@('-DENABLE_TEST=OFF','-DENABLE_GUI=OFF','-DENABLE_BROWSER=OFF','-DENABLE_OPENCC=OFF','-DENABLE_CLOUDPINYIN=OFF','-DENABLE_DATA=OFF','-DENABLE_TOOLS=OFF','-DBUILD_SHARED_FCITX_ADDON=OFF'))
+Invoke-Native 'cmake' @('--build',$taskChineseBuild,'--parallel','8','--target','pinyin','pinyinhelper','punctuation','py-stroke-extract','py-table-extract','chinese/im/pinyin/pinyin-addon.conf','chinese/im/pinyin/pinyin.conf','chinese/modules/punctuation/punctuation.conf','chinese/modules/pinyinhelper/pinyinhelper.conf')
+$taskData=Join-Path $taskPrefix 'data\fcitx5'
+foreach($taskDirectory in @($taskData,(Join-Path $taskData 'addon'),(Join-Path $taskData 'inputmethod'),(Join-Path $taskData 'pinyin'),(Join-Path $taskData 'pinyinhelper'),(Join-Path $taskData 'punctuation'),(Join-Path $taskPrefix 'data\libime'),(Join-Path $taskPrefix 'lib\libime'))) {New-Item -ItemType Directory -Force $taskDirectory | Out-Null}
+Copy-Item (Join-Path $taskPrefix 'share\fcitx5\*') $taskData -Recurse -Force
+foreach($taskAddon in @('pinyin','pinyinhelper','punctuation')) {Copy-Item (Join-Path $taskChineseBuild ('lib\'+$taskAddon+'.lib')) (Join-Path $taskPrefix 'lib\fcitx5') -Force}
+Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin-addon.conf') (Join-Path $taskData 'addon\pinyin.conf') -Force
+Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin.conf') (Join-Path $taskData 'inputmethod\pinyin.conf') -Force
+Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\pinyinhelper\pinyinhelper.conf') (Join-Path $taskData 'addon') -Force
+Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\punctuation\punctuation.conf') (Join-Path $taskData 'addon') -Force
+Copy-Item (Join-Path $taskChinese 'im\pinyin\symbols') (Join-Path $taskData 'pinyin') -Force
+Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\pinyinhelper\*.mb') (Join-Path $taskData 'pinyinhelper') -Force
+Copy-Item (Join-Path $taskChinese 'modules\punctuation\punc.mb.*') (Join-Path $taskData 'punctuation') -Force
+$taskNativeBin=Join-Path $taskVcpkg ('installed\x64-windows\'+$(if($Configuration -eq 'Debug') {'debug\bin'} else {'bin'}))
+Copy-Item (Join-Path $taskNativeBin '*.dll') (Join-Path $taskPrefix 'bin') -Force
+$env:PATH=(Join-Path $taskPrefix 'bin')+';'+$env:PATH
+$taskResources=Join-Path $WorkRoot 'resources'
+New-Item -ItemType Directory -Force $taskResources | Out-Null
+function Get-Resource([string]$Name,[string]$Hash) {
+  $taskArchive=Join-Path $taskResources $Name
+  if(-not(Test-Path -LiteralPath $taskArchive)) {Invoke-WebRequest -Uri ('https://download.fcitx-im.org/data/'+$Name) -OutFile $taskArchive}
+  if((Get-FileHash -LiteralPath $taskArchive -Algorithm SHA256).Hash -ne $Hash) {throw "Resource hash mismatch: $Name"}
+  Push-Location $taskResources
+  try {Invoke-Native 'cmake' @('-E','tar','xf',$taskArchive)} finally {Pop-Location}
+}
+Get-Resource 'lm_sc.arpa-20260629.tar.zst' '06808333b9173e5374cf2cb5afc12d08f5625bf9abb536489cac376fc05f2e7f'
+Get-Resource 'dict-20260907.tar.zst' 'fb75a179065e690dfc4559ce1807cbaf4fbe4f0111a5005615be9f435e6b9d76'
+Invoke-Native (Join-Path $taskPrefix 'bin\libime_pinyindict.exe') @((Join-Path $taskResources 'dict_sc.txt'),(Join-Path $taskPrefix 'data\libime\sc.dict'))
+Invoke-Native (Join-Path $taskPrefix 'bin\libime_pinyindict.exe') @((Join-Path $taskResources 'dict_extb.txt'),(Join-Path $taskPrefix 'data\libime\extb.dict'))
+Invoke-Native (Join-Path $taskPrefix 'bin\libime_pinyindict.exe') @((Join-Path $taskChinese 'im\pinyin\chaizi.txt'),(Join-Path $taskData 'pinyin\chaizi.dict'))
+Invoke-Native (Join-Path $taskPrefix 'bin\libime_slm_build_binary.exe') @('-s','-a','22','-q','4','trie',(Join-Path $taskResources 'lm_sc.arpa'),(Join-Path $taskPrefix 'lib\libime\zh_CN.lm'))
+Write-Output ('Native runtime ready: '+$taskPrefix)
+Write-Output ('Configure product with -DFUSION_WITH_FCITX5=ON -DFUSION_FCITX5_ROOT='+$taskPrefix+' -DCMAKE_TOOLCHAIN_FILE='+$taskToolchain)
+
