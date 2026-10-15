@@ -35,6 +35,7 @@ struct SemanticDecision {
     State,             // owned STATE key; text is the full preedit projection
     Effect,            // owned EFFECT key; text is the immutable commit intent
     Reject,            // owned key failed after ownership; already settled here
+    Unsupported,       // complete result outside a bounded product envelope
     FailOpen,          // ownership was NOT admitted (policy/capacity): not eaten
     CancelledRecovery, // ownership admitted, then explicitly cancelled (§7.3)
   };
@@ -44,6 +45,9 @@ struct SemanticDecision {
   std::uint64_t backend_session_id = 0;
   std::uint64_t stimulus_id = 0;
   std::size_t operation_count = 0;
+  std::size_t effect_count = 0;
+  std::vector<BackendOperation> operations;
+  std::size_t prefix_cursor = 0;
   Intent intent = Intent::Pass;
   std::string text; // STATE/EFFECT text to materialize, when routed
   std::optional<Key> key;
@@ -54,6 +58,8 @@ struct PendingWork {
   Kind kind = Kind::State;
   Key key{};
   std::string text; // STATE: snapshot at enqueue time; latest-wins at execution
+  std::size_t operation_index = 0;
+  std::vector<BackendOperation> operations;
 };
 
 class SemanticController {
@@ -73,12 +79,19 @@ public:
 
   // EFFECT: propose at the watermark, then (after grant+revalidation) open the
   // single execution ticket immediately before the real mutation.
-  Result propose_effect(Key key);
-  std::optional<Ticket> open_effect(Key key);
+  Result propose_effect(Key key, std::size_t operation_index = 0);
+  std::optional<Ticket> open_effect(Key key, std::size_t operation_index = SIZE_MAX);
   Result settle_effect(Ticket ticket, EditResult observed);
 
   // STATE: consume with the observed edit result.
   Result settle_state(Key key, EditResult observed);
+
+  // Ordered-result cursor used by the S1 PoC. It is deliberately a cursor,
+  // not a second ledger: Core remains the authority for operation tickets.
+  void begin_ordered_result(Key key, std::size_t operation_count, std::size_t cursor = 0);
+  void advance_ordered_result(Key key, std::size_t operation_index);
+  std::size_t ordered_cursor() const { return ordered_cursor_; }
+  bool ordered_at(Key key, std::size_t operation_index) const;
 
   // Genuine-PASS barrier (D072 §7.2): Clear lets the key pass; anything else
   // requires the caller to drain (drain_work) or explicitly cancel.
@@ -96,8 +109,10 @@ public:
   Key cancel_pass_recovery();
 
   // Fallback queue after a refused synchronous session (state or effect).
-  void enqueue_state(Key key, std::string text);
-  void enqueue_effect(Key key, std::string text);
+  void enqueue_state(Key key, std::string text, std::size_t operation_index = 0,
+                     std::vector<BackendOperation> operations = {});
+  void enqueue_effect(Key key, std::string text, std::size_t operation_index = 0,
+                      std::vector<BackendOperation> operations = {});
   const std::vector<PendingWork> &pending() const { return pending_; }
   // Async execution: settles queued STATE work latest-wins — every pending
   // state key receives the same observed result in FIFO order.
@@ -137,6 +152,9 @@ private:
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
   std::string buffer_;
   std::vector<PendingWork> pending_;
+  std::optional<Key> ordered_key_;
+  std::size_t ordered_size_ = 0;
+  std::size_t ordered_cursor_ = 0;
 };
 
 } // namespace fusion::tsf

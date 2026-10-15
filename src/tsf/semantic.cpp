@@ -176,13 +176,9 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
   // Windows PoC classification admits ownership BEFORE observing Fcitx. In
   // particular, Fcitx's consumed bit cannot turn an admitted key into PASS.
   const bool owns = predicts_owned(action);
-  const bool effect_class =
-      action.type == KeyAction::Type::Commit ||
-      (action.type == KeyAction::Type::Pass && action.virtual_key == kVkReturn) ||
-      (action.type == KeyAction::Type::AppendChar && action.ch >= '0' && action.ch <= '9');
   if (owns) {
     const bool capacity_allows = core_.records().size() + recovery_reserve_ < core_.capacity();
-    decision.key = core_.own(effect_class ? Kind::Effect : Kind::State, capacity_allows);
+    decision.key = core_.own(capacity_allows);
     if (!decision.key) {
       decision.route = SemanticDecision::Route::FailOpen;
       return decision;
@@ -194,12 +190,13 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
   decision.backend_session_id = batch.backend_session_id;
   decision.stimulus_id = batch.stimulus_id;
   decision.operation_count = batch.operations.size();
+  decision.operations = batch.operations;
   bool valid = batch.backend_session_id == real_backend_->session_id() &&
                batch.binding == stimulus.binding && batch.stimulus_id == stimulus.stimulus_id &&
                batch.disposition != BackendBatch::Disposition::Reject;
   std::string preedit = buffer_;
   std::string commit;
-  unsigned commits = 0;
+  std::size_t commits = 0;
   bool changed_preedit = false;
   for (const auto &operation : batch.operations) {
     switch (operation.type) {
@@ -218,18 +215,46 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
       break; // never synthesize product replay
     }
   }
-  valid = valid && commits <= 1;
+  decision.effect_count = commits;
   if (!owns && valid && batch.disposition == BackendBatch::Disposition::Forward && commits == 0 &&
       (!changed_preedit || preedit == buffer_))
     return decision;
   if (owns && valid && batch.disposition == BackendBatch::Disposition::Consumed) {
-    if (effect_class && commits == 1 && (!changed_preedit || preedit.empty())) {
+    if (commits > 0) {
+      std::vector<std::size_t> effect_indices;
+      for (std::size_t i = 0; i < batch.operations.size(); ++i)
+        if (batch.operations[i].type == BackendOperation::Type::CommitText)
+          effect_indices.push_back(i);
+      std::optional<std::size_t> state_index;
+      for (std::size_t i = 0; i < batch.operations.size(); ++i)
+        if (batch.operations[i].type == BackendOperation::Type::SetPreedit)
+          state_index = i;
+      if (host_.classify(*decision.key, state_index, effect_indices) != Result::Accepted) {
+        (void)host_.reject(*decision.key);
+        decision.route = SemanticDecision::Route::Reject;
+        return decision;
+      }
+      if (commits > 1) {
+        decision.route = SemanticDecision::Route::Effect;
+        decision.intent = Intent::Commit;
+        decision.text = std::move(commit);
+        return decision;
+      }
       decision.intent = Intent::Commit;
       decision.route = SemanticDecision::Route::Effect;
       decision.text = std::move(commit);
       return decision;
     }
-    if (!effect_class && commits == 0 && changed_preedit) {
+    if (changed_preedit) {
+      std::optional<std::size_t> state_index;
+      for (std::size_t i = 0; i < batch.operations.size(); ++i)
+        if (batch.operations[i].type == BackendOperation::Type::SetPreedit)
+          state_index = i;
+      if (host_.classify(*decision.key, state_index, {}) != Result::Accepted) {
+        (void)host_.reject(*decision.key);
+        decision.route = SemanticDecision::Route::Reject;
+        return decision;
+      }
       decision.intent = Intent::Preedit;
       decision.route = SemanticDecision::Route::State;
       decision.text = preedit;
@@ -255,13 +280,15 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
   return decision;
 }
 
-Result SemanticController::propose_effect(Key key) {
+Result SemanticController::propose_effect(Key key, std::size_t operation_index) {
   if (core_.consumed_state() < state_dependency_)
     return Result::Blocked;
-  return host_.commit(key);
+  return host_.commit(key, operation_index);
 }
 
-std::optional<Ticket> SemanticController::open_effect(Key key) { return host_.open(key); }
+std::optional<Ticket> SemanticController::open_effect(Key key, std::size_t operation_index) {
+  return host_.open(key, operation_index);
+}
 
 Result SemanticController::settle_effect(Ticket ticket, EditResult observed) {
   Result result = host_.settle(ticket, observed);
@@ -294,6 +321,25 @@ Result SemanticController::settle_state(Key key, EditResult observed) {
   return host_.preedit(key, observed);
 }
 
+void SemanticController::begin_ordered_result(Key key, std::size_t operation_count,
+                                              std::size_t cursor) {
+  ordered_key_ = key;
+  ordered_size_ = operation_count;
+  ordered_cursor_ = cursor;
+}
+
+bool SemanticController::ordered_at(Key key, std::size_t operation_index) const {
+  return ordered_key_.has_value() && ordered_key_->binding == key.binding &&
+         ordered_key_->sequence == key.sequence && operation_index == ordered_cursor_ &&
+         operation_index < ordered_size_;
+}
+
+void SemanticController::advance_ordered_result(Key key, std::size_t operation_index) {
+  if (!ordered_at(key, operation_index))
+    return;
+  ++ordered_cursor_;
+}
+
 Pass SemanticController::pass_probe() const { return host_.pass_barrier(); }
 
 std::optional<PendingWork> SemanticController::drain_work() {
@@ -322,7 +368,8 @@ Key SemanticController::cancel_pass_recovery() {
   return key;
 }
 
-void SemanticController::enqueue_state(Key key, std::string text) {
+void SemanticController::enqueue_state(Key key, std::string text, std::size_t operation_index,
+                                       std::vector<BackendOperation> operations) {
   const bool live =
       std::any_of(core_.records().begin(), core_.records().end(), [&](const Record &record) {
         return record.key == key && record.key.binding == core_.binding() &&
@@ -333,10 +380,12 @@ void SemanticController::enqueue_state(Key key, std::string text) {
   if (std::any_of(pending_.begin(), pending_.end(),
                   [&](const PendingWork &w) { return w.key == key; }))
     return;
-  pending_.push_back(PendingWork{Kind::State, key, std::move(text)});
+  pending_.push_back(PendingWork{Kind::State, key, std::move(text), operation_index,
+                                 std::move(operations)});
 }
 
-void SemanticController::enqueue_effect(Key key, std::string text) {
+void SemanticController::enqueue_effect(Key key, std::string text, std::size_t operation_index,
+                                        std::vector<BackendOperation> operations) {
   const bool live =
       std::any_of(core_.records().begin(), core_.records().end(), [&](const Record &record) {
         return record.key == key && record.key.binding == core_.binding() &&
@@ -347,7 +396,8 @@ void SemanticController::enqueue_effect(Key key, std::string text) {
   if (std::any_of(pending_.begin(), pending_.end(),
                   [&](const PendingWork &w) { return w.key == key; }))
     return;
-  pending_.push_back(PendingWork{Kind::Effect, key, std::move(text)});
+  pending_.push_back(PendingWork{Kind::Effect, key, std::move(text), operation_index,
+                                 std::move(operations)});
 }
 
 void SemanticController::settle_queued_states(EditResult observed) {
@@ -357,6 +407,12 @@ void SemanticController::settle_queued_states(EditResult observed) {
     const Key key = pending_.front().key;
     const Result result = settle_state(key, observed);
     if (result == Result::Accepted) {
+      if (!pending_.front().operations.empty() &&
+          observed == EditResult::AppliedReadback)
+        advance_ordered_result(key, pending_.front().operation_index);
+      if (!pending_.front().operations.empty() &&
+          observed != EditResult::AppliedReadback)
+        return;
       pending_.erase(pending_.begin());
     } else if (result == Result::Blocked) {
       return;
@@ -377,7 +433,8 @@ bool SemanticController::state_applicable(Key key) const {
   for (const auto &record : core_.records()) {
     if (record.key == key) {
       found =
-          record.kind == Kind::State && record.terminal == Terminal::Pending && !record.uncertain;
+          record.has_state && !record.state_settled && !record.uncertain &&
+          (record.terminal == Terminal::Pending || record.has_effect);
     }
     if (record.key.binding == key.binding && record.key.sequence < key.sequence &&
         (record.terminal == Terminal::Pending || record.uncertain))

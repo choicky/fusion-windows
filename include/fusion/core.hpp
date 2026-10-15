@@ -31,18 +31,35 @@ enum class Readback { Applied, NoEffect };
 struct Ticket {
   Key key;
   std::uint64_t serial;
+  std::size_t operation_index = 0;
   bool operator==(const Ticket &) const = default;
 };
 
-struct Record {
-  Key key;
-  Kind kind;
+struct EffectOperation {
+  bool present = false;
   Terminal terminal = Terminal::Pending;
   bool proposed = false;
   bool issued = false;
   bool uncertain = false;
   std::uint64_t required_state = 0;
   std::optional<Ticket> ticket;
+};
+
+struct Record {
+  Key key;
+  Kind kind;
+  bool kind_known = true;
+  bool has_state = false;
+  bool has_effect = false;
+  bool state_settled = false;
+  std::optional<std::size_t> state_index;
+  Terminal terminal = Terminal::Pending;
+  bool proposed = false;
+  bool issued = false;
+  bool uncertain = false;
+  std::uint64_t required_state = 0;
+  std::optional<Ticket> ticket;
+  std::vector<EffectOperation> effects;
 };
 
 // One Windows-side logical context; caller owns admission and document execution.
@@ -55,9 +72,12 @@ public:
   Core(Core &&) = delete;
   Core &operator=(Core &&) = delete;
   std::optional<Key> own(Kind kind, bool policy_allows);
+  std::optional<Key> own(bool policy_allows);
+  Result classify(Key key, std::optional<std::size_t> state_index,
+                  const std::vector<std::size_t> &effect_indices);
   Result consume_state(Key key, EditResult result);
-  Result propose_effect(Key key, std::uint64_t required_state);
-  std::optional<Ticket> begin_effect(Key key);
+  Result propose_effect(Key key, std::uint64_t required_state, std::size_t operation_index = 0);
+  std::optional<Ticket> begin_effect(Key key, std::size_t operation_index = SIZE_MAX);
   Result complete_effect(Ticket ticket, EditResult result);
   Result reject(Key key);
   Result cancel(Key key);
@@ -84,6 +104,8 @@ private:
   Record *find(Ticket ticket);
   bool applicable(Key key) const;
   bool prior_pending(Key key) const;
+  bool fully_settled(const Record &record) const;
+  bool terminally_settled(const Record &record) const;
   void fence();
   Binding binding_;
   std::size_t capacity_;

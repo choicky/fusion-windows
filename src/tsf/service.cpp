@@ -81,6 +81,8 @@ const char *route_name(SemanticDecision::Route route) {
     return "Effect";
   case SemanticDecision::Route::Reject:
     return "Reject";
+  case SemanticDecision::Route::Unsupported:
+    return "Unsupported";
   case SemanticDecision::Route::FailOpen:
     return "FailOpen";
   case SemanticDecision::Route::CancelledRecovery:
@@ -178,9 +180,10 @@ private:
 class EffectEditSession final : public ITfEditSession {
 public:
   EffectEditSession(TextService &service, ContextEntry &entry, std::uint64_t generation,
-                    fusion::Key key, std::wstring text)
+                    fusion::Key key, std::vector<fusion::BackendOperation> operations,
+                    std::size_t start_index = 0)
       : service_(&service), entry_(&entry), generation_(generation), key_(key),
-        text_(std::move(text)) {
+        operations_(std::move(operations)), start_index_(start_index) {
     hold_ = service.hold_entry(&entry);
     service.AddRef();
   }
@@ -219,23 +222,51 @@ public:
       service_->schedule_cleanup(*entry);
       return S_OK;
     }
-    // D072 §8/README: the single execution ticket opens only now — after grant
-    // and revalidation, immediately before the real document mutation.
-    auto ticket = entry->semantic.open_effect(key_);
-    if (!ticket) {
-      diagf("EFFECT_OPEN_BLOCKED", "key.seq=%" PRIu64, key_.sequence);
-      entry->semantic.enqueue_effect(key_, narrow(text_));
-      service_->schedule_async_pump(*entry);
-      return S_OK;
-    }
-    bool mutated = false;
-    const fusion::EditResult observed = service_->apply_effect_text(*entry, ec, text_, mutated);
-    const fusion::Result settled = entry->semantic.settle_effect(*ticket, observed);
-    diagf("SETTLE_EFFECT", "key.seq=%" PRIu64 " observed=%d settled=%d mutated=%d", key_.sequence,
-          static_cast<int>(observed), static_cast<int>(settled), mutated ? 1 : 0);
-    if (observed == fusion::EditResult::RefusedNoMutation && settled == fusion::Result::Accepted) {
-      entry->semantic.enqueue_effect(key_, narrow(text_));
-      service_->schedule_async_pump(*entry);
+    entry->semantic.begin_ordered_result(key_, operations_.size(), start_index_);
+    for (std::size_t operation_index = start_index_; operation_index < operations_.size(); ++operation_index) {
+      const auto &operation = operations_[operation_index];
+      if (!entry->semantic.ordered_at(key_, operation_index))
+        return S_OK;
+      if (operation.type == fusion::BackendOperation::Type::CandidateSnapshot) {
+        entry->semantic.advance_ordered_result(key_, operation_index);
+        continue;
+      }
+      if (operation.type == fusion::BackendOperation::Type::ForwardKey)
+        return S_OK;
+      if (operation.type == fusion::BackendOperation::Type::SetPreedit) {
+        if (!entry->semantic.state_applicable(key_)) {
+          entry->semantic.enqueue_state(key_, operation.text, operation_index, operations_);
+          service_->schedule_async_pump(*entry);
+          return S_OK;
+        }
+        bool mutated = false;
+        const auto observed = service_->apply_state_text(*entry, ec, widen(operation.text), mutated);
+        const auto settled = entry->semantic.settle_state(key_, observed);
+        diagf("SETTLE_ORDERED_STATE", "key.seq=%" PRIu64 " op=%zu observed=%d settled=%d",
+              key_.sequence, operation_index, static_cast<int>(observed), static_cast<int>(settled));
+        if (settled != fusion::Result::Accepted || observed != fusion::EditResult::AppliedReadback) {
+          entry->semantic.enqueue_state(key_, operation.text, operation_index, operations_);
+          service_->schedule_async_pump(*entry);
+          return S_OK;
+        }
+        entry->semantic.advance_ordered_result(key_, operation_index);
+        continue;
+      }
+      auto ticket = entry->semantic.open_effect(key_, operation_index);
+      if (!ticket) {
+        diagf("EFFECT_OPEN_BLOCKED", "key.seq=%" PRIu64 " op=%zu", key_.sequence, operation_index);
+        entry->semantic.enqueue_effect(key_, operation.text, operation_index, operations_);
+        service_->schedule_async_pump(*entry);
+        return S_OK;
+      }
+      bool mutated = false;
+      const auto observed = service_->apply_effect_text(*entry, ec, widen(operation.text), mutated);
+      const auto settled = entry->semantic.settle_effect(*ticket, observed);
+      diagf("SETTLE_ORDERED_EFFECT", "key.seq=%" PRIu64 " op=%zu observed=%d settled=%d mutated=%d",
+            key_.sequence, operation_index, static_cast<int>(observed), static_cast<int>(settled), mutated ? 1 : 0);
+      if (settled != fusion::Result::Accepted || observed != fusion::EditResult::AppliedReadback)
+        return S_OK;
+      entry->semantic.advance_ordered_result(key_, operation_index);
     }
     return S_OK;
   }
@@ -247,7 +278,8 @@ private:
   ContextEntry *entry_;
   std::uint64_t generation_;
   fusion::Key key_;
-  std::wstring text_;
+  std::vector<fusion::BackendOperation> operations_;
+  std::size_t start_index_ = 0;
 };
 
 class CleanupEditSession final : public ITfEditSession {
@@ -384,16 +416,25 @@ public:
             entry->semantic.pending().size());
     } else if (!pending.empty() && pending.front().kind == fusion::Kind::Effect) {
       const PendingWork work = pending.front();
-      auto ticket = entry->semantic.open_effect(work.key);
-      if (ticket) {
-        bool mutated = false;
-        const fusion::EditResult observed =
-            service_->apply_effect_text(*entry, ec, widen(work.text), mutated);
-        const fusion::Result settled = entry->semantic.settle_effect(*ticket, observed);
-        diagf("PUMP_EFFECT", "key.seq=%" PRIu64 " observed=%d settled=%d", work.key.sequence,
-              static_cast<int>(observed), static_cast<int>(settled));
+      if (!work.operations.empty()) {
+        auto *session = new EffectEditSession(*service_, *entry, entry->generation, work.key,
+                                              work.operations, work.operation_index);
+        session->DoEditSession(ec);
+        session->Release();
       } else {
-        diagf("PUMP_EFFECT_OPEN_BLOCKED", "key.seq=%" PRIu64, work.key.sequence);
+        auto ticket = entry->semantic.open_effect(work.key, work.operation_index);
+        if (ticket) {
+          bool mutated = false;
+          const fusion::EditResult observed =
+              service_->apply_effect_text(*entry, ec, widen(work.text), mutated);
+          const fusion::Result settled = entry->semantic.settle_effect(*ticket, observed);
+          diagf("PUMP_EFFECT", "key.seq=%" PRIu64 " op=%zu observed=%d settled=%d",
+                work.key.sequence, work.operation_index, static_cast<int>(observed),
+                static_cast<int>(settled));
+        } else {
+          diagf("PUMP_EFFECT_OPEN_BLOCKED", "key.seq=%" PRIu64 " op=%zu", work.key.sequence,
+                work.operation_index);
+        }
       }
     }
     service_->note_async_done(*entry, entry->semantic.pending().size() < before);
@@ -709,6 +750,12 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
     break;
   case SemanticDecision::Route::Reject:
     // Already settled inside begin_key: explicit FailedNoEffect terminal.
+    handle_reject_cleanup(*entry);
+    *pfEaten = TRUE;
+    break;
+  case SemanticDecision::Route::Unsupported:
+    diagf("BACKEND_UNSUPPORTED", "effects=%zu ops=%zu", decision.effect_count,
+          decision.operation_count);
     handle_reject_cleanup(*entry);
     *pfEaten = TRUE;
     break;
@@ -1143,8 +1190,15 @@ void TextService::drain_prior_effect(ContextEntry &entry) {
       auto work = entry.semantic.drain_work();
       if (work && work->kind == fusion::Kind::Effect) {
         diagf("DRAIN", "key.seq=%" PRIu64, work->key.sequence);
-        auto *session =
-            new EffectEditSession(*this, entry, entry.generation, work->key, widen(work->text));
+        auto operations = work->operations;
+        if (operations.empty()) {
+          fusion::BackendOperation operation;
+          operation.type = fusion::BackendOperation::Type::CommitText;
+          operation.text = work->text;
+          operations.push_back(std::move(operation));
+        }
+        auto *session = new EffectEditSession(*this, entry, entry.generation, work->key,
+                                              std::move(operations), work->operation_index);
         HRESULT outer = E_FAIL;
         HRESULT inner = E_FAIL;
         const bool executed = request_sync_session(entry, session, outer, inner);
@@ -1215,7 +1269,16 @@ void TextService::handle_owned_state(ContextEntry &entry, const SemanticDecision
 }
 
 void TextService::handle_owned_effect(ContextEntry &entry, const SemanticDecision &decision) {
-  const fusion::Result proposed = entry.semantic.propose_effect(*decision.key);
+  entry.semantic.begin_ordered_result(*decision.key, decision.operations.size());
+  fusion::Result proposed = fusion::Result::Accepted;
+  for (std::size_t operation_index = 0; operation_index < decision.operations.size(); ++operation_index) {
+    const auto &operation = decision.operations[operation_index];
+    if (operation.type != fusion::BackendOperation::Type::CommitText)
+      continue;
+    proposed = entry.semantic.propose_effect(*decision.key, operation_index);
+    if (proposed != fusion::Result::Accepted)
+      break;
+  }
   diagf("HOST_COMMIT", "key.seq=%" PRIu64 " settled=%d", decision.key->sequence,
         static_cast<int>(proposed));
   if (proposed != fusion::Result::Accepted) {
@@ -1226,7 +1289,7 @@ void TextService::handle_owned_effect(ContextEntry &entry, const SemanticDecisio
     return;
   }
   auto *session =
-      new EffectEditSession(*this, entry, entry.generation, *decision.key, widen(decision.text));
+      new EffectEditSession(*this, entry, entry.generation, *decision.key, decision.operations);
   HRESULT outer = E_FAIL;
   HRESULT inner = E_FAIL;
   const bool executed = request_sync_session(entry, session, outer, inner);

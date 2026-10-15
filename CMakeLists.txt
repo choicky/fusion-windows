@@ -98,7 +98,7 @@ if(BUILD_TESTING)
   foreach(test routing cleanup termination)
     add_test(NAME tsf_orchestration_${test} COMMAND tsf_orchestration ${test})
   endforeach()
-  foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference)
+  foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference ordered_result)
     add_test(NAME rg0_${test} COMMAND rg0 ${test})
   endforeach()
   foreach(test state_path effect_path pass pass_barrier delay reorder duplicate stale restart

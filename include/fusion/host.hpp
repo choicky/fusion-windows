@@ -33,11 +33,19 @@ public:
 
   // STATE path: apply a preedit observation for an owned State key.
   Result preedit(Key key, EditResult observed) { return core_.consume_state(key, observed); }
+  Result classify(Key key, std::optional<std::size_t> state_index,
+                  const std::vector<std::size_t> &effect_indices) {
+    return core_.classify(key, state_index, effect_indices);
+  }
 
   // EFFECT path: propose the commit against the current consumed-STATE watermark,
   // open the single execution opportunity, then settle it with the observed edit.
-  Result commit(Key key) { return core_.propose_effect(key, core_.consumed_state()); }
-  std::optional<Ticket> open(Key key) { return core_.begin_effect(key); }
+  Result commit(Key key, std::size_t operation_index = 0) {
+    return core_.propose_effect(key, core_.consumed_state(), operation_index);
+  }
+  std::optional<Ticket> open(Key key, std::size_t operation_index = SIZE_MAX) {
+    return core_.begin_effect(key, operation_index);
+  }
   Result settle(const Ticket &ticket, EditResult observed) {
     return core_.complete_effect(ticket, observed);
   }

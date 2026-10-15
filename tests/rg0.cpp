@@ -256,6 +256,73 @@ void reference() {
   }
 }
 
+void ordered_result() {
+  Core core({1, 1, 1}, 8);
+  auto event = core.own(true);
+  require(event.has_value(), "owned event admitted without predicted Kind");
+  require(core.classify(*event, 1, {0, 2}) == Result::Accepted, "ordered result classified");
+  require(core.propose_effect(*event, 0, 0) == Result::Accepted, "first effect proposed");
+  auto first = core.begin_effect(*event, 0);
+  require(first.has_value(), "first effect ticket");
+  require(core.complete_effect(*first, EditResult::AppliedReadback) == Result::Accepted,
+          "first effect applied");
+  require(core.records().front().terminal == Terminal::Pending,
+          "event remains unresolved after first effect");
+  require(core.consume_state(*event, EditResult::AppliedReadback) == Result::Accepted,
+          "interleaved state applied");
+  require(core.probe_pass() == Pass::DrainRequired, "pending op2 blocks PASS");
+  require(core.acknowledge(*event) == Result::Blocked, "pending op2 blocks acknowledgement");
+  require(core.propose_effect(*event, 0, 1) == Result::Invalid,
+          "non-effect state index is rejected");
+  require(!core.begin_effect(*event, 1), "dense ordinal cannot stand in for op2");
+  require(core.propose_effect(*event, 0, 2) == Result::Accepted, "second effect proposed");
+  require(core.records().front().effects[2].proposed, "op2 proposal retained");
+  require(core.records().front().effects[2].terminal == Terminal::Pending, "op2 pending");
+  require(core.records().front().state_settled, "state settled");
+  require(core.records().front().has_effect, "effect result retained");
+  auto second = core.begin_effect(*event, 2);
+  require(second.has_value(), "second effect ticket");
+  require(second->operation_index == 2, "ticket keeps semantic operation index");
+  require(core.complete_effect(*second, EditResult::RefusedNoMutation) == Result::Accepted,
+          "op2 refusal keeps it pending");
+  auto resumed = core.begin_effect(*event, 2);
+  require(resumed.has_value() && resumed->operation_index == 2,
+          "continuation resumes original op2");
+  require(core.complete_effect(*resumed, EditResult::AppliedReadback) == Result::Accepted,
+          "second effect applied");
+  require(core.records().front().effects[0].terminal == Terminal::Applied &&
+              core.records().front().effects[2].terminal == Terminal::Applied,
+          "both operation identities applied exactly once");
+  require(core.records().front().terminal == Terminal::Applied, "event fully settled");
+  require(core.probe_pass() == Pass::Clear, "PASS clears after full result");
+  require(core.complete_effect(*first, EditResult::AppliedReadback) == Result::Duplicate,
+          "stale first ticket cannot duplicate effect");
+  require(core.acknowledge(*event) == Result::Accepted, "fully settled event retires");
+
+  Core recovery_core({1, 1, 1}, 8);
+  auto failed_state = recovery_core.own(true);
+  require(failed_state.has_value(), "second event admitted");
+  require(recovery_core.classify(*failed_state, 1, {0, 2}) == Result::Accepted,
+          "second result classified");
+  require(recovery_core.propose_effect(*failed_state, 0, 0) == Result::Accepted,
+          "second result op0 proposed");
+  auto first_again = recovery_core.begin_effect(*failed_state, 0);
+  require(first_again.has_value(), "second result op0 ticket");
+  require(recovery_core.complete_effect(*first_again, EditResult::AppliedReadback) == Result::Accepted,
+          "second result op0 applied");
+  require(recovery_core.consume_state(*failed_state, EditResult::RefusedNoMutation) == Result::Accepted,
+          "state refusal recorded without claiming settlement");
+  require(recovery_core.propose_effect(*failed_state, 0, 2) == Result::Accepted,
+          "op2 proposal retained behind failed state");
+  require(!recovery_core.begin_effect(*failed_state, 2), "op2 cannot overtake failed state");
+  require(recovery_core.consume_state(*failed_state, EditResult::AppliedReadback) == Result::Accepted,
+          "same state safely reprojected");
+  auto final_effect = recovery_core.begin_effect(*failed_state, 2);
+  require(final_effect.has_value(), "op2 proceeds after state reconciliation");
+  require(recovery_core.complete_effect(*final_effect, EditResult::AppliedReadback) == Result::Accepted,
+          "reconciled op2 applied");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -286,6 +353,8 @@ int main(int argc, char **argv) {
       retry();
     } else if (name == "reference") {
       reference();
+    } else if (name == "ordered_result") {
+      ordered_result();
     } else {
       return 2;
     }
