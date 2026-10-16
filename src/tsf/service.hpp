@@ -52,6 +52,10 @@ struct ContextEntry {
   ComRef<IUnknown> cleanup_identity;
   SelfEnd self_end;
   bool async_in_flight = false;
+  // Last link identity observed for this context, purely for diagnostics: a
+  // change means a disconnect, reconnect or incarnation/connection move.
+  LinkStatus observed_link{};
+  bool link_observed = false;
 
   ContextEntry(std::uint64_t context_id, std::size_t capacity, ServiceBackend &backend,
                ITfDocumentMgr *dim, ITfContext *pic);

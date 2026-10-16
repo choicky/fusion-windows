@@ -7,7 +7,9 @@ an explicit Host-side boundary (`fusion::Host`) that translates backend semantic
 intent into existing FusionCore operations, and a Stage 2.5 real Windows TSF/COM
 development shell (`FusionTsf`). Stage 3B/3C provide the real Fcitx5 backend PoC
 and faithful frontend path. Stage 4A adds an out-of-process Fcitx Host
-(`FusionHost.exe`) connected by length-prefixed binary IPC over a local Named Pipe.
+(`FusionHost.exe`) connected by length-prefixed binary IPC over a local Named Pipe;
+Stage 4B adds Host-incarnation identity, a bounded product-path reconnect, explicit
+semantic readiness and incarnation fencing.
 There is no end-user Windows input product yet; independent review is required
 before further integration.
 
@@ -55,7 +57,7 @@ repository entry point only.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure
-clang-format --dry-run --Werror include/fusion/core.hpp include/fusion/host.hpp include/fusion/backend.hpp include/fusion/ipc_protocol.hpp src/core.cpp src/tsf/*.hpp src/tsf/*.cpp src/ipc/*.hpp src/ipc/*.cpp src/host/*.hpp src/host/*.cpp tests/mock.hpp tests/mock.cpp tests/mock_backend.hpp tests/mock_backend.cpp tests/rg0.cpp tests/stage2.cpp tests/stage3b.cpp tests/stage3c.cpp tests/stage4a_ipc.cpp tests/tsf_semantic.cpp
+clang-format --dry-run --Werror include/fusion/core.hpp include/fusion/host.hpp include/fusion/backend.hpp include/fusion/ipc_protocol.hpp src/core.cpp src/tsf/*.hpp src/tsf/*.cpp src/ipc/*.hpp src/ipc/*.cpp src/host/*.hpp src/host/*.cpp tests/mock.hpp tests/mock.cpp tests/mock_backend.hpp tests/mock_backend.cpp tests/rg0.cpp tests/stage2.cpp tests/stage3b.cpp tests/stage3c.cpp tests/stage4a_ipc.cpp tests/stage4b_reconnect.cpp tests/tsf_semantic.cpp
 ```
 
 CMake 3.20+, a C++20 compiler, and CTest are sufficient. There are no external
@@ -229,8 +231,11 @@ backend and serves IPC requests from connected TSF DLL clients.
 payload_length][1 byte: message_type][N bytes: payload]`. Strict
 request/response alternation per connection. All deserialization is fail-closed
 and rejects trailing bytes. Message types: Hello, Bind, Reset, Unbind, Send.
-The Hello handshake exchanges `protocol_version` (currently 1) and the backend
-`session_id`. Version mismatch returns version=0 and the client disconnects.
+The Hello handshake exchanges `protocol_version` (currently 2) and the backend
+`session_id`; since Stage 4B every Host response payload is prefixed with the
+responding Host incarnation (`[8 bytes: host_incarnation]`). Version mismatch
+returns version=0 and the client disconnects, so a mixed Stage 4A/4B pairing
+fails the handshake instead of misparsing it.
 
 **Pipe name and security.** The default pipe name is computed from the user SID
 and session ID (`\\.\pipe\FusionHost-v1-<SID>-<sessionId>`), ensuring per-user
@@ -241,7 +246,8 @@ token SID with its own after connect.
 
 **Multi-client and context remapping.** The Host accepts multiple concurrent
 clients, each on its own pipe instance. Each connection has its own thread and
-remaps client context IDs to Host-unique context IDs. On disconnect, the Host
+remaps client context IDs to Host-unique context IDs (a new connection to the
+same Host is always remapped to a new Host context). On disconnect, the Host
 unbinds all contexts owned by that connection. All backend calls are serialized
 through a shared mutex.
 
@@ -250,10 +256,12 @@ failure (transport never saw the request → `Forward` with no ops) from
 post-write failure (request on the wire, response lost → `Reject` + mark
 unhealthy). `healthy()` is local state only — no IPC probe.
 
-**TSF DLL fail-open.** When `FUSION_WITH_FCITX5` is ON, the TSF DLL attempts
-one IPC connection with a 200ms timeout during `Activate`. If the Host is
-unreachable, the DLL activates without a backend and all keys are genuine PASS
-(fail-open). The DLL does not auto-launch the Host (P0-D OPEN).
+**TSF DLL fail-open.** When `FUSION_WITH_FCITX5` is ON, the TSF DLL creates its
+`IpcBackend` during `Activate` and makes one bounded connection attempt
+(200 ms). If the Host is unreachable, the DLL activates without a link and all
+keys are genuine PASS (fail-open); the client object still exists, so a Host that
+appears later is reached by the bounded reconnect described under Stage 4B. The
+DLL does not auto-launch the Host (P0-D OPEN).
 
 **FusionHost.exe startup.** The Host is a standalone executable that must be
 started externally before the TSF DLL can connect. From a build directory:
@@ -287,5 +295,77 @@ Run with `ctest --test-dir build -R stage4a`.
 P0-A/P0-B/P0-D remain OPEN; Host startup/lifecycle belongs to P0-D. Recovery UX, permanent
 identifiers, final wire format, timing thresholds, candidate renderer and environment
 policy also remain OPEN. The IPC protocol is an engineering constant, not a frozen wire
-format. If an application activated the IME before `FusionHost.exe` was started, switch the
-IME away and back in that application to connect.
+format.
+
+## Stage 4B — Host failure, reconnect, semantic readiness, incarnation fencing
+
+Stage 4B makes the D072 §13 reconnect ladder reachable on the Stage 4A product path and
+gives Host incarnations a concrete, testable identity. It changes no Fcitx/LibIME semantics
+and adds no second ledger: ownership, uncertainty, ordering and accountings stay in the
+existing `FusionCore` ledger.
+
+**Identity.** `HostServer` owns one incarnation identity per Host process/instance
+(a PoC engineering value from process id + monotonic clock + a process-local sequence; 0 is
+reserved for "no incarnation"). The Hello response publishes it and every Host response
+payload is prefixed with it (`[8 bytes: host_incarnation]`, `protocol_version` 2). The
+client refuses a response whose incarnation is not the one its connection established, and
+`LinkStatus` exposes `{state, host_incarnation, connection_generation}` — the two causal
+distinctions D072 §11 already named.
+
+**The ladder is explicit.** `LinkState` is `Disconnected` → `Connected` (transport up,
+handshake incomplete) → `Established` (protocol and incarnation known). "Semantic ready" is
+a further, per-context condition: the context binding must belong to the current
+incarnation *and* connection generation, because the Host unbinds every context of a
+dropped connection and remaps a new connection to new Host context ids.
+
+**Bounded reconnect.** `IpcBackend::ensure_link` is idempotent, bounded (transport connect
+plus one Hello round trip, 200 ms engineering constant) and performs no I/O when already
+established; it never reuses a connection across an establishment. It is driven from the
+existing key/context path (`SemanticController::begin_real_key`,
+`resolve_or_create_entry`) — no background thread and no busy loop. A Host that is not
+running fails the transport open immediately, so repeated attempts are cheap; a failure is
+`FailOpen` (the key stays application-owned), which is why a Host crash cannot crash the
+target application. Because the DLL keeps its client object even when the Host is
+unreachable at `Activate`, a Host started later is reached without switching the IME.
+
+**Fencing and preserved responsibility.** On an incarnation or connection-generation move
+the controller fences the previous incarnation's Host-provided semantic projection
+(`buffer_`, `state_dependency_`, a deferred reset intent) and re-binds the context;
+ownership/uncertainty accounting and the never-issued materialization queue are
+deliberately *not* cleared, and the Core ledger (`prior_pending`, `consumed_state_`,
+`probe_pass`) still prevents an effect from overtaking unresolved prior work. A request
+whose execution certainty is unknown stays `Reject`/cancelled with an explicit terminal and
+is never replayed; an indeterminate effect is never converted into ordinary PASS. Unresolved
+P0-A/P0-B recovery is therefore preserved and observable, not resolved.
+
+**Diagnostics.** The TSF shell emits one `LINK` diagnostic per observed link transition
+(state, incarnation, connection generation, semantic readiness, route), so disconnect,
+reconnect and rebind are visible in `%LOCALAPPDATA%\fusion-tsf\`.
+
+**Tests.** `tests/stage4b_reconnect.cpp` drives the real product classes (`IpcBackend` +
+`HostServer` + the Stage 2.5/3C `SemanticController`) against a deterministic Host-side test
+double, so every mode builds and runs in the Mock-only build too:
+
+- `link`: the state ladder (including "transport connected but not established"), bounded
+  `ensure_link`, idempotence without I/O, and the preserved definitely-not-written `Forward`
+  boundary
+- `failover`: Host death while idle, an observable loss, restart, bounded reconnect, a new
+  incarnation, rebind and working new input
+- `cycles`: four Host loss/restart cycles — distinct incarnations, exactly one connection
+  generation per establishment, no context reuse inside a Host, no leaked handles, no replay
+- `fencing`: a result stamped with a foreign incarnation and a response without an envelope
+  are both refused deterministically, while a correct round trip on a fresh connection is
+  accepted and the refused stimulus is never reissued
+- `contexts`: isolation across an incarnation change; a context that has not re-established
+  its binding cannot reach the new Host or affect another context
+- `semantic`: stale STATE from the dead incarnation cannot become current STATE for the new
+  one, owned/uncertain accounting survives, an effect cannot overtake unresolved prior STATE,
+  a deferred action of the dead incarnation is not replayed, and an unresolved EFFECT is not
+  converted into PASS or re-materialized
+
+Run with `ctest --test-dir build -R stage4b`.
+
+P0-A/P0-B/P0-D remain OPEN. Stage 4B deliberately does not choose the final user-visible
+recovery policy: a composition that the dead incarnation had already materialized in the
+document is left in place (recovery representation/UX is P0-B), and the exact
+reconnect/readiness numbers remain engineering constants.

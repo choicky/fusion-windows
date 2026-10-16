@@ -557,17 +557,19 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   }
 #ifdef FUSION_WITH_FCITX5
   if (!backend_) {
-    // P0-D OPEN: FusionHost startup is external to the DLL.
-    // Attempt one connection with a short timeout; fail open if unreachable.
+    // P0-D OPEN: FusionHost startup is external to the DLL. The client object is
+    // created unconditionally so a Host that becomes available later is reachable
+    // through the bounded reconnect path on the normal key/context path; this
+    // activation-time attempt only shortens the first-key latency.
     try {
-      backend_ = fusion::ipc::make_ipc_backend(std::chrono::milliseconds(200));
-      if (!backend_) {
-        diagf("IPC_HOST_UNREACHABLE", "FusionHost not reachable, fail-open PASS");
-        // Fail open: activate without backend, all keys will be PASS.
+      backend_ = std::make_unique<fusion::ipc::IpcBackend>();
+      if (!backend_->ensure_link(std::chrono::milliseconds(200))) {
+        diagf("IPC_HOST_UNREACHABLE", "FusionHost not reachable, fail-open PASS, reconnect armed");
+        // Fail open: activate without a link, all keys PASS until a Host answers.
       }
     } catch (const std::exception &error) {
       diagf("IPC_HOST_CONNECT_FAILED", "%s, fail-open PASS", error.what());
-      // Fail open: activate without backend.
+      // Fail open: activate without a link.
     }
   }
 #endif
@@ -769,6 +771,23 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   diagf("BACKEND", "symbolic=%s intent=%d route=%s eaten=%d", decision.symbolic.c_str(),
         static_cast<int>(decision.intent), route_name(decision.route), decision.eaten ? 1 : 0);
 
+  if (entry->semantic.real_frontend()) {
+    // Observability (D072 §21): disconnect / reconnect / incarnation / connection
+    // moves on the real product path, with the semantic-readiness answer.
+    const fusion::LinkStatus link = entry->semantic.link_status();
+    const bool moved = !entry->link_observed || link.state != entry->observed_link.state ||
+                       link.host_incarnation != entry->observed_link.host_incarnation ||
+                       link.connection_generation != entry->observed_link.connection_generation;
+    if (moved) {
+      diagf("LINK", "state=%d incarnation=%llu generation=%llu semantic_ready=%d route=%s",
+            static_cast<int>(link.state), static_cast<unsigned long long>(link.host_incarnation),
+            static_cast<unsigned long long>(link.connection_generation),
+            entry->semantic.semantic_ready() ? 1 : 0, route_name(decision.route));
+      entry->observed_link = link;
+      entry->link_observed = true;
+    }
+  }
+
   if (decision.backend_session_id)
     diagf("FCITX_BATCH", "session=%" PRIu64 " stimulus=%" PRIu64 " ops=%zu",
           decision.backend_session_id, decision.stimulus_id, decision.operation_count);
@@ -968,7 +987,10 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
     }
   }
 #ifdef FUSION_WITH_FCITX5
-  if (!backend_ || !backend_->healthy())
+  // Bounded reconnect on the context path: a Host that became available after
+  // the context was first needed is reachable without an IME switch. Failure is
+  // fail-open (the key stays application-owned), never a semantic verdict.
+  if (!backend_ || !backend_->ensure_link(std::chrono::milliseconds(200)))
     return nullptr;
 #endif
   auto entry =

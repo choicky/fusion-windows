@@ -128,6 +128,15 @@ public:
   Result replace_context(std::uint64_t context_id);
   void destroy();
 
+  // --- Stage 4B link/incarnation readiness (real frontend only) ---
+  //
+  // "Semantic ready" is not "pipe connected": it requires an established
+  // protocol incarnation AND a context binding established for that same
+  // incarnation and connection.
+  bool semantic_ready() const;
+  // Current link identity, for observability and tests.
+  LinkStatus link_status() const;
+
   Core &core() { return core_; }
   Host &host() { return host_; }
   std::uint64_t context_id() const { return id_; }
@@ -143,8 +152,17 @@ private:
   Backend *real_backend_ = nullptr;
   bool backend_ready_ = false;
   bool backend_reset_pending_ = false;
+  // Identity of the incarnation/connection this controller is bound to. 0 means
+  // "not bound to any incarnation".
+  std::uint64_t bound_incarnation_ = 0;
+  std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
+  // Bounded reconnect + incarnation/connection fencing + context (re)bind.
+  bool ensure_semantic_ready();
+  // The previous incarnation's Host-provided semantic projection is not current
+  // STATE for the new one. Ownership/uncertainty accounting is NOT touched.
+  void fence_previous_incarnation();
   std::string buffer_;
   std::vector<PendingWork> pending_;
 };

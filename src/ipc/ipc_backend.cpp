@@ -6,53 +6,94 @@ IpcBackend::IpcBackend(std::wstring pipe_name) : client_(std::move(pipe_name)) {
 
 IpcBackend::~IpcBackend() { client_.disconnect(); }
 
-bool IpcBackend::connect(std::chrono::milliseconds timeout) {
-  if (!client_.connect(timeout))
-    return false;
+LinkStatus IpcBackend::link_status() const {
+  return LinkStatus{link_state_.load(), incarnation_.load(), connection_generation_.load()};
+}
 
-  // Hello handshake: send protocol_version, expect version + session_id.
+std::uint64_t IpcBackend::incarnation() const { return incarnation_.load(); }
+
+void IpcBackend::drop_link() {
+  client_.disconnect();
+  link_state_ = LinkState::Disconnected;
+  // The incarnation/generation of the dropped connection are deliberately kept:
+  // they are the identity that later work must not be accepted against, and the
+  // generation only ever advances when a new connection is established.
+}
+
+bool IpcBackend::handshake(std::chrono::milliseconds timeout) {
+  // Hello handshake: send protocol_version, expect envelope(incarnation) +
+  // version + session_id.
   std::vector<std::uint8_t> hello_payload;
   detail::write_u32(hello_payload, protocol_version);
 
-  std::lock_guard lock(rpc_mutex_);
-  if (client_.send_request(MessageType::HelloRequest, hello_payload) != WriteOutcome::Written) {
-    client_.disconnect();
+  if (client_.send_request(MessageType::HelloRequest, hello_payload) != WriteOutcome::Written)
     return false;
-  }
-  auto response = client_.recv_response(kRequestTimeout);
-  if (!response || response->type != MessageType::HelloResponse) {
-    client_.disconnect();
+  auto response = client_.recv_response(timeout);
+  if (!response || response->type != MessageType::HelloResponse)
     return false;
-  }
 
   detail::Reader r(response->payload.data(), response->payload.size());
+  auto envelope_incarnation = r.read_u64();
   auto version = r.read_u32();
   auto sid = r.read_u64();
-  if (!version || *version == 0 || !sid || !r.at_end()) {
-    client_.disconnect();
+  // A zero incarnation is never a usable Host identity, and a version mismatch
+  // (including the Host's explicit version=0 rejection) fails closed.
+  if (!envelope_incarnation || *envelope_incarnation == 0 || !version || !sid || !r.at_end())
     return false;
-  }
-  if (*version != protocol_version) {
-    client_.disconnect();
+  if (*version != protocol_version)
     return false;
-  }
 
   cached_session_id_ = *sid;
-  healthy_ = true;
+  incarnation_ = *envelope_incarnation;
+  connection_generation_ = connection_generation_.load() + 1;
+  link_state_ = LinkState::Established;
   return true;
+}
+
+bool IpcBackend::ensure_link(std::chrono::milliseconds timeout) {
+  std::lock_guard lock(rpc_mutex_);
+  if (link_state_.load() == LinkState::Established && client_.connected())
+    return true;
+
+  // Never carry a previous connection (or its identity) into a new one.
+  drop_link();
+  if (!client_.connect(timeout))
+    return false;
+  // Transport is up; the Host incarnation is not established until Hello
+  // succeeds, so nothing semantic may be admitted from here.
+  link_state_ = LinkState::Connected;
+  if (!handshake(timeout)) {
+    drop_link();
+    return false;
+  }
+  return true;
+}
+
+bool IpcBackend::connect(std::chrono::milliseconds timeout) { return ensure_link(timeout); }
+
+bool IpcBackend::envelope_matches(const WireFrame &response) const {
+  if (response.payload.size() < response_envelope_size)
+    return false;
+  detail::Reader r(response.payload.data(), response.payload.size());
+  auto envelope_incarnation = r.read_u64();
+  return envelope_incarnation && *envelope_incarnation == incarnation_.load();
 }
 
 std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
                                          const std::vector<std::uint8_t> &payload,
                                          MessageType expected_response) {
   std::lock_guard lock(rpc_mutex_);
-  if (!client_.connected())
+  if (link_state_.load() != LinkState::Established || !client_.connected())
     return std::nullopt;
-  if (client_.send_request(request_type, payload) != WriteOutcome::Written)
+  if (client_.send_request(request_type, payload) != WriteOutcome::Written) {
+    drop_link();
     return std::nullopt;
+  }
   auto response = client_.recv_response(kRequestTimeout);
-  if (!response || response->type != expected_response)
+  if (!response || response->type != expected_response || !envelope_matches(*response)) {
+    drop_link();
     return std::nullopt;
+  }
   return response;
 }
 
@@ -62,7 +103,8 @@ bool IpcBackend::bind(Binding binding) {
   auto response = rpc(MessageType::BindRequest, payload, MessageType::BindResponse);
   if (!response)
     return false;
-  auto result = deserialize_bool(response->payload.data(), response->payload.size());
+  auto result = deserialize_bool(response->payload.data() + response_envelope_size,
+                                 response->payload.size() - response_envelope_size);
   return result.value_or(false);
 }
 
@@ -72,7 +114,8 @@ bool IpcBackend::reset(Binding binding) {
   auto response = rpc(MessageType::ResetRequest, payload, MessageType::ResetResponse);
   if (!response)
     return false;
-  auto result = deserialize_bool(response->payload.data(), response->payload.size());
+  auto result = deserialize_bool(response->payload.data() + response_envelope_size,
+                                 response->payload.size() - response_envelope_size);
   return result.value_or(false);
 }
 
@@ -83,8 +126,9 @@ void IpcBackend::unbind(Binding binding) {
 }
 
 bool IpcBackend::healthy() const {
-  // Local state only — no IPC probe.
-  return healthy_.load() && client_.connected();
+  // Local state only — no IPC probe. "Healthy" means the protocol handshake for
+  // the current connection completed; it is not semantic readiness.
+  return link_state_.load() == LinkState::Established && client_.connected();
 }
 
 std::uint64_t IpcBackend::session_id() const { return cached_session_id_; }
@@ -98,14 +142,24 @@ BackendBatch IpcBackend::forward_batch(const BackendStimulus &stimulus) const {
   return batch;
 }
 
+BackendBatch IpcBackend::reject_batch(const BackendStimulus &stimulus) const {
+  BackendBatch batch;
+  batch.disposition = BackendBatch::Disposition::Reject;
+  batch.backend_session_id = cached_session_id_;
+  batch.binding = stimulus.binding;
+  batch.stimulus_id = stimulus.stimulus_id;
+  return batch;
+}
+
 BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   std::vector<std::uint8_t> payload;
   serialize(payload, stimulus);
 
   std::lock_guard lock(rpc_mutex_);
 
-  // Pre-write check: if not connected, the request cannot be written at all.
-  if (!client_.connected())
+  // Pre-write check: without an established incarnation no request may be
+  // written at all, so the stimulus cannot have reached any Host.
+  if (link_state_.load() != LinkState::Established || !client_.connected())
     return forward_batch(stimulus);
 
   // Attempt to write the request. Only a write that provably accepted no byte of
@@ -114,42 +168,28 @@ BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   // have observed enough of the request for the outcome to be unknown.
   const WriteOutcome write = client_.send_request(MessageType::SendRequest, payload);
   if (write == WriteOutcome::NotWritten) {
-    healthy_ = false;
+    drop_link();
     return forward_batch(stimulus);
   }
   if (write == WriteOutcome::Uncertain) {
     // No replay, no synthetic key: report the uncertain stimulus as Reject and
     // keep the identity fields so caller-side accounting matches what was sent.
-    healthy_ = false;
-    BackendBatch batch;
-    batch.disposition = BackendBatch::Disposition::Reject;
-    batch.backend_session_id = cached_session_id_;
-    batch.binding = stimulus.binding;
-    batch.stimulus_id = stimulus.stimulus_id;
-    return batch;
+    drop_link();
+    return reject_batch(stimulus);
   }
 
   // Post-write: the request is on the wire. Any failure now is a Reject.
   auto response = client_.recv_response(kRequestTimeout);
-  if (!response) {
-    healthy_ = false;
-    BackendBatch batch;
-    batch.disposition = BackendBatch::Disposition::Reject;
-    return batch;
-  }
-  if (response->type != MessageType::SendResponse) {
-    healthy_ = false;
-    BackendBatch batch;
-    batch.disposition = BackendBatch::Disposition::Reject;
-    return batch;
+  if (!response || response->type != MessageType::SendResponse || !envelope_matches(*response)) {
+    drop_link();
+    return reject_batch(stimulus);
   }
 
-  auto batch = deserialize_batch(response->payload.data(), response->payload.size());
+  auto batch = deserialize_batch(response->payload.data() + response_envelope_size,
+                                 response->payload.size() - response_envelope_size);
   if (!batch) {
-    healthy_ = false;
-    BackendBatch rejected;
-    rejected.disposition = BackendBatch::Disposition::Reject;
-    return rejected;
+    drop_link();
+    return reject_batch(stimulus);
   }
   return *batch;
 }

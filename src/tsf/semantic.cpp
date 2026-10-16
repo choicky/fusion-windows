@@ -1,10 +1,27 @@
 #include "tsf/semantic.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 #include <utility>
 
 namespace fusion::tsf {
+
+namespace {
+
+// UNFROZEN engineering constant: upper bound of one bounded reconnect attempt
+// (transport connect + one Hello round trip) on the key/context path. A missing
+// Host fails the transport open immediately, so this bound is only reached when
+// the pipe exists but cannot be served.
+constexpr auto kLinkTimeout = std::chrono::milliseconds(200);
+
+// A backend that reports no incarnation has no transport to fence: the Stage 4A
+// single-bind lifecycle applies unchanged.
+bool incarnation_tracked(const LinkStatus &link) {
+  return link.host_incarnation != 0 || link.connection_generation != 0;
+}
+
+} // namespace
 
 SemanticController::SemanticController(std::uint64_t context_id, std::size_t capacity,
                                        fusion::test::MockBackend &backend,
@@ -127,11 +144,84 @@ SemanticController::SemanticController(std::uint64_t context_id, std::size_t cap
     : recovery_reserve_(recovery_reserve), id_(context_id), lifetime_(1),
       core_(Binding{context_id, 1, 1}, capacity), host_(core_), real_backend_(&backend) {
   backend_ready_ = backend.bind(core_.binding());
+  if (backend_ready_) {
+    const LinkStatus link = backend.link_status();
+    bound_incarnation_ = link.host_incarnation;
+    bound_connection_ = link.connection_generation;
+  }
+}
+
+LinkStatus SemanticController::link_status() const {
+  if (!real_backend_)
+    return LinkStatus{LinkState::Established, 0, 0};
+  return real_backend_->link_status();
+}
+
+bool SemanticController::semantic_ready() const {
+  if (!real_backend_)
+    return false;
+  const LinkStatus link = real_backend_->link_status();
+  if (link.state != LinkState::Established)
+    return false;
+  if (!incarnation_tracked(link))
+    return backend_ready_; // in-process backend: Stage 4A single-bind readiness
+  return backend_ready_ && bound_incarnation_ == link.host_incarnation &&
+         bound_connection_ == link.connection_generation;
+}
+
+void SemanticController::fence_previous_incarnation() {
+  // Host-provided semantic projection from the previous incarnation must never
+  // become current STATE for the new one (D072 §23 "zero stale resurrection").
+  buffer_.clear();
+  state_dependency_ = 0;
+  // A deferred reset intent belonged to the connection that is gone.
+  backend_reset_pending_ = false;
+  // Deliberately NOT cleared: Core records, uncertainty and the pending
+  // materialization queue. An unresolved/indeterminate EFFECT stays owned and
+  // auditable (P0-A/P0-B), and a callback that was received but never issued to
+  // the document is still owed to the document authority. Neither is replayed
+  // against the new incarnation.
+}
+
+bool SemanticController::ensure_semantic_ready() {
+  // Bounded reconnect. Failure is fail-open before ownership, never a semantic
+  // verdict and never a replay of earlier work.
+  if (!real_backend_->ensure_link(kLinkTimeout))
+    return false;
+
+  const LinkStatus link = real_backend_->link_status();
+  if (link.state != LinkState::Established)
+    return false;
+  if (!incarnation_tracked(link))
+    return backend_ready_; // in-process backend: no incarnation to fence
+
+  const bool moved = bound_incarnation_ != link.host_incarnation ||
+                     bound_connection_ != link.connection_generation;
+  if (moved) {
+    if (bound_incarnation_ != 0 || bound_connection_ != 0)
+      fence_previous_incarnation();
+    // A binding belongs to one incarnation and connection; it is never carried
+    // across either.
+    backend_ready_ = false;
+  }
+  if (!backend_ready_) {
+    // CONTEXT REBIND (D072 §13): readiness for this context requires an
+    // established binding on the current incarnation/connection.
+    backend_ready_ = real_backend_->bind(core_.binding());
+    if (backend_ready_) {
+      bound_incarnation_ = link.host_incarnation;
+      bound_connection_ = link.connection_generation;
+    } else {
+      bound_incarnation_ = 0;
+      bound_connection_ = 0;
+    }
+  }
+  return backend_ready_;
 }
 
 bool SemanticController::routes_key(const KeyAction &action) const {
   if (real_backend_)
-    return backend_ready_ && real_backend_->healthy() && !action.modified &&
+    return semantic_ready() && real_backend_->healthy() && !action.modified &&
            (action.keysym != 0 || action.type != KeyAction::Type::Pass ||
             action.virtual_key == kVkReturn);
   return action.type == KeyAction::Type::AppendChar ||
@@ -139,12 +229,22 @@ bool SemanticController::routes_key(const KeyAction &action) const {
 }
 
 SemanticDecision SemanticController::begin_real_key(const KeyAction &action, bool policy_allows) {
+  SemanticDecision decision;
+  if (!policy_allows) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  // Reconnect + incarnation fencing + rebind happen before any ownership
+  // admission, so a failed reconnect can only fail open.
+  if (!ensure_semantic_ready()) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
   if (backend_reset_pending_) {
     backend_ready_ = real_backend_->reset(core_.binding());
     backend_reset_pending_ = false;
   }
-  SemanticDecision decision;
-  if (!policy_allows || !backend_ready_ || !real_backend_->healthy()) {
+  if (!backend_ready_ || !real_backend_->healthy()) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
@@ -459,6 +559,10 @@ Result SemanticController::replace_context(std::uint64_t context_id) {
     if (real_backend_) {
       real_backend_->unbind(previous);
       backend_ready_ = real_backend_->bind(core_.binding());
+      // The new binding belongs to the current link identity.
+      const LinkStatus link = real_backend_->link_status();
+      bound_incarnation_ = backend_ready_ ? link.host_incarnation : 0;
+      bound_connection_ = backend_ready_ ? link.connection_generation : 0;
     }
     lifetime_ = next_lifetime;
     id_ = context_id;
@@ -473,6 +577,8 @@ void SemanticController::destroy() {
   if (real_backend_) {
     real_backend_->unbind(core_.binding());
     backend_ready_ = false;
+    bound_incarnation_ = 0;
+    bound_connection_ = 0;
   }
   core_.destroy_context();
   buffer_.clear();
