@@ -8,9 +8,15 @@
 // health, plus development diagnostics. All semantic decisions go through the
 // existing fusion::Host / FusionCore and the existing Mock Backend — this shell
 // adds no second engine, ledger, decoder or materializer.
+//
+// Stage 4C: the sink bodies apply `lifecycle_obligation` (tsf/lifecycle.hpp) so
+// the real TSF lifecycle drives explicit Fusion context transitions, and every
+// context teardown fences what can be fenced and emits one audit record for
+// whatever remained unresolved.
 
 #include "mock_backend.hpp"
 #include "tsf/com_ptr.hpp"
+#include "tsf/lifecycle.hpp"
 #include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
 
@@ -135,7 +141,14 @@ private:
   void handle_owned_state(ContextEntry &entry, const SemanticDecision &decision);
   void handle_owned_effect(ContextEntry &entry, const SemanticDecision &decision);
   void handle_reject_cleanup(ContextEntry &entry);
-  void destroy_all_entries();
+  void destroy_all_entries(const char *reason);
+  // Stage 4C teardown boundary: audit what is unresolved, fence the ledger to
+  // explicit terminals, unbind the Host context and fence late results by
+  // bumping the entry generation. Never resolves P0-A/P0-B responsibility.
+  void reconcile_context_teardown(ContextEntry &entry, const char *reason);
+  // Authoritative document-manager lookup for an entry whose document manager was
+  // not recorded at creation (the context was not the focused top context then).
+  bool context_reports_document(ContextEntry &entry, ITfDocumentMgr *pdim);
 
   std::atomic<ULONG> ref_count_{1};
   ComRef<ITfThreadMgr> thread_mgr_;
@@ -150,6 +163,9 @@ private:
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;
   bool handling_key_ = false; // reentrancy guard (D072 §7.5)
+  // Diagnostics only: how many context teardowns had to record unresolved
+  // responsibility. Not a ledger and not an admission policy.
+  std::uint64_t unresolved_teardowns_ = 0;
 };
 
 } // namespace fusion::tsf

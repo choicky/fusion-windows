@@ -37,7 +37,7 @@ repository entry point only.
 - `include/fusion/backend.hpp` — Stage 3B/4A `fusion::Backend` interface and `BackendStimulus`/`BackendBatch`/`BackendOperation` types.
 - `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free).
 - `src/core.cpp` — FusionCore implementation.
-- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration. The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
+- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests. The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
 - `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server, Host-side only), `pipe_security.{hpp,cpp}` (per-user pipe name, server identity verification, security descriptor), `ipc_backend.{hpp,cpp}` (Backend over IPC).
 - `src/host/` — Stage 4A FusionHost.exe: `main.cpp` (entry point), `host_server.{hpp,cpp}` (multi-client accept loop, per-connection threads, backend mutex, context remapping).
 - `tests/mock.{hpp,cpp}` — deterministic FusionMock scheduler, fault harness and oracles.
@@ -48,6 +48,7 @@ repository entry point only.
 - `tests/stage3c.cpp` — Stage 3C faithful frontend tests.
 - `tests/stage4a_ipc.cpp` — Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer (multi-client, transport-failure separation, clean shutdown) and the FusionHost.exe integration mode. The first three modes run in the Mock-only build too; only the integration mode needs `FUSION_WITH_FCITX5=ON`.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
+- `tests/tsf_lifecycle.cpp` — Stage 4C lifecycle obligation and teardown-reconciliation tests (context identity, unresolved responsibility, external termination, cross-context isolation).
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -57,7 +58,7 @@ repository entry point only.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure
-clang-format --dry-run --Werror include/fusion/core.hpp include/fusion/host.hpp include/fusion/backend.hpp include/fusion/ipc_protocol.hpp src/core.cpp src/tsf/*.hpp src/tsf/*.cpp src/ipc/*.hpp src/ipc/*.cpp src/host/*.hpp src/host/*.cpp tests/mock.hpp tests/mock.cpp tests/mock_backend.hpp tests/mock_backend.cpp tests/rg0.cpp tests/stage2.cpp tests/stage3b.cpp tests/stage3c.cpp tests/stage4a_ipc.cpp tests/stage4b_reconnect.cpp tests/tsf_semantic.cpp
+clang-format --dry-run --Werror include/fusion/core.hpp include/fusion/host.hpp include/fusion/backend.hpp include/fusion/ipc_protocol.hpp src/core.cpp src/tsf/*.hpp src/tsf/*.cpp src/ipc/*.hpp src/ipc/*.cpp src/host/*.hpp src/host/*.cpp tests/mock.hpp tests/mock.cpp tests/mock_backend.hpp tests/mock_backend.cpp tests/rg0.cpp tests/stage2.cpp tests/stage3b.cpp tests/stage3c.cpp tests/stage4a_ipc.cpp tests/stage4b_reconnect.cpp tests/tsf_lifecycle.cpp tests/tsf_semantic.cpp
 ```
 
 CMake 3.20+, a C++20 compiler, and CTest are sufficient. There are no external
@@ -369,3 +370,45 @@ P0-A/P0-B/P0-D remain OPEN. Stage 4B deliberately does not choose the final user
 recovery policy: a composition that the dead incarnation had already materialized in the
 document is left in place (recovery representation/UX is P0-B), and the exact
 reconnect/readiness numbers remain engineering constants.
+
+## Stage 4C — TSF lifecycle wiring and context reconciliation
+
+Stage 4C wires the real TSF lifecycle to the Fusion context boundary (D072 §25 item 3). It adds no
+engine, ledger or recovery policy: `src/tsf/lifecycle.hpp` states what one lifecycle event obliges the
+shell to do with a Fusion context, and the sinks in `src/tsf/service.cpp` apply it.
+
+**Obligation table (evidence-bounded).** Only *teardown* events end a Fusion context — `Deactivate`,
+`OnPopContext`, `OnUninitDocumentMgr`. An external `OnCompositionTerminated` reconciles the projection
+and settles queued/pending work but keeps the context identity and Host binding. Focus
+(`ITfThreadMgrEventSink::OnSetFocus`), thread foreground (`ITfKeyEventSink::OnSetFocus`), `OnPushContext`
+and `OnInitDocumentMgr` are recorded and change nothing: D072 §9 fixes that focus is not a semantic
+incarnation and that focus loss alone is neither an epoch advance nor a composition termination, so push
+and focus must not silently become discontinuity policy. Whether push/pop and transitory contexts
+constitute a discontinuity remains **UNFROZEN** (§9/§18).
+
+**Teardown reconciliation.** Every context teardown now (a) computes what is still unresolved (owned
+keys, unsettled or uncertain EFFECTs, owned callbacks never issued to the document), (b) fences the
+ledger to explicit terminals and unbinds the Host context, (c) bumps the entry generation so late edit
+sessions and pumps can no longer match, and (d) emits one `CONTEXT_TEARDOWN` audit record naming the
+counts, the resulting terminal dispositions and a session-level tally of teardowns that had to record
+unresolved responsibility. It deliberately chooses no user-visible recovery: that stays P0-A/P0-B. An
+external composition termination reports the same accounting in `COMPOSITION_TERMINATED`.
+
+**Document-manager destruction** reclaims entries recorded against that document manager *and*, for
+entries created while their context was not the focused top context (no recorded document manager), asks
+the live context through `ITfContext::GetDocumentMgr`, so destruction cannot leave a semantically live
+Fusion context and Host binding behind. A failed or foreign lookup keeps the previous behaviour.
+
+**Tests.** `tests/tsf_lifecycle.cpp` asserts transitions, not callbacks: the obligation table; a clean
+teardown; an unresolved teardown (unknown execution certainty retained as an explicit indeterminate
+terminal, never-issued work reaching an explicit no-effect terminal, a late result for a destroyed context
+fenced as `Stale`); external termination (projection cleared, queue drained explicitly, an applied EFFECT
+never undone, identity and binding preserved, the context still usable); identity preserved across focus,
+thread-foreground, push and document creation; and cross-context isolation (tearing one context down
+cannot rebind, mutate or admit work for another).
+
+Run with `ctest --test-dir build -R tsf_lifecycle`.
+
+P0-A/P0-B/P0-D remain OPEN. Stage 4C does not decide the user-visible disposition of work that a teardown
+had to leave unresolved, and does not freeze whether push/pop or transitory contexts constitute a
+semantic discontinuity.

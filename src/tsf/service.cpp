@@ -515,7 +515,7 @@ TextService::TextService() {
         module_path);
 }
 
-TextService::~TextService() { destroy_all_entries(); }
+TextService::~TextService() { destroy_all_entries("destroy"); }
 
 STDMETHODIMP TextService::QueryInterface(REFIID riid, void **ppv) {
   if (ppv == nullptr) {
@@ -616,7 +616,8 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
 }
 
 STDMETHODIMP TextService::Deactivate() {
-  diagf("DEACTIVATE", "tid=%lu", static_cast<unsigned long>(client_id_));
+  diagf("DEACTIVATE", "tid=%lu entries=%zu", static_cast<unsigned long>(client_id_),
+        entries_.size());
   if (thread_mgr_) {
     if (auto keystroke_mgr = thread_mgr_.as<ITfKeystrokeMgr>(IID_ITfKeystrokeMgr)) {
       keystroke_mgr->UnadviseKeyEventSink(client_id_);
@@ -628,19 +629,63 @@ STDMETHODIMP TextService::Deactivate() {
       thread_event_cookie_ = 0;
     }
   }
-  destroy_all_entries();
+  if (lifecycle_obligation(LifecycleEvent::Deactivate).end_context)
+    destroy_all_entries("deactivate");
   client_id_ = TF_CLIENTID_NULL;
   // TSF contract: release the thread manager before returning.
   thread_mgr_.reset();
   return S_OK;
 }
 
-void TextService::destroy_all_entries() {
+void TextService::destroy_all_entries(const char *reason) {
   for (auto &entry : entries_) {
-    entry->semantic.destroy();
-    entry->generation++;
+    reconcile_context_teardown(*entry, reason);
   }
   entries_.clear();
+}
+
+void TextService::reconcile_context_teardown(ContextEntry &entry, const char *reason) {
+  // Accounting happens before the ledger and the queue are dropped, so a teardown
+  // records what it could not settle instead of silently erasing responsibility
+  // (D072 §25.2). The user-visible disposition of that responsibility stays
+  // P0-A/P0-B, so nothing is fabricated here.
+  const TeardownSummary summary =
+      summarize_teardown(entry.semantic.core().records(), entry.semantic.pending().size());
+  const std::uint64_t context_id = entry.semantic.context_id();
+  entry.semantic.destroy(); // unbind the Host context; Core::fence() -> explicit terminals
+  entry.generation++;       // late edit sessions / pumps can no longer match this entry
+  if (summary.needs_audit()) {
+    ++unresolved_teardowns_;
+    std::size_t fenced_uncertain = 0;
+    std::size_t fenced_no_effect = 0;
+    for (const fusion::Record &record : entry.semantic.core().records()) {
+      if (record.uncertain)
+        ++fenced_uncertain;
+      if (record.terminal == fusion::Terminal::FailedNoEffect)
+        ++fenced_no_effect;
+    }
+    diagf("CONTEXT_TEARDOWN",
+          "reason=%s cid=%" PRIu64 " owned=%zu pending_effects=%zu uncertain=%zu queued=%zu "
+          "fenced_uncertain=%zu fenced_no_effect=%zu unresolved_teardowns=%" PRIu64,
+          reason, context_id, summary.records, summary.pending_effects, summary.uncertain,
+          summary.queued, fenced_uncertain, fenced_no_effect, unresolved_teardowns_);
+  } else {
+    diagf("CONTEXT_TEARDOWN", "reason=%s cid=%" PRIu64 " owned=%zu clean=1", reason, context_id,
+          summary.records);
+  }
+}
+
+bool TextService::context_reports_document(ContextEntry &entry, ITfDocumentMgr *pdim) {
+  // An entry created while its context was not the focused document's top context
+  // has no recorded document manager; ask the live context instead so document
+  // destruction cannot leave a semantically live Fusion context (and its Host
+  // binding) behind. A failed or foreign lookup keeps the previous behaviour.
+  if (pdim == nullptr || entry.context == nullptr)
+    return false;
+  ComRef<ITfDocumentMgr> document;
+  if (FAILED(entry.context->GetDocumentMgr(document.out())) || !document)
+    return false;
+  return document.get() == pdim;
 }
 
 // ---------------------------------------------------------------------------
@@ -648,7 +693,12 @@ void TextService::destroy_all_entries() {
 // ---------------------------------------------------------------------------
 
 STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
-  (void)fForeground;
+  // Thread-level foreground notification. D072 §9: focus is not a semantic
+  // incarnation, so this only records the transition; no context is rebound,
+  // reset or ended.
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::ThreadForeground);
+  diagf("FOCUS_FOREGROUND", "fg=%d entries=%zu end_context=%d", fForeground ? 1 : 0,
+        entries_.size(), obligation.end_context ? 1 : 0);
   return S_OK;
 }
 
@@ -861,41 +911,84 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
 // ---------------------------------------------------------------------------
 
 STDMETHODIMP TextService::OnInitDocumentMgr(ITfDocumentMgr *pdim) {
-  (void)pdim;
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::DocumentCreated);
+  diagf("DOCMGR_INIT", "dim=%p entries=%zu end_context=%d", static_cast<void *>(pdim),
+        entries_.size(), obligation.end_context ? 1 : 0);
   return S_OK;
 }
 
 STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr *pdim) {
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::DocumentDestroyed);
+  std::size_t reclaimed = 0;
   for (auto it = entries_.begin(); it != entries_.end();) {
-    if ((*it)->document_mgr != nullptr && (*it)->document_mgr == pdim) {
-      (*it)->semantic.destroy();
-      (*it)->generation++;
-      diagf("ENTRY_DESTROY", "cid=%" PRIu64, (*it)->semantic.context_id());
+    ContextEntry &entry = **it;
+    const bool recorded = entry.document_mgr != nullptr && entry.document_mgr == pdim;
+    const bool reported = !recorded && context_reports_document(entry, pdim);
+    if (obligation.end_context && (recorded || reported)) {
+      diagf("ENTRY_DESTROY", "cid=%" PRIu64 " via=%s", entry.semantic.context_id(),
+            reported ? "context-document" : "recorded-document");
+      reconcile_context_teardown(entry, reported ? "docmgr-reported" : "docmgr");
       it = entries_.erase(it);
+      ++reclaimed;
     } else {
       ++it;
     }
   }
+  diagf("DOCMGR_UNINIT", "dim=%p reclaimed=%zu entries=%zu", static_cast<void *>(pdim), reclaimed,
+        entries_.size());
   return S_OK;
 }
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *pdimPrevFocus) {
-  (void)pdimPrevFocus;
-  diagf("FOCUS", "dim=%p", static_cast<void *>(pdimFocus));
+  // D072 §9: focus loss is not by itself an epoch advance or a composition
+  // termination, so the previous context keeps its Fusion identity, Host binding
+  // and projection. This records the real transition and what was attached to
+  // each document manager at that moment, which is the evidence the OPEN
+  // continuity sub-boundary needs.
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::FocusChanged);
+  std::size_t in_focus = 0;
+  std::size_t in_previous = 0;
+  for (const auto &entry : entries_) {
+    if (pdimFocus != nullptr && entry->document_mgr == pdimFocus)
+      ++in_focus;
+    if (pdimPrevFocus != nullptr && entry->document_mgr == pdimPrevFocus)
+      ++in_previous;
+  }
+  diagf("FOCUS_CHANGED",
+        "dim=%p prev=%p entries=%zu in_focus=%zu in_previous=%zu end_context=%d reset_epoch=0",
+        static_cast<void *>(pdimFocus), static_cast<void *>(pdimPrevFocus), entries_.size(),
+        in_focus, in_previous, obligation.end_context ? 1 : 0);
   return S_OK;
 }
 
 STDMETHODIMP TextService::OnPushContext(ITfContext *pic) {
-  (void)pic;
+  // D072 §9/§18: a pushed context is not by itself a semantic discontinuity of the
+  // previous one, and push/pop behaviour is UNFROZEN until real execution
+  // provides evidence. A pushed context is represented by its own Fusion context,
+  // created lazily on its first use; nothing is ended or rebound here.
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::ContextPushed);
+  ContextEntry *entry = pic != nullptr ? find_entry(pic) : nullptr;
+  diagf("CONTEXT_PUSH", "ctx=%p cid=%" PRIu64 " known=%d entries=%zu end_context=%d",
+        static_cast<void *>(pic), entry != nullptr ? entry->semantic.context_id() : 0,
+        entry != nullptr ? 1 : 0, entries_.size(), obligation.end_context ? 1 : 0);
+  if (obligation.end_context && entry != nullptr) {
+    reconcile_context_teardown(*entry, "push");
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [&](const auto &item) { return item.get() == entry; }),
+                   entries_.end());
+  }
   return S_OK;
 }
 
 STDMETHODIMP TextService::OnPopContext(ITfContext *pic) {
-  ContextEntry *entry = find_entry(pic);
-  if (entry) {
-    entry->semantic.destroy();
-    ++entry->generation;
+  const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::ContextPopped);
+  ContextEntry *entry = pic != nullptr ? find_entry(pic) : nullptr;
+  diagf("CONTEXT_POP", "ctx=%p cid=%" PRIu64 " known=%d entries=%zu end_context=%d",
+        static_cast<void *>(pic), entry != nullptr ? entry->semantic.context_id() : 0,
+        entry != nullptr ? 1 : 0, entries_.size(), obligation.end_context ? 1 : 0);
+  if (obligation.end_context && entry != nullptr) {
     diagf("ENTRY_FENCE", "pop cid=%" PRIu64, entry->semantic.context_id());
+    reconcile_context_teardown(*entry, "pop");
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                   [&](const auto &item) { return item.get() == entry; }),
                    entries_.end());
@@ -914,6 +1007,11 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
     const auto callback_identity = qi<IUnknown>(pComposition, IID_IUnknown);
     const auto live_identity = qi<IUnknown>(entry->composition, IID_IUnknown);
     if (callback_identity && callback_identity.get() == live_identity.get()) {
+      // Accounting for the external authority event (D072 §9): report what the
+      // reconciliation had to settle, so an externally destroyed composition is
+      // auditable rather than silently absorbed.
+      const TeardownSummary before =
+          summarize_teardown(entry->semantic.core().records(), entry->semantic.pending().size());
       if (entry->self_end.terminated(entry->generation, callback_identity.get(), [&] {
             entry->semantic.note_composition_terminated();
             entry->cleanup.reconciled();
@@ -925,7 +1023,10 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
       // and pending work reaches explicit terminals, never silent loss.
       entry->composition->Release();
       entry->composition = nullptr;
-      diagf("COMPOSITION_TERMINATED", "cid=%" PRIu64, entry->semantic.context_id());
+      diagf("COMPOSITION_TERMINATED",
+            "cid=%" PRIu64 " owned=%zu pending_effects=%zu uncertain=%zu queued=%zu remaining=%zu",
+            entry->semantic.context_id(), before.records, before.pending_effects, before.uncertain,
+            before.queued, entry->semantic.pending().size());
       break;
     }
   }
