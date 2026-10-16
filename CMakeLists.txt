@@ -156,10 +156,11 @@ if(BUILD_TESTING)
     endforeach()
     if(FUSION_WITH_FCITX5)
       # Real FusionHost.exe process failover: needs the built Host executable and
-      # the Fcitx runtime on PATH. FUSION_STAGE4B_SKIP_HOST_PROCESS skips it.
+      # the Fcitx runtime on PATH. FUSION_STAGE4B_SKIP_HOST_PROCESS skips them.
       target_compile_definitions(stage4b PRIVATE FUSION_WITH_FCITX5)
       target_link_libraries(stage4b PRIVATE FusionFcitxHost)
       add_test(NAME stage4b_hostprocess COMMAND stage4b hostprocess)
+      add_test(NAME stage4b_silentdeath COMMAND stage4b silentdeath)
     endif()
   endif()
   add_library(FusionMock tests/mock.cpp)

@@ -1245,6 +1245,65 @@ std::string type_nihao_and_commit(SemanticController &controller) {
   return settle_frontend(controller, commit);
 }
 
+// One key of the traced sequence: its routing decision and the ordered callbacks
+// the real engine produced for it.
+struct KeyTrace {
+  std::string label;
+  SemanticDecision::Route route = SemanticDecision::Route::FailOpen;
+  bool eaten = false;
+  bool forward = false;
+  bool reached_engine = false; // a batch came back from the (possibly new) incarnation
+  std::string preedit;
+  std::string committed;
+};
+
+// Drives "nihao" + Space and reports the per-key execution path plus the text an
+// application would actually end up with: forwarded (definitely-not-written)
+// physical characters followed by the committed text of the engine callbacks.
+std::vector<KeyTrace> trace_nihao_and_commit(SemanticController &controller,
+                                             std::string &visible_text) {
+  std::vector<KeyTrace> traces;
+  std::string keys = "nihao";
+  keys.push_back(' ');
+  for (char character : keys) {
+    const bool is_space = character == ' ';
+    const SemanticDecision decision =
+        controller.begin_key(is_space ? space_key() : physical(character), true);
+    KeyTrace trace;
+    trace.label = is_space ? "space" : std::string(1, character);
+    trace.route = decision.route;
+    trace.eaten = decision.eaten;
+    trace.forward = decision.forward;
+    trace.reached_engine = decision.backend_session_id != 0;
+    std::string committed = settle_frontend(controller, decision);
+    for (const auto &work : decision.frontend) {
+      if (work.operation.type == BackendOperation::Type::SetPreedit)
+        trace.preedit = work.operation.text;
+    }
+    trace.committed = committed;
+    // What the application sees: a forwarded physical character is delivered to
+    // the application unchanged; a commit inserts the engine's text.
+    if (decision.forward && decision.route == SemanticDecision::Route::Pass && !is_space)
+      visible_text += character;
+    visible_text += committed;
+    traces.push_back(std::move(trace));
+  }
+  return traces;
+}
+
+void print_traces(const char *label, const std::vector<KeyTrace> &traces,
+                  const std::string &visible_text) {
+  std::printf("[%s] per-key execution path:\n", label);
+  for (const auto &trace : traces) {
+    std::printf("  key=%-5s route=%-17d eaten=%d forward=%d engine=%d preedit=\"%s\" "
+                "commit=\"%s\"\n",
+                trace.label.c_str(), static_cast<int>(trace.route), trace.eaten ? 1 : 0,
+                trace.forward ? 1 : 0, trace.reached_engine ? 1 : 0, trace.preedit.c_str(),
+                trace.committed.c_str());
+  }
+  std::printf("[%s] application-visible text: \"%s\"\n", label, visible_text.c_str());
+}
+
 void test_host_process() {
   if (std::getenv("FUSION_STAGE4B_SKIP_HOST_PROCESS")) {
     std::printf("SKIP stage4b hostprocess (FUSION_STAGE4B_SKIP_HOST_PROCESS set)\n");
@@ -1288,6 +1347,90 @@ void test_host_process() {
   std::printf("PASS stage4b hostprocess\n");
 }
 
+// The exact real-smoke sequence: the Host dies *silently* (nothing detects it),
+// it is restarted, and the operator types "nihao" + Space with no intervening
+// probe. This is the case the manual smoke hit; it is traced, not asserted away.
+void test_silent_death_sequence() {
+  if (std::getenv("FUSION_STAGE4B_SKIP_HOST_PROCESS")) {
+    std::printf("SKIP stage4b silentdeath (FUSION_STAGE4B_SKIP_HOST_PROCESS set)\n");
+    return;
+  }
+  const std::wstring executable = executable_directory() + L"\\FusionHost.exe";
+  if (GetFileAttributesW(executable.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::printf("SKIP stage4b silentdeath (FusionHost.exe not built next to the test)\n");
+    return;
+  }
+
+  const auto name = pipe_name(L"silent-death-real");
+  IpcBackend client(name);
+  HostProcess host(executable, name);
+  require(host.start(), "silentdeath host started");
+  require(wait_for_host_pipe(name, kWait), "silentdeath host listens");
+  require(connect_with_retry(client, kWait), "silentdeath connect");
+  const Binding binding{33, 1, 1};
+  require(client.bind(binding), "silentdeath bind");
+  auto controller = std::make_unique<SemanticController>(913, 65, client, 1);
+  require(controller->semantic_ready(), "silentdeath readiness");
+  std::string before_text;
+  (void)trace_nihao_and_commit(*controller, before_text);
+  require(before_text == "你好", "baseline commit before the silent death");
+  const std::uint64_t incarnation_before = client.incarnation();
+  const std::uint64_t generation_before = client.link_status().connection_generation;
+
+  // Silent death + restart, with NO request in between: exactly what the manual
+  // smoke does when the operator restarts the Host and then types.
+  host.kill();
+  require(wait_until([&] { return !host.running(); }, kWait), "silentdeath host terminated");
+  require(host.start(), "silentdeath host restarted");
+  require(wait_for_host_pipe(name, kWait), "the restarted silentdeath host listens");
+
+  std::string visible;
+  const std::vector<KeyTrace> traces = trace_nihao_and_commit(*controller, visible);
+  print_traces("silentdeath: type immediately after the restart", traces, visible);
+
+  // What the implementation actually does, stated as the regression contract:
+  // the first physical key cannot be proven to have reached any Host, so it stays
+  // caller-owned and is forwarded to the application (Stage 4A boundary); the
+  // following key reconnects to the new incarnation and is served from its fresh
+  // state. The resulting visible text is therefore the forwarded prefix plus the
+  // new incarnation's commit of the remaining keys.
+  require(!traces.empty() && traces.front().forward && !traces.front().eaten,
+          "the first key after a silent death is forwarded, not owned");
+  require(traces.front().committed.empty(), "the forwarded key commits nothing");
+  require(!traces[1].forward && traces[1].eaten, "the second key reaches the new incarnation");
+  require(client.incarnation() != incarnation_before, "a new incarnation is established");
+  require(client.link_status().connection_generation == generation_before + 1,
+          "exactly one new connection generation");
+  require(controller->semantic_ready(), "semantic readiness is re-established");
+  require(visible.rfind("n", 0) == 0, "the application received the forwarded prefix");
+  require(visible.size() > 1, "the new incarnation committed the remaining input");
+
+  // Phase 2: the operationally correct sequence. One non-text key first detects
+  // the silent death (it is lawfully forwarded and has no visible effect), and the
+  // following composition is then complete and commits exactly 你好.
+  host.kill();
+  require(wait_until([&] { return !host.running(); }, kWait), "silentdeath host terminated again");
+  require(host.start(), "silentdeath host restarted again");
+  require(wait_for_host_pipe(name, kWait), "the restarted host listens again");
+
+  const SemanticDecision prime =
+      controller->begin_key(translate_key(kVkEscape, false, false, false), true);
+  require(prime.forward && !prime.eaten && prime.frontend.empty(),
+          "the detection key is forwarded with no semantic work");
+  const std::uint64_t incarnation_after_prime = client.incarnation();
+  require(incarnation_after_prime != incarnation_before, "the detection key re-established a link");
+
+  std::string visible_primed;
+  const std::vector<KeyTrace> primed = trace_nihao_and_commit(*controller, visible_primed);
+  print_traces("silentdeath: one detection key first, then type", primed, visible_primed);
+  require(!primed.front().forward, "after detection the first key reaches the engine");
+  require(visible_primed == "你好",
+          "with the link re-established the composition commits exactly 你好");
+
+  host.kill();
+  std::printf("PASS stage4b silentdeath (traced, see the per-key paths above)\n");
+}
+
 #endif // FUSION_WITH_FCITX5
 
 } // namespace
@@ -1301,7 +1444,7 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage =
-      "Usage: stage4b <link|failover|cycles|fencing|contexts|semantic|hostprocess>\n";
+      "Usage: stage4b <link|failover|cycles|fencing|contexts|semantic|hostprocess|silentdeath>\n";
 #else
   const char *usage = "Usage: stage4b <link|failover|cycles|fencing|contexts|semantic>\n";
 #endif
@@ -1328,6 +1471,13 @@ int main(int argc, char *argv[]) {
       test_host_process();
 #else
       std::fprintf(stderr, "hostprocess mode requires the FUSION_WITH_FCITX5 build\n");
+      return 1;
+#endif
+    } else if (mode == "silentdeath") {
+#ifdef FUSION_WITH_FCITX5
+      test_silent_death_sequence();
+#else
+      std::fprintf(stderr, "silentdeath mode requires the FUSION_WITH_FCITX5 build\n");
       return 1;
 #endif
     } else {
