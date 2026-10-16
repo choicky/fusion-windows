@@ -28,10 +28,10 @@ namespace {
 std::wstring parse_pipe_name(int argc, char *argv[]) {
   for (int i = 1; i < argc - 1; ++i) {
     if (std::strcmp(argv[i], "--pipe-name") == 0) {
-      int len = std::MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, nullptr, 0);
+      int len = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, nullptr, 0);
       if (len > 0) {
         std::wstring name(static_cast<size_t>(len - 1), L'\0');
-        std::MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, name.data(), len);
+        MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, name.data(), len);
         return name;
       }
     }

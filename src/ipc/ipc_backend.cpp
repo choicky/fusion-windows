@@ -43,8 +43,8 @@ bool IpcBackend::connect(std::chrono::milliseconds timeout) {
 }
 
 std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
-                                          const std::vector<std::uint8_t> &payload,
-                                          MessageType expected_response) {
+                                         const std::vector<std::uint8_t> &payload,
+                                         MessageType expected_response) {
   std::lock_guard lock(rpc_mutex_);
   if (!client_.connected())
     return std::nullopt;
@@ -89,29 +89,30 @@ bool IpcBackend::healthy() const {
 
 std::uint64_t IpcBackend::session_id() const { return cached_session_id_; }
 
+BackendBatch IpcBackend::forward_batch(const BackendStimulus &stimulus) const {
+  BackendBatch batch;
+  batch.disposition = BackendBatch::Disposition::Forward;
+  batch.backend_session_id = cached_session_id_;
+  batch.binding = stimulus.binding;
+  batch.stimulus_id = stimulus.stimulus_id;
+  return batch;
+}
+
 BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   std::vector<std::uint8_t> payload;
   serialize(payload, stimulus);
 
   std::lock_guard lock(rpc_mutex_);
 
-  // Pre-write check: if not connected, return Forward with session_id, binding, stimulus_id, no ops.
-  if (!client_.connected()) {
-    BackendBatch batch;
-    batch.disposition = BackendBatch::Disposition::Forward;
-    batch.backend_session_id = cached_session_id_;
-    batch.binding = stimulus.binding;
-    batch.stimulus_id = stimulus.stimulus_id;
-    return batch;
-  }
+  // Pre-write check: if not connected, the request cannot be written at all.
+  if (!client_.connected())
+    return forward_batch(stimulus);
 
   // Attempt to write the request.
   if (!client_.send_request(MessageType::SendRequest, payload)) {
     // Pre-write failure: transport never saw the request → Forward.
     healthy_ = false;
-    BackendBatch batch;
-    batch.disposition = BackendBatch::Disposition::Forward;
-    return batch;
+    return forward_batch(stimulus);
   }
 
   // Post-write: the request is on the wire. Any failure now is a Reject.

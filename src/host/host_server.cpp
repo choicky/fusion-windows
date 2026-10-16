@@ -1,5 +1,14 @@
 #include "host/host_server.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -17,13 +26,53 @@ bool HostServer::start() {
 }
 
 void HostServer::run() {
-  running_ = true;
+  accept_loop_active_ = true;
+  // A stop() that raced ahead of run() must not be undone here.
+  if (!stopping_.load())
+    running_ = true;
   std::fprintf(stderr, "[FusionHost] accepting connections on: %ls\n", pipe_name_.c_str());
   accept_loop();
+  accept_loop_active_ = false;
+  std::lock_guard lock(accept_done_mutex_);
+  accept_done_cv_.notify_all();
 }
 
 void HostServer::stop() {
+  stopping_ = true;
   running_ = false;
+  // ConnectNamedPipe is called without a timeout, so the accept loop cannot
+  // observe running_ by itself: one short-lived client connection completes the
+  // pending call and lets the loop exit.
+  wake_accept_loop();
+  {
+    // Do not drain while the accept loop could still spawn a connection.
+    std::unique_lock lock(accept_done_mutex_);
+    accept_done_cv_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return !accept_loop_active_.load(); });
+  }
+  drain_connections();
+}
+
+void HostServer::wake_accept_loop() {
+  HANDLE wake = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+  if (wake != INVALID_HANDLE_VALUE)
+    CloseHandle(wake);
+}
+
+void HostServer::drain_connections() {
+  std::vector<TrackedConnection> connections;
+  {
+    std::lock_guard lock(connections_mutex_);
+    connections.swap(connections_);
+  }
+  for (auto &tracked : connections) {
+    // Unblock the connection's pending receive, then wait for it to finish so
+    // no thread can touch backend_ after this call returns.
+    tracked.connection->disconnect();
+    if (tracked.thread.joinable())
+      tracked.thread.join();
+  }
 }
 
 void HostServer::accept_loop() {
@@ -43,11 +92,21 @@ void HostServer::accept_loop() {
     }
     // Wait for a client — block indefinitely (no timeout).
     if (!pipe->wait_for_client(std::chrono::milliseconds(0))) {
+      if (!running_)
+        break; // woken by stop()
       continue;
     }
+    if (!running_)
+      break; // stop() woke this iteration: nothing to serve
     std::fprintf(stderr, "[FusionHost] client connected\n");
-    auto *conn = new Connection{std::move(pipe), *backend_, backend_mutex_, next_host_context_, {}};
-    std::thread(&Connection::run, conn).detach();
+    auto connection = std::make_unique<Connection>(std::move(pipe), *backend_, backend_mutex_,
+                                                   next_host_context_);
+    Connection *raw = connection.get();
+    std::lock_guard lock(connections_mutex_);
+    TrackedConnection tracked;
+    tracked.connection = std::move(connection);
+    tracked.thread = std::thread([raw] { raw->run(); });
+    connections_.push_back(std::move(tracked));
   }
 }
 
@@ -55,13 +114,13 @@ void HostServer::accept_loop() {
 // Connection
 // ---------------------------------------------------------------------------
 
+void HostServer::Connection::disconnect() { pipe->disconnect_client(); }
+
 void HostServer::Connection::run() {
   // First message must be Hello.
   handle_hello();
-  if (!pipe->client_connected()) {
-    delete this;
+  if (!pipe->client_connected())
     return;
-  }
 
   // Process requests until disconnect.
   while (pipe->client_connected()) {
@@ -94,7 +153,6 @@ void HostServer::Connection::run() {
   // Unbind all contexts owned by this connection.
   unbind_all();
   std::fprintf(stderr, "[FusionHost] client disconnected, contexts unbound\n");
-  delete this;
 }
 
 void HostServer::Connection::handle_hello() {
@@ -250,7 +308,8 @@ Binding HostServer::Connection::remap_binding(const Binding &client_binding) {
     return it->second;
   }
   // New mapping: only the context field is Host-unique; lifetime/epoch pass through.
-  Binding host_binding{next_host_context.fetch_add(1), client_binding.lifetime, client_binding.epoch};
+  Binding host_binding{next_host_context.fetch_add(1), client_binding.lifetime,
+                       client_binding.epoch};
   context_map[client_binding.context] = host_binding;
   return host_binding;
 }

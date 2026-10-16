@@ -38,11 +38,17 @@ private:
   std::uint64_t cached_session_id_ = 0;
   std::atomic<bool> healthy_{false};
 
+  // Pre-write transport failure: the request never reached the Host, so the
+  // physical stimulus stays caller-owned and is reported as a genuine Forward.
+  // Identity fields are preserved so the caller's accounting matches the
+  // stimulus it sent. Used by both pre-write branches (not connected, and write
+  // failure) so they cannot diverge.
+  BackendBatch forward_batch(const BackendStimulus &stimulus) const;
+
   // Send a request and receive the expected response.
   // Returns nullopt on any failure (write fail, read fail, wrong message type).
   // The caller must track whether the write succeeded for transport failure classification.
-  std::optional<WireFrame> rpc(MessageType request_type,
-                               const std::vector<std::uint8_t> &payload,
+  std::optional<WireFrame> rpc(MessageType request_type, const std::vector<std::uint8_t> &payload,
                                MessageType expected_response);
 };
 

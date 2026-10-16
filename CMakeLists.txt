@@ -51,9 +51,9 @@ if(WIN32 AND MSVC)
   target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
   if(FUSION_WITH_FCITX5)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
+    # Client side only: the TSF DLL never hosts a pipe server.
     target_sources(FusionTsf PRIVATE
       src/ipc/pipe_client.cpp
-      src/ipc/pipe_server.cpp
       src/ipc/pipe_security.cpp
       src/ipc/ipc_backend.cpp)
   endif()
@@ -92,7 +92,22 @@ if(BUILD_TESTING)
     target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
 
-    # Stage 4A IPC tests: protocol serialization, loopback pipe, and full integration.
+    # Dependency portability regression for the two MSVC empty-range guards in
+    # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
+    # engine directly; it does not exercise or change TSF key admission.
+    add_executable(fcitx_msvc_empty_range_guards tests/fcitx_msvc_empty_range_guards.cpp)
+    target_include_directories(fcitx_msvc_empty_range_guards PRIVATE include)
+    target_compile_features(fcitx_msvc_empty_range_guards PRIVATE cxx_std_20)
+    target_compile_options(fcitx_msvc_empty_range_guards PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(fcitx_msvc_empty_range_guards PRIVATE FusionFcitxHost)
+    add_test(NAME fcitx_msvc_empty_range_guards COMMAND fcitx_msvc_empty_range_guards)
+  endif()
+
+  if(WIN32 AND MSVC)
+    # Stage 4A IPC tests: the protocol, the IpcBackend client and the HostServer
+    # transport are independent of Fcitx, so they compile and run in every
+    # Windows/MSVC build (Mock-only included). Only the end-to-end
+    # FusionHost.exe + real Fcitx mode needs FUSION_WITH_FCITX5.
     add_executable(stage4a
       tests/stage4a_ipc.cpp
       src/ipc/pipe_client.cpp
@@ -103,23 +118,19 @@ if(BUILD_TESTING)
       src/tsf/key_map.cpp
       src/tsf/semantic.cpp)
     target_include_directories(stage4a PRIVATE src)
-    target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
+    target_compile_features(stage4a PRIVATE cxx_std_20)
+    # std::getenv in the integration mode; same convention as FusionFcitxHost.
+    target_compile_definitions(stage4a PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(stage4a PRIVATE FusionFcitxHost MockBackend)
+    target_link_libraries(stage4a PRIVATE MockBackend)
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
     add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
-    add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
-
-    # Dependency portability regression for the two MSVC empty-range guards in
-    # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
-    # engine directly; it does not exercise or change TSF key admission.
-    add_executable(fcitx_msvc_empty_range_guards tests/fcitx_msvc_empty_range_guards.cpp)
-    target_include_directories(fcitx_msvc_empty_range_guards PRIVATE include)
-    target_compile_features(fcitx_msvc_empty_range_guards PRIVATE cxx_std_20)
-    target_compile_options(fcitx_msvc_empty_range_guards PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(fcitx_msvc_empty_range_guards PRIVATE FusionFcitxHost)
-    add_test(NAME fcitx_msvc_empty_range_guards COMMAND fcitx_msvc_empty_range_guards)
+    if(FUSION_WITH_FCITX5)
+      target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
+      target_link_libraries(stage4a PRIVATE FusionFcitxHost)
+      add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
+    endif()
   endif()
   add_library(FusionMock tests/mock.cpp)
   target_link_libraries(FusionMock PUBLIC FusionCore)

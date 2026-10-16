@@ -7,18 +7,25 @@
 // and spawns a per-connection thread. All backend calls are serialized
 // through a shared mutex. Each connection remaps client context IDs to
 // Host-unique context IDs and unbinds all contexts on disconnect.
+//
+// Lifecycle: every connection is owned together with its thread, so stop() can
+// disconnect the pipes, join the threads and return without leaving a thread
+// that could touch backend_. Running the Host normally (run() until the process
+// is terminated) is unchanged.
 
 #include "fusion/backend.hpp"
 #include "ipc/pipe_security.hpp"
 #include "ipc/pipe_server.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fusion::ipc {
 
@@ -32,10 +39,17 @@ public:
 
   bool start();
   void run();
+  // Stops accepting, disconnects every client and joins every connection
+  // thread before returning. Idempotent; never leaves a running thread.
   void stop();
 
 private:
   struct Connection {
+    Connection(std::unique_ptr<PipeServer> pipe_server, Backend &backend_ref,
+               std::mutex &backend_mutex_ref, std::atomic<std::uint64_t> &next_context)
+        : pipe(std::move(pipe_server)), backend(backend_ref), backend_mutex(backend_mutex_ref),
+          next_host_context(next_context) {}
+
     std::unique_ptr<PipeServer> pipe;
     Backend &backend;
     std::mutex &backend_mutex;
@@ -43,6 +57,9 @@ private:
     std::map<std::uint64_t, Binding> context_map; // client_context → host binding
 
     void run();
+    // Cancels a blocking receive and drops the client so run() can leave its
+    // loop. Safe to call from another thread (stop()).
+    void disconnect();
     void handle_hello();
     void handle_bind(const std::vector<std::uint8_t> &payload);
     void handle_reset(const std::vector<std::uint8_t> &payload);
@@ -54,14 +71,32 @@ private:
     Binding remap_binding(const Binding &client_binding);
   };
 
+  // One live client: the connection state and the thread that serves it.
+  struct TrackedConnection {
+    std::unique_ptr<Connection> connection;
+    std::thread thread;
+  };
+
   std::unique_ptr<Backend> backend_;
   std::wstring pipe_name_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> stopping_{false};
   std::mutex backend_mutex_;
   std::atomic<std::uint64_t> next_host_context_{1};
   bool first_instance_ = true;
 
+  std::mutex connections_mutex_;
+  std::vector<TrackedConnection> connections_;
+
+  // Accept-loop exit handshake: stop() must not drain connections while the
+  // accept loop could still spawn one.
+  std::atomic<bool> accept_loop_active_{false};
+  std::mutex accept_done_mutex_;
+  std::condition_variable accept_done_cv_;
+
   void accept_loop();
+  void wake_accept_loop();
+  void drain_connections();
 };
 
 } // namespace fusion::ipc

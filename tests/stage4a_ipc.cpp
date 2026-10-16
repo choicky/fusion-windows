@@ -1,11 +1,21 @@
-// Stage 4A IPC tests: protocol serialization, loopback pipe, and full integration.
+// Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
+// end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <protocol|loopback|integration>
+// Usage: stage4a <protocol|loopback|hostserver|integration>
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
-// - integration: full FusionHost.exe + Fcitx backend (requires Fcitx runtime)
-//   Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
+// - hostserver: real HostServer with a fake Backend that mimics FcitxBackend
+//   admission (duplicate bind rejected, every call fails on admission contention):
+//   concurrent multi-client bind/send with context remapping, disconnect
+//   isolation, transport-failure separation, healthy() performs no IPC, and
+//   stop()/join shutdown.
+// - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
+//   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
+//   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
+//
+// protocol/loopback/hostserver build and run in the Mock-only build too: the
+// transport, the IpcBackend client and the HostServer do not depend on Fcitx.
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
@@ -15,16 +25,20 @@
 #include "ipc/pipe_server.hpp"
 #include "tsf/semantic.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace fusion;
 using namespace fusion::tsf;
@@ -34,6 +48,110 @@ void require(bool ok, const char *message) {
   if (!ok)
     throw std::runtime_error(message);
 }
+
+// ---------------------------------------------------------------------------
+// Server fixtures
+//
+// A failing assertion must report its message. A joinable std::thread on the
+// unwinding stack would call std::terminate instead, so every server thread is
+// owned by a fixture that disconnects, stops and joins on scope exit.
+// ---------------------------------------------------------------------------
+
+constexpr std::chrono::milliseconds kWait{10000};
+
+std::wstring test_pipe_name(const wchar_t *suffix) {
+  return std::wstring(L"\\\\.\\pipe\\FusionHost-ipc-test-") + suffix;
+}
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, std::chrono::milliseconds limit) {
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate())
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return predicate();
+}
+
+BackendStimulus character_stimulus(const Binding &binding, std::uint64_t stimulus_id,
+                                   char character) {
+  BackendStimulus stimulus;
+  stimulus.binding = binding;
+  stimulus.stimulus_id = stimulus_id;
+  stimulus.type = BackendStimulus::Type::Character;
+  stimulus.character = character;
+  stimulus.keysym = static_cast<std::uint32_t>(static_cast<unsigned char>(character));
+  return stimulus;
+}
+
+// HostServer::run() creates the first pipe instance asynchronously, so connect
+// with retries instead of sleeping for a fixed time.
+std::unique_ptr<IpcBackend> connect_client(const std::wstring &pipe_name) {
+  const auto deadline = std::chrono::steady_clock::now() + kWait;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto client = std::make_unique<IpcBackend>(pipe_name);
+    if (client->connect(std::chrono::milliseconds(200)))
+      return client;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return nullptr;
+}
+
+// Raw PipeServer plus its serving thread.
+class RawPipeServer {
+public:
+  explicit RawPipeServer(std::wstring pipe_name)
+      : server_(std::make_unique<PipeServer>(std::move(pipe_name))) {}
+
+  bool create() { return server_->create(); }
+  PipeServer &server() { return *server_; }
+  // Closes the server end (used to force a client-side write failure).
+  void close() { server_.reset(); }
+
+  template <typename Body> void serve(Body body) {
+    thread_ = std::thread([this, body] { body(*this); });
+  }
+
+  ~RawPipeServer() {
+    if (server_)
+      server_->disconnect_client();
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+private:
+  std::unique_ptr<PipeServer> server_;
+  std::thread thread_;
+};
+
+// HostServer plus its accept-loop thread.
+class RunningHost {
+public:
+  RunningHost(std::unique_ptr<Backend> backend, std::wstring pipe_name)
+      : server_(std::move(backend), std::move(pipe_name)) {}
+
+  bool start() {
+    if (!server_.start())
+      return false;
+    thread_ = std::thread([this] { server_.run(); });
+    return true;
+  }
+
+  HostServer &server() { return server_; }
+
+  void stop_and_join() {
+    server_.stop();
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+  ~RunningHost() { stop_and_join(); }
+
+private:
+  HostServer server_;
+  std::thread thread_;
+};
 
 // ---------------------------------------------------------------------------
 // Layer 1: Protocol unit tests
@@ -100,20 +218,15 @@ void test_protocol() {
     batch.binding = {10, 1, 1};
     batch.stimulus_id = 5;
     batch.disposition = BackendBatch::Disposition::Consumed;
-    batch.operations.push_back(
-        {BackendOperation::Type::CommitText, "hello", {}, false});
-    batch.operations.push_back(
-        {BackendOperation::Type::SetPreedit, "pre", {}, false});
-    batch.operations.push_back(
-        {BackendOperation::Type::ForwardKey, "Tab", {}, true});
+    batch.operations.push_back({BackendOperation::Type::CommitText, "hello", {}, false});
+    batch.operations.push_back({BackendOperation::Type::SetPreedit, "pre", {}, false});
+    batch.operations.push_back({BackendOperation::Type::ForwardKey, "Tab", {}, true});
     std::vector<std::uint8_t> buf;
     serialize(buf, batch);
     auto decoded = deserialize_batch(buf.data(), buf.size());
     require(decoded && decoded->backend_session_id == batch.backend_session_id &&
-                decoded->binding == batch.binding &&
-                decoded->stimulus_id == batch.stimulus_id &&
-                decoded->disposition == batch.disposition &&
-                decoded->operations.size() == 3 &&
+                decoded->binding == batch.binding && decoded->stimulus_id == batch.stimulus_id &&
+                decoded->disposition == batch.disposition && decoded->operations.size() == 3 &&
                 decoded->operations[0].type == BackendOperation::Type::CommitText &&
                 decoded->operations[0].text == "hello" &&
                 decoded->operations[1].type == BackendOperation::Type::SetPreedit &&
@@ -201,8 +314,7 @@ void test_protocol() {
     auto frame = frame_message(MessageType::SendRequest, payload);
     require(frame.size() == header_size + payload.size(), "frame size");
     auto parsed = parse_header(frame.data(), frame.size());
-    require(parsed && parsed->type == MessageType::SendRequest &&
-                parsed->payload == payload,
+    require(parsed && parsed->type == MessageType::SendRequest && parsed->payload == payload,
             "frame parse");
   }
 
@@ -257,18 +369,18 @@ void test_protocol() {
     require(!s, "oversized string rejected");
   }
 
-  // Invalid enum value in stimulus
+  // Invalid enum value in stimulus: rebuild the payload with an out-of-range
+  // type byte. Constructed field by field with the same writers as the
+  // serializer, because the wire format is UNFROZEN and a hard-coded byte
+  // offset silently stops testing the type field when a field is added.
   {
-    BackendStimulus s;
-    s.binding = {1, 1, 1};
-    s.stimulus_id = 1;
-    s.type = BackendStimulus::Type::Character;
-    s.character = 'a';
-    s.keysym = 0x61;
-    s.modifiers = 0;
     std::vector<std::uint8_t> buf;
-    serialize(buf, s);
-    buf[24] = 0xFF; // corrupt the type byte (binding=24, then stimulus_id=8, type=1)
+    detail::write_binding(buf, Binding{1, 1, 1});
+    detail::write_u64(buf, 1);
+    detail::write_u8(buf, 0xFF); // invalid BackendStimulus::Type
+    detail::write_u8(buf, static_cast<std::uint8_t>('a'));
+    detail::write_u32(buf, 0x61);
+    detail::write_u32(buf, 0);
     auto decoded = deserialize_stimulus(buf.data(), buf.size());
     require(!decoded, "invalid stimulus type rejected");
   }
@@ -310,7 +422,11 @@ public:
 };
 
 void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atomic<bool> &done) {
-  // Wait for Hello.
+  // Accept one client, then wait for Hello.
+  if (!server.wait_for_client(std::chrono::milliseconds(10000))) {
+    done = true;
+    return;
+  }
   auto hello = server.recv_frame(std::chrono::milliseconds(10000));
   if (!hello || hello->type != MessageType::HelloRequest) {
     done = true;
@@ -382,7 +498,7 @@ void test_loopback() {
   // Basic send/recv with Hello handshake
   {
     std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-loopback-basic";
-    PipeServer server(pipe_name);
+    RawPipeServer server(pipe_name);
     require(server.create(), "loopback server create");
 
     CallbackBackend backend;
@@ -390,8 +506,7 @@ void test_loopback() {
     backend.next.operations = {{BackendOperation::Type::SetPreedit, "ni", {}, false}};
 
     std::atomic<bool> done{false};
-    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
-                              std::ref(done));
+    server.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend, done); });
 
     IpcBackend client(pipe_name);
     require(client.connect(std::chrono::milliseconds(5000)), "loopback client connect");
@@ -417,22 +532,18 @@ void test_loopback() {
     require(batch.operations[0].text == "ni", "loopback op text");
 
     client.unbind(binding);
-
-    done = true;
-    server.disconnect_client();
-    server_thread.join();
+    done = true; // the fixture disconnects and joins on scope exit
   }
 
   // healthy() is local state only — no IPC
   {
     std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-healthy";
-    PipeServer server(pipe_name);
+    RawPipeServer server(pipe_name);
     require(server.create(), "healthy server create");
 
     CallbackBackend backend;
     std::atomic<bool> done{false};
-    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
-                              std::ref(done));
+    server.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend, done); });
 
     IpcBackend client(pipe_name);
     require(client.connect(std::chrono::milliseconds(5000)), "healthy client connect");
@@ -443,20 +554,17 @@ void test_loopback() {
     require(client.healthy(), "healthy repeated");
 
     done = true;
-    server.disconnect_client();
-    server_thread.join();
   }
 
   // 6s idle success — server should not disconnect on idle
   {
     std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-idle";
-    PipeServer server(pipe_name);
+    RawPipeServer server(pipe_name);
     require(server.create(), "idle server create");
 
     CallbackBackend backend;
     std::atomic<bool> done{false};
-    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
-                              std::ref(done));
+    server.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend, done); });
 
     IpcBackend client(pipe_name);
     require(client.connect(std::chrono::milliseconds(5000)), "idle client connect");
@@ -472,45 +580,55 @@ void test_loopback() {
     require(client.bind(binding), "bind after 6s idle");
 
     done = true;
-    server.disconnect_client();
-    server_thread.join();
   }
 
-  // Two concurrent clients
+  // Two concurrent clients, each on its own pipe instance and backend
   {
     std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-concurrent";
 
     CallbackBackend backend1, backend2;
     backend1.sid = 100;
     backend2.sid = 200;
+    backend1.next.disposition = BackendBatch::Disposition::Consumed;
+    backend1.next.operations = {{BackendOperation::Type::SetPreedit, "one", {}, false}};
+    backend2.next.disposition = BackendBatch::Disposition::Consumed;
+    backend2.next.operations = {{BackendOperation::Type::SetPreedit, "two", {}, false}};
     std::atomic<bool> done1{false}, done2{false};
 
-    PipeServer server1(pipe_name, true); // first instance
+    RawPipeServer server1(pipe_name); // first instance
     require(server1.create(), "concurrent server1 create");
-    PipeServer server2(pipe_name, false); // second instance
+    RawPipeServer server2(pipe_name); // second instance
     require(server2.create(), "concurrent server2 create");
 
-    std::thread t1(run_loopback_server, std::ref(server1), std::ref(backend1), std::ref(done1));
-    std::thread t2(run_loopback_server, std::ref(server2), std::ref(backend2), std::ref(done2));
+    server1.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend1, done1); });
+    server2.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend2, done2); });
 
     IpcBackend client1(pipe_name);
     require(client1.connect(std::chrono::milliseconds(5000)), "concurrent client1 connect");
-    require(client1.session_id() == 100, "concurrent client1 session_id");
-
     IpcBackend client2(pipe_name);
     require(client2.connect(std::chrono::milliseconds(5000)), "concurrent client2 connect");
-    require(client2.session_id() == 200, "concurrent client2 session_id");
 
-    // Both clients should be independent.
-    require(client1.healthy(), "concurrent client1 healthy");
-    require(client2.healthy(), "concurrent client2 healthy");
+    // Which instance a client lands on is not ordered by Windows, so the
+    // invariant is that both instances are used and neither client shares
+    // another client's backend state.
+    const auto session1 = client1.session_id();
+    const auto session2 = client2.session_id();
+    require((session1 == 100 || session1 == 200) && (session2 == 100 || session2 == 200) &&
+                session1 != session2,
+            "each concurrent client is served by its own server instance");
+    require(client1.healthy() && client2.healthy(), "concurrent clients healthy");
+
+    const auto batch1 = client1.send(character_stimulus({1, 1, 1}, 1, 'a'));
+    const auto batch2 = client2.send(character_stimulus({1, 1, 1}, 1, 'a'));
+    require(batch1.backend_session_id == session1 && batch2.backend_session_id == session2,
+            "concurrent clients keep their own session id");
+    require(batch1.operations.size() == 1 && batch2.operations.size() == 1,
+            "concurrent clients receive a response each");
+    require(batch1.operations[0].text != batch2.operations[0].text,
+            "concurrent clients are backed by independent backends");
 
     done1 = true;
     done2 = true;
-    server1.disconnect_client();
-    server2.disconnect_client();
-    t1.join();
-    t2.join();
   }
 
   // Pre-write failure → Forward with session_id, binding, stimulus_id, no ops
@@ -529,35 +647,35 @@ void test_loopback() {
               "pre-write failure → Forward");
       require(batch.operations.empty(), "pre-write failure → no ops");
       require(batch.binding == stimulus.binding, "pre-write failure → binding preserved");
-      require(batch.stimulus_id == stimulus.stimulus_id, "pre-write failure → stimulus_id preserved");
+      require(batch.stimulus_id == stimulus.stimulus_id,
+              "pre-write failure → stimulus_id preserved");
       // session_id is 0 because connect was never performed (cached_session_id_ = 0).
-      require(batch.backend_session_id == 0, "pre-write failure → session_id is 0 (never connected)");
+      require(batch.backend_session_id == 0,
+              "pre-write failure → session_id is 0 (never connected)");
     }
   }
 
   // Version mismatch
   {
     std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-version";
-    PipeServer server(pipe_name);
+    RawPipeServer server(pipe_name);
     require(server.create(), "version server create");
 
-    std::atomic<bool> done{false};
-    std::thread server_thread([&] {
-      auto hello = server.recv_frame(std::chrono::milliseconds(5000));
-      if (!hello || hello->type != MessageType::HelloRequest) {
-        done = true;
+    server.serve([&](RawPipeServer &s) {
+      if (!s.server().wait_for_client(kWait))
         return;
-      }
-      // Read client version.
+      auto hello = s.server().recv_frame(std::chrono::milliseconds(5000));
+      if (!hello || hello->type != MessageType::HelloRequest)
+        return;
       detail::Reader r(hello->payload.data(), hello->payload.size());
       auto client_version = r.read_u32();
+      (void)client_version;
       // Respond with version=0 (mismatch).
       WireFrame resp;
       resp.type = MessageType::HelloResponse;
       detail::write_u32(resp.payload, 0);
       detail::write_u64(resp.payload, 0);
-      server.send_frame(resp);
-      done = true;
+      s.server().send_frame(resp);
     });
 
     // Send a Hello with wrong version.
@@ -572,159 +690,431 @@ void test_loopback() {
     detail::Reader r2(resp->payload.data(), resp->payload.size());
     auto server_version = r2.read_u32();
     require(server_version && *server_version == 0, "version mismatch → version=0");
-
-    server_thread.join();
   }
 
   // SemanticController over IPC loopback
   {
-    PipeServer server2(L"\\\\.\\pipe\\FusionHost-ipc-test-semantic");
-    require(server2.create(), "semantic server create");
+    RawPipeServer server(L"\\\\.\\pipe\\FusionHost-ipc-test-semantic");
+    require(server.create(), "semantic server create");
 
-    CallbackBackend backend2;
-    backend2.next.disposition = BackendBatch::Disposition::Consumed;
-    backend2.next.operations = {{BackendOperation::Type::SetPreedit, "nihao", {}, false}};
+    CallbackBackend backend;
+    backend.next.disposition = BackendBatch::Disposition::Consumed;
+    backend.next.operations = {{BackendOperation::Type::SetPreedit, "nihao", {}, false}};
 
-    std::atomic<bool> done2{false};
-    std::thread server_thread2(run_loopback_server, std::ref(server2), std::ref(backend2),
-                               std::ref(done2));
+    std::atomic<bool> done{false};
+    server.serve([&](RawPipeServer &s) { run_loopback_server(s.server(), backend, done); });
 
-    IpcBackend client2(L"\\\\.\\pipe\\FusionHost-ipc-test-semantic");
-    require(client2.connect(std::chrono::milliseconds(5000)), "semantic client connect");
+    IpcBackend client(L"\\\\.\\pipe\\FusionHost-ipc-test-semantic");
+    require(client.connect(std::chrono::milliseconds(5000)), "semantic client connect");
 
-    SemanticController controller(900, 64, static_cast<Backend &>(client2));
+    SemanticController controller(900, 64, static_cast<Backend &>(client));
     auto d = controller.begin_key(physical('n'), true);
     require(d.eaten, "semantic loopback eaten");
     require(d.route == SemanticDecision::Route::State, "semantic loopback route");
     require(d.text == "nihao", "semantic loopback text");
 
     controller.destroy();
-    done2 = true;
-    server2.disconnect_client();
-    server_thread2.join();
+    done = true;
   }
 
-  std::cout << "PASS loopback pipe with Hello, idle, concurrent, transport failure, version\n";
+  std::cout << "PASS loopback pipe with Hello, idle, concurrent clients, transport failure, "
+               "version mismatch\n";
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2B: HostServer test with real HostServer + fake Backend
+// Layer 2B: HostServer tests with the real HostServer + fake Backend
 // ---------------------------------------------------------------------------
 
-class CountingBackend final : public Backend {
-public:
-  std::uint64_t sid = 777;
-  std::atomic<int> bind_count{0};
-  std::atomic<int> unbind_count{0};
-  std::atomic<int> send_count{0};
-  std::set<std::uint64_t> bound_contexts;
-  std::mutex bind_mutex;
+namespace {
 
-  bool bind(Binding b) override {
-    std::lock_guard lock(bind_mutex);
-    if (bound_contexts.count(b.context))
-      return false; // reject duplicate context
-    bound_contexts.insert(b.context);
-    bind_count++;
+// Fake backend that mimics the real FcitxBackend's admission constraints:
+//  * a context can be bound only once (a duplicate bind is rejected);
+//  * every call must take the admission lock with try_lock, so a contended call
+//    FAILS instead of queueing.
+// HostServer must serialize backend calls and remap client contexts, so no call
+// ever contends, and each connection keeps its own Host context.
+class FcitxLikeBackend final : public Backend {
+public:
+  std::uint64_t sid = 555;
+  std::atomic<int> call_count{0};
+  std::atomic<int> contention_count{0};
+
+  bool bind(Binding binding) override {
+    call_count++;
+    std::unique_lock<std::mutex> admission(admission_, std::try_to_lock);
+    if (!admission) {
+      contention_count++;
+      return false;
+    }
+    std::lock_guard lock(state_);
+    if (contexts_.count(binding.context))
+      return false; // duplicate context
+    contexts_.insert(binding.context);
     return true;
   }
-  bool reset(Binding) override { return true; }
-  void unbind(Binding b) override {
-    std::lock_guard lock(bind_mutex);
-    bound_contexts.erase(b.context);
-    unbind_count++;
+
+  bool reset(Binding binding) override {
+    call_count++;
+    std::unique_lock<std::mutex> admission(admission_, std::try_to_lock);
+    if (!admission) {
+      contention_count++;
+      return false;
+    }
+    std::lock_guard lock(state_);
+    return contexts_.count(binding.context) != 0;
   }
+
+  void unbind(Binding binding) override {
+    call_count++;
+    std::unique_lock<std::mutex> admission(admission_, std::try_to_lock);
+    if (!admission) {
+      contention_count++;
+      return;
+    }
+    std::lock_guard lock(state_);
+    contexts_.erase(binding.context);
+    unbound_.push_back(binding.context);
+  }
+
   bool healthy() const override { return true; }
   std::uint64_t session_id() const override { return sid; }
-  BackendBatch send(const BackendStimulus &input) override {
-    send_count++;
+
+  BackendBatch send(const BackendStimulus &stimulus) override {
+    call_count++;
     BackendBatch batch;
+    std::unique_lock<std::mutex> admission(admission_, std::try_to_lock);
+    if (!admission) {
+      contention_count++;
+      batch.disposition = BackendBatch::Disposition::Reject;
+      return batch;
+    }
+    std::lock_guard lock(state_);
+    if (!contexts_.count(stimulus.binding.context)) {
+      batch.disposition = BackendBatch::Disposition::Reject;
+      return batch;
+    }
     batch.backend_session_id = sid;
-    batch.binding = input.binding;
-    batch.stimulus_id = input.stimulus_id;
+    batch.binding = stimulus.binding;
+    batch.stimulus_id = stimulus.stimulus_id;
     batch.disposition = BackendBatch::Disposition::Consumed;
-    batch.operations = {{BackendOperation::Type::SetPreedit, "test", {}, false}};
+    // The Host context that served the call travels back to the client, so the
+    // test can verify per-connection identity without HostServer internals.
+    batch.operations.push_back(
+        {BackendOperation::Type::SetPreedit, std::to_string(stimulus.binding.context), {}, false});
     return batch;
   }
+
+  std::size_t bound_count() {
+    std::lock_guard lock(state_);
+    return contexts_.size();
+  }
+
+  bool saw_unbind(std::uint64_t context) {
+    std::lock_guard lock(state_);
+    return std::find(unbound_.begin(), unbound_.end(), context) != unbound_.end();
+  }
+
+private:
+  std::mutex admission_; // FcitxBackend admission lock: try_lock, never wait
+  std::mutex state_;
+  std::set<std::uint64_t> contexts_;
+  std::vector<std::uint64_t> unbound_;
 };
 
-void test_hostserver() {
-  // HostServer with CountingBackend: bind rejects duplicate context.
-  {
-    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hostserver-dup";
-    auto backend = std::make_unique<CountingBackend>();
-    auto *backend_ptr = backend.get();
-    HostServer server(std::move(backend), pipe_name);
-    require(server.start(), "hostserver start");
+// Two IpcBackend clients using the SAME client context id, binding and sending
+// concurrently. The Host must give them distinct host contexts, serialize every
+// backend call, and return each client its own binding.
+void test_hostserver_multi_client() {
+  const auto pipe_name = test_pipe_name(L"hostserver-multi");
+  auto backend = std::make_unique<FcitxLikeBackend>();
+  FcitxLikeBackend *fake = backend.get();
+  RunningHost host(std::move(backend), pipe_name);
+  require(host.start(), "hostserver start");
 
-    std::thread server_thread([&] { server.run(); });
+  auto client1 = connect_client(pipe_name);
+  require(client1 != nullptr, "hostserver client1 connect");
+  auto client2 = connect_client(pipe_name);
+  require(client2 != nullptr, "hostserver client2 connect");
+  require(client1->session_id() == fake->sid && client2->session_id() == fake->sid,
+          "hostserver session id comes from the Hello handshake");
 
-    // Give the server time to start listening.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const Binding client_binding{1, 1, 1}; // identical client-side context for both clients
+  require(client1->bind(client_binding), "client1 bind");
+  require(client2->bind(client_binding), "client2 bind");
+  require(fake->bound_count() == 2, "each client got its own host context");
 
-    IpcBackend client(pipe_name);
-    require(client.connect(std::chrono::milliseconds(5000)), "hostserver client connect");
-    require(client.session_id() == 777, "hostserver session_id");
+  constexpr int kIterations = 16;
+  std::string host_context1;
+  std::string host_context2;
+  std::string error1;
+  std::string error2;
+  auto drive = [&](IpcBackend &client, std::string &host_context, std::string &error) {
+    try {
+      for (int i = 1; i <= kIterations; ++i) {
+        const auto stimulus =
+            character_stimulus(client_binding, static_cast<std::uint64_t>(i), 'a');
+        const BackendBatch batch = client.send(stimulus);
+        if (batch.disposition != BackendBatch::Disposition::Consumed ||
+            batch.binding != client_binding || batch.stimulus_id != stimulus.stimulus_id ||
+            batch.backend_session_id != fake->sid || batch.operations.size() != 1) {
+          error = "concurrent send result mismatch";
+          return;
+        }
+        host_context = batch.operations[0].text;
+      }
+    } catch (const std::exception &e) {
+      error = e.what();
+    }
+  };
+  std::thread t1(drive, std::ref(*client1), std::ref(host_context1), std::ref(error1));
+  std::thread t2(drive, std::ref(*client2), std::ref(host_context2), std::ref(error2));
+  t1.join();
+  t2.join();
+  require(error1.empty() && error2.empty(), "concurrent clients: every call succeeded");
+  require(!host_context1.empty() && !host_context2.empty() && host_context1 != host_context2,
+          "each client was served by its own host context");
+  require(fake->contention_count == 0,
+          "Host serialized every backend call (the fake fails on admission contention)");
 
-    // First bind should succeed.
-    Binding b1{1, 1, 1};
-    require(client.bind(b1), "hostserver first bind");
-    require(backend_ptr->bind_count == 1, "hostserver bind_count == 1");
+  // Disconnecting one client must unbind exactly that client's host context.
+  const auto host_context_a = static_cast<std::uint64_t>(std::stoull(host_context1));
+  const auto host_context_b = static_cast<std::uint64_t>(std::stoull(host_context2));
+  client1.reset(); // closing the pipe is what the Host observes as a disconnect
+  require(wait_until([fake, host_context_a] { return fake->saw_unbind(host_context_a); }, kWait),
+          "disconnected client's host context was unbound");
+  require(!fake->saw_unbind(host_context_b), "the other client's host context was untouched");
+  require(fake->bound_count() == 1, "exactly one host context remains bound");
+  client2.reset();
+  require(wait_until([fake] { return fake->bound_count() == 0; }, kWait),
+          "second client's host context was unbound");
 
-    // Second bind with same context should be rejected by the backend.
-    // Note: the HostServer remaps context, so we use a different client context
-    // that maps to the same host context. Actually, the HostServer will assign
-    // a different host context for a different client context, so this won't
-    // trigger the duplicate rejection. Let me test with the same client context.
-    // The HostServer already has a mapping for client context 1, so it will
-    // reuse the same host binding. The backend will see the same host context
-    // and reject it.
-    require(!client.bind(b1), "hostserver duplicate bind rejected");
-
-    // Send should work.
-    BackendStimulus stimulus;
-    stimulus.binding = b1;
-    stimulus.stimulus_id = 1;
-    stimulus.type = BackendStimulus::Type::Character;
-    stimulus.character = 'a';
-    auto batch = client.send(stimulus);
-    require(batch.disposition == BackendBatch::Disposition::Consumed, "hostserver send consumed");
-    require(batch.binding == b1, "hostserver send returns client binding");
-    require(backend_ptr->send_count == 1, "hostserver send_count == 1");
-
-    client.disconnect();
-    server.stop();
-    server_thread.join();
-  }
-
-  // healthy() sends no IPC — already tested in test_loopback, but verify again here.
-  {
-    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hostserver-healthy";
-    auto backend = std::make_unique<CountingBackend>();
-    auto *backend_ptr = backend.get();
-    HostServer server(std::move(backend), pipe_name);
-    require(server.start(), "hostserver healthy start");
-
-    std::thread server_thread([&] { server.run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    IpcBackend client(pipe_name);
-    require(client.connect(std::chrono::milliseconds(5000)), "hostserver healthy connect");
-    require(client.healthy(), "hostserver healthy after connect");
-    require(backend_ptr->send_count == 0, "hostserver healthy sends no IPC");
-
-    client.disconnect();
-    server.stop();
-    server_thread.join();
-  }
-
-  std::cout << "PASS HostServer with fake Backend: bind duplicate, send, healthy no IPC\n";
+  host.stop_and_join();
+  require(fake->contention_count == 0, "no admission contention during shutdown");
 }
 
+// Pre-write failure (transport never saw the request) → Forward with identity
+// preserved; post-write failure (request on the wire, response lost) → Reject.
+void test_hostserver_transport_failure() {
+  // (a) Not connected at all.
+  {
+    IpcBackend client(test_pipe_name(L"never-connected"));
+    const auto stimulus = character_stimulus({42, 7, 3}, 99, 'a');
+    const BackendBatch batch = client.send(stimulus);
+    require(batch.disposition == BackendBatch::Disposition::Forward, "never connected -> Forward");
+    require(batch.operations.empty(), "never connected -> no operations");
+    require(batch.binding == stimulus.binding, "never connected -> binding preserved");
+    require(batch.stimulus_id == stimulus.stimulus_id, "never connected -> stimulus_id preserved");
+    require(batch.backend_session_id == 0, "never connected -> no session id cached");
+    require(!client.healthy(), "never connected -> not healthy");
+  }
+
+  // (b) The server closed the pipe after the Hello handshake, so the request
+  //     cannot be written at all. The server waits for the client's read of the
+  //     Hello response before closing, because closing a pipe discards data the
+  //     peer has not consumed yet.
+  {
+    const auto pipe_name = test_pipe_name(L"write-failure");
+    RawPipeServer server(pipe_name);
+    require(server.create(), "write-failure server create");
+    std::atomic<bool> hello_read{false};
+    std::atomic<bool> closed{false};
+    server.serve([&](RawPipeServer &s) {
+      if (!s.server().wait_for_client(kWait))
+        return;
+      auto hello = s.server().recv_frame(kWait);
+      if (!hello || hello->type != MessageType::HelloRequest)
+        return;
+      WireFrame response;
+      response.type = MessageType::HelloResponse;
+      detail::write_u32(response.payload, protocol_version);
+      detail::write_u64(response.payload, 4242);
+      s.server().send_frame(response);
+      const auto deadline = std::chrono::steady_clock::now() + kWait;
+      while (!hello_read.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      s.close(); // close the server end: the client's write must now fail
+      closed = true;
+    });
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::seconds(5)), "write-failure client connect");
+    require(client.session_id() == 4242, "write-failure session id cached from Hello");
+    hello_read = true; // the Hello response is consumed; the server may close
+    require(wait_until([&closed] { return closed.load(); }, kWait), "write-failure server closed");
+
+    const auto stimulus = character_stimulus({5, 1, 2}, 7, 'a');
+    const BackendBatch batch = client.send(stimulus);
+    require(batch.disposition == BackendBatch::Disposition::Forward, "write failure -> Forward");
+    require(batch.operations.empty(), "write failure -> no operations");
+    require(batch.binding == stimulus.binding, "write failure -> binding preserved");
+    require(batch.stimulus_id == stimulus.stimulus_id, "write failure -> stimulus_id preserved");
+    require(batch.backend_session_id == 4242, "write failure -> cached session id preserved");
+    require(!client.healthy(), "write failure marks the client unhealthy");
+  }
+
+  // (c) The server read the request and closed without replying: the Host may
+  //     have consumed the stimulus, so this must never be reported as Forward.
+  {
+    const auto pipe_name = test_pipe_name(L"post-write");
+    RawPipeServer server(pipe_name);
+    require(server.create(), "post-write server create");
+    std::atomic<bool> request_seen{false};
+    server.serve([&](RawPipeServer &s) {
+      if (!s.server().wait_for_client(kWait))
+        return;
+      auto hello = s.server().recv_frame(kWait);
+      if (!hello || hello->type != MessageType::HelloRequest)
+        return;
+      WireFrame response;
+      response.type = MessageType::HelloResponse;
+      detail::write_u32(response.payload, protocol_version);
+      detail::write_u64(response.payload, 555);
+      s.server().send_frame(response);
+      auto request = s.server().recv_frame(kWait);
+      request_seen = request && request->type == MessageType::SendRequest;
+      s.server().disconnect_client(); // close without replying
+    });
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::seconds(5)), "post-write client connect");
+    const auto stimulus = character_stimulus({9, 1, 1}, 3, 'b');
+    const BackendBatch batch = client.send(stimulus);
+    require(request_seen.load(), "post-write: server received the SendRequest");
+    require(batch.disposition == BackendBatch::Disposition::Reject, "post-write failure -> Reject");
+    require(batch.operations.empty(), "post-write failure -> no operations");
+    require(!client.healthy(), "post-write failure marks the client unhealthy");
+  }
+}
+
+// healthy() is local state only: it must not write a single frame, counted on
+// the server side, and must not reach the backend through HostServer.
+void test_hostserver_healthy_no_ipc() {
+  // Server-side received-frame count on a raw pipe server.
+  {
+    const auto pipe_name = test_pipe_name(L"healthy-frames");
+    RawPipeServer server(pipe_name);
+    require(server.create(), "healthy server create");
+    std::atomic<int> frames_received{0};
+    std::atomic<bool> hello_handled{false};
+    server.serve([&](RawPipeServer &s) {
+      if (!s.server().wait_for_client(kWait))
+        return;
+      auto hello = s.server().recv_frame(kWait);
+      if (!hello || hello->type != MessageType::HelloRequest)
+        return;
+      ++frames_received;
+      WireFrame response;
+      response.type = MessageType::HelloResponse;
+      detail::write_u32(response.payload, protocol_version);
+      detail::write_u64(response.payload, 7);
+      s.server().send_frame(response);
+      hello_handled = true;
+      while (s.server().client_connected()) {
+        auto frame = s.server().recv_frame(std::chrono::milliseconds(0));
+        if (!frame)
+          break;
+        ++frames_received; // any further frame is exactly what must not happen
+      }
+    });
+
+    {
+      IpcBackend client(pipe_name);
+      require(client.connect(std::chrono::seconds(5)), "healthy client connect");
+      require(wait_until([&hello_handled] { return hello_handled.load(); }, kWait),
+              "healthy hello handled");
+      const int frames_after_connect = frames_received.load();
+      for (int i = 0; i < 5; ++i)
+        require(client.healthy(), "healthy() reports local transport state");
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      require(frames_received.load() == frames_after_connect,
+              "healthy() sent no frame (server-side received-frame count unchanged)");
+    }
+  }
+
+  // HostServer-level: healthy() must not reach the backend either.
+  {
+    const auto pipe_name = test_pipe_name(L"healthy-hostserver");
+    auto backend = std::make_unique<FcitxLikeBackend>();
+    FcitxLikeBackend *fake = backend.get();
+    RunningHost host(std::move(backend), pipe_name);
+    require(host.start(), "healthy hostserver start");
+    {
+      auto client = connect_client(pipe_name);
+      require(client != nullptr, "healthy hostserver connect");
+      for (int i = 0; i < 5; ++i)
+        require(client->healthy(), "healthy() over a Host connection");
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      require(fake->call_count == 0, "healthy() performed no backend call");
+    }
+    host.stop_and_join();
+  }
+}
+
+// stop() must wake the accept loop, disconnect live clients and join every
+// connection thread: no hang, and no thread left that could touch the backend.
+void test_hostserver_shutdown() {
+  // No client at all.
+  {
+    const auto pipe_name = test_pipe_name(L"shutdown-idle");
+    auto backend = std::make_unique<FcitxLikeBackend>();
+    RunningHost host(std::move(backend), pipe_name);
+    require(host.start(), "shutdown idle start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let it block on the pipe
+    const auto begin = std::chrono::steady_clock::now();
+    host.stop_and_join();
+    require(std::chrono::steady_clock::now() - begin < std::chrono::seconds(5),
+            "stop() unblocked the idle accept loop without hanging");
+  }
+
+  // Connected but idle client: the connection thread is blocked in a receive.
+  {
+    const auto pipe_name = test_pipe_name(L"shutdown-connected");
+    auto backend = std::make_unique<FcitxLikeBackend>();
+    FcitxLikeBackend *fake = backend.get();
+    RunningHost host(std::move(backend), pipe_name);
+    require(host.start(), "shutdown connected start");
+    {
+      auto client = connect_client(pipe_name);
+      require(client != nullptr, "shutdown connected client");
+      require(client->bind(Binding{1, 1, 1}), "shutdown connected bind");
+      const auto begin = std::chrono::steady_clock::now();
+      host.stop_and_join();
+      require(std::chrono::steady_clock::now() - begin < std::chrono::seconds(5),
+              "stop() with a live client did not hang");
+      require(wait_until([fake] { return fake->bound_count() == 0; }, std::chrono::seconds(5)),
+              "stop() unbound the live client's contexts");
+      require(fake->contention_count == 0, "stop() caused no backend contention");
+    }
+  }
+
+  // Repeated stop() (also the destructor path) stays safe.
+  {
+    const auto pipe_name = test_pipe_name(L"shutdown-twice");
+    auto backend = std::make_unique<FcitxLikeBackend>();
+    RunningHost host(std::move(backend), pipe_name);
+    require(host.start(), "shutdown twice start");
+    host.server().stop();
+    host.server().stop();
+    host.stop_and_join();
+  }
+}
+
+void test_hostserver() {
+  test_hostserver_multi_client();
+  test_hostserver_transport_failure();
+  test_hostserver_healthy_no_ipc();
+  test_hostserver_shutdown();
+  std::cout << "PASS HostServer: multi-client remapping, disconnect isolation, transport "
+               "failure separation, healthy() no IPC, clean stop/join\n";
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
-// Layer 3: Full integration test (requires FusionHost.exe + Fcitx)
+// Layer 3: Full integration test (FUSION_WITH_FCITX5 build only)
 // ---------------------------------------------------------------------------
 
+#ifdef FUSION_WITH_FCITX5
 void test_integration() {
   // Check if we should skip.
   if (std::getenv("FUSION_STAGE4A_SKIP_INTEGRATION")) {
@@ -784,14 +1174,28 @@ void test_integration() {
   controller.destroy();
   std::cout << "PASS integration with real Fcitx over IPC\n";
 }
+#endif // FUSION_WITH_FCITX5
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
+  // Diagnostics to stderr: an assertion must never open a modal dialog in an
+  // automated ctest run (same convention as the other test targets).
+  _set_error_mode(_OUT_TO_STDERR);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#ifdef _DEBUG
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+#ifdef FUSION_WITH_FCITX5
+  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|integration>\n";
+#else
+  const char *usage = "Usage: stage4a <protocol|loopback|hostserver>\n";
+#endif
   if (argc < 2) {
-    std::fprintf(stderr, "Usage: stage4a <protocol|loopback|hostserver|integration>\n");
+    std::fprintf(stderr, "%s", usage);
     return 1;
   }
   std::string mode = argv[1];
@@ -802,10 +1206,15 @@ int main(int argc, char *argv[]) {
       test_loopback();
     else if (mode == "hostserver")
       test_hostserver();
-    else if (mode == "integration")
+    else if (mode == "integration") {
+#ifdef FUSION_WITH_FCITX5
       test_integration();
-    else {
-      std::fprintf(stderr, "Unknown mode: %s\n", mode.c_str());
+#else
+      std::fprintf(stderr, "integration mode requires the FUSION_WITH_FCITX5 build\n");
+      return 1;
+#endif
+    } else {
+      std::fprintf(stderr, "Unknown mode: %s\n%s", mode.c_str(), usage);
       return 1;
     }
     return 0;

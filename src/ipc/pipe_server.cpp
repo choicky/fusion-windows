@@ -32,10 +32,10 @@ bool PipeServer::create() {
   if (first_instance_)
     open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
   DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-  handle_ = CreateNamedPipeW(pipe_name_.c_str(), open_mode, pipe_mode, PIPE_UNLIMITED_INSTANCES,
-                             static_cast<DWORD>(max_message_payload + header_size),
-                             static_cast<DWORD>(max_message_payload + header_size), 0,
-                             &security_attrs_);
+  handle_ =
+      CreateNamedPipeW(pipe_name_.c_str(), open_mode, pipe_mode, PIPE_UNLIMITED_INSTANCES,
+                       static_cast<DWORD>(max_message_payload + header_size),
+                       static_cast<DWORD>(max_message_payload + header_size), 0, &security_attrs_);
   return handle_ != INVALID_HANDLE_VALUE;
 }
 
@@ -81,11 +81,13 @@ bool PipeServer::wait_for_client(std::chrono::milliseconds timeout) {
 }
 
 void PipeServer::disconnect_client() {
-  if (client_connected_) {
-    CancelIo(handle_);
-    DisconnectNamedPipe(handle_);
-    client_connected_ = false;
-  }
+  if (handle_ == INVALID_HANDLE_VALUE)
+    return;
+  // CancelIo only cancels I/O issued by the calling thread, so it cannot unblock
+  // a receive that another thread (HostServer::stop()) has to interrupt.
+  CancelIoEx(handle_, nullptr);
+  DisconnectNamedPipe(handle_);
+  client_connected_ = false;
 }
 
 bool PipeServer::client_connected() const { return client_connected_; }
