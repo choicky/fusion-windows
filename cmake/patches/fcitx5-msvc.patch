@@ -126,10 +126,19 @@ index c9d6942..82600b3 100644
 +
 +
 diff --git a/src/lib/fcitx-utils/utf8.h b/src/lib/fcitx-utils/utf8.h
-index 8c4e563..04d4036 100644
+index 8c4e563..a8330f3 100644
 --- a/src/lib/fcitx-utils/utf8.h
 +++ b/src/lib/fcitx-utils/utf8.h
-@@ -102,6 +102,7 @@ inline bool isValidChar(uint32_t c) {
+@@ -58,5 +58,8 @@ constexpr size_t INVALID_LENGTH = static_cast<size_t>(-1);
+ /// Will return INVALID_LENGTH if string is not a valid utf8 string.
+ template <typename Iter>
+ inline size_t lengthValidated(Iter start, Iter end) {
++    if (start == end) {
++        return 0;
++    }
+     return fcitx_utf8_strnlen_validated(&(*start), std::distance(start, end));
+ }
+@@ -102,6 +105,7 @@ inline bool isValidChar(uint32_t c) {
  /// INVALID_CHAR or NOT_ENOUGH_SPACE
  template <typename Iter>
  inline uint32_t getChar(Iter iter, Iter end) {
@@ -137,7 +146,7 @@ index 8c4e563..04d4036 100644
      const char *c = &(*iter);
      return fcitx_utf8_get_char_validated(c, std::distance(iter, end), nullptr);
  }
-@@ -114,6 +115,7 @@ inline uint32_t getChar(const T &s) {
+@@ -114,6 +118,7 @@ inline uint32_t getChar(const T &s) {
  
  template <typename Iter>
  inline Iter getNextChar(Iter iter, Iter end, uint32_t *chr) {
@@ -145,7 +154,19 @@ index 8c4e563..04d4036 100644
      const char *c = &(*iter);
      int plen = 0;
      *chr = fcitx_utf8_get_char_validated(c, std::distance(iter, end), &plen);
-@@ -348,3 +350,4 @@ std::wstring UTF8ToUTF16(std::string_view str);
+@@ -278,5 +281,10 @@ private:
+         if (iter_ != end_ && iter_ == next_) {
+             throw std::runtime_error("Invalid UTF8 character.");
+         }
+-        currentView_ = std::string_view(&*iter_, std::distance(iter_, next_));
++        if (iter_ == end_) {
++            currentView_ = std::string_view{};
++        } else {
++            currentView_ =
++                std::string_view(&*iter_, std::distance(iter_, next_));
++        }
+     }
+@@ -348,3 +358,4 @@ std::wstring UTF8ToUTF16(std::string_view str);
  } // namespace fcitx::utf8
  
  #endif // _FCITX_UTILS_UTF8_H_

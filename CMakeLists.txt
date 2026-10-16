@@ -62,6 +62,16 @@ if(BUILD_TESTING)
     target_compile_options(stage3b PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage3b PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3b_real_backend COMMAND stage3b)
+
+    # Dependency portability regression for the two MSVC empty-range guards in
+    # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
+    # engine directly; it does not exercise or change TSF key admission.
+    add_executable(fcitx_msvc_empty_range_guards tests/fcitx_msvc_empty_range_guards.cpp)
+    target_include_directories(fcitx_msvc_empty_range_guards PRIVATE include)
+    target_compile_features(fcitx_msvc_empty_range_guards PRIVATE cxx_std_20)
+    target_compile_options(fcitx_msvc_empty_range_guards PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(fcitx_msvc_empty_range_guards PRIVATE FusionFcitxHost)
+    add_test(NAME fcitx_msvc_empty_range_guards COMMAND fcitx_msvc_empty_range_guards)
   endif()
   add_library(FusionMock tests/mock.cpp)
   target_link_libraries(FusionMock PUBLIC FusionCore)
