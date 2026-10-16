@@ -31,6 +31,8 @@ if(WIN32 AND MSVC)
   add_executable(FusionTsfProfile tools/tsf/profile.cpp)
   target_link_libraries(FusionTsfProfile PRIVATE ole32)
   # Stage 2.5 real TSF/COM development shell (x64; see README for registration).
+  # Stage 4A: FusionTsf.dll no longer links Fcitx runtime directly.
+  # When FUSION_WITH_FCITX5 is ON, it uses the IPC backend to talk to FusionHost.exe.
   add_library(FusionTsf SHARED
     src/tsf/guids.cpp
     src/tsf/key_map.cpp
@@ -49,7 +51,24 @@ if(WIN32 AND MSVC)
   target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
   if(FUSION_WITH_FCITX5)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
-    target_link_libraries(FusionTsf PRIVATE FusionFcitxHost)
+    target_sources(FusionTsf PRIVATE
+      src/ipc/pipe_client.cpp
+      src/ipc/ipc_backend.cpp)
+  endif()
+
+  # Stage 4A: out-of-process Fusion Host executable.
+  # Links the real Fcitx backend and serves IPC requests from FusionTsf.dll.
+  if(FUSION_WITH_FCITX5)
+    add_executable(FusionHostExe
+      src/host/main.cpp
+      src/host/host_server.cpp
+      src/ipc/pipe_server.cpp)
+    target_include_directories(FusionHostExe PRIVATE include src)
+    target_compile_features(FusionHostExe PRIVATE cxx_std_20)
+    set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost)
+    target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore)
   endif()
 endif()
 
@@ -69,6 +88,22 @@ if(BUILD_TESTING)
     target_compile_options(stage3c PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
+
+    # Stage 4A IPC tests: protocol serialization, loopback pipe, and full integration.
+    add_executable(stage4a
+      tests/stage4a_ipc.cpp
+      src/ipc/pipe_client.cpp
+      src/ipc/pipe_server.cpp
+      src/ipc/ipc_backend.cpp
+      src/tsf/key_map.cpp
+      src/tsf/semantic.cpp)
+    target_include_directories(stage4a PRIVATE src)
+    target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
+    target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(stage4a PRIVATE FusionFcitxHost MockBackend)
+    add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
+    add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
+    add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
 
     # Dependency portability regression for the two MSVC empty-range guards in
     # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
