@@ -1,6 +1,7 @@
 #include "host/host_server.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace fusion::ipc {
 
@@ -26,20 +27,26 @@ void HostServer::stop() {
 }
 
 void HostServer::accept_loop() {
+  bool is_first = true;
   while (running_) {
-    auto pipe = std::make_unique<PipeServer>(pipe_name_, first_instance_);
-    first_instance_ = false;
+    auto pipe = std::make_unique<PipeServer>(pipe_name_, is_first);
+    bool was_first = is_first;
+    is_first = false;
     if (!pipe->create()) {
+      if (was_first) {
+        std::fprintf(stderr, "[FusionHost] first pipe instance create failed, exiting\n");
+        std::exit(1);
+      }
       std::fprintf(stderr, "[FusionHost] pipe create failed, retrying...\n");
       Sleep(100);
       continue;
     }
-    // Wait for a client with a 1-second timeout so we can check running_.
-    if (!pipe->wait_for_client(std::chrono::milliseconds(1000))) {
+    // Wait for a client — block indefinitely (no timeout).
+    if (!pipe->wait_for_client(std::chrono::milliseconds(0))) {
       continue;
     }
     std::fprintf(stderr, "[FusionHost] client connected\n");
-    auto *conn = new Connection{std::move(pipe), *backend_, backend_mutex_, {}, 1};
+    auto *conn = new Connection{std::move(pipe), *backend_, backend_mutex_, next_host_context_, {}};
     std::thread(&Connection::run, conn).detach();
   }
 }
@@ -148,9 +155,6 @@ void HostServer::Connection::handle_reset(const std::vector<std::uint8_t> &paylo
     return;
   }
   auto host_binding = it->second;
-  host_binding.lifetime = client_binding->lifetime;
-  host_binding.epoch = client_binding->epoch;
-  it->second = host_binding;
 
   bool result = false;
   {
@@ -207,8 +211,8 @@ void HostServer::Connection::handle_send(const std::vector<std::uint8_t> &payloa
     batch = backend.send(host_stimulus);
   }
 
-  // Restore the client's context ID in the response.
-  batch.binding.context = stimulus->binding.context;
+  // Return the client's full original binding in the response.
+  batch.binding = stimulus->binding;
 
   std::vector<std::uint8_t> response_payload;
   serialize(response_payload, batch);
@@ -243,24 +247,11 @@ void HostServer::Connection::unbind_all() {
 Binding HostServer::Connection::remap_binding(const Binding &client_binding) {
   auto it = context_map.find(client_binding.context);
   if (it != context_map.end()) {
-    // Already mapped: update lifetime/epoch.
-    auto host_binding = it->second;
-    host_binding.lifetime = client_binding.lifetime;
-    host_binding.epoch = client_binding.epoch;
-    it->second = host_binding;
-    return host_binding;
+    return it->second;
   }
-  // New mapping.
-  Binding host_binding{next_host_context++, client_binding.lifetime, client_binding.epoch};
+  // New mapping: only the context field is Host-unique; lifetime/epoch pass through.
+  Binding host_binding{next_host_context.fetch_add(1), client_binding.lifetime, client_binding.epoch};
   context_map[client_binding.context] = host_binding;
-  return host_binding;
-}
-
-Binding HostServer::Connection::restore_binding(const Binding &host_binding) {
-  for (auto &[client_ctx, hb] : context_map) {
-    if (hb.context == host_binding.context)
-      return Binding{client_ctx, host_binding.lifetime, host_binding.epoch};
-  }
   return host_binding;
 }
 

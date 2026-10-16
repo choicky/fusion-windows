@@ -1,7 +1,11 @@
 #include "ipc/pipe_client.hpp"
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 namespace fusion::ipc {
@@ -52,12 +56,12 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
 
 void PipeClient::disconnect() {
   std::lock_guard lock(mutex_);
-  if (connected_) {
+  if (handle_ != INVALID_HANDLE_VALUE) {
     CancelIo(handle_);
     CloseHandle(handle_);
     handle_ = INVALID_HANDLE_VALUE;
-    connected_ = false;
   }
+  connected_ = false;
 }
 
 bool PipeClient::connected() const {
@@ -94,6 +98,7 @@ bool PipeClient::write_all(const void *data, std::size_t size) {
     auto result = WaitForSingleObject(ov.hEvent, static_cast<DWORD>(kRequestTimeout.count()));
     if (result != WAIT_OBJECT_0) {
       CancelIoEx(handle_, &ov);
+      GetOverlappedResult(handle_, &ov, &written, TRUE);
       CloseHandle(ov.hEvent);
       return false;
     }
@@ -135,6 +140,7 @@ bool PipeClient::read_all_overlapped(void *data, std::size_t size,
     auto result = WaitForSingleObject(ov.hEvent, wait_ms);
     if (result != WAIT_OBJECT_0) {
       CancelIoEx(handle_, &ov);
+      GetOverlappedResult(handle_, &ov, &bytes_read, TRUE);
       CloseHandle(ov.hEvent);
       return false;
     }

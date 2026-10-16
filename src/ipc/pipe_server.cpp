@@ -1,7 +1,11 @@
 #include "ipc/pipe_server.hpp"
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <cstring>
@@ -22,6 +26,8 @@ PipeServer::~PipeServer() {
 
 bool PipeServer::create() {
   security_attrs_ = make_pipe_security();
+  if (!security_attrs_.lpSecurityDescriptor)
+    return false; // fail closed: security descriptor construction failed
   DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
   if (first_instance_)
     open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -52,6 +58,8 @@ bool PipeServer::wait_for_client(std::chrono::milliseconds timeout) {
       auto result = WaitForSingleObject(ov.hEvent, wait_ms);
       if (result != WAIT_OBJECT_0) {
         CancelIo(handle_);
+        DWORD bytes_transferred_cancel = 0;
+        GetOverlappedResult(handle_, &ov, &bytes_transferred_cancel, TRUE);
         DisconnectNamedPipe(handle_);
         CloseHandle(ov.hEvent);
         return false;
@@ -106,6 +114,7 @@ bool PipeServer::write_all(const void *data, std::size_t size) {
     auto result = WaitForSingleObject(ov.hEvent, INFINITE);
     if (result != WAIT_OBJECT_0) {
       CancelIoEx(handle_, &ov);
+      GetOverlappedResult(handle_, &ov, &written, TRUE);
       CloseHandle(ov.hEvent);
       return false;
     }
@@ -147,6 +156,7 @@ bool PipeServer::read_all_overlapped(void *data, std::size_t size,
     auto result = WaitForSingleObject(ov.hEvent, wait_ms);
     if (result != WAIT_OBJECT_0) {
       CancelIoEx(handle_, &ov);
+      GetOverlappedResult(handle_, &ov, &bytes_read, TRUE);
       CloseHandle(ov.hEvent);
       return false;
     }

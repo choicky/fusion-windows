@@ -53,6 +53,8 @@ if(WIN32 AND MSVC)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
     target_sources(FusionTsf PRIVATE
       src/ipc/pipe_client.cpp
+      src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp
       src/ipc/ipc_backend.cpp)
   endif()
 
@@ -62,7 +64,8 @@ if(WIN32 AND MSVC)
     add_executable(FusionHostExe
       src/host/main.cpp
       src/host/host_server.cpp
-      src/ipc/pipe_server.cpp)
+      src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp)
     target_include_directories(FusionHostExe PRIVATE include src)
     target_compile_features(FusionHostExe PRIVATE cxx_std_20)
     set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost)
@@ -94,7 +97,9 @@ if(BUILD_TESTING)
       tests/stage4a_ipc.cpp
       src/ipc/pipe_client.cpp
       src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp
       src/ipc/ipc_backend.cpp
+      src/host/host_server.cpp
       src/tsf/key_map.cpp
       src/tsf/semantic.cpp)
     target_include_directories(stage4a PRIVATE src)
@@ -103,6 +108,7 @@ if(BUILD_TESTING)
     target_link_libraries(stage4a PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
+    add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
     add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
 
     # Dependency portability regression for the two MSVC empty-range guards in

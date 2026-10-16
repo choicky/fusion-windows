@@ -6,6 +6,7 @@
 // On any error or timeout, marks disconnected; all subsequent operations fail.
 
 #include "fusion/ipc_protocol.hpp"
+#include "ipc/pipe_security.hpp"
 
 #include <chrono>
 #include <mutex>

@@ -6,6 +6,7 @@
 // for multi-client support.
 
 #include "fusion/ipc_protocol.hpp"
+#include "ipc/pipe_security.hpp"
 
 #include <chrono>
 #include <string>

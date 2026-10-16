@@ -44,9 +44,6 @@ private:
   std::optional<WireFrame> rpc(MessageType request_type,
                                const std::vector<std::uint8_t> &payload,
                                MessageType expected_response);
-
-  // Send a request frame. Returns true if the write succeeded.
-  bool send_request_locked(MessageType type, const std::vector<std::uint8_t> &payload);
 };
 
 std::unique_ptr<Backend> make_ipc_backend();

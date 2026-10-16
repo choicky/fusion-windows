@@ -9,7 +9,9 @@
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
+#include "host/host_server.hpp"
 #include "ipc/ipc_backend.hpp"
+#include "ipc/pipe_security.hpp"
 #include "ipc/pipe_server.hpp"
 #include "tsf/semantic.hpp"
 
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -510,20 +513,25 @@ void test_loopback() {
     t2.join();
   }
 
-  // Pre-write failure → Forward, post-write failure → Reject
+  // Pre-write failure → Forward with session_id, binding, stimulus_id, no ops
   {
     // Pre-write: client not connected.
     {
       IpcBackend client(L"\\\\.\\pipe\\FusionHost-ipc-test-nonexistent");
-      // Don't connect — send should return Forward.
+      // Don't connect — send should return Forward with fields populated.
       BackendStimulus stimulus;
-      stimulus.binding = {1, 1, 1};
-      stimulus.stimulus_id = 1;
+      stimulus.binding = {42, 7, 3};
+      stimulus.stimulus_id = 99;
       stimulus.type = BackendStimulus::Type::Character;
       stimulus.character = 'a';
       auto batch = client.send(stimulus);
       require(batch.disposition == BackendBatch::Disposition::Forward,
               "pre-write failure → Forward");
+      require(batch.operations.empty(), "pre-write failure → no ops");
+      require(batch.binding == stimulus.binding, "pre-write failure → binding preserved");
+      require(batch.stimulus_id == stimulus.stimulus_id, "pre-write failure → stimulus_id preserved");
+      // session_id is 0 because connect was never performed (cached_session_id_ = 0).
+      require(batch.backend_session_id == 0, "pre-write failure → session_id is 0 (never connected)");
     }
   }
 
@@ -600,6 +608,120 @@ void test_loopback() {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2B: HostServer test with real HostServer + fake Backend
+// ---------------------------------------------------------------------------
+
+class CountingBackend final : public Backend {
+public:
+  std::uint64_t sid = 777;
+  std::atomic<int> bind_count{0};
+  std::atomic<int> unbind_count{0};
+  std::atomic<int> send_count{0};
+  std::set<std::uint64_t> bound_contexts;
+  std::mutex bind_mutex;
+
+  bool bind(Binding b) override {
+    std::lock_guard lock(bind_mutex);
+    if (bound_contexts.count(b.context))
+      return false; // reject duplicate context
+    bound_contexts.insert(b.context);
+    bind_count++;
+    return true;
+  }
+  bool reset(Binding) override { return true; }
+  void unbind(Binding b) override {
+    std::lock_guard lock(bind_mutex);
+    bound_contexts.erase(b.context);
+    unbind_count++;
+  }
+  bool healthy() const override { return true; }
+  std::uint64_t session_id() const override { return sid; }
+  BackendBatch send(const BackendStimulus &input) override {
+    send_count++;
+    BackendBatch batch;
+    batch.backend_session_id = sid;
+    batch.binding = input.binding;
+    batch.stimulus_id = input.stimulus_id;
+    batch.disposition = BackendBatch::Disposition::Consumed;
+    batch.operations = {{BackendOperation::Type::SetPreedit, "test", {}, false}};
+    return batch;
+  }
+};
+
+void test_hostserver() {
+  // HostServer with CountingBackend: bind rejects duplicate context.
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hostserver-dup";
+    auto backend = std::make_unique<CountingBackend>();
+    auto *backend_ptr = backend.get();
+    HostServer server(std::move(backend), pipe_name);
+    require(server.start(), "hostserver start");
+
+    std::thread server_thread([&] { server.run(); });
+
+    // Give the server time to start listening.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::milliseconds(5000)), "hostserver client connect");
+    require(client.session_id() == 777, "hostserver session_id");
+
+    // First bind should succeed.
+    Binding b1{1, 1, 1};
+    require(client.bind(b1), "hostserver first bind");
+    require(backend_ptr->bind_count == 1, "hostserver bind_count == 1");
+
+    // Second bind with same context should be rejected by the backend.
+    // Note: the HostServer remaps context, so we use a different client context
+    // that maps to the same host context. Actually, the HostServer will assign
+    // a different host context for a different client context, so this won't
+    // trigger the duplicate rejection. Let me test with the same client context.
+    // The HostServer already has a mapping for client context 1, so it will
+    // reuse the same host binding. The backend will see the same host context
+    // and reject it.
+    require(!client.bind(b1), "hostserver duplicate bind rejected");
+
+    // Send should work.
+    BackendStimulus stimulus;
+    stimulus.binding = b1;
+    stimulus.stimulus_id = 1;
+    stimulus.type = BackendStimulus::Type::Character;
+    stimulus.character = 'a';
+    auto batch = client.send(stimulus);
+    require(batch.disposition == BackendBatch::Disposition::Consumed, "hostserver send consumed");
+    require(batch.binding == b1, "hostserver send returns client binding");
+    require(backend_ptr->send_count == 1, "hostserver send_count == 1");
+
+    client.disconnect();
+    server.stop();
+    server_thread.join();
+  }
+
+  // healthy() sends no IPC — already tested in test_loopback, but verify again here.
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hostserver-healthy";
+    auto backend = std::make_unique<CountingBackend>();
+    auto *backend_ptr = backend.get();
+    HostServer server(std::move(backend), pipe_name);
+    require(server.start(), "hostserver healthy start");
+
+    std::thread server_thread([&] { server.run(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::milliseconds(5000)), "hostserver healthy connect");
+    require(client.healthy(), "hostserver healthy after connect");
+    require(backend_ptr->send_count == 0, "hostserver healthy sends no IPC");
+
+    client.disconnect();
+    server.stop();
+    server_thread.join();
+  }
+
+  std::cout << "PASS HostServer with fake Backend: bind duplicate, send, healthy no IPC\n";
+}
+
+// ---------------------------------------------------------------------------
 // Layer 3: Full integration test (requires FusionHost.exe + Fcitx)
 // ---------------------------------------------------------------------------
 
@@ -669,7 +791,7 @@ void test_integration() {
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::fprintf(stderr, "Usage: stage4a <protocol|loopback|integration>\n");
+    std::fprintf(stderr, "Usage: stage4a <protocol|loopback|hostserver|integration>\n");
     return 1;
   }
   std::string mode = argv[1];
@@ -678,6 +800,8 @@ int main(int argc, char *argv[]) {
       test_protocol();
     else if (mode == "loopback")
       test_loopback();
+    else if (mode == "hostserver")
+      test_hostserver();
     else if (mode == "integration")
       test_integration();
     else {

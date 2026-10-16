@@ -9,6 +9,7 @@
 // Host-unique context IDs and unbinds all contexts on disconnect.
 
 #include "fusion/backend.hpp"
+#include "ipc/pipe_security.hpp"
 #include "ipc/pipe_server.hpp"
 
 #include <atomic>
@@ -38,8 +39,8 @@ private:
     std::unique_ptr<PipeServer> pipe;
     Backend &backend;
     std::mutex &backend_mutex;
-    std::map<std::uint64_t, Binding> context_map; // client_context → host_binding
-    std::uint64_t next_host_context = 1;
+    std::atomic<std::uint64_t> &next_host_context;
+    std::map<std::uint64_t, Binding> context_map; // client_context → host binding
 
     void run();
     void handle_hello();
@@ -51,13 +52,13 @@ private:
     void send_bool_response(MessageType type, bool value);
     void unbind_all();
     Binding remap_binding(const Binding &client_binding);
-    Binding restore_binding(const Binding &host_binding);
   };
 
   std::unique_ptr<Backend> backend_;
   std::wstring pipe_name_;
   std::atomic<bool> running_{false};
   std::mutex backend_mutex_;
+  std::atomic<std::uint64_t> next_host_context_{1};
   bool first_instance_ = true;
 
   void accept_loop();

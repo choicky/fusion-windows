@@ -7,9 +7,14 @@
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
 #include "host/host_server.hpp"
+#include "ipc/pipe_security.hpp"
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <cstdio>

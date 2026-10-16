@@ -42,11 +42,6 @@ bool IpcBackend::connect(std::chrono::milliseconds timeout) {
   return true;
 }
 
-bool IpcBackend::send_request_locked(MessageType type,
-                                      const std::vector<std::uint8_t> &payload) {
-  return client_.send_request(type, payload);
-}
-
 std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
                                           const std::vector<std::uint8_t> &payload,
                                           MessageType expected_response) {
@@ -100,10 +95,13 @@ BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
 
   std::lock_guard lock(rpc_mutex_);
 
-  // Pre-write check: if not connected, return Forward with no ops.
+  // Pre-write check: if not connected, return Forward with session_id, binding, stimulus_id, no ops.
   if (!client_.connected()) {
     BackendBatch batch;
     batch.disposition = BackendBatch::Disposition::Forward;
+    batch.backend_session_id = cached_session_id_;
+    batch.binding = stimulus.binding;
+    batch.stimulus_id = stimulus.stimulus_id;
     return batch;
   }
 

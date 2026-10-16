@@ -4,8 +4,9 @@ Windows product implementation for the Fusion Enhanced IME line. Today it is a
 portable, sans-IO C++20 correctness core (`FusionCore`), a deterministic test-only
 scheduler and fault harness (`FusionMock`), a minimal semantic Mock Backend with
 an explicit Host-side boundary (`fusion::Host`) that translates backend semantic
-intent into existing FusionCore operations, a Stage 2.5 real Windows TSF/COM
-development shell (`FusionTsf`), and a Stage 4A out-of-process Fcitx Host
+intent into existing FusionCore operations, and a Stage 2.5 real Windows TSF/COM
+development shell (`FusionTsf`). Stage 3B/3C provide the real Fcitx5 backend PoC
+and faithful frontend path. Stage 4A adds an out-of-process Fcitx Host
 (`FusionHost.exe`) connected by length-prefixed binary IPC over a local Named Pipe.
 There is no end-user Windows input product yet; independent review is required
 before further integration.
@@ -37,10 +38,10 @@ repository entry point only.
 - `include/fusion/core.hpp` — portable FusionCore public model (Key/Kind/Result/Ticket, …).
 - `include/fusion/host.hpp` — Stage 2 `fusion::Host` Host-side boundary (backend `Intent` → Core operations).
 - `include/fusion/backend.hpp` — Stage 3B/4A `fusion::Backend` interface and `BackendStimulus`/`BackendBatch`/`BackendOperation` types.
-- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing, serialization, per-user per-session pipe name computation, server identity verification, pipe security descriptor.
+- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free).
 - `src/core.cpp` — FusionCore implementation.
-- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration. When `FUSION_WITH_FCITX5` is ON, links the IPC backend to talk to FusionHost.exe.
-- `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server), `ipc_backend.{hpp,cpp}` (Backend over IPC).
+- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration. The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
+- `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server), `pipe_security.{hpp,cpp}` (per-user pipe name, server identity verification, security descriptor), `ipc_backend.{hpp,cpp}` (Backend over IPC).
 - `src/host/` — Stage 4A FusionHost.exe: `main.cpp` (entry point), `host_server.{hpp,cpp}` (multi-client accept loop, per-connection threads, backend mutex, context remapping).
 - `tests/mock.{hpp,cpp}` — deterministic FusionMock scheduler, fault harness and oracles.
 - `tests/mock_backend.{hpp,cpp}` — Stage 2 semantic Mock Backend (a test abstraction).
@@ -51,7 +52,7 @@ repository entry point only.
 - `tests/stage4a_ipc.cpp` — Stage 4A IPC tests: protocol serialization, loopback pipe, full integration.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
-- `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL and FusionHost.exe build on WIN32+MSVC when `FUSION_WITH_FCITX5=ON`.
+- `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
 ## Local validation
 
@@ -68,6 +69,8 @@ The library alone builds with `-DBUILD_TESTING=OFF`. On Windows with MSVC the
 build additionally produces the `FusionTsf.dll` x64 development TSF shell
 (register it per "Stage 2.5" below; non-Windows and non-MSVC builds skip it).
 When `FUSION_WITH_FCITX5=ON`, the build also produces `FusionHost.exe`.
+The Mock Backend is a test abstraction used by Stage 2 and the Stage 2.5
+in-process fixture; it is not a production backend.
 
 ## Portable model boundary
 
@@ -137,7 +140,7 @@ post-ownership rejection and indeterminate irreversible mutation, confirming the
 semantic path does not bypass the RG-0 invariants. Run them with
 `ctest --test-dir build -R stage2`.
 
-P0-B/P0-D, recovery UX, permanent identifiers, final protocol/IPC/Host
+P0-A/P0-B/P0-D, recovery UX, permanent identifiers, final protocol/IPC/Host
 topology, key classification, timing thresholds, candidate renderer and
 environment policy remain open. The enums here describe test/model outcomes;
 they do not select those product policies. Stage 2 was implemented before
@@ -160,7 +163,7 @@ properties actually exercised. It does not validate Host crash isolation, bounde
 IPC, transport failures, cross-process Host restart/incarnation fencing or production
 cross-process lifecycle. D072 still requires a thin TSF DLL, bounded causal IPC and
 an out-of-process Host. No production backend is moved into this DLL; this fixture
-must not grow into the Stage 3 production runtime. P0-B/P0-D and final
+must not grow into the Stage 3 production runtime. P0-A/P0-B/P0-D and final
 protocol/identifiers/topology remain OPEN. Stage 2.5 was implemented before
 Stage 4A moved the backend out-of-process; the in-process Mock Backend fixture
 is historical.
@@ -260,14 +263,17 @@ The Host computes the default pipe name from the user SID and session ID. The
 `--pipe-name <name>` override is for tests only. The Host enters an accept loop
 and serves IPC requests until terminated.
 
-**Tests.** `tests/stage4a_ipc.cpp` has three modes:
+**Tests.** `tests/stage4a_ipc.cpp` has four modes:
 - `protocol`: serialization round-trip, bounds, trailing byte rejection, malformed input
 - `loopback`: real Named Pipe with a CallbackBackend server thread (no Fcitx)
+- `hostserver`: real HostServer with a fake Backend (bind duplicate, send, healthy no IPC)
 - `integration`: full FusionHost.exe + Fcitx backend (requires Fcitx runtime; set
   `FUSION_STAGE4A_SKIP_INTEGRATION=1` to skip instead of fail)
 
 Run with `ctest --test-dir build -R stage4a`.
 
-P0-D (Host startup/lifecycle), recovery UX, permanent identifiers, final wire
+P0-A/P0-D (Host startup/lifecycle), recovery UX, permanent identifiers, final wire
 format, timing thresholds, candidate renderer and environment policy remain
 OPEN. The IPC protocol is an engineering constant, not a frozen wire format.
+After testing with the TSF DLL, re-activate the previous input method through
+the input-method switcher to restore normal input.

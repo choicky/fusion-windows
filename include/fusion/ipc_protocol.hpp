@@ -22,10 +22,6 @@
 #include <string>
 #include <vector>
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 namespace fusion::ipc {
 
 inline constexpr std::uint32_t protocol_version = 1;
@@ -34,76 +30,6 @@ inline constexpr std::size_t max_message_payload = 65536;
 inline constexpr std::size_t max_string_length = 8192;
 inline constexpr std::size_t max_vector_length = 64;
 inline constexpr std::size_t header_size = 5;
-
-// UNFROZEN engineering constant (P0-D OPEN).
-inline constexpr const wchar_t *default_pipe_name_prefix = L"\\\\.\\pipe\\FusionHost-v1-";
-
-inline std::wstring compute_pipe_name() {
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-    return {};
-  DWORD len = 0;
-  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
-  if (len == 0) {
-    CloseHandle(token);
-    return {};
-  }
-  std::vector<std::uint8_t> buf(len);
-  if (!GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
-    CloseHandle(token);
-    return {};
-  }
-  CloseHandle(token);
-  auto *user = reinterpret_cast<TOKEN_USER *>(buf.data());
-  wchar_t *sid_str = nullptr;
-  if (!ConvertSidToStringSidW(user->User.Sid, &sid_str))
-    return {};
-  DWORD session_id = 0;
-  ProcessIdToSessionId(GetCurrentProcessId(), &session_id);
-  std::wstring name(default_pipe_name_prefix);
-  name += sid_str;
-  name += L'-';
-  name += std::to_wstring(session_id);
-  LocalFree(sid_str);
-  return name;
-}
-
-inline bool verify_server_identity(HANDLE pipe_handle) {
-  DWORD server_pid = 0;
-  if (!GetNamedPipeServerProcessId(pipe_handle, &server_pid))
-    return false;
-  HANDLE server_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, server_pid);
-  if (!server_proc)
-    return false;
-  HANDLE server_token = nullptr;
-  bool ok = false;
-  if (OpenProcessToken(server_proc, TOKEN_QUERY, &server_token)) {
-    DWORD len = 0;
-    GetTokenInformation(server_token, TokenUser, nullptr, 0, &len);
-    if (len > 0) {
-      std::vector<std::uint8_t> buf(len);
-      if (GetTokenInformation(server_token, TokenUser, buf.data(), len, &len)) {
-        auto *server_user = reinterpret_cast<TOKEN_USER *>(buf.data());
-        HANDLE my_token = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &my_token)) {
-          DWORD my_len = 0;
-          GetTokenInformation(my_token, TokenUser, nullptr, 0, &my_len);
-          if (my_len > 0) {
-            std::vector<std::uint8_t> my_buf(my_len);
-            if (GetTokenInformation(my_token, TokenUser, my_buf.data(), my_len, &my_len)) {
-              auto *my_user = reinterpret_cast<TOKEN_USER *>(my_buf.data());
-              ok = EqualSid(server_user->User.Sid, my_user->User.Sid);
-            }
-          }
-          CloseHandle(my_token);
-        }
-      }
-    }
-    CloseHandle(server_token);
-  }
-  CloseHandle(server_proc);
-  return ok;
-}
 
 enum class MessageType : std::uint8_t {
   HelloRequest = 0x01,
@@ -374,55 +300,6 @@ inline std::optional<WireFrame> parse_header(const std::uint8_t *data, std::size
   frame.type = static_cast<MessageType>(type_byte);
   frame.payload.assign(data + header_size, data + header_size + payload_len);
   return frame;
-}
-
-inline SECURITY_ATTRIBUTES make_pipe_security() {
-  SECURITY_ATTRIBUTES sa{};
-  sa.nLength = sizeof(sa);
-
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-    return sa;
-  DWORD len = 0;
-  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
-  if (len == 0) {
-    CloseHandle(token);
-    return sa;
-  }
-  std::vector<std::uint8_t> buf(len);
-  if (!GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
-    CloseHandle(token);
-    return sa;
-  }
-  CloseHandle(token);
-  auto *user = reinterpret_cast<TOKEN_USER *>(buf.data());
-
-  EXPLICIT_ACCESSW ea{};
-  ea.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-  ea.grfAccessMode = SET_ACCESS;
-  ea.grfInheritance = NO_INHERITANCE;
-  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-  ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(user->User.Sid);
-
-  PACL new_dacl = nullptr;
-  if (SetEntriesInAclW(1, &ea, nullptr, &new_dacl) != ERROR_SUCCESS)
-    return sa;
-
-  sa.lpSecurityDescriptor = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
-  if (!sa.lpSecurityDescriptor) {
-    LocalFree(new_dacl);
-    return sa;
-  }
-  InitializeSecurityDescriptor(sa.lpSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION);
-  SetSecurityDescriptorDacl(sa.lpSecurityDescriptor, TRUE, new_dacl, FALSE);
-  return sa;
-}
-
-inline void free_pipe_security(SECURITY_ATTRIBUTES &sa) {
-  if (sa.lpSecurityDescriptor) {
-    LocalFree(sa.lpSecurityDescriptor);
-    sa.lpSecurityDescriptor = nullptr;
-  }
 }
 
 } // namespace fusion::ipc
