@@ -5,143 +5,263 @@
 namespace fusion::ipc {
 
 HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name)
-    : backend_(std::move(backend)), server_(std::move(pipe_name)) {}
+    : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)) {}
 
 HostServer::~HostServer() { stop(); }
 
 bool HostServer::start() {
   if (!backend_)
     return false;
-  return server_.create();
+  return true;
 }
 
 void HostServer::run() {
   running_ = true;
-  std::fprintf(stderr, "[FusionHost] waiting for client connection...\n");
-  while (running_) {
-    if (!server_.wait_for_client()) {
-      if (!running_)
-        break;
-      std::fprintf(stderr, "[FusionHost] client wait failed, retrying...\n");
-      continue;
-    }
-    std::fprintf(stderr, "[FusionHost] client connected\n");
-    handle_client();
-    std::fprintf(stderr, "[FusionHost] client disconnected\n");
-    server_.disconnect_client();
-  }
+  std::fprintf(stderr, "[FusionHost] accepting connections on: %ls\n", pipe_name_.c_str());
+  accept_loop();
 }
 
 void HostServer::stop() {
   running_ = false;
-  server_.shutdown();
 }
 
-void HostServer::handle_client() {
-  while (running_ && server_.client_connected()) {
-    auto frame = server_.recv_frame();
-    if (!frame) {
-      std::fprintf(stderr, "[FusionHost] malformed or no frame, closing client\n");
-      return;
+void HostServer::accept_loop() {
+  while (running_) {
+    auto pipe = std::make_unique<PipeServer>(pipe_name_, first_instance_);
+    first_instance_ = false;
+    if (!pipe->create()) {
+      std::fprintf(stderr, "[FusionHost] pipe create failed, retrying...\n");
+      Sleep(100);
+      continue;
     }
-    dispatch(*frame);
+    // Wait for a client with a 1-second timeout so we can check running_.
+    if (!pipe->wait_for_client(std::chrono::milliseconds(1000))) {
+      continue;
+    }
+    std::fprintf(stderr, "[FusionHost] client connected\n");
+    auto *conn = new Connection{std::move(pipe), *backend_, backend_mutex_, {}, 1};
+    std::thread(&Connection::run, conn).detach();
   }
 }
 
-void HostServer::dispatch(const WireFrame &request) {
-  switch (request.type) {
-  case MessageType::BindRequest:
-    handle_bind(request.payload);
-    break;
-  case MessageType::ResetRequest:
-    handle_reset(request.payload);
-    break;
-  case MessageType::UnbindRequest:
-    handle_unbind(request.payload);
-    break;
-  case MessageType::HealthyRequest:
-    handle_healthy();
-    break;
-  case MessageType::SessionIdRequest:
-    handle_session_id();
-    break;
-  case MessageType::SendRequest:
-    handle_send(request.payload);
-    break;
-  default:
-    std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, closing client\n",
-                 static_cast<unsigned>(static_cast<std::uint8_t>(request.type)));
-    server_.disconnect_client();
-    break;
-  }
-}
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
 
-void HostServer::handle_bind(const std::vector<std::uint8_t> &payload) {
-  auto binding = deserialize_binding(payload.data(), payload.size());
-  if (!binding) {
-    server_.disconnect_client();
+void HostServer::Connection::run() {
+  // First message must be Hello.
+  handle_hello();
+  if (!pipe->client_connected()) {
+    delete this;
     return;
   }
-  bool result = backend_->bind(*binding);
+
+  // Process requests until disconnect.
+  while (pipe->client_connected()) {
+    auto frame = pipe->recv_frame(std::chrono::milliseconds(0)); // block indefinitely
+    if (!frame) {
+      std::fprintf(stderr, "[FusionHost] client read failed, disconnecting\n");
+      break;
+    }
+    switch (frame->type) {
+    case MessageType::BindRequest:
+      handle_bind(frame->payload);
+      break;
+    case MessageType::ResetRequest:
+      handle_reset(frame->payload);
+      break;
+    case MessageType::UnbindRequest:
+      handle_unbind(frame->payload);
+      break;
+    case MessageType::SendRequest:
+      handle_send(frame->payload);
+      break;
+    default:
+      std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, disconnecting\n",
+                   static_cast<unsigned>(static_cast<std::uint8_t>(frame->type)));
+      pipe->disconnect_client();
+      break;
+    }
+  }
+
+  // Unbind all contexts owned by this connection.
+  unbind_all();
+  std::fprintf(stderr, "[FusionHost] client disconnected, contexts unbound\n");
+  delete this;
+}
+
+void HostServer::Connection::handle_hello() {
+  auto frame = pipe->recv_frame(std::chrono::milliseconds(5000));
+  if (!frame || frame->type != MessageType::HelloRequest) {
+    std::fprintf(stderr, "[FusionHost] expected Hello, got type=0x%02x\n",
+                 frame ? static_cast<unsigned>(static_cast<std::uint8_t>(frame->type)) : 0);
+    pipe->disconnect_client();
+    return;
+  }
+
+  detail::Reader r(frame->payload.data(), frame->payload.size());
+  auto client_version = r.read_u32();
+  if (!client_version || !r.at_end()) {
+    pipe->disconnect_client();
+    return;
+  }
+
+  std::vector<std::uint8_t> response_payload;
+  if (*client_version != protocol_version) {
+    // Version mismatch: respond with version=0.
+    detail::write_u32(response_payload, 0);
+    detail::write_u64(response_payload, 0);
+  } else {
+    std::lock_guard lock(backend_mutex);
+    detail::write_u32(response_payload, protocol_version);
+    detail::write_u64(response_payload, backend.session_id());
+  }
+  send_response(MessageType::HelloResponse, response_payload);
+}
+
+void HostServer::Connection::handle_bind(const std::vector<std::uint8_t> &payload) {
+  auto client_binding = deserialize_binding(payload.data(), payload.size());
+  if (!client_binding) {
+    pipe->disconnect_client();
+    return;
+  }
+
+  auto host_binding = remap_binding(*client_binding);
+  bool result = false;
+  {
+    std::lock_guard lock(backend_mutex);
+    result = backend.bind(host_binding);
+  }
   send_bool_response(MessageType::BindResponse, result);
 }
 
-void HostServer::handle_reset(const std::vector<std::uint8_t> &payload) {
-  auto binding = deserialize_binding(payload.data(), payload.size());
-  if (!binding) {
-    server_.disconnect_client();
+void HostServer::Connection::handle_reset(const std::vector<std::uint8_t> &payload) {
+  auto client_binding = deserialize_binding(payload.data(), payload.size());
+  if (!client_binding) {
+    pipe->disconnect_client();
     return;
   }
-  bool result = backend_->reset(*binding);
+
+  auto it = context_map.find(client_binding->context);
+  if (it == context_map.end()) {
+    send_bool_response(MessageType::ResetResponse, false);
+    return;
+  }
+  auto host_binding = it->second;
+  host_binding.lifetime = client_binding->lifetime;
+  host_binding.epoch = client_binding->epoch;
+  it->second = host_binding;
+
+  bool result = false;
+  {
+    std::lock_guard lock(backend_mutex);
+    result = backend.reset(host_binding);
+  }
   send_bool_response(MessageType::ResetResponse, result);
 }
 
-void HostServer::handle_unbind(const std::vector<std::uint8_t> &payload) {
-  auto binding = deserialize_binding(payload.data(), payload.size());
-  if (!binding) {
-    server_.disconnect_client();
+void HostServer::Connection::handle_unbind(const std::vector<std::uint8_t> &payload) {
+  auto client_binding = deserialize_binding(payload.data(), payload.size());
+  if (!client_binding) {
+    pipe->disconnect_client();
     return;
   }
-  backend_->unbind(*binding);
+
+  auto it = context_map.find(client_binding->context);
+  if (it != context_map.end()) {
+    auto host_binding = it->second;
+    {
+      std::lock_guard lock(backend_mutex);
+      backend.unbind(host_binding);
+    }
+    context_map.erase(it);
+  }
   send_response(MessageType::UnbindResponse, {});
 }
 
-void HostServer::handle_healthy() {
-  send_bool_response(MessageType::HealthyResponse, backend_->healthy());
-}
-
-void HostServer::handle_session_id() {
-  std::vector<std::uint8_t> payload;
-  serialize(payload, backend_->session_id());
-  send_response(MessageType::SessionIdResponse, payload);
-}
-
-void HostServer::handle_send(const std::vector<std::uint8_t> &payload) {
+void HostServer::Connection::handle_send(const std::vector<std::uint8_t> &payload) {
   auto stimulus = deserialize_stimulus(payload.data(), payload.size());
   if (!stimulus) {
-    server_.disconnect_client();
+    pipe->disconnect_client();
     return;
   }
-  auto batch = backend_->send(*stimulus);
+
+  // Remap the binding context.
+  auto it = context_map.find(stimulus->binding.context);
+  if (it == context_map.end()) {
+    // Unknown context: reject.
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Reject;
+    std::vector<std::uint8_t> response_payload;
+    serialize(response_payload, batch);
+    send_response(MessageType::SendResponse, response_payload);
+    return;
+  }
+
+  auto host_stimulus = *stimulus;
+  host_stimulus.binding = it->second;
+
+  BackendBatch batch;
+  {
+    std::lock_guard lock(backend_mutex);
+    batch = backend.send(host_stimulus);
+  }
+
+  // Restore the client's context ID in the response.
+  batch.binding.context = stimulus->binding.context;
+
   std::vector<std::uint8_t> response_payload;
   serialize(response_payload, batch);
   send_response(MessageType::SendResponse, response_payload);
 }
 
-void HostServer::send_response(MessageType type, const std::vector<std::uint8_t> &payload) {
+void HostServer::Connection::send_response(MessageType type,
+                                           const std::vector<std::uint8_t> &payload) {
   WireFrame frame;
   frame.type = type;
   frame.payload = payload;
-  if (!server_.send_frame(frame)) {
-    std::fprintf(stderr, "[FusionHost] send failed, closing client\n");
-    server_.disconnect_client();
+  if (!pipe->send_frame(frame)) {
+    std::fprintf(stderr, "[FusionHost] send failed, disconnecting client\n");
+    pipe->disconnect_client();
   }
 }
 
-void HostServer::send_bool_response(MessageType type, bool value) {
+void HostServer::Connection::send_bool_response(MessageType type, bool value) {
   std::vector<std::uint8_t> payload;
   serialize(payload, value);
   send_response(type, payload);
+}
+
+void HostServer::Connection::unbind_all() {
+  std::lock_guard lock(backend_mutex);
+  for (auto &[client_ctx, host_binding] : context_map) {
+    backend.unbind(host_binding);
+  }
+  context_map.clear();
+}
+
+Binding HostServer::Connection::remap_binding(const Binding &client_binding) {
+  auto it = context_map.find(client_binding.context);
+  if (it != context_map.end()) {
+    // Already mapped: update lifetime/epoch.
+    auto host_binding = it->second;
+    host_binding.lifetime = client_binding.lifetime;
+    host_binding.epoch = client_binding.epoch;
+    it->second = host_binding;
+    return host_binding;
+  }
+  // New mapping.
+  Binding host_binding{next_host_context++, client_binding.lifetime, client_binding.epoch};
+  context_map[client_binding.context] = host_binding;
+  return host_binding;
+}
+
+Binding HostServer::Connection::restore_binding(const Binding &host_binding) {
+  for (auto &[client_ctx, hb] : context_map) {
+    if (hb.context == host_binding.context)
+      return Binding{client_ctx, host_binding.lifetime, host_binding.epoch};
+  }
+  return host_binding;
 }
 
 } // namespace fusion::ipc

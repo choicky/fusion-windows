@@ -19,10 +19,15 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
   while (true) {
     handle_ =
         CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                    0, nullptr);
+                    FILE_FLAG_OVERLAPPED, nullptr);
     if (handle_ != INVALID_HANDLE_VALUE) {
       DWORD mode = PIPE_READMODE_BYTE;
       if (!SetNamedPipeHandleState(handle_, &mode, nullptr, nullptr)) {
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+        return false;
+      }
+      if (!verify_server_identity(handle_)) {
         CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
         return false;
@@ -35,11 +40,12 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
       return false;
     if (std::chrono::steady_clock::now() >= deadline)
       return false;
-    if (!WaitNamedPipeW(pipe_name_.c_str(),
-                        static_cast<DWORD>(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
-                                                                                  std::chrono::steady_clock::now())
-                                .count())))
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - std::chrono::steady_clock::now())
+                         .count();
+    if (remaining <= 0)
+      return false;
+    if (!WaitNamedPipeW(pipe_name_.c_str(), static_cast<DWORD>(remaining)))
       return false;
   }
 }
@@ -47,6 +53,7 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
 void PipeClient::disconnect() {
   std::lock_guard lock(mutex_);
   if (connected_) {
+    CancelIo(handle_);
     CloseHandle(handle_);
     handle_ = INVALID_HANDLE_VALUE;
     connected_ = false;
@@ -58,48 +65,87 @@ bool PipeClient::connected() const {
   return connected_;
 }
 
+void *PipeClient::native_handle() const {
+  std::lock_guard lock(mutex_);
+  return connected_ ? handle_ : INVALID_HANDLE_VALUE;
+}
+
 bool PipeClient::write_all(const void *data, std::size_t size) {
   const auto *ptr = static_cast<const std::uint8_t *>(data);
   std::size_t written_total = 0;
   while (written_total < size) {
-    DWORD written = 0;
-    if (!WriteFile(handle_, ptr + written_total,
-                   static_cast<DWORD>(size - written_total), &written, nullptr))
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent)
       return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(handle_, ptr + written_total,
+                        static_cast<DWORD>(size - written_total), &written, &ov);
+    if (ok) {
+      CloseHandle(ov.hEvent);
+      written_total += written;
+      continue;
+    }
+    auto err = GetLastError();
+    if (err != ERROR_IO_PENDING) {
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    auto result = WaitForSingleObject(ov.hEvent, static_cast<DWORD>(kRequestTimeout.count()));
+    if (result != WAIT_OBJECT_0) {
+      CancelIoEx(handle_, &ov);
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    if (!GetOverlappedResult(handle_, &ov, &written, FALSE)) {
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    CloseHandle(ov.hEvent);
     written_total += written;
   }
   return true;
 }
 
-bool PipeClient::wait_for_data(std::chrono::milliseconds timeout) {
-  DWORD bytes_available = 0;
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (true) {
-    if (!PeekNamedPipe(handle_, nullptr, 0, nullptr, &bytes_available, nullptr))
-      return false;
-    if (bytes_available > 0)
-      return true;
-    if (std::chrono::steady_clock::now() >= deadline)
-      return false;
-    Sleep(1);
-  }
-}
-
-bool PipeClient::read_all(void *data, std::size_t size, std::chrono::milliseconds timeout) {
-  if (!wait_for_data(timeout))
-    return false;
+bool PipeClient::read_all_overlapped(void *data, std::size_t size,
+                                     std::chrono::milliseconds timeout) {
   auto *ptr = static_cast<std::uint8_t *>(data);
   std::size_t read_total = 0;
   while (read_total < size) {
-    DWORD bytes_read = 0;
-    if (!ReadFile(handle_, ptr + read_total, static_cast<DWORD>(size - read_total), &bytes_read,
-                  nullptr))
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent)
       return false;
+    DWORD bytes_read = 0;
+    BOOL ok = ReadFile(handle_, ptr + read_total, static_cast<DWORD>(size - read_total),
+                       &bytes_read, &ov);
+    if (ok) {
+      CloseHandle(ov.hEvent);
+      if (bytes_read == 0)
+        return false;
+      read_total += bytes_read;
+      continue;
+    }
+    auto err = GetLastError();
+    if (err != ERROR_IO_PENDING) {
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    DWORD wait_ms = (timeout.count() == 0) ? INFINITE : static_cast<DWORD>(timeout.count());
+    auto result = WaitForSingleObject(ov.hEvent, wait_ms);
+    if (result != WAIT_OBJECT_0) {
+      CancelIoEx(handle_, &ov);
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    if (!GetOverlappedResult(handle_, &ov, &bytes_read, FALSE)) {
+      CloseHandle(ov.hEvent);
+      return false;
+    }
+    CloseHandle(ov.hEvent);
     if (bytes_read == 0)
       return false;
     read_total += bytes_read;
-    if (read_total < size && !wait_for_data(timeout))
-      return false;
   }
   return true;
 }
@@ -122,7 +168,7 @@ std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeou
     return std::nullopt;
 
   std::uint8_t header_buf[header_size];
-  if (!read_all(header_buf, header_size, timeout)) {
+  if (!read_all_overlapped(header_buf, header_size, timeout)) {
     connected_ = false;
     return std::nullopt;
   }
@@ -135,7 +181,7 @@ std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeou
   }
 
   auto type_byte = header_buf[4];
-  if (type_byte < 0x01 || type_byte > 0x0C) {
+  if (type_byte < 0x01 || type_byte > 0x0A) {
     connected_ = false;
     return std::nullopt;
   }
@@ -144,7 +190,7 @@ std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeou
   frame.type = static_cast<MessageType>(type_byte);
   if (payload_len > 0) {
     frame.payload.resize(payload_len);
-    if (!read_all(frame.payload.data(), payload_len, timeout)) {
+    if (!read_all_overlapped(frame.payload.data(), payload_len, timeout)) {
       connected_ = false;
       return std::nullopt;
     }

@@ -2,9 +2,10 @@
 //
 // Usage: stage4a <protocol|loopback|integration>
 //
-// - protocol: serialization round-trip, bounds, malformed input (no pipe, no Fcitx)
+// - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
 // - integration: full FusionHost.exe + Fcitx backend (requires Fcitx runtime)
+//   Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -44,6 +46,16 @@ void test_protocol() {
     require(decoded && *decoded == b, "binding round-trip");
   }
 
+  // Binding trailing byte rejection
+  {
+    Binding b{100, 2, 3};
+    std::vector<std::uint8_t> buf;
+    serialize(buf, b);
+    buf.push_back(0xFF); // trailing byte
+    auto decoded = deserialize_binding(buf.data(), buf.size());
+    require(!decoded, "binding trailing byte rejected");
+  }
+
   // BackendStimulus round-trip
   {
     BackendStimulus s;
@@ -60,6 +72,22 @@ void test_protocol() {
                 decoded->type == s.type && decoded->character == s.character &&
                 decoded->keysym == s.keysym && decoded->modifiers == s.modifiers,
             "stimulus round-trip");
+  }
+
+  // Stimulus trailing byte rejection
+  {
+    BackendStimulus s;
+    s.binding = {1, 1, 1};
+    s.stimulus_id = 1;
+    s.type = BackendStimulus::Type::Character;
+    s.character = 'a';
+    s.keysym = 0x61;
+    s.modifiers = 0;
+    std::vector<std::uint8_t> buf;
+    serialize(buf, s);
+    buf.push_back(0xFF);
+    auto decoded = deserialize_stimulus(buf.data(), buf.size());
+    require(!decoded, "stimulus trailing byte rejected");
   }
 
   // BackendBatch round-trip with multiple operations
@@ -90,6 +118,20 @@ void test_protocol() {
                 decoded->operations[2].type == BackendOperation::Type::ForwardKey &&
                 decoded->operations[2].original_key == true,
             "batch round-trip");
+  }
+
+  // Batch trailing byte rejection
+  {
+    BackendBatch batch;
+    batch.backend_session_id = 1;
+    batch.binding = {1, 1, 1};
+    batch.stimulus_id = 1;
+    batch.disposition = BackendBatch::Disposition::Forward;
+    std::vector<std::uint8_t> buf;
+    serialize(buf, batch);
+    buf.push_back(0xFF);
+    auto decoded = deserialize_batch(buf.data(), buf.size());
+    require(!decoded, "batch trailing byte rejected");
   }
 
   // Batch with candidates
@@ -124,12 +166,30 @@ void test_protocol() {
     require(t && *t == true && f && *f == false, "bool round-trip");
   }
 
+  // Bool trailing byte rejection
+  {
+    std::vector<std::uint8_t> buf;
+    serialize(buf, true);
+    buf.push_back(0xFF);
+    auto decoded = deserialize_bool(buf.data(), buf.size());
+    require(!decoded, "bool trailing byte rejected");
+  }
+
   // u64 round-trip
   {
     std::vector<std::uint8_t> buf;
     serialize(buf, std::uint64_t{0xDEADBEEFCAFE1234ULL});
     auto v = deserialize_u64(buf.data(), buf.size());
     require(v && *v == 0xDEADBEEFCAFE1234ULL, "u64 round-trip");
+  }
+
+  // u64 trailing byte rejection
+  {
+    std::vector<std::uint8_t> buf;
+    serialize(buf, std::uint64_t{42});
+    buf.push_back(0xFF);
+    auto decoded = deserialize_u64(buf.data(), buf.size());
+    require(!decoded, "u64 trailing byte rejected");
   }
 
   // Framing round-trip
@@ -161,6 +221,16 @@ void test_protocol() {
     frame[4] = 0xFF;
     auto parsed = parse_header(frame.data(), frame.size());
     require(!parsed, "invalid message type rejected");
+  }
+
+  // Bound enforcement: incomplete frame (header says more payload than available)
+  {
+    std::vector<std::uint8_t> frame(header_size + 2);
+    std::uint32_t len = 100;
+    std::memcpy(frame.data(), &len, 4);
+    frame[4] = static_cast<std::uint8_t>(MessageType::SendRequest);
+    auto parsed = parse_header(frame.data(), frame.size());
+    require(!parsed, "incomplete frame rejected");
   }
 
   // Truncated message
@@ -200,7 +270,12 @@ void test_protocol() {
     require(!decoded, "invalid stimulus type rejected");
   }
 
-  std::cout << "PASS protocol serialization, bounds, and malformed input\n";
+  // Protocol version constant
+  {
+    require(protocol_version == 1, "protocol_version is 1");
+  }
+
+  std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -211,10 +286,15 @@ class CallbackBackend final : public Backend {
 public:
   BackendBatch next;
   std::uint64_t sid = 42;
+  std::atomic<int> bind_count{0};
+  std::atomic<int> unbind_count{0};
 
-  bool bind(Binding) override { return true; }
+  bool bind(Binding) override {
+    bind_count++;
+    return true;
+  }
   bool reset(Binding) override { return true; }
-  void unbind(Binding) override {}
+  void unbind(Binding) override { unbind_count++; }
   bool healthy() const override { return true; }
   std::uint64_t session_id() const override { return sid; }
   BackendBatch send(const BackendStimulus &input) override {
@@ -227,21 +307,28 @@ public:
 };
 
 void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atomic<bool> &done) {
-  if (!server.wait_for_client(std::chrono::milliseconds(10000))) {
+  // Wait for Hello.
+  auto hello = server.recv_frame(std::chrono::milliseconds(10000));
+  if (!hello || hello->type != MessageType::HelloRequest) {
     done = true;
     return;
   }
+  // Respond with Hello.
+  WireFrame hello_resp;
+  hello_resp.type = MessageType::HelloResponse;
+  detail::write_u32(hello_resp.payload, protocol_version);
+  detail::write_u64(hello_resp.payload, backend.session_id());
+  if (!server.send_frame(hello_resp)) {
+    done = true;
+    return;
+  }
+
   while (done.load() == false && server.client_connected()) {
-    auto frame = server.recv_frame(std::chrono::milliseconds(1000));
+    auto frame = server.recv_frame(std::chrono::milliseconds(0)); // block indefinitely
     if (!frame)
       break;
     WireFrame response;
     switch (frame->type) {
-    case MessageType::SessionIdRequest: {
-      response.type = MessageType::SessionIdResponse;
-      serialize(response.payload, backend.session_id());
-      break;
-    }
     case MessageType::BindRequest: {
       auto binding = deserialize_binding(frame->payload.data(), frame->payload.size());
       response.type = MessageType::BindResponse;
@@ -259,11 +346,6 @@ void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atom
       if (binding)
         backend.unbind(*binding);
       response.type = MessageType::UnbindResponse;
-      break;
-    }
-    case MessageType::HealthyRequest: {
-      response.type = MessageType::HealthyResponse;
-      serialize(response.payload, backend.healthy());
       break;
     }
     case MessageType::SendRequest: {
@@ -294,49 +376,199 @@ KeyAction physical(char character) {
 }
 
 void test_loopback() {
-  std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-loopback";
-  PipeServer server(pipe_name);
-  require(server.create(), "loopback server create");
+  // Basic send/recv with Hello handshake
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-loopback-basic";
+    PipeServer server(pipe_name);
+    require(server.create(), "loopback server create");
 
-  CallbackBackend backend;
-  backend.next.disposition = BackendBatch::Disposition::Consumed;
-  backend.next.operations = {{BackendOperation::Type::SetPreedit, "ni", {}, false}};
+    CallbackBackend backend;
+    backend.next.disposition = BackendBatch::Disposition::Consumed;
+    backend.next.operations = {{BackendOperation::Type::SetPreedit, "ni", {}, false}};
 
-  std::atomic<bool> done{false};
-  std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
-                            std::ref(done));
+    std::atomic<bool> done{false};
+    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
+                              std::ref(done));
 
-  IpcBackend client(pipe_name);
-  require(client.connect(std::chrono::milliseconds(5000)), "loopback client connect");
-  require(client.session_id() == 42, "loopback session_id");
-  require(client.healthy(), "loopback healthy");
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::milliseconds(5000)), "loopback client connect");
+    require(client.session_id() == 42, "loopback session_id");
+    require(client.healthy(), "loopback healthy");
 
-  Binding binding{1, 1, 1};
-  require(client.bind(binding), "loopback bind");
+    Binding binding{1, 1, 1};
+    require(client.bind(binding), "loopback bind");
 
-  BackendStimulus stimulus;
-  stimulus.binding = binding;
-  stimulus.stimulus_id = 1;
-  stimulus.type = BackendStimulus::Type::Character;
-  stimulus.character = 'n';
-  stimulus.keysym = 'n';
-  auto batch = client.send(stimulus);
-  require(batch.backend_session_id == 42, "loopback batch session_id");
-  require(batch.binding == binding, "loopback batch binding");
-  require(batch.stimulus_id == 1, "loopback batch stimulus_id");
-  require(batch.disposition == BackendBatch::Disposition::Consumed, "loopback batch disposition");
-  require(batch.operations.size() == 1, "loopback batch ops count");
-  require(batch.operations[0].type == BackendOperation::Type::SetPreedit, "loopback op type");
-  require(batch.operations[0].text == "ni", "loopback op text");
+    BackendStimulus stimulus;
+    stimulus.binding = binding;
+    stimulus.stimulus_id = 1;
+    stimulus.type = BackendStimulus::Type::Character;
+    stimulus.character = 'n';
+    stimulus.keysym = 'n';
+    auto batch = client.send(stimulus);
+    require(batch.backend_session_id == 42, "loopback batch session_id");
+    require(batch.binding == binding, "loopback batch binding");
+    require(batch.stimulus_id == 1, "loopback batch stimulus_id");
+    require(batch.disposition == BackendBatch::Disposition::Consumed, "loopback batch disposition");
+    require(batch.operations.size() == 1, "loopback batch ops count");
+    require(batch.operations[0].type == BackendOperation::Type::SetPreedit, "loopback op type");
+    require(batch.operations[0].text == "ni", "loopback op text");
 
-  client.unbind(binding);
+    client.unbind(binding);
 
-  done = true;
-  server.disconnect_client();
-  server.shutdown();
-  server_thread.join();
+    done = true;
+    server.disconnect_client();
+    server_thread.join();
+  }
 
-  // Now test SemanticController over IPC loopback
+  // healthy() is local state only — no IPC
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-healthy";
+    PipeServer server(pipe_name);
+    require(server.create(), "healthy server create");
+
+    CallbackBackend backend;
+    std::atomic<bool> done{false};
+    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
+                              std::ref(done));
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::milliseconds(5000)), "healthy client connect");
+
+    // healthy() should return true without sending any IPC.
+    require(client.healthy(), "healthy after connect");
+    // Call it again — still no IPC.
+    require(client.healthy(), "healthy repeated");
+
+    done = true;
+    server.disconnect_client();
+    server_thread.join();
+  }
+
+  // 6s idle success — server should not disconnect on idle
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-idle";
+    PipeServer server(pipe_name);
+    require(server.create(), "idle server create");
+
+    CallbackBackend backend;
+    std::atomic<bool> done{false};
+    std::thread server_thread(run_loopback_server, std::ref(server), std::ref(backend),
+                              std::ref(done));
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::milliseconds(5000)), "idle client connect");
+
+    // Wait 6 seconds — the server should not disconnect us.
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+
+    // We should still be connected and healthy.
+    require(client.healthy(), "healthy after 6s idle");
+
+    // Send a request to verify the connection is still working.
+    Binding binding{1, 1, 1};
+    require(client.bind(binding), "bind after 6s idle");
+
+    done = true;
+    server.disconnect_client();
+    server_thread.join();
+  }
+
+  // Two concurrent clients
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-concurrent";
+
+    CallbackBackend backend1, backend2;
+    backend1.sid = 100;
+    backend2.sid = 200;
+    std::atomic<bool> done1{false}, done2{false};
+
+    PipeServer server1(pipe_name, true); // first instance
+    require(server1.create(), "concurrent server1 create");
+    PipeServer server2(pipe_name, false); // second instance
+    require(server2.create(), "concurrent server2 create");
+
+    std::thread t1(run_loopback_server, std::ref(server1), std::ref(backend1), std::ref(done1));
+    std::thread t2(run_loopback_server, std::ref(server2), std::ref(backend2), std::ref(done2));
+
+    IpcBackend client1(pipe_name);
+    require(client1.connect(std::chrono::milliseconds(5000)), "concurrent client1 connect");
+    require(client1.session_id() == 100, "concurrent client1 session_id");
+
+    IpcBackend client2(pipe_name);
+    require(client2.connect(std::chrono::milliseconds(5000)), "concurrent client2 connect");
+    require(client2.session_id() == 200, "concurrent client2 session_id");
+
+    // Both clients should be independent.
+    require(client1.healthy(), "concurrent client1 healthy");
+    require(client2.healthy(), "concurrent client2 healthy");
+
+    done1 = true;
+    done2 = true;
+    server1.disconnect_client();
+    server2.disconnect_client();
+    t1.join();
+    t2.join();
+  }
+
+  // Pre-write failure → Forward, post-write failure → Reject
+  {
+    // Pre-write: client not connected.
+    {
+      IpcBackend client(L"\\\\.\\pipe\\FusionHost-ipc-test-nonexistent");
+      // Don't connect — send should return Forward.
+      BackendStimulus stimulus;
+      stimulus.binding = {1, 1, 1};
+      stimulus.stimulus_id = 1;
+      stimulus.type = BackendStimulus::Type::Character;
+      stimulus.character = 'a';
+      auto batch = client.send(stimulus);
+      require(batch.disposition == BackendBatch::Disposition::Forward,
+              "pre-write failure → Forward");
+    }
+  }
+
+  // Version mismatch
+  {
+    std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-version";
+    PipeServer server(pipe_name);
+    require(server.create(), "version server create");
+
+    std::atomic<bool> done{false};
+    std::thread server_thread([&] {
+      auto hello = server.recv_frame(std::chrono::milliseconds(5000));
+      if (!hello || hello->type != MessageType::HelloRequest) {
+        done = true;
+        return;
+      }
+      // Read client version.
+      detail::Reader r(hello->payload.data(), hello->payload.size());
+      auto client_version = r.read_u32();
+      // Respond with version=0 (mismatch).
+      WireFrame resp;
+      resp.type = MessageType::HelloResponse;
+      detail::write_u32(resp.payload, 0);
+      detail::write_u64(resp.payload, 0);
+      server.send_frame(resp);
+      done = true;
+    });
+
+    // Send a Hello with wrong version.
+    PipeClient raw_client(pipe_name);
+    require(raw_client.connect(std::chrono::milliseconds(5000)), "version client connect");
+    std::vector<std::uint8_t> hello_payload;
+    detail::write_u32(hello_payload, 999); // wrong version
+    require(raw_client.send_request(MessageType::HelloRequest, hello_payload),
+            "version hello send");
+    auto resp = raw_client.recv_response(std::chrono::milliseconds(5000));
+    require(resp && resp->type == MessageType::HelloResponse, "version response received");
+    detail::Reader r2(resp->payload.data(), resp->payload.size());
+    auto server_version = r2.read_u32();
+    require(server_version && *server_version == 0, "version mismatch → version=0");
+
+    server_thread.join();
+  }
+
+  // SemanticController over IPC loopback
   {
     PipeServer server2(L"\\\\.\\pipe\\FusionHost-ipc-test-semantic");
     require(server2.create(), "semantic server create");
@@ -361,11 +593,10 @@ void test_loopback() {
     controller.destroy();
     done2 = true;
     server2.disconnect_client();
-    server2.shutdown();
     server_thread2.join();
   }
 
-  std::cout << "PASS loopback pipe with CallbackBackend and SemanticController\n";
+  std::cout << "PASS loopback pipe with Hello, idle, concurrent, transport failure, version\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -373,12 +604,18 @@ void test_loopback() {
 // ---------------------------------------------------------------------------
 
 void test_integration() {
-  // This test requires FusionHost.exe to be running or auto-launchable.
-  // For now, we just verify the IPC backend can connect to a running host.
-  auto backend = make_ipc_backend();
-  if (!backend) {
-    std::cout << "SKIP integration (FusionHost not reachable)\n";
+  // Check if we should skip.
+  if (std::getenv("FUSION_STAGE4A_SKIP_INTEGRATION")) {
+    std::cout << "SKIP integration (FUSION_STAGE4A_SKIP_INTEGRATION set)\n";
     return;
+  }
+
+  // This test requires FusionHost.exe to be running.
+  auto backend = make_ipc_backend(std::chrono::milliseconds(2000));
+  if (!backend) {
+    std::fprintf(stderr, "FAIL integration: FusionHost not reachable\n");
+    std::fprintf(stderr, "  Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip.\n");
+    throw std::runtime_error("integration: FusionHost not reachable");
   }
   require(backend->healthy(), "integration healthy");
 

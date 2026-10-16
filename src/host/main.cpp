@@ -1,9 +1,11 @@
 // FusionHost.exe — Stage 4A out-of-process Fcitx Host.
 //
 // Creates a Named Pipe server, instantiates the real Fcitx backend,
-// and dispatches IPC requests from the TSF DLL client.
+// and dispatches IPC requests from connected TSF DLL clients.
+// Default pipe name is computed from the user SID and session ID.
 
 #include "fusion/backend.hpp"
+#include "fusion/ipc_protocol.hpp"
 #include "host/host_server.hpp"
 
 #define NOMINMAX
@@ -18,10 +20,6 @@
 
 namespace {
 
-volatile std::sig_atomic_t g_running = 1;
-
-void signal_handler(int) { g_running = 0; }
-
 std::wstring parse_pipe_name(int argc, char *argv[]) {
   for (int i = 1; i < argc - 1; ++i) {
     if (std::strcmp(argv[i], "--pipe-name") == 0) {
@@ -33,15 +31,12 @@ std::wstring parse_pipe_name(int argc, char *argv[]) {
       }
     }
   }
-  return fusion::ipc::default_pipe_name;
+  return fusion::ipc::compute_pipe_name();
 }
 
 } // namespace
 
 int main(int argc, char *argv[]) {
-  std::signal(SIGINT, signal_handler);
-  std::signal(SIGTERM, signal_handler);
-
   auto pipe_name = parse_pipe_name(argc, argv);
   std::fprintf(stderr, "[FusionHost] starting with pipe: %ls\n", pipe_name.c_str());
 
@@ -61,11 +56,11 @@ int main(int argc, char *argv[]) {
 
   fusion::ipc::HostServer server(std::move(backend), pipe_name);
   if (!server.start()) {
-    std::fprintf(stderr, "[FusionHost] failed to create pipe server\n");
+    std::fprintf(stderr, "[FusionHost] failed to initialize server\n");
     return 1;
   }
 
-  std::fprintf(stderr, "[FusionHost] pipe server created, entering main loop\n");
+  std::fprintf(stderr, "[FusionHost] entering accept loop\n");
   server.run();
   std::fprintf(stderr, "[FusionHost] shutting down\n");
   return 0;

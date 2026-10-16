@@ -484,60 +484,6 @@ private:
 
 } // namespace
 
-// Stage 4A: locate and optionally auto-launch FusionHost.exe.
-// This is a temporary development startup mechanism (P0-A OPEN).
-#ifdef FUSION_WITH_FCITX5
-namespace {
-
-std::wstring find_host_exe() {
-  wchar_t module_path[1024] = {};
-  HMODULE module = nullptr;
-  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                     reinterpret_cast<LPCWSTR>(&find_host_exe), &module);
-  if (!module)
-    return {};
-  DWORD len = GetModuleFileNameW(module, module_path, 1024);
-  if (len == 0 || len >= 1024)
-    return {};
-  std::wstring path(module_path);
-  auto pos = path.find_last_of(L'\\');
-  if (pos == std::wstring::npos)
-    return {};
-  return path.substr(0, pos + 1) + L"FusionHost.exe";
-}
-
-bool try_launch_host() {
-  auto host_path = find_host_exe();
-  if (host_path.empty())
-    return false;
-  DWORD attrs = GetFileAttributesW(host_path.c_str());
-  if (attrs == INVALID_FILE_ATTRIBUTES)
-    return false;
-  STARTUPINFOW si{};
-  si.cb = sizeof(si);
-  PROCESS_INFORMATION pi{};
-  if (!CreateProcessW(host_path.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr,
-                      &si, &pi))
-    return false;
-  CloseHandle(pi.hThread);
-  CloseHandle(pi.hProcess);
-  return true;
-}
-
-std::unique_ptr<fusion::Backend> create_ipc_backend_with_launch() {
-  auto backend = fusion::ipc::make_ipc_backend();
-  if (backend)
-    return backend;
-  if (!try_launch_host())
-    return nullptr;
-  Sleep(1000);
-  return fusion::ipc::make_ipc_backend(std::chrono::milliseconds(10000));
-}
-
-} // namespace
-#endif
-
 // ---------------------------------------------------------------------------
 // ContextEntry
 // ---------------------------------------------------------------------------
@@ -611,15 +557,17 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   }
 #ifdef FUSION_WITH_FCITX5
   if (!backend_) {
+    // P0-D OPEN: FusionHost startup is external to the DLL.
+    // Attempt one connection with a short timeout; fail open if unreachable.
     try {
-      backend_ = create_ipc_backend_with_launch();
+      backend_ = fusion::ipc::make_ipc_backend(std::chrono::milliseconds(200));
       if (!backend_) {
-        diagf("IPC_HOST_CONNECT_FAILED", "could not connect to or launch FusionHost");
-        return E_FAIL;
+        diagf("IPC_HOST_UNREACHABLE", "FusionHost not reachable, fail-open PASS");
+        // Fail open: activate without backend, all keys will be PASS.
       }
     } catch (const std::exception &error) {
-      diagf("IPC_HOST_START_FAILED", "%s", error.what());
-      return E_FAIL;
+      diagf("IPC_HOST_CONNECT_FAILED", "%s, fail-open PASS", error.what());
+      // Fail open: activate without backend.
     }
   }
 #endif

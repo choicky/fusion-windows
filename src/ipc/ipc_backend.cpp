@@ -9,20 +9,42 @@ IpcBackend::~IpcBackend() { client_.disconnect(); }
 bool IpcBackend::connect(std::chrono::milliseconds timeout) {
   if (!client_.connect(timeout))
     return false;
-  std::vector<std::uint8_t> empty;
-  auto response = rpc(MessageType::SessionIdRequest, empty, MessageType::SessionIdResponse);
-  if (!response) {
+
+  // Hello handshake: send protocol_version, expect version + session_id.
+  std::vector<std::uint8_t> hello_payload;
+  detail::write_u32(hello_payload, protocol_version);
+
+  std::lock_guard lock(rpc_mutex_);
+  if (!client_.send_request(MessageType::HelloRequest, hello_payload)) {
     client_.disconnect();
     return false;
   }
-  auto sid = deserialize_u64(response->payload.data(), response->payload.size());
-  if (!sid) {
+  auto response = client_.recv_response(kRequestTimeout);
+  if (!response || response->type != MessageType::HelloResponse) {
     client_.disconnect();
     return false;
   }
+
+  detail::Reader r(response->payload.data(), response->payload.size());
+  auto version = r.read_u32();
+  auto sid = r.read_u64();
+  if (!version || *version == 0 || !sid || !r.at_end()) {
+    client_.disconnect();
+    return false;
+  }
+  if (*version != protocol_version) {
+    client_.disconnect();
+    return false;
+  }
+
   cached_session_id_ = *sid;
   healthy_ = true;
   return true;
+}
+
+bool IpcBackend::send_request_locked(MessageType type,
+                                      const std::vector<std::uint8_t> &payload) {
+  return client_.send_request(type, payload);
 }
 
 std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
@@ -31,19 +53,11 @@ std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
   std::lock_guard lock(rpc_mutex_);
   if (!client_.connected())
     return std::nullopt;
-  if (!client_.send_request(request_type, payload)) {
-    healthy_ = false;
+  if (!client_.send_request(request_type, payload))
     return std::nullopt;
-  }
-  auto response = client_.recv_response();
-  if (!response) {
-    healthy_ = false;
+  auto response = client_.recv_response(kRequestTimeout);
+  if (!response || response->type != expected_response)
     return std::nullopt;
-  }
-  if (response->type != expected_response) {
-    healthy_ = false;
-    return std::nullopt;
-  }
   return response;
 }
 
@@ -74,25 +88,8 @@ void IpcBackend::unbind(Binding binding) {
 }
 
 bool IpcBackend::healthy() const {
-  if (!healthy_)
-    return false;
-  std::lock_guard lock(rpc_mutex_);
-  if (!client_.connected()) {
-    healthy_ = false;
-    return false;
-  }
-  std::vector<std::uint8_t> empty;
-  if (!client_.send_request(MessageType::HealthyRequest, empty)) {
-    healthy_ = false;
-    return false;
-  }
-  auto response = client_.recv_response();
-  if (!response || response->type != MessageType::HealthyResponse) {
-    healthy_ = false;
-    return false;
-  }
-  auto result = deserialize_bool(response->payload.data(), response->payload.size());
-  return result.value_or(false);
+  // Local state only — no IPC probe.
+  return healthy_.load() && client_.connected();
 }
 
 std::uint64_t IpcBackend::session_id() const { return cached_session_id_; }
@@ -100,12 +97,40 @@ std::uint64_t IpcBackend::session_id() const { return cached_session_id_; }
 BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   std::vector<std::uint8_t> payload;
   serialize(payload, stimulus);
-  auto response = rpc(MessageType::SendRequest, payload, MessageType::SendResponse);
+
+  std::lock_guard lock(rpc_mutex_);
+
+  // Pre-write check: if not connected, return Forward with no ops.
+  if (!client_.connected()) {
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Forward;
+    return batch;
+  }
+
+  // Attempt to write the request.
+  if (!client_.send_request(MessageType::SendRequest, payload)) {
+    // Pre-write failure: transport never saw the request → Forward.
+    healthy_ = false;
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Forward;
+    return batch;
+  }
+
+  // Post-write: the request is on the wire. Any failure now is a Reject.
+  auto response = client_.recv_response(kRequestTimeout);
   if (!response) {
+    healthy_ = false;
     BackendBatch batch;
     batch.disposition = BackendBatch::Disposition::Reject;
     return batch;
   }
+  if (response->type != MessageType::SendResponse) {
+    healthy_ = false;
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Reject;
+    return batch;
+  }
+
   auto batch = deserialize_batch(response->payload.data(), response->payload.size());
   if (!batch) {
     healthy_ = false;
@@ -116,8 +141,8 @@ BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   return *batch;
 }
 
-std::unique_ptr<Backend> make_ipc_backend(std::wstring pipe_name) {
-  auto backend = std::make_unique<IpcBackend>(std::move(pipe_name));
+std::unique_ptr<Backend> make_ipc_backend() {
+  auto backend = std::make_unique<IpcBackend>();
   if (!backend->connect())
     return nullptr;
   return backend;
@@ -131,7 +156,7 @@ std::unique_ptr<Backend> make_ipc_backend(std::chrono::milliseconds timeout) {
 }
 
 std::unique_ptr<Backend> make_ipc_backend(std::wstring pipe_name,
-                                           std::chrono::milliseconds timeout) {
+                                          std::chrono::milliseconds timeout) {
   auto backend = std::make_unique<IpcBackend>(std::move(pipe_name));
   if (!backend->connect(timeout))
     return nullptr;

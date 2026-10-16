@@ -2,6 +2,7 @@
 
 // Windows Named Pipe client transport for Stage 4A IPC.
 // Thread-safe: internal mutex serializes all operations.
+// Uses FILE_FLAG_OVERLAPPED for request timeout via WaitForSingleObject.
 // On any error or timeout, marks disconnected; all subsequent operations fail.
 
 #include "fusion/ipc_protocol.hpp"
@@ -12,25 +13,30 @@
 
 namespace fusion::ipc {
 
+// UNFROZEN engineering constant — matches FcitxBackend::invoke request_wait (2s).
+inline constexpr auto kRequestTimeout = std::chrono::milliseconds(2000);
+
 class PipeClient {
 public:
-  explicit PipeClient(std::wstring pipe_name = default_pipe_name);
+  explicit PipeClient(std::wstring pipe_name = compute_pipe_name());
   ~PipeClient();
 
   PipeClient(const PipeClient &) = delete;
   PipeClient &operator=(const PipeClient &) = delete;
 
-  bool connect(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
+  // connect_timeout: max wait for ERROR_PIPE_BUSY (UNFROZEN engineering constant).
+  bool connect(std::chrono::milliseconds connect_timeout = std::chrono::milliseconds(200));
   void disconnect();
   bool connected() const;
 
   bool send_frame(const WireFrame &frame);
-  std::optional<WireFrame> recv_frame(std::chrono::milliseconds timeout =
-                                          std::chrono::milliseconds(5000));
+  // recv_timeout == 0 means block indefinitely (for idle wait on server side).
+  std::optional<WireFrame> recv_frame(std::chrono::milliseconds recv_timeout = kRequestTimeout);
 
   bool send_request(MessageType type, const std::vector<std::uint8_t> &payload);
-  std::optional<WireFrame> recv_response(std::chrono::milliseconds timeout =
-                                             std::chrono::milliseconds(5000));
+  std::optional<WireFrame> recv_response(std::chrono::milliseconds timeout = kRequestTimeout);
+
+  void *native_handle() const;
 
 private:
   std::wstring pipe_name_;
@@ -39,8 +45,7 @@ private:
   bool connected_ = false;
 
   bool write_all(const void *data, std::size_t size);
-  bool read_all(void *data, std::size_t size, std::chrono::milliseconds timeout);
-  bool wait_for_data(std::chrono::milliseconds timeout);
+  bool read_all_overlapped(void *data, std::size_t size, std::chrono::milliseconds timeout);
 };
 
 } // namespace fusion::ipc

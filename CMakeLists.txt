@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(FusionWindowsStage1 LANGUAGES CXX)
 
-option(FUSION_WITH_FCITX5 "Enable the Stage 3B real Fcitx Host backend PoC" OFF)
+option(FUSION_WITH_FCITX5 "Enable the Stage 4A out-of-process Fcitx Host (FusionHost.exe + IPC)" OFF)
 if(FUSION_WITH_FCITX5)
   include(cmake/FcitxBackend.cmake)
 endif()
