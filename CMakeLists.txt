@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(FusionWindowsStage1 LANGUAGES CXX)
 
-option(FUSION_WITH_FCITX5 "Enable the Stage 3B real Fcitx Host backend PoC" OFF)
+option(FUSION_WITH_FCITX5 "Enable the Stage 4A out-of-process Fcitx Host (FusionHost.exe + IPC)" OFF)
 if(FUSION_WITH_FCITX5)
   include(cmake/FcitxBackend.cmake)
 endif()
@@ -31,6 +31,8 @@ if(WIN32 AND MSVC)
   add_executable(FusionTsfProfile tools/tsf/profile.cpp)
   target_link_libraries(FusionTsfProfile PRIVATE ole32)
   # Stage 2.5 real TSF/COM development shell (x64; see README for registration).
+  # Stage 4A: FusionTsf.dll no longer links Fcitx runtime directly.
+  # When FUSION_WITH_FCITX5 is ON, it uses the IPC backend to talk to FusionHost.exe.
   add_library(FusionTsf SHARED
     src/tsf/guids.cpp
     src/tsf/key_map.cpp
@@ -49,7 +51,27 @@ if(WIN32 AND MSVC)
   target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
   if(FUSION_WITH_FCITX5)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
-    target_link_libraries(FusionTsf PRIVATE FusionFcitxHost)
+    # Client side only: the TSF DLL never hosts a pipe server.
+    target_sources(FusionTsf PRIVATE
+      src/ipc/pipe_client.cpp
+      src/ipc/pipe_security.cpp
+      src/ipc/ipc_backend.cpp)
+  endif()
+
+  # Stage 4A: out-of-process Fusion Host executable.
+  # Links the real Fcitx backend and serves IPC requests from FusionTsf.dll.
+  if(FUSION_WITH_FCITX5)
+    add_executable(FusionHostExe
+      src/host/main.cpp
+      src/host/host_server.cpp
+      src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp)
+    target_include_directories(FusionHostExe PRIVATE include src)
+    target_compile_features(FusionHostExe PRIVATE cxx_std_20)
+    set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost)
+    target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore)
   endif()
 endif()
 
@@ -79,6 +101,36 @@ if(BUILD_TESTING)
     target_compile_options(fcitx_msvc_empty_range_guards PRIVATE /W4 /WX /utf-8)
     target_link_libraries(fcitx_msvc_empty_range_guards PRIVATE FusionFcitxHost)
     add_test(NAME fcitx_msvc_empty_range_guards COMMAND fcitx_msvc_empty_range_guards)
+  endif()
+
+  if(WIN32 AND MSVC)
+    # Stage 4A IPC tests: the protocol, the IpcBackend client and the HostServer
+    # transport are independent of Fcitx, so they compile and run in every
+    # Windows/MSVC build (Mock-only included). Only the end-to-end
+    # FusionHost.exe + real Fcitx mode needs FUSION_WITH_FCITX5.
+    add_executable(stage4a
+      tests/stage4a_ipc.cpp
+      src/ipc/pipe_client.cpp
+      src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp
+      src/ipc/ipc_backend.cpp
+      src/host/host_server.cpp
+      src/tsf/key_map.cpp
+      src/tsf/semantic.cpp)
+    target_include_directories(stage4a PRIVATE src)
+    target_compile_features(stage4a PRIVATE cxx_std_20)
+    # std::getenv in the integration mode; same convention as FusionFcitxHost.
+    target_compile_definitions(stage4a PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(stage4a PRIVATE MockBackend)
+    add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
+    add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
+    add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
+    if(FUSION_WITH_FCITX5)
+      target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
+      target_link_libraries(stage4a PRIVATE FusionFcitxHost)
+      add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
+    endif()
   endif()
   add_library(FusionMock tests/mock.cpp)
   target_link_libraries(FusionMock PUBLIC FusionCore)

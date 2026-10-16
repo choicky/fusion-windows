@@ -4,6 +4,10 @@
 #include "tsf/diag.hpp"
 #include "tsf/observation.hpp"
 
+#ifdef FUSION_WITH_FCITX5
+#include "ipc/ipc_backend.hpp"
+#endif
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdarg>
@@ -553,11 +557,17 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   }
 #ifdef FUSION_WITH_FCITX5
   if (!backend_) {
+    // P0-D OPEN: FusionHost startup is external to the DLL.
+    // Attempt one connection with a short timeout; fail open if unreachable.
     try {
-      backend_ = make_fcitx_backend();
+      backend_ = fusion::ipc::make_ipc_backend(std::chrono::milliseconds(200));
+      if (!backend_) {
+        diagf("IPC_HOST_UNREACHABLE", "FusionHost not reachable, fail-open PASS");
+        // Fail open: activate without backend, all keys will be PASS.
+      }
     } catch (const std::exception &error) {
-      diagf("FCITX_START_FAILED", "%s", error.what());
-      return E_FAIL;
+      diagf("IPC_HOST_CONNECT_FAILED", "%s, fail-open PASS", error.what());
+      // Fail open: activate without backend.
     }
   }
 #endif
