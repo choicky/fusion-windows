@@ -73,6 +73,10 @@ int main(int argc, char *argv[]) {
     std::fprintf(stderr, "[FusionHost] failed to initialize server\n");
     return 1;
   }
+  // The incarnation distinguishes this Host process from any earlier or later
+  // one for client-side fencing; it is an engineering identity, not a frozen ID.
+  std::fprintf(stderr, "[FusionHost] incarnation=%llu\n",
+               static_cast<unsigned long long>(server.incarnation()));
 
   std::fprintf(stderr, "[FusionHost] entering accept loop\n");
   server.run();

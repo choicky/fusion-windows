@@ -1,6 +1,6 @@
 #pragma once
 
-// Stage 4A out-of-process IPC protocol (UNFROZEN / not final wire format).
+// Stage 4A/4B out-of-process IPC protocol (UNFROZEN / not final wire format).
 //
 // Length-prefixed binary framing over a local Named Pipe. Each wire message is:
 //   [4 bytes: payload_length (uint32_t, little-endian)]
@@ -11,6 +11,17 @@
 // Strict request/response alternation per connection. No pipelining.
 // All deserialization is fail-closed: malformed input yields std::nullopt.
 // All deserialize_* functions reject trailing bytes.
+//
+// Stage 4B response envelope: every Host response payload starts with the
+// responding Host incarnation
+//   [8 bytes: host_incarnation (uint64_t, little-endian)] [response payload]
+// so a client can never accept a result as belonging to a different Host
+// incarnation than the one its connection established (D072 §13 incarnation
+// fencing). Requests carry no envelope: a request can only be written on a
+// connection whose own Hello established that connection's incarnation, and one
+// pipe instance is served by exactly one Host process incarnation.
+// `protocol_version` was raised 1 -> 2 for this envelope so an old/new pairing
+// fails the handshake instead of misparsing.
 
 #include "fusion/backend.hpp"
 #include "fusion/core.hpp"
@@ -24,7 +35,10 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 1;
+inline constexpr std::uint32_t protocol_version = 2;
+
+// Size of the Stage 4B response envelope (one host_incarnation field).
+inline constexpr std::size_t response_envelope_size = 8;
 
 inline constexpr std::size_t max_message_payload = 65536;
 inline constexpr std::size_t max_string_length = 8192;
@@ -272,6 +286,18 @@ inline std::optional<std::uint64_t> deserialize_u64(const std::uint8_t *data, st
   if (v && !r.at_end())
     return std::nullopt;
   return v;
+}
+
+// Stage 4B response envelope. The Host prefixes every response payload with its
+// own incarnation; the client validates the prefix against the incarnation its
+// connection established before it parses the response body.
+inline std::vector<std::uint8_t> envelop_response(std::uint64_t host_incarnation,
+                                                  const std::vector<std::uint8_t> &payload) {
+  std::vector<std::uint8_t> enveloped;
+  enveloped.reserve(8 + payload.size());
+  detail::write_u64(enveloped, host_incarnation);
+  enveloped.insert(enveloped.end(), payload.begin(), payload.end());
+  return enveloped;
 }
 
 inline std::vector<std::uint8_t> frame_message(MessageType type,

@@ -68,6 +68,10 @@ void require(bool ok, const char *message) {
 
 constexpr std::chrono::milliseconds kWait{10000};
 
+// Stage 4B response envelope: a test server that hand-writes Hello responses
+// must stamp the responding Host incarnation.
+constexpr std::uint64_t kTestIncarnation = 0x4B00000000000001ull;
+
 std::wstring test_pipe_name(const wchar_t *suffix) {
   return std::wstring(L"\\\\.\\pipe\\FusionHost-ipc-test-") + suffix;
 }
@@ -176,6 +180,7 @@ public:
       return false;
     WireFrame response;
     response.type = MessageType::HelloResponse;
+    detail::write_u64(response.payload, kTestIncarnation);
     detail::write_u32(response.payload, protocol_version);
     detail::write_u64(response.payload, session_id);
     const std::vector<std::uint8_t> wire = frame_message(response.type, response.payload);
@@ -502,7 +507,7 @@ void test_protocol() {
 
   // Protocol version constant
   {
-    require(protocol_version == 1, "protocol_version is 1");
+    require(protocol_version == 2, "protocol_version is 2 (Stage 4B incarnation envelope)");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";
@@ -550,6 +555,7 @@ void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atom
   // Respond with Hello.
   WireFrame hello_resp;
   hello_resp.type = MessageType::HelloResponse;
+  detail::write_u64(hello_resp.payload, kTestIncarnation);
   detail::write_u32(hello_resp.payload, protocol_version);
   detail::write_u64(hello_resp.payload, backend.session_id());
   if (!server.send_frame(hello_resp)) {
@@ -599,6 +605,8 @@ void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atom
       done = true;
       return;
     }
+    // Stage 4B: every response payload carries the responding incarnation.
+    response.payload = envelop_response(kTestIncarnation, response.payload);
     if (!server.send_frame(response))
       break;
   }
@@ -785,9 +793,10 @@ void test_loopback() {
       detail::Reader r(hello->payload.data(), hello->payload.size());
       auto client_version = r.read_u32();
       (void)client_version;
-      // Respond with version=0 (mismatch).
+      // Respond with version=0 (mismatch), still under the Stage 4B envelope.
       WireFrame resp;
       resp.type = MessageType::HelloResponse;
+      detail::write_u64(resp.payload, kTestIncarnation);
       detail::write_u32(resp.payload, 0);
       detail::write_u64(resp.payload, 0);
       s.server().send_frame(resp);
@@ -804,7 +813,10 @@ void test_loopback() {
     auto resp = raw_client.recv_response(std::chrono::milliseconds(5000));
     require(resp && resp->type == MessageType::HelloResponse, "version response received");
     detail::Reader r2(resp->payload.data(), resp->payload.size());
+    auto envelope_incarnation = r2.read_u64();
     auto server_version = r2.read_u32();
+    require(envelope_incarnation && *envelope_incarnation == kTestIncarnation,
+            "every response carries the Host incarnation envelope");
     require(server_version && *server_version == 0, "version mismatch → version=0");
   }
 
@@ -1044,6 +1056,7 @@ void test_hostserver_transport_failure() {
         return;
       WireFrame response;
       response.type = MessageType::HelloResponse;
+      detail::write_u64(response.payload, kTestIncarnation);
       detail::write_u32(response.payload, protocol_version);
       detail::write_u64(response.payload, 4242);
       s.server().send_frame(response);
@@ -1085,6 +1098,7 @@ void test_hostserver_transport_failure() {
         return;
       WireFrame response;
       response.type = MessageType::HelloResponse;
+      detail::write_u64(response.payload, kTestIncarnation);
       detail::write_u32(response.payload, protocol_version);
       detail::write_u64(response.payload, 555);
       s.server().send_frame(response);
@@ -1175,6 +1189,7 @@ void test_hostserver_healthy_no_ipc() {
       ++frames_received;
       WireFrame response;
       response.type = MessageType::HelloResponse;
+      detail::write_u64(response.payload, kTestIncarnation);
       detail::write_u32(response.payload, protocol_version);
       detail::write_u64(response.payload, 7);
       s.server().send_frame(response);

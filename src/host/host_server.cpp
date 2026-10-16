@@ -14,8 +14,27 @@
 
 namespace fusion::ipc {
 
-HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name)
-    : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)) {}
+namespace {
+
+// PoC incarnation identity for one Host process/instance: never 0 (0 means "no
+// incarnation"), distinct across Host restarts on this machine. This is an
+// engineering identifier for incarnation fencing, not a frozen production ID.
+std::uint64_t generate_incarnation() {
+  static std::atomic<std::uint64_t> sequence{0};
+  LARGE_INTEGER counter{};
+  QueryPerformanceCounter(&counter);
+  std::uint64_t value = static_cast<std::uint64_t>(counter.QuadPart);
+  value ^= static_cast<std::uint64_t>(GetCurrentProcessId()) * 0x9E3779B97F4A7C15ull;
+  value ^= (sequence.fetch_add(1) + 1) * 0xC2B2AE3D27D4EB4Full;
+  return value == 0 ? 1 : value;
+}
+
+} // namespace
+
+HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name,
+                       std::uint64_t incarnation)
+    : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)),
+      incarnation_(incarnation == 0 ? generate_incarnation() : incarnation) {}
 
 HostServer::~HostServer() { stop(); }
 
@@ -122,7 +141,7 @@ void HostServer::accept_loop() {
       break; // stop() woke this iteration: nothing to serve
     std::fprintf(stderr, "[FusionHost] client connected\n");
     auto connection = std::make_unique<Connection>(std::move(pipe), *backend_, backend_mutex_,
-                                                   next_host_context_);
+                                                   next_host_context_, incarnation_);
     Connection *raw = connection.get();
     // A finished connection is reaped on the next accepted connection, so the
     // retained entries stay bounded by the live connections plus one completed
@@ -313,7 +332,9 @@ void HostServer::Connection::send_response(MessageType type,
                                            const std::vector<std::uint8_t> &payload) {
   WireFrame frame;
   frame.type = type;
-  frame.payload = payload;
+  // Stage 4B: every response is stamped with this Host incarnation, so a client
+  // can reject a result that does not belong to the connection's incarnation.
+  frame.payload = envelop_response(incarnation, payload);
   if (!pipe->send_frame(frame)) {
     std::fprintf(stderr, "[FusionHost] send failed, disconnecting client\n");
     pipe->disconnect_client();

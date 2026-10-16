@@ -3,9 +3,20 @@
 // IPC Backend: implements fusion::Backend over a Named Pipe connection
 // to an out-of-process FusionHost. Linked into FusionTsf.dll.
 //
+// Stage 4B link lifecycle (D072 §13). The transport is owned here and is never
+// reused across an establishment:
+//
+//   Disconnected --ensure_link--> Connected --Hello--> Established(incarnation N)
+//        ^                                                      |
+//        +--------------- any failure / disconnect -------------+
+//
+// ensure_link is idempotent and bounded, and performs no I/O once the link is
+// established. It never replays a request: a request is only written by send()
+// on the connection whose Hello established the current incarnation, and a
+// transport failure keeps the Stage 4A classification (provably-not-written ->
+// Forward, uncertain write or lost response -> Reject).
+//
 // healthy() is local state only — no IPC probe.
-// send() distinguishes pre-write failure (Forward, no ops) from post-write
-// failure (Reject, mark unhealthy). Connect uses Hello protocol.
 
 #include "fusion/backend.hpp"
 #include "ipc/pipe_client.hpp"
@@ -28,15 +39,39 @@ public:
   std::uint64_t session_id() const override;
   BackendBatch send(const BackendStimulus &stimulus) override;
 
-  // Connect and perform Hello handshake. Returns false on connect failure,
-  // version mismatch, or malformed Hello response.
+  // Link lifecycle (see the header comment).
+  LinkStatus link_status() const override;
+  // Bounded establishment: transport connect (up to `timeout`) plus one Hello
+  // round trip (up to `timeout`). Never unbounded, and no I/O while established.
+  bool ensure_link(std::chrono::milliseconds timeout) override;
+
+  // Stage 4A entry point, kept as connect-or-report: establish the link within
+  // the bound and report whether the handshake completed. Prefer ensure_link()
+  // when the caller owns a reconnect lifecycle.
   bool connect(std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+
+  // Identity of the last established link, 0 before any establishment. It is
+  // deliberately retained across a disconnect so the dead incarnation stays
+  // identifiable; link_status().state reports usability.
+  std::uint64_t incarnation() const;
 
 private:
   PipeClient client_;
   mutable std::mutex rpc_mutex_;
   std::uint64_t cached_session_id_ = 0;
-  std::atomic<bool> healthy_{false};
+  // Link state is read without rpc_mutex_ (healthy() must not block a send).
+  std::atomic<LinkState> link_state_{LinkState::Disconnected};
+  std::atomic<std::uint64_t> incarnation_{0};
+  std::atomic<std::uint64_t> connection_generation_{0};
+
+  // Hello handshake on the current connection. On success it publishes
+  // incarnation_/cached_session_id_ and bumps connection_generation_.
+  // The caller holds rpc_mutex_.
+  bool handshake(std::chrono::milliseconds timeout);
+  // Drops the transport and every link identity derived from it.
+  void drop_link();
+  // Validates a response envelope against the established incarnation.
+  bool envelope_matches(const WireFrame &response) const;
 
   // Definitely-not-written transport failure: no byte of the request reached the
   // Host, so the physical stimulus stays caller-owned and is reported as a
@@ -45,10 +80,15 @@ private:
   // (not connected, and a write that provably accepted no byte) so they cannot
   // diverge; an uncertain write must NOT use this path.
   BackendBatch forward_batch(const BackendStimulus &stimulus) const;
+  // The stimulus is no longer provably caller-owned (uncertain write, lost
+  // response, protocol violation): explicit non-PASS terminal with the identity
+  // fields preserved. Never a replay.
+  BackendBatch reject_batch(const BackendStimulus &stimulus) const;
 
   // Send a request and receive the expected response.
-  // Returns nullopt on any failure (write fail, read fail, wrong message type).
-  // The caller must track whether the write succeeded for transport failure classification.
+  // Returns nullopt on any failure (write fail, read fail, wrong message type,
+  // envelope mismatch). The caller must track whether the write succeeded for
+  // transport failure classification.
   std::optional<WireFrame> rpc(MessageType request_type, const std::vector<std::uint8_t> &payload,
                                MessageType expected_response);
 };

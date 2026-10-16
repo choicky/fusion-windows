@@ -131,6 +131,37 @@ if(BUILD_TESTING)
       target_link_libraries(stage4a PRIVATE FusionFcitxHost)
       add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
     endif()
+
+    # Stage 4B reconnect / semantic-readiness / incarnation-fencing tests. They
+    # drive the real product classes (IpcBackend + HostServer + the Stage 2.5/3C
+    # semantic controller) against a deterministic Host-side test double, so they
+    # build and run in every Windows/MSVC build (Mock-only included).
+    add_executable(stage4b
+      tests/stage4b_reconnect.cpp
+      src/ipc/pipe_client.cpp
+      src/ipc/pipe_server.cpp
+      src/ipc/pipe_security.cpp
+      src/ipc/ipc_backend.cpp
+      src/host/host_server.cpp
+      src/tsf/key_map.cpp
+      src/tsf/semantic.cpp)
+    target_include_directories(stage4b PRIVATE src)
+    target_compile_features(stage4b PRIVATE cxx_std_20)
+    # std::getenv in the real-Host mode; same convention as stage4a.
+    target_compile_definitions(stage4b PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(stage4b PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(stage4b PRIVATE MockBackend)
+    foreach(mode link failover cycles fencing contexts semantic)
+      add_test(NAME stage4b_${mode} COMMAND stage4b ${mode})
+    endforeach()
+    if(FUSION_WITH_FCITX5)
+      # Real FusionHost.exe process failover: needs the built Host executable and
+      # the Fcitx runtime on PATH. FUSION_STAGE4B_SKIP_HOST_PROCESS skips them.
+      target_compile_definitions(stage4b PRIVATE FUSION_WITH_FCITX5)
+      target_link_libraries(stage4b PRIVATE FusionFcitxHost)
+      add_test(NAME stage4b_hostprocess COMMAND stage4b hostprocess)
+      add_test(NAME stage4b_silentdeath COMMAND stage4b silentdeath)
+    endif()
   endif()
   add_library(FusionMock tests/mock.cpp)
   target_link_libraries(FusionMock PUBLIC FusionCore)

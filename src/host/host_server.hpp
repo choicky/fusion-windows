@@ -8,6 +8,13 @@
 // through a shared mutex. Each connection remaps client context IDs to
 // Host-unique context IDs and unbinds all contexts on disconnect.
 //
+// Incarnation (Stage 4B): one HostServer instance represents exactly one Host
+// process incarnation and answers every Hello with that identity; every response
+// carries it as an envelope so a client can never accept a result from a
+// different incarnation. The value is a PoC engineering identifier (process id,
+// monotonic clock and a process-local sequence), not a frozen production
+// identifier; 0 is reserved for "no incarnation".
+//
 // Lifecycle: every connection is owned together with its thread. A finished
 // connection marks itself completed and is reaped (joined and erased) by the
 // accept path, so completed connections do not accumulate in a long-running
@@ -33,7 +40,9 @@ namespace fusion::ipc {
 
 class HostServer {
 public:
-  HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name = compute_pipe_name());
+  // `incarnation` 0 means "generate one for this instance" (tests may pin it).
+  HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name = compute_pipe_name(),
+             std::uint64_t incarnation = 0);
   ~HostServer();
 
   HostServer(const HostServer &) = delete;
@@ -49,17 +58,22 @@ public:
   // completed one not yet reaped). Not product semantics.
   std::size_t tracked_connection_count() const;
 
+  // Identity of this Host incarnation, as sent in every response envelope.
+  std::uint64_t incarnation() const { return incarnation_; }
+
 private:
   struct Connection {
     Connection(std::unique_ptr<PipeServer> pipe_server, Backend &backend_ref,
-               std::mutex &backend_mutex_ref, std::atomic<std::uint64_t> &next_context)
+               std::mutex &backend_mutex_ref, std::atomic<std::uint64_t> &next_context,
+               std::uint64_t host_incarnation)
         : pipe(std::move(pipe_server)), backend(backend_ref), backend_mutex(backend_mutex_ref),
-          next_host_context(next_context) {}
+          next_host_context(next_context), incarnation(host_incarnation) {}
 
     std::unique_ptr<PipeServer> pipe;
     Backend &backend;
     std::mutex &backend_mutex;
     std::atomic<std::uint64_t> &next_host_context;
+    std::uint64_t incarnation;
     std::map<std::uint64_t, Binding> context_map; // client_context → host binding
 
     void run();
@@ -89,6 +103,7 @@ private:
 
   std::unique_ptr<Backend> backend_;
   std::wstring pipe_name_;
+  const std::uint64_t incarnation_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stopping_{false};
   std::mutex backend_mutex_;
