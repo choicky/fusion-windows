@@ -60,8 +60,30 @@ void HostServer::wake_accept_loop() {
     CloseHandle(wake);
 }
 
+std::size_t HostServer::tracked_connection_count() const {
+  std::lock_guard lock(connections_mutex_);
+  return connections_.size();
+}
+
+void HostServer::reap_completed_connections() {
+  std::lock_guard lock(connections_mutex_);
+  for (auto it = connections_.begin(); it != connections_.end();) {
+    TrackedConnection &tracked = **it;
+    // completed is set by the connection thread as its last action, so the
+    // thread needs nothing from this lock and joining cannot deadlock. A live
+    // connection is never joined here.
+    if (!tracked.completed.load()) {
+      ++it;
+      continue;
+    }
+    if (tracked.thread.joinable())
+      tracked.thread.join();
+    it = connections_.erase(it);
+  }
+}
+
 void HostServer::drain_connections() {
-  std::vector<TrackedConnection> connections;
+  std::vector<std::unique_ptr<TrackedConnection>> connections;
   {
     std::lock_guard lock(connections_mutex_);
     connections.swap(connections_);
@@ -69,9 +91,9 @@ void HostServer::drain_connections() {
   for (auto &tracked : connections) {
     // Unblock the connection's pending receive, then wait for it to finish so
     // no thread can touch backend_ after this call returns.
-    tracked.connection->disconnect();
-    if (tracked.thread.joinable())
-      tracked.thread.join();
+    tracked->connection->disconnect();
+    if (tracked->thread.joinable())
+      tracked->thread.join();
   }
 }
 
@@ -102,11 +124,21 @@ void HostServer::accept_loop() {
     auto connection = std::make_unique<Connection>(std::move(pipe), *backend_, backend_mutex_,
                                                    next_host_context_);
     Connection *raw = connection.get();
-    std::lock_guard lock(connections_mutex_);
-    TrackedConnection tracked;
-    tracked.connection = std::move(connection);
-    tracked.thread = std::thread([raw] { raw->run(); });
-    connections_.push_back(std::move(tracked));
+    // A finished connection is reaped on the next accepted connection, so the
+    // retained entries stay bounded by the live connections plus one completed
+    // one instead of growing with the Host's connection history.
+    auto tracked = std::make_unique<TrackedConnection>();
+    tracked->connection = std::move(connection);
+    TrackedConnection *tracked_raw = tracked.get();
+    tracked->thread = std::thread([raw, tracked_raw] {
+      raw->run();
+      tracked_raw->completed = true;
+    });
+    {
+      std::lock_guard lock(connections_mutex_);
+      connections_.push_back(std::move(tracked));
+    }
+    reap_completed_connections();
   }
 }
 

@@ -8,10 +8,12 @@
 // through a shared mutex. Each connection remaps client context IDs to
 // Host-unique context IDs and unbinds all contexts on disconnect.
 //
-// Lifecycle: every connection is owned together with its thread, so stop() can
-// disconnect the pipes, join the threads and return without leaving a thread
-// that could touch backend_. Running the Host normally (run() until the process
-// is terminated) is unchanged.
+// Lifecycle: every connection is owned together with its thread. A finished
+// connection marks itself completed and is reaped (joined and erased) by the
+// accept path, so completed connections do not accumulate in a long-running
+// Host; stop() still disconnects and joins every remaining live connection and
+// returns without leaving a thread that could touch backend_. Running the Host
+// normally (run() until the process is terminated) is unchanged.
 
 #include "fusion/backend.hpp"
 #include "ipc/pipe_security.hpp"
@@ -43,6 +45,10 @@ public:
   // thread before returning. Idempotent; never leaves a running thread.
   void stop();
 
+  // Development/test observable: number of tracked connections (live plus any
+  // completed one not yet reaped). Not product semantics.
+  std::size_t tracked_connection_count() const;
+
 private:
   struct Connection {
     Connection(std::unique_ptr<PipeServer> pipe_server, Backend &backend_ref,
@@ -71,10 +77,14 @@ private:
     Binding remap_binding(const Binding &client_binding);
   };
 
-  // One live client: the connection state and the thread that serves it.
+  // One connection: its state, the thread that serves it, and the completion
+  // flag the thread sets as its last action so the accept path can join and
+  // erase it without racing a live connection. Held by pointer so the flag has a
+  // stable address while the tracking vector grows.
   struct TrackedConnection {
     std::unique_ptr<Connection> connection;
     std::thread thread;
+    std::atomic<bool> completed{false};
   };
 
   std::unique_ptr<Backend> backend_;
@@ -85,8 +95,8 @@ private:
   std::atomic<std::uint64_t> next_host_context_{1};
   bool first_instance_ = true;
 
-  std::mutex connections_mutex_;
-  std::vector<TrackedConnection> connections_;
+  mutable std::mutex connections_mutex_;
+  std::vector<std::unique_ptr<TrackedConnection>> connections_;
 
   // Accept-loop exit handshake: stop() must not drain connections while the
   // accept loop could still spawn one.
@@ -96,6 +106,9 @@ private:
 
   void accept_loop();
   void wake_accept_loop();
+  // Joins and erases every completed connection. Never joins a live connection,
+  // and the connection thread never takes connections_mutex_.
+  void reap_completed_connections();
   void drain_connections();
 };
 

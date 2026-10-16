@@ -15,7 +15,7 @@ bool IpcBackend::connect(std::chrono::milliseconds timeout) {
   detail::write_u32(hello_payload, protocol_version);
 
   std::lock_guard lock(rpc_mutex_);
-  if (!client_.send_request(MessageType::HelloRequest, hello_payload)) {
+  if (client_.send_request(MessageType::HelloRequest, hello_payload) != WriteOutcome::Written) {
     client_.disconnect();
     return false;
   }
@@ -48,7 +48,7 @@ std::optional<WireFrame> IpcBackend::rpc(MessageType request_type,
   std::lock_guard lock(rpc_mutex_);
   if (!client_.connected())
     return std::nullopt;
-  if (!client_.send_request(request_type, payload))
+  if (client_.send_request(request_type, payload) != WriteOutcome::Written)
     return std::nullopt;
   auto response = client_.recv_response(kRequestTimeout);
   if (!response || response->type != expected_response)
@@ -108,11 +108,25 @@ BackendBatch IpcBackend::send(const BackendStimulus &stimulus) {
   if (!client_.connected())
     return forward_batch(stimulus);
 
-  // Attempt to write the request.
-  if (!client_.send_request(MessageType::SendRequest, payload)) {
-    // Pre-write failure: transport never saw the request → Forward.
+  // Attempt to write the request. Only a write that provably accepted no byte of
+  // this frame leaves the physical key caller-owned; a partial/uncertain write
+  // must never be reported as an ordinary Forward, because the Host may already
+  // have observed enough of the request for the outcome to be unknown.
+  const WriteOutcome write = client_.send_request(MessageType::SendRequest, payload);
+  if (write == WriteOutcome::NotWritten) {
     healthy_ = false;
     return forward_batch(stimulus);
+  }
+  if (write == WriteOutcome::Uncertain) {
+    // No replay, no synthetic key: report the uncertain stimulus as Reject and
+    // keep the identity fields so caller-side accounting matches what was sent.
+    healthy_ = false;
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Reject;
+    batch.backend_session_id = cached_session_id_;
+    batch.binding = stimulus.binding;
+    batch.stimulus_id = stimulus.stimulus_id;
+    return batch;
   }
 
   // Post-write: the request is on the wire. Any failure now is a Reject.

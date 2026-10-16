@@ -17,6 +17,18 @@ namespace fusion::ipc {
 // UNFROZEN engineering constant — matches FcitxBackend::invoke request_wait (2s).
 inline constexpr auto kRequestTimeout = std::chrono::milliseconds(2000);
 
+// Outcome of writing one frame. A frame may be written in several chunks, and an
+// overlapped write that the transport accepted and that only fails later cannot be
+// distinguished from one that delivered bytes, so a caller that needs to know
+// whether a request can still be treated as "never delivered" must use this result
+// instead of a bool.
+enum class WriteOutcome {
+  NotWritten, // provably no byte of this frame was accepted (not connected, or the
+              // first write attempt was rejected outright by an unusable pipe)
+  Written,    // the whole frame was accepted by the transport
+  Uncertain,  // bytes may have been accepted; zero-byte status cannot be proven
+};
+
 class PipeClient {
 public:
   explicit PipeClient(std::wstring pipe_name = compute_pipe_name());
@@ -30,11 +42,11 @@ public:
   void disconnect();
   bool connected() const;
 
-  bool send_frame(const WireFrame &frame);
+  WriteOutcome send_frame(const WireFrame &frame);
   // recv_timeout == 0 means block indefinitely (for idle wait on server side).
   std::optional<WireFrame> recv_frame(std::chrono::milliseconds recv_timeout = kRequestTimeout);
 
-  bool send_request(MessageType type, const std::vector<std::uint8_t> &payload);
+  WriteOutcome send_request(MessageType type, const std::vector<std::uint8_t> &payload);
   std::optional<WireFrame> recv_response(std::chrono::milliseconds timeout = kRequestTimeout);
 
   void *native_handle() const;
@@ -45,7 +57,7 @@ private:
   mutable std::mutex mutex_;
   bool connected_ = false;
 
-  bool write_all(const void *data, std::size_t size);
+  WriteOutcome write_all(const void *data, std::size_t size);
   bool read_all_overlapped(void *data, std::size_t size, std::chrono::milliseconds timeout);
 };
 

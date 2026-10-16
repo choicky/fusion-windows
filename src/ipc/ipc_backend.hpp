@@ -38,11 +38,12 @@ private:
   std::uint64_t cached_session_id_ = 0;
   std::atomic<bool> healthy_{false};
 
-  // Pre-write transport failure: the request never reached the Host, so the
-  // physical stimulus stays caller-owned and is reported as a genuine Forward.
-  // Identity fields are preserved so the caller's accounting matches the
-  // stimulus it sent. Used by both pre-write branches (not connected, and write
-  // failure) so they cannot diverge.
+  // Definitely-not-written transport failure: no byte of the request reached the
+  // Host, so the physical stimulus stays caller-owned and is reported as a
+  // genuine Forward. Identity fields are preserved so the caller's accounting
+  // matches the stimulus it sent. Used by both definitely-not-written branches
+  // (not connected, and a write that provably accepted no byte) so they cannot
+  // diverge; an uncertain write must NOT use this path.
   BackendBatch forward_batch(const BackendStimulus &stimulus) const;
 
   // Send a request and receive the expected response.

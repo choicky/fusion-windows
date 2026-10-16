@@ -8,14 +8,23 @@
 // - hostserver: real HostServer with a fake Backend that mimics FcitxBackend
 //   admission (duplicate bind rejected, every call fails on admission contention):
 //   concurrent multi-client bind/send with context remapping, disconnect
-//   isolation, transport-failure separation, healthy() performs no IPC, and
-//   stop()/join shutdown.
+//   isolation, transport-failure separation (definitely-not-written vs
+//   uncertain-write vs post-write), healthy() performs no IPC, completed
+//   connection reaping, and stop()/join shutdown.
 // - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
 //   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
 //   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
 //
 // protocol/loopback/hostserver build and run in the Mock-only build too: the
 // transport, the IpcBackend client and the HostServer do not depend on Fcitx.
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
@@ -122,6 +131,112 @@ public:
 
 private:
   std::unique_ptr<PipeServer> server_;
+  std::thread thread_;
+};
+
+// ---------------------------------------------------------------------------
+// Tiny-buffer raw pipe server.
+//
+// One request frame is far larger than this server's inbound buffer, so the
+// client's frame is accepted only partially: that is the state in which a write
+// failure can no longer prove that zero bytes reached the transport. Deliberately
+// minimal — a test seam for the write-certainty classification, not a transport
+// fixture.
+// ---------------------------------------------------------------------------
+
+constexpr DWORD kTinyInBuffer = 8;
+
+class TinyBufferPipeServer {
+public:
+  explicit TinyBufferPipeServer(std::wstring pipe_name) : pipe_name_(std::move(pipe_name)) {}
+
+  bool create() {
+    handle_ = CreateNamedPipeW(pipe_name_.c_str(), PIPE_ACCESS_DUPLEX,
+                               PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096,
+                               kTinyInBuffer, 0, nullptr);
+    return handle_ != INVALID_HANDLE_VALUE;
+  }
+
+  template <typename Body> void serve(Body body) {
+    thread_ = std::thread([this, body] { body(*this); });
+  }
+
+  // Reads the Hello frame and answers it, so the client's connect() succeeds.
+  bool answer_hello(std::uint64_t session_id) {
+    std::uint8_t header[header_size];
+    if (!read_exact(header, header_size))
+      return false;
+    std::uint32_t length = 0;
+    std::memcpy(&length, header, sizeof(length));
+    if (length == 0 || length > max_message_payload ||
+        header[4] != static_cast<std::uint8_t>(MessageType::HelloRequest))
+      return false;
+    std::vector<std::uint8_t> hello(length);
+    if (!read_exact(hello.data(), length))
+      return false;
+    WireFrame response;
+    response.type = MessageType::HelloResponse;
+    detail::write_u32(response.payload, protocol_version);
+    detail::write_u64(response.payload, session_id);
+    const std::vector<std::uint8_t> wire = frame_message(response.type, response.payload);
+    return write_all(wire.data(), wire.size());
+  }
+
+  // Bytes the client pushed that this server never consumed: a non-zero value
+  // proves that part of a frame was accepted by the transport.
+  DWORD peek_available() {
+    DWORD available = 0;
+    if (handle_ == INVALID_HANDLE_VALUE)
+      return 0;
+    if (!PeekNamedPipe(handle_, nullptr, 0, nullptr, &available, nullptr))
+      return 0;
+    return available;
+  }
+
+  // Drops the connection while the client may still have bytes in flight.
+  void abort_connection() {
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      DisconnectNamedPipe(handle_);
+      CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
+  }
+
+  ~TinyBufferPipeServer() {
+    abort_connection();
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+private:
+  bool read_exact(void *data, std::size_t size) {
+    auto *ptr = static_cast<std::uint8_t *>(data);
+    std::size_t total = 0;
+    while (total < size) {
+      DWORD read = 0;
+      if (!ReadFile(handle_, ptr + total, static_cast<DWORD>(size - total), &read, nullptr) ||
+          read == 0)
+        return false;
+      total += read;
+    }
+    return true;
+  }
+
+  bool write_all(const void *data, std::size_t size) {
+    const auto *ptr = static_cast<const std::uint8_t *>(data);
+    std::size_t total = 0;
+    while (total < size) {
+      DWORD written = 0;
+      if (!WriteFile(handle_, ptr + total, static_cast<DWORD>(size - total), &written, nullptr) ||
+          written == 0)
+        return false;
+      total += written;
+    }
+    return true;
+  }
+
+  std::wstring pipe_name_;
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
   std::thread thread_;
 };
 
@@ -683,7 +798,8 @@ void test_loopback() {
     require(raw_client.connect(std::chrono::milliseconds(5000)), "version client connect");
     std::vector<std::uint8_t> hello_payload;
     detail::write_u32(hello_payload, 999); // wrong version
-    require(raw_client.send_request(MessageType::HelloRequest, hello_payload),
+    require(raw_client.send_request(MessageType::HelloRequest, hello_payload) ==
+                WriteOutcome::Written,
             "version hello send");
     auto resp = raw_client.recv_response(std::chrono::milliseconds(5000));
     require(resp && resp->type == MessageType::HelloResponse, "version response received");
@@ -892,8 +1008,10 @@ void test_hostserver_multi_client() {
   require(fake->contention_count == 0, "no admission contention during shutdown");
 }
 
-// Pre-write failure (transport never saw the request) → Forward with identity
-// preserved; post-write failure (request on the wire, response lost) → Reject.
+// Transport failure classification: a definitely-not-written request (never
+// connected, or a write that provably accepted no byte) → Forward with identity
+// preserved; an uncertain write (some bytes accepted, outcome unknown) → Reject;
+// a completed write whose response is lost → Reject.
 void test_hostserver_transport_failure() {
   // (a) Not connected at all.
   {
@@ -983,6 +1101,58 @@ void test_hostserver_transport_failure() {
     require(batch.disposition == BackendBatch::Disposition::Reject, "post-write failure -> Reject");
     require(batch.operations.empty(), "post-write failure -> no operations");
     require(!client.healthy(), "post-write failure marks the client unhealthy");
+  }
+
+  // (d) The transport accepted part of the request frame and only then died. Some
+  //     bytes of this frame are on the pipe, so zero-byte status cannot be
+  //     proven: the stimulus is no longer provably caller-owned and must never
+  //     become an ordinary Forward. Nothing is replayed and no key is injected.
+  {
+    const auto pipe_name = test_pipe_name(L"uncertain-write");
+    TinyBufferPipeServer server(pipe_name);
+    require(server.create(), "uncertain-write server create");
+    std::atomic<bool> hello_answered{false};
+    std::atomic<bool> partial_seen{false};
+    std::atomic<DWORD> partial_bytes{0};
+    server.serve([&](TinyBufferPipeServer &s) {
+      hello_answered = s.answer_hello(9090);
+      if (!hello_answered.load())
+        return;
+      // Stop reading: the next frame only fills part of the tiny inbound buffer.
+      const auto deadline = std::chrono::steady_clock::now() + kWait;
+      while (std::chrono::steady_clock::now() < deadline && !partial_seen.load()) {
+        const DWORD available = s.peek_available();
+        if (available > 0) {
+          partial_bytes = available;
+          partial_seen = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      s.abort_connection(); // the client still has bytes in flight
+    });
+
+    IpcBackend client(pipe_name);
+    require(client.connect(std::chrono::seconds(5)), "uncertain-write client connect");
+    require(wait_until([&hello_answered] { return hello_answered.load(); }, kWait),
+            "uncertain-write hello answered");
+    require(client.session_id() == 9090, "uncertain-write session id cached");
+
+    const auto stimulus = character_stimulus({11, 1, 1}, 21, 'c');
+    const BackendBatch batch = client.send(stimulus);
+    require(partial_seen.load() && partial_bytes.load() > 0,
+            "uncertain-write: server accepted part of the request frame");
+    require(batch.disposition != BackendBatch::Disposition::Forward,
+            "uncertain write must never Forward");
+    require(batch.disposition == BackendBatch::Disposition::Reject,
+            "uncertain write -> Reject (non-PASS terminal)");
+    require(batch.operations.empty(), "uncertain write -> no operations");
+    require(batch.binding == stimulus.binding, "uncertain write -> binding preserved");
+    require(batch.stimulus_id == stimulus.stimulus_id, "uncertain write -> stimulus_id preserved");
+    require(batch.backend_session_id == 9090, "uncertain write -> session id preserved");
+    // The transport drops the connection and the backend stays unhealthy, so the
+    // uncertain request is never retried or replayed.
+    require(!client.healthy(), "uncertain write marks the client unhealthy");
   }
 }
 
@@ -1099,13 +1269,81 @@ void test_hostserver_shutdown() {
   }
 }
 
+// Completed connections must be released during normal operation instead of
+// accumulating until Host shutdown: the retained tracked-connection count stays
+// bounded by the live connections (plus at most the one that finished last),
+// however many connect/disconnect cycles the Host has served.
+void test_hostserver_connection_reaping() {
+  const auto pipe_name = test_pipe_name(L"reaping");
+  auto backend = std::make_unique<FcitxLikeBackend>();
+  FcitxLikeBackend *fake = backend.get();
+  RunningHost host(std::move(backend), pipe_name);
+  require(host.start(), "reaping start");
+
+  constexpr int kBatch = 6;
+  const auto run_cycles = [&](int first) {
+    for (int i = first; i < first + kBatch; ++i) {
+      auto client = connect_client(pipe_name);
+      require(client != nullptr, "reaping client connect");
+      // A live connection is tracked and must not be reaped.
+      require(wait_until([&host] { return host.server().tracked_connection_count() == 1; }, kWait),
+              "live connection is the only tracked connection");
+      const Binding binding{static_cast<std::uint64_t>(100 + i), 1, 1};
+      require(client->bind(binding), "reaping bind");
+      const BackendBatch batch = client->send(character_stimulus(binding, 5 + i, 'a'));
+      require(batch.disposition == BackendBatch::Disposition::Consumed,
+              "live connection is still served");
+      client.reset(); // disconnect: the connection thread finishes on its own
+      require(wait_until([fake] { return fake->bound_count() == 0; }, kWait),
+              "disconnected connection unbound its context");
+      // live 0 + at most the connection that just completed: the count must not
+      // grow with the number of historical connections.
+      require(host.server().tracked_connection_count() <= 2,
+              "completed connections do not accumulate");
+    }
+  };
+
+  DWORD handles_before = 0;
+  DWORD handles_middle = 0;
+  DWORD handles_after = 0;
+  GetProcessHandleCount(GetCurrentProcess(), &handles_before);
+  run_cycles(0);
+  GetProcessHandleCount(GetCurrentProcess(), &handles_middle);
+  run_cycles(kBatch);
+  GetProcessHandleCount(GetCurrentProcess(), &handles_after);
+  std::printf("  reaping: %d cycles in %d batches, tracked=%zu handles %lu -> %lu -> %lu\n",
+              2 * kBatch, 2, host.server().tracked_connection_count(), handles_before,
+              handles_middle, handles_after);
+  // A second batch of the same size must not consume more resources than the
+  // first: that is what distinguishes reaping from retaining every connection.
+  require(handles_after <= handles_middle + 3,
+          "connection resources do not grow with further connect/disconnect cycles");
+  require(fake->bound_count() == 0, "no context left bound after the cycles");
+  require(fake->contention_count == 0, "no admission contention during reaping");
+
+  // A live connection at stop() time is still disconnected and joined, and the
+  // reaping path leaves nothing behind.
+  {
+    auto client = connect_client(pipe_name);
+    require(client != nullptr, "reaping stop client");
+    require(client->bind(Binding{777, 1, 1}), "reaping stop bind");
+    host.stop_and_join();
+    require(wait_until([fake] { return fake->bound_count() == 0; }, kWait),
+            "stop() unbound the live connection");
+    require(host.server().tracked_connection_count() == 0,
+            "stop() released every tracked connection");
+    host.server().stop(); // repeated stop stays safe
+  }
+}
+
 void test_hostserver() {
   test_hostserver_multi_client();
   test_hostserver_transport_failure();
   test_hostserver_healthy_no_ipc();
+  test_hostserver_connection_reaping();
   test_hostserver_shutdown();
   std::cout << "PASS HostServer: multi-client remapping, disconnect isolation, transport "
-               "failure separation, healthy() no IPC, clean stop/join\n";
+               "failure separation, healthy() no IPC, connection reaping, clean stop/join\n";
 }
 
 } // namespace

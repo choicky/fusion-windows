@@ -11,8 +11,7 @@ and faithful frontend path. Stage 4A adds an out-of-process Fcitx Host
 There is no end-user Windows input product yet; independent review is required
 before further integration.
 
-**Current implementation snapshot.** Stage 4A (out-of-process `FusionHost.exe` + IPC) is
-unmerged work on a Draft PR; current Windows stage status is authoritative in D072
+**Current implementation snapshot.** Current Windows stage status is authoritative in D072
 §22/§25 and is not duplicated here.
 
 ## Project authority
@@ -276,8 +275,9 @@ are compiled and registered in every Windows/MSVC build (Mock-only included), an
 - `hostserver`: real HostServer with a fake Backend that mirrors FcitxBackend admission
   (duplicate bind rejected, every call fails on admission contention) — concurrent
   multi-client bind/send with context remapping and disconnect isolation, transport-failure
-  separation (pre-write `Forward` vs post-write `Reject`), `healthy()` performs no IPC
-  (server-side received-frame count), and `stop()`/join shutdown without hanging
+  separation (definitely-not-written `Forward` vs uncertain-write `Reject` vs post-write
+  `Reject`), `healthy()` performs no IPC (server-side received-frame count), completed
+  connection reaping during normal operation, and `stop()`/join shutdown without hanging
 - `integration`: full FusionHost.exe + Fcitx backend over IPC (requires a running
   FusionHost.exe and the Fcitx runtime; set `FUSION_STAGE4A_SKIP_INTEGRATION=1` to skip
   instead of fail)

@@ -28,12 +28,21 @@ namespace {
 std::wstring parse_pipe_name(int argc, char *argv[]) {
   for (int i = 1; i < argc - 1; ++i) {
     if (std::strcmp(argv[i], "--pipe-name") == 0) {
-      int len = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, nullptr, 0);
-      if (len > 0) {
-        std::wstring name(static_cast<size_t>(len - 1), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, name.data(), len);
-        return name;
-      }
+      // -1 conversion: the returned length counts the terminating NUL, so the
+      // buffer must have room for it and the conversion must be told that
+      // capacity. A conversion failure (or an invalid UTF-8 argument) must not
+      // produce a partially initialized pipe name.
+      const int length =
+          MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, argv[i + 1], -1, nullptr, 0);
+      if (length <= 0)
+        return fusion::ipc::compute_pipe_name();
+      std::wstring name(static_cast<size_t>(length), L'\0');
+      const int converted =
+          MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, argv[i + 1], -1, name.data(), length);
+      if (converted != length)
+        return fusion::ipc::compute_pipe_name();
+      name.resize(static_cast<size_t>(length - 1)); // drop the terminating NUL
+      return name;
     }
   }
   return fusion::ipc::compute_pipe_name();

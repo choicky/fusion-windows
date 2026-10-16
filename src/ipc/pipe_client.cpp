@@ -21,9 +21,8 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
-    handle_ =
-        CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED, nullptr);
+    handle_ = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (handle_ != INVALID_HANDLE_VALUE) {
       DWORD mode = PIPE_READMODE_BYTE;
       if (!SetNamedPipeHandleState(handle_, &mode, nullptr, nullptr)) {
@@ -74,42 +73,66 @@ void *PipeClient::native_handle() const {
   return connected_ ? handle_ : INVALID_HANDLE_VALUE;
 }
 
-bool PipeClient::write_all(const void *data, std::size_t size) {
+namespace {
+
+// A pipe that cannot be written at all. On these errors the first write attempt
+// is rejected outright, so no byte of the frame was accepted. Every other
+// failure — in particular an overlapped write that was pending and then failed —
+// is treated as uncertain: an aborted pending write reports zero transferred
+// bytes even when the pipe already held part of the frame (measured on this
+// machine: the peer could PeekNamedPipe those bytes).
+bool connection_unusable(DWORD error) {
+  return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA || error == ERROR_PIPE_NOT_CONNECTED;
+}
+
+} // namespace
+
+WriteOutcome PipeClient::write_all(const void *data, std::size_t size) {
   const auto *ptr = static_cast<const std::uint8_t *>(data);
   std::size_t written_total = 0;
+  // Only a proven zero-byte outcome may be reported as NotWritten. A frame can be
+  // written in several chunks, and a write that the transport accepted and that
+  // only failed later can no longer be distinguished from one that delivered
+  // bytes, so anything unproven becomes Uncertain.
   while (written_total < size) {
     OVERLAPPED ov{};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!ov.hEvent)
-      return false;
+      return written_total == 0 ? WriteOutcome::NotWritten : WriteOutcome::Uncertain;
     DWORD written = 0;
-    BOOL ok = WriteFile(handle_, ptr + written_total,
-                        static_cast<DWORD>(size - written_total), &written, &ov);
+    BOOL ok = WriteFile(handle_, ptr + written_total, static_cast<DWORD>(size - written_total),
+                        &written, &ov);
     if (ok) {
       CloseHandle(ov.hEvent);
       written_total += written;
       continue;
     }
-    auto err = GetLastError();
+    const DWORD err = GetLastError();
     if (err != ERROR_IO_PENDING) {
+      // The request never reached the transport queue: with no byte written by an
+      // earlier chunk and a dead pipe this is a definite zero-byte failure.
       CloseHandle(ov.hEvent);
-      return false;
+      if (written_total == 0 && connection_unusable(err))
+        return WriteOutcome::NotWritten;
+      return WriteOutcome::Uncertain;
     }
     auto result = WaitForSingleObject(ov.hEvent, static_cast<DWORD>(kRequestTimeout.count()));
     if (result != WAIT_OBJECT_0) {
       CancelIoEx(handle_, &ov);
       GetOverlappedResult(handle_, &ov, &written, TRUE);
+      written_total += written;
       CloseHandle(ov.hEvent);
-      return false;
+      return WriteOutcome::Uncertain;
     }
     if (!GetOverlappedResult(handle_, &ov, &written, FALSE)) {
+      // A pending write that fails may already have delivered part of the frame.
       CloseHandle(ov.hEvent);
-      return false;
+      return WriteOutcome::Uncertain;
     }
     CloseHandle(ov.hEvent);
     written_total += written;
   }
-  return true;
+  return WriteOutcome::Written;
 }
 
 bool PipeClient::read_all_overlapped(void *data, std::size_t size,
@@ -156,16 +179,15 @@ bool PipeClient::read_all_overlapped(void *data, std::size_t size,
   return true;
 }
 
-bool PipeClient::send_frame(const WireFrame &frame) {
+WriteOutcome PipeClient::send_frame(const WireFrame &frame) {
   std::lock_guard lock(mutex_);
   if (!connected_)
-    return false;
+    return WriteOutcome::NotWritten;
   auto wire = frame_message(frame.type, frame.payload);
-  if (!write_all(wire.data(), wire.size())) {
+  const WriteOutcome outcome = write_all(wire.data(), wire.size());
+  if (outcome != WriteOutcome::Written)
     connected_ = false;
-    return false;
-  }
-  return true;
+  return outcome;
 }
 
 std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeout) {
@@ -204,7 +226,7 @@ std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeou
   return frame;
 }
 
-bool PipeClient::send_request(MessageType type, const std::vector<std::uint8_t> &payload) {
+WriteOutcome PipeClient::send_request(MessageType type, const std::vector<std::uint8_t> &payload) {
   WireFrame frame;
   frame.type = type;
   frame.payload = payload;
