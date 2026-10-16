@@ -11,14 +11,27 @@ void require(bool value, const char *message) {
   if (!value)
     throw std::runtime_error(message);
 }
+void settle(SemanticController &controller, const SemanticDecision &decision) {
+  for (const auto &work : decision.frontend) {
+    if (work.operation.type == BackendOperation::Type::SetPreedit) {
+      require(controller.settle_state(work.key, EditResult::AppliedReadback) == Result::Accepted,
+              "STATE settlement failed");
+    } else {
+      require(controller.propose_effect(work.key) == Result::Accepted, "effect proposal failed");
+      const auto ticket = controller.open_effect(work.key);
+      require(ticket.has_value(), "effect ticket missing");
+      require(controller.settle_effect(*ticket, EditResult::AppliedReadback) == Result::Accepted,
+              "effect settlement failed");
+    }
+  }
+}
 SemanticDecision state(SemanticController &controller, std::uint32_t key) {
   auto decision = controller.begin_key(classify_key(key, false, false, false), true);
   require(decision.route == SemanticDecision::Route::State && decision.key.has_value(),
           "real STATE route missing");
   require(decision.backend_session_id != 0 && decision.operation_count != 0,
           "real frontend observations missing");
-  require(controller.settle_state(*decision.key, EditResult::AppliedReadback) == Result::Accepted,
-          "STATE settlement failed");
+  settle(controller, decision);
   return decision;
 }
 int main() {
@@ -39,12 +52,7 @@ int main() {
     auto commit = controller.begin_key(classify_key(kVkSpace, false, false, false), true);
     require(commit.route == SemanticDecision::Route::Effect && commit.text == "你好",
             "real Pinyin Space commit mismatch");
-    require(controller.propose_effect(*commit.key) == Result::Accepted,
-            "commit watermark gate failed");
-    auto ticket = controller.open_effect(*commit.key);
-    require(ticket.has_value(), "commit ticket missing");
-    require(controller.settle_effect(*ticket, EditResult::AppliedReadback) == Result::Accepted,
-            "commit settlement failed");
+    settle(controller, commit);
     std::cout
         << "PASS real stimulus -> adapter -> Fcitx frontend preedit/commit -> Host/Core ticket\n";
     state(controller, 'N');

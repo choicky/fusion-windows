@@ -6,7 +6,7 @@
 // admission, fallback queue and settlement bookkeeping are deterministically
 // testable. It owns NO second ledger and NO semantic engine: every causal
 // transition delegates to the existing fusion::Core through fusion::Host, and
-// every semantic verdict comes from the existing Stage 2 Mock Backend. The TSF
+// semantic verdicts come from the selected Mock or Fcitx Backend. The TSF
 // shell supplies: the Windows hard-policy answer (policy_allows), real edit
 // observations (fusion::EditResult), and projection notifications.
 //
@@ -29,6 +29,11 @@
 
 namespace fusion::tsf {
 
+struct FrontendWork {
+  BackendOperation operation;
+  Key key;
+};
+
 struct SemanticDecision {
   enum class Route {
     Pass,              // backend says genuine PASS; caller must run finish_pass
@@ -47,13 +52,15 @@ struct SemanticDecision {
   Intent intent = Intent::Pass;
   std::string text; // STATE/EFFECT text to materialize, when routed
   std::optional<Key> key;
+  std::vector<FrontendWork> frontend; // callback order, never folded
+  bool forward = false;
 };
 
 // One queued execution opportunity after a refused synchronous session.
 struct PendingWork {
   Kind kind = Kind::State;
   Key key{};
-  std::string text; // STATE: snapshot at enqueue time; latest-wins at execution
+  std::string text; // Real frontend: immutable callback; Mock STATE: latest-wins
 };
 
 class SemanticController {
@@ -63,7 +70,9 @@ public:
 
   SemanticController(std::uint64_t context_id, std::size_t capacity, Backend &backend,
                      std::size_t recovery_reserve = 0);
-  bool predicts_owned(const KeyAction &action) const;
+  bool real_frontend() const { return real_backend_ != nullptr; }
+  // T routing eligibility; real Fcitx consumption is determined only by send().
+  bool routes_key(const KeyAction &action) const;
 
   // Key-callback entry point: classification -> hard policy -> ownership
   // admission -> Mock Backend response -> routing. See SemanticDecision.
@@ -103,6 +112,7 @@ public:
   // state key receives the same observed result in FIFO order.
   void settle_queued_states(EditResult observed);
   void clear_pending();
+  void settle_front_state(Key key, EditResult observed);
   // Retire only observed terminals without uncertainty or queued references.
   void retire_terminals();
   bool state_applicable(Key key) const;

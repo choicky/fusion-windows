@@ -32,10 +32,16 @@ struct KeyAction {
   char ch = '\0'; // valid only for AppendChar
   std::uint32_t virtual_key = 0;
   bool modified = false;
+  std::uint32_t keysym = 0;
+  std::uint32_t modifiers = 0;
 };
 
 // Pure classification of one physical key-down. Modifier combinations and every
 // key outside the development vocabulary classify as Pass.
 KeyAction classify_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win);
+
+// Physical-key translation; this does not predict engine consumption.
+KeyAction translate_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win,
+                        char32_t character = 0, bool shift = false, bool caps = false);
 
 } // namespace fusion::tsf

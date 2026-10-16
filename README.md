@@ -12,10 +12,10 @@ yet; independent review is required before further integration.
 **Current implementation snapshot.** Stage 1 (portable FusionCore + deterministic
 simulator + executable RG-0 tests), Stage 2 (minimal semantic Mock Backend +
 `fusion::Host` boundary + end-to-end Stage 2 tests) are implemented and merged into `main`. Stage 2.5 (real TSF +
-existing Host/Core + Mock Backend) has passed local fixture validation on its
-task branch, including Notepad and the independent Notepad++ Scintilla editor;
-it is not merged and awaits independent review. The Edge attempt was
-HARNESS/TOOL INVALID because the desktop tool could not observe its target. Stage 3 is not started. Current Windows stage status
+existing Host/Core + Mock Backend) is merged (PR #4). Stage 3B (real Fcitx5
+backend PoC) is merged (PR #5); Stage 3C implements the faithful frontend path,
+with physical-key TSF smoke validation pending. The Edge attempt was
+HARNESS/TOOL INVALID because the desktop tool could not observe its target. Current Windows stage status
 is authoritative in D072 §22/§25 and is not duplicated here.
 
 ## Project authority

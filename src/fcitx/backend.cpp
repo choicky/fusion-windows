@@ -35,7 +35,7 @@ FCITX_IMPORT_ADDON_FACTORY(registry, spell);
 FCITX_IMPORT_ADDON_FACTORY(registry, clipboard);
 std::atomic<std::uint64_t> next_session{1};
 std::once_flag paths_initialized;
-constexpr std::size_t operation_bound = 32;
+constexpr std::size_t operation_bound = frontend_operation_bound;
 constexpr std::size_t payload_bound = 4096;
 constexpr std::size_t context_bound = 64;
 // Engineering bounds for this PoC only; D072 numerical policy remains OPEN.
@@ -57,7 +57,9 @@ public:
     observe({BackendOperation::Type::SetPreedit, inputPanel().clientPreedit().toString(), {}});
   }
   void forwardKeyImpl(const fcitx::ForwardKeyEvent &event) override {
-    observe({BackendOperation::Type::ForwardKey, event.key().toString(), {}});
+    BackendOperation operation{BackendOperation::Type::ForwardKey, event.rawKey().toString(), {}};
+    operation.original_key = event.rawKey() == dispatched_key && !event.isRelease();
+    observe(std::move(operation));
   }
   void deleteSurroundingTextImpl(int, unsigned) override {
     // Unsupported materialization cannot be silently lost or executed by Fcitx.
@@ -73,6 +75,7 @@ public:
     }
     batch->operations.push_back(std::move(operation));
   }
+  fcitx::Key dispatched_key;
   Binding binding;
   std::uint64_t last_stimulus = 0;
   BackendBatch *batch = nullptr;
@@ -138,7 +141,12 @@ public:
           const auto name = key_name(stimulus);
           context->batch = output.get();
           try {
-            fcitx::KeyEvent event(context, fcitx::Key(name), false);
+            const auto key = stimulus.keysym
+                                 ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
+                                              fcitx::KeyStates(stimulus.modifiers))
+                                 : fcitx::Key(name);
+            context->dispatched_key = key;
+            fcitx::KeyEvent event(context, key, false);
             const bool consumed = context->keyEvent(event);
             output->disposition =
                 consumed ? BackendBatch::Disposition::Consumed : BackendBatch::Disposition::Forward;
