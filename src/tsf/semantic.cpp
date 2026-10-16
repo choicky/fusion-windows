@@ -129,15 +129,11 @@ SemanticController::SemanticController(std::uint64_t context_id, std::size_t cap
   backend_ready_ = backend.bind(core_.binding());
 }
 
-bool SemanticController::predicts_owned(const KeyAction &action) const {
-  if (real_backend_ && (!backend_ready_ || !real_backend_->healthy()))
-    return false;
-  if (real_backend_ && action.type == KeyAction::Type::AppendChar && action.ch >= '0' &&
-      action.ch <= '9')
-    return !buffer_.empty();
-  if (real_backend_ && action.type == KeyAction::Type::Pass && action.virtual_key == kVkReturn &&
-      !action.modified)
-    return !buffer_.empty();
+bool SemanticController::routes_key(const KeyAction &action) const {
+  if (real_backend_)
+    return backend_ready_ && real_backend_->healthy() && !action.modified &&
+           (action.keysym != 0 || action.type != KeyAction::Type::Pass ||
+            action.virtual_key == kVkReturn);
   return action.type == KeyAction::Type::AppendChar ||
          (action.type != KeyAction::Type::Pass && !buffer_.empty());
 }
@@ -149,6 +145,11 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
   }
   SemanticDecision decision;
   if (!policy_allows || !backend_ready_ || !real_backend_->healthy()) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  retire_terminals();
+  if (!routes_key(action)) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
@@ -168,94 +169,108 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     stimulus.type = BackendStimulus::Type::Escape;
     break;
   case KeyAction::Type::Pass:
-    if (action.virtual_key != kVkReturn || action.modified)
+    if (action.modified || (!action.keysym && action.virtual_key != kVkReturn))
       return decision;
     stimulus.type = BackendStimulus::Type::Return;
     break;
   }
-  // Windows PoC classification admits ownership BEFORE observing Fcitx. In
-  // particular, Fcitx's consumed bit cannot turn an admitted key into PASS.
-  const bool owns = predicts_owned(action);
-  const bool effect_class =
-      action.type == KeyAction::Type::Commit ||
-      (action.type == KeyAction::Type::Pass && action.virtual_key == kVkReturn) ||
-      (action.type == KeyAction::Type::AppendChar && action.ch >= '0' && action.ch <= '9');
-  if (owns) {
-    const bool capacity_allows = core_.records().size() + recovery_reserve_ < core_.capacity();
-    decision.key = core_.own(effect_class ? Kind::Effect : Kind::State, capacity_allows);
-    if (!decision.key) {
-      decision.route = SemanticDecision::Route::FailOpen;
-      return decision;
-    }
-    decision.eaten = true;
+  stimulus.keysym = action.keysym;
+  stimulus.modifiers = action.modifiers;
+  // Reserve room for the bounded frontend callback list before invoking Fcitx.
+  // This is resource admission, not a prediction of semantic consumption.
+  constexpr std::size_t callback_bound = frontend_operation_bound;
+  if (core_.records().size() + callback_bound + recovery_reserve_ > core_.capacity() ||
+      core_.probe_pass() == Pass::RecoveryRequired) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
   }
   const auto batch = real_backend_->send(stimulus);
-  decision.symbolic = "fcitx:" + std::to_string(static_cast<int>(stimulus.type));
+  decision.symbolic = "fcitx:" + std::to_string(stimulus.keysym);
   decision.backend_session_id = batch.backend_session_id;
   decision.stimulus_id = batch.stimulus_id;
   decision.operation_count = batch.operations.size();
   bool valid = batch.backend_session_id == real_backend_->session_id() &&
                batch.binding == stimulus.binding && batch.stimulus_id == stimulus.stimulus_id &&
-               batch.disposition != BackendBatch::Disposition::Reject;
-  std::string preedit = buffer_;
-  std::string commit;
-  unsigned commits = 0;
-  bool changed_preedit = false;
+               batch.disposition != BackendBatch::Disposition::Reject &&
+               batch.operations.size() <= callback_bound;
+  bool original_forward = false;
   for (const auto &operation : batch.operations) {
-    switch (operation.type) {
-    case BackendOperation::Type::SetPreedit:
-      preedit = operation.text;
-      changed_preedit = true;
-      break;
-    case BackendOperation::Type::CommitText:
-      commit = operation.text;
-      ++commits;
-      break;
-    case BackendOperation::Type::CandidateSnapshot:
-      break; // no Stage 3B candidate renderer
-    case BackendOperation::Type::ForwardKey:
-      valid = false;
-      break; // never synthesize product replay
+    if (operation.type == BackendOperation::Type::CandidateSnapshot)
+      continue;
+    if (original_forward)
+      valid = false; // no callback may follow the natural key
+    if (operation.type == BackendOperation::Type::ForwardKey) {
+      valid = valid && operation.original_key;
+      original_forward = true;
     }
   }
-  valid = valid && commits <= 1;
-  if (!owns && valid && batch.disposition == BackendBatch::Disposition::Forward && commits == 0 &&
-      (!changed_preedit || preedit == buffer_))
-    return decision;
-  if (owns && valid && batch.disposition == BackendBatch::Disposition::Consumed) {
-    if (effect_class && commits == 1 && (!changed_preedit || preedit.empty())) {
-      decision.intent = Intent::Commit;
-      decision.route = SemanticDecision::Route::Effect;
-      decision.text = std::move(commit);
-      return decision;
-    }
-    if (!effect_class && commits == 0 && changed_preedit) {
-      decision.intent = Intent::Preedit;
-      decision.route = SemanticDecision::Route::State;
-      decision.text = preedit;
-      buffer_ = std::move(preedit);
-      state_dependency_ = decision.key->sequence;
-      return decision;
-    }
-  }
-  // POC-LOCAL unsupported/mismatched batch: explicit failure/recovery. Never
-  // silently discard a commit then report genuine PASS, and never issue an edit.
-  if (decision.key) {
-    (void)host_.reject(*decision.key);
-    decision.route = SemanticDecision::Route::Reject;
-  } else {
+  if (!valid) {
     decision.key = core_.record_cancelled_recovery();
     decision.route = SemanticDecision::Route::CancelledRecovery;
     decision.eaten = true;
+    decision.intent = Intent::Reject;
+    backend_ready_ = real_backend_->reset(core_.binding());
+    buffer_.clear();
+    state_dependency_ = 0;
+    return decision;
   }
-  decision.intent = Intent::Reject;
-  backend_ready_ = real_backend_->reset(core_.binding());
-  buffer_.clear();
-  state_dependency_ = 0;
+  decision.forward = original_forward || batch.disposition == BackendBatch::Disposition::Forward;
+  decision.eaten = !decision.forward;
+  for (const auto &operation : batch.operations) {
+    if (operation.type == BackendOperation::Type::CandidateSnapshot ||
+        operation.type == BackendOperation::Type::ForwardKey)
+      continue; // retained by BackendBatch; Stage 3B has no candidate renderer
+    const bool effect = operation.type == BackendOperation::Type::CommitText;
+    auto key = core_.own(effect ? Kind::Effect : Kind::State, true);
+    if (!key) { // reserved capacity and readiness were checked before dispatch
+      decision.route = SemanticDecision::Route::CancelledRecovery;
+      decision.eaten = true;
+      for (const auto &work : decision.frontend)
+        (void)host_.cancel(work.key);
+      decision.frontend.clear();
+      backend_ready_ = real_backend_->reset(core_.binding());
+      return decision;
+    }
+    decision.frontend.push_back({operation, *key});
+    if (effect) {
+      // Capture the actual preceding STATE dependency, including callbacks in
+      // this dispatch. The existing Core gate delays execution until consumed.
+      (void)core_.propose_effect(*key, state_dependency_);
+    } else {
+      state_dependency_ = key->sequence;
+      buffer_ = operation.text;
+    }
+  }
+  if (decision.frontend.empty()) {
+    if (!decision.forward) {
+      // Consumed without a document callback still receives an explicit terminal.
+      auto key = core_.own(Kind::State, true);
+      if (key)
+        (void)host_.reject(*key); // explicit no-document-effect terminal
+    }
+    decision.route =
+        decision.forward ? SemanticDecision::Route::Pass : SemanticDecision::Route::State;
+    return decision;
+  }
+  const auto &first = decision.frontend.front();
+  decision.key = first.key;
+  decision.text = first.operation.text;
+  decision.route = first.operation.type == BackendOperation::Type::CommitText
+                       ? SemanticDecision::Route::Effect
+                       : SemanticDecision::Route::State;
+  decision.intent =
+      decision.route == SemanticDecision::Route::Effect ? Intent::Commit : Intent::Preedit;
   return decision;
 }
 
 Result SemanticController::propose_effect(Key key) {
+  if (real_backend_) {
+    for (const auto &record : core_.records())
+      if (record.key == key && record.kind == Kind::Effect && record.proposed &&
+          record.terminal == Terminal::Pending)
+        return Result::Accepted; // already proposed with its preceding STATE dependency
+    return Result::Invalid;
+  }
   if (core_.consumed_state() < state_dependency_)
     return Result::Blocked;
   return host_.commit(key);
@@ -284,7 +299,7 @@ Result SemanticController::settle_effect(Ticket ticket, EditResult observed) {
                        [key = ticket.key](const PendingWork &work) { return work.key == key; }),
         pending_.end());
   }
-  if (record && record->terminal == Terminal::Applied) {
+  if (!real_backend_ && record && record->terminal == Terminal::Applied) {
     note_composition_reset();
   }
   return result;
@@ -298,7 +313,7 @@ Pass SemanticController::pass_probe() const { return host_.pass_barrier(); }
 
 std::optional<PendingWork> SemanticController::drain_work() {
   for (const auto &work : pending_) {
-    if (work.kind == Kind::Effect) {
+    if (real_backend_ || work.kind == Kind::Effect) {
       return work;
     }
   }
@@ -366,6 +381,15 @@ void SemanticController::settle_queued_states(EditResult observed) {
       pending_.erase(pending_.begin());
     }
   }
+}
+
+void SemanticController::settle_front_state(Key key, EditResult observed) {
+  if (observed == EditResult::RefusedNoMutation)
+    return;
+  if (settle_state(key, observed) == Result::Accepted)
+    pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+                                  [&](const PendingWork &work) { return work.key == key; }),
+                   pending_.end());
 }
 
 void SemanticController::clear_pending() { pending_.clear(); }

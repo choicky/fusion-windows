@@ -63,6 +63,13 @@ if(BUILD_TESTING)
     target_link_libraries(stage3b PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3b_real_backend COMMAND stage3b)
 
+    add_executable(stage3c tests/stage3c.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+    target_include_directories(stage3c PRIVATE src)
+    target_compile_definitions(stage3c PRIVATE FUSION_WITH_FCITX5)
+    target_compile_options(stage3c PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
+    add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
+
     # Dependency portability regression for the two MSVC empty-range guards in
     # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
     # engine directly; it does not exercise or change TSF key admission.

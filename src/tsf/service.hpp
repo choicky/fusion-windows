@@ -114,6 +114,7 @@ public:
   ITfThreadMgr *thread_mgr() { return thread_mgr_.get(); }
   TfClientId client_id() const { return client_id_; }
   void note_async_done(ContextEntry &entry, bool progress);
+  bool apply_frontend(ContextEntry &entry, TfEditCookie ec);
   ServiceBackend &backend() {
 #ifdef FUSION_WITH_FCITX5
     return *backend_;

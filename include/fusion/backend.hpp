@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 namespace fusion {
+inline constexpr std::size_t frontend_operation_bound = 32;
 // POC-LOCAL / NOT ACCEPTED ARCHITECTURE: an in-process Host adapter interface,
 // not a final wire schema, ownership policy, or D072 P0 resolution.
 struct BackendStimulus {
@@ -13,12 +14,16 @@ struct BackendStimulus {
   std::uint64_t stimulus_id = 0;
   Type type = Type::Character;
   char character = 0;
+  // X11/Fcitx keysym and modifier bits, supplied by Windows translation.
+  std::uint32_t keysym = 0;
+  std::uint32_t modifiers = 0;
 };
 struct BackendOperation {
   enum class Type { SetPreedit, CandidateSnapshot, CommitText, ForwardKey };
   Type type = Type::SetPreedit;
   std::string text;
   std::vector<std::string> candidates;
+  bool original_key = false; // ForwardKey refers exactly to the current physical event
 };
 struct BackendBatch {
   enum class Disposition { Consumed, Forward, Reject };

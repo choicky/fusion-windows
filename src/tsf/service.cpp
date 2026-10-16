@@ -71,6 +71,31 @@ std::string narrow(const std::wstring &text) {
     return {};
   return result;
 }
+KeyAction physical_key(WPARAM vk, LPARAM scan) {
+  const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  const bool win = (GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000);
+#ifndef FUSION_WITH_FCITX5
+  (void)scan;
+  return classify_key(static_cast<std::uint32_t>(vk), ctrl, alt, win);
+#else
+  BYTE state[256]{};
+  wchar_t text[8]{};
+  char32_t character = 0;
+  if (GetKeyboardState(state)) {
+    // Flag 4 leaves the keyboard dead-key state untouched (Windows 10 1607+).
+    const int count = ToUnicodeEx(static_cast<UINT>(vk), static_cast<UINT>((scan >> 16) & 0xff),
+                                  state, text, 8, 4, GetKeyboardLayout(0));
+    if (count == 1 && !(text[0] >= 0xd800 && text[0] <= 0xdfff))
+      character = text[0];
+    else if (count == 2 && text[0] >= 0xd800 && text[0] <= 0xdbff && text[1] >= 0xdc00 &&
+             text[1] <= 0xdfff)
+      character = 0x10000u + ((text[0] - 0xd800u) << 10) + text[1] - 0xdc00u;
+  }
+  return translate_key(static_cast<std::uint32_t>(vk), ctrl, alt, win, character,
+                       (state[VK_SHIFT] & 0x80) != 0, (state[VK_CAPITAL] & 1) != 0);
+#endif
+}
 const char *route_name(SemanticDecision::Route route) {
   switch (route) {
   case SemanticDecision::Route::Pass:
@@ -250,6 +275,46 @@ private:
   std::wstring text_;
 };
 
+// A thin execution opportunity for the original ordered frontend callbacks.
+// Core retains all causal/terminal accounting; this session adds no ledger.
+class FrontendEditSession final : public ITfEditSession {
+public:
+  FrontendEditSession(TextService &service, ContextEntry &entry)
+      : service_(service), hold_(service.hold_entry(&entry)), generation_(entry.generation) {
+    service_.AddRef();
+  }
+  ~FrontendEditSession() { service_.Release(); }
+  STDMETHODIMP QueryInterface(REFIID iid, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (iid != IID_IUnknown && iid != IID_ITfEditSession)
+      return E_NOINTERFACE;
+    *out = static_cast<ITfEditSession *>(this);
+    AddRef();
+    return S_OK;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const auto refs = --refs_;
+    if (!refs)
+      delete this;
+    return refs;
+  }
+  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+    auto *entry = service_.find_entry_alive(hold_.get(), generation_);
+    if (entry && !entry->cleanup.pending())
+      service_.apply_frontend(*entry, ec);
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> refs_{1};
+  TextService &service_;
+  std::shared_ptr<ContextEntry> hold_;
+  std::uint64_t generation_;
+};
+
 class CleanupEditSession final : public ITfEditSession {
 public:
   CleanupEditSession(TextService &service, ContextEntry &entry, std::uint64_t generation)
@@ -365,6 +430,11 @@ public:
     if (entry->cleanup.pending()) {
       service_->note_async_done(*entry, false);
       service_->schedule_cleanup(*entry);
+      return S_OK;
+    }
+    if (entry->semantic.real_frontend()) {
+      const bool progress = service_->apply_frontend(*entry, ec);
+      service_->note_async_done(*entry, progress);
       return S_OK;
     }
     const auto &pending = entry->semantic.pending();
@@ -572,7 +642,7 @@ STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
 
 STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lparam,
                                         BOOL *pfEaten) {
-  // Prediction only: no semantic state/ownership transition in the T callback.
+  // Eligibility only: no engine consumption prediction or dispatch in T.
   // Applications which consult T must receive TRUE to subsequently route K.
   (void)lparam;
   if (pfEaten == nullptr)
@@ -589,14 +659,11 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   ContextEntry *entry = resolve_or_create_entry(pic);
   if (!entry)
     return S_OK;
-  const auto action =
-      classify_key(static_cast<std::uint32_t>(wparam), (GetKeyState(VK_CONTROL) & 0x8000) != 0,
-                   (GetKeyState(VK_MENU) & 0x8000) != 0,
-                   (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0);
-  const bool mapped = entry->semantic.predicts_owned(action);
+  const auto action = physical_key(wparam, lparam);
+  const bool mapped = entry->semantic.routes_key(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
-  diagf("TEST_KEY", "vk=0x%03llX predicted=%d", static_cast<unsigned long long>(wparam), *pfEaten);
+  diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);
   return S_OK;
 }
 
@@ -668,7 +735,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
   const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
   const bool win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
-  const KeyAction action = classify_key(static_cast<std::uint32_t>(wparam), ctrl, alt, win);
+  const KeyAction action = physical_key(wparam, lparam);
   diag_key_arrival(pic, wparam, entry->semantic.context_id());
   diagf("CLASSIFY", "type=%d policy=%d ctrl=%d alt=%d win=%d", static_cast<int>(action.type),
         policy_allows ? 1 : 0, ctrl ? 1 : 0, alt ? 1 : 0, win ? 1 : 0);
@@ -695,6 +762,39 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   if (decision.backend_session_id)
     diagf("FCITX_BATCH", "session=%" PRIu64 " stimulus=%" PRIu64 " ops=%zu",
           decision.backend_session_id, decision.stimulus_id, decision.operation_count);
+  if (entry->semantic.real_frontend() && decision.route != SemanticDecision::Route::FailOpen &&
+      decision.route != SemanticDecision::Route::CancelledRecovery) {
+    for (const auto &work : decision.frontend) {
+      if (GetEnvironmentVariableW(L"FUSION_TSF_FRONTEND_TRACE", nullptr, 0))
+        diagf("FRONTEND_OP", "stimulus=%" PRIu64 " seq=%" PRIu64 " type=%d text=%s",
+              decision.stimulus_id, work.key.sequence, static_cast<int>(work.operation.type),
+              work.operation.text.c_str());
+      if (work.operation.type == BackendOperation::Type::CommitText)
+        entry->semantic.enqueue_effect(work.key, work.operation.text);
+      else
+        entry->semantic.enqueue_state(work.key, work.operation.text);
+    }
+    if (!entry->semantic.pending().empty()) {
+      auto *session = new FrontendEditSession(*this, *entry);
+      HRESULT outer = E_FAIL, inner = E_FAIL;
+      request_sync_session(*entry, session, outer, inner);
+      session->Release();
+      schedule_async_pump(*entry);
+    }
+    if (decision.forward) {
+      // Only the original physical key passes naturally, after its preceding
+      // callbacks and prior effects have actually settled. No replay.
+      if (entry->semantic.pending().empty() && entry->semantic.finish_pass())
+        *pfEaten = FALSE;
+      else
+        cancel_current_key(*entry, pfEaten);
+    } else {
+      *pfEaten = TRUE;
+    }
+    entry->semantic.retire_terminals();
+    handling_key_ = false;
+    return S_OK;
+  }
   switch (decision.route) {
   case SemanticDecision::Route::Pass:
     handle_pass_key(*entry, decision, pfEaten);
@@ -1134,7 +1234,46 @@ void TextService::note_async_done(ContextEntry &entry, bool progress) {
 // Key routing
 // ---------------------------------------------------------------------------
 
+bool TextService::apply_frontend(ContextEntry &entry, TfEditCookie ec) {
+  bool progress = false;
+  // The callback bound also bounds one execution opportunity. Stop at the first
+  // refusal/uncertainty: later callbacks must never overtake it.
+  for (unsigned count = 0; count < frontend_operation_bound && !entry.semantic.pending().empty();
+       ++count) {
+    const PendingWork work = entry.semantic.pending().front();
+    bool mutated = false;
+    EditResult observed;
+    if (work.kind == Kind::Effect) {
+      auto ticket = entry.semantic.open_effect(work.key);
+      if (!ticket)
+        break;
+      observed = apply_effect_text(entry, ec, widen(work.text), mutated);
+      entry.semantic.settle_effect(*ticket, observed);
+    } else {
+      if (!entry.semantic.state_applicable(work.key))
+        break;
+      observed = apply_state_text(entry, ec, widen(work.text), mutated);
+      entry.semantic.settle_front_state(work.key, observed);
+    }
+    if (GetEnvironmentVariableW(L"FUSION_TSF_FRONTEND_TRACE", nullptr, 0))
+      diagf("FRONTEND_SETTLE", "seq=%" PRIu64 " observed=%d mutated=%d", work.key.sequence,
+            static_cast<int>(observed), mutated ? 1 : 0);
+    if (observed != EditResult::AppliedReadback)
+      break;
+    progress = true;
+  }
+  return progress;
+}
+
 void TextService::drain_prior_effect(ContextEntry &entry) {
+  if (entry.semantic.real_frontend() && !entry.semantic.pending().empty()) {
+    auto *session = new FrontendEditSession(*this, entry);
+    HRESULT outer = E_FAIL, inner = E_FAIL;
+    request_sync_session(entry, session, outer, inner);
+    session->Release();
+    schedule_async_pump(entry);
+    return;
+  }
   const fusion::Pass probe = entry.semantic.pass_probe();
   if (probe != fusion::Pass::Clear) {
     if (probe == fusion::Pass::DrainRequired) {
