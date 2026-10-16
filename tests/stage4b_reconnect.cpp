@@ -1405,25 +1405,48 @@ void test_silent_death_sequence() {
   require(visible.rfind("n", 0) == 0, "the application received the forwarded prefix");
   require(visible.size() > 1, "the new incarnation committed the remaining input");
 
-  // Phase 2: the operationally correct sequence. One non-text key first detects
-  // the silent death (it is lawfully forwarded and has no visible effect), and the
-  // following composition is then complete and commits exactly 你好.
+  // Phase 2: the operational sequence that actually re-establishes the link. A
+  // silent death is learned from the first operation, which is therefore forwarded;
+  // only the NEXT operation reconnects. One key can never both detect and
+  // re-establish, so an expectation of reconnection after a single key is wrong.
   host.kill();
   require(wait_until([&] { return !host.running(); }, kWait), "silentdeath host terminated again");
   require(host.start(), "silentdeath host restarted again");
   require(wait_for_host_pipe(name, kWait), "the restarted host listens again");
 
-  const SemanticDecision prime =
-      controller->begin_key(translate_key(kVkEscape, false, false, false), true);
-  require(prime.forward && !prime.eaten && prime.frontend.empty(),
-          "the detection key is forwarded with no semantic work");
-  const std::uint64_t incarnation_after_prime = client.incarnation();
-  require(incarnation_after_prime != incarnation_before, "the detection key re-established a link");
+  const std::uint64_t incarnation_stale = client.incarnation();
+  const std::uint64_t generation_stale = client.link_status().connection_generation;
+
+  const SemanticDecision detect = controller->begin_key(space_key(), true);
+  std::printf("  [detection key] route=%d eaten=%d forward=%d ops=%zu link_state=%d\n",
+              static_cast<int>(detect.route), detect.eaten ? 1 : 0, detect.forward ? 1 : 0,
+              detect.operation_count, static_cast<int>(client.link_status().state));
+  require(detect.forward && !detect.eaten, "the detection key is forwarded to the application");
+  require(detect.operation_count == 0, "the detection key produced no engine callback");
+  require(client.link_status().state == LinkState::Disconnected, "detection drops the dead link");
+  require(client.incarnation() == incarnation_stale, "detection alone does not reconnect");
+  require(!controller->semantic_ready(), "detection alone is not semantic readiness");
+
+  const SemanticDecision reestablish = controller->begin_key(space_key(), true);
+  std::printf("  [reconnect key] route=%d eaten=%d forward=%d ops=%zu link_state=%d\n",
+              static_cast<int>(reestablish.route), reestablish.eaten ? 1 : 0,
+              reestablish.forward ? 1 : 0, reestablish.operation_count,
+              static_cast<int>(client.link_status().state));
+  // The engine may answer a forwarded key with no callback at all (a Space with an
+  // empty preedit is disposition Forward with zero operations), so the reconnect is
+  // asserted on the link identity, and the functional proof is the complete
+  // composition traced below.
+  require(client.link_status().state == LinkState::Established, "the next key reconnects");
+  require(client.incarnation() != incarnation_stale, "a new incarnation is established");
+  require(client.link_status().connection_generation == generation_stale + 1,
+          "exactly one new connection generation");
+  require(controller->semantic_ready(), "semantic readiness is re-established");
+  (void)settle_frontend(*controller, reestablish);
 
   std::string visible_primed;
   const std::vector<KeyTrace> primed = trace_nihao_and_commit(*controller, visible_primed);
-  print_traces("silentdeath: one detection key first, then type", primed, visible_primed);
-  require(!primed.front().forward, "after detection the first key reaches the engine");
+  print_traces("silentdeath: detected, then re-established, then type", primed, visible_primed);
+  require(!primed.front().forward, "after re-establishment the first key reaches the engine");
   require(visible_primed == "你好",
           "with the link re-established the composition commits exactly 你好");
 
