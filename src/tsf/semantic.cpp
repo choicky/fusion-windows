@@ -176,11 +176,20 @@ void SemanticController::fence_previous_incarnation() {
   state_dependency_ = 0;
   // A deferred reset intent belonged to the connection that is gone.
   backend_reset_pending_ = false;
+  // The previous incarnation's candidate page is not the new one's projection;
+  // it must not be displayed or acted on after the link moved.
+  clear_displayed_page();
   // Deliberately NOT cleared: Core records, uncertainty and the pending
   // materialization queue. An unresolved/indeterminate EFFECT stays owned and
   // auditable (P0-A/P0-B), and a callback that was received but never issued to
   // the document is still owed to the document authority. Neither is replayed
   // against the new incarnation.
+}
+
+void SemanticController::clear_displayed_page() {
+  displayed_page_.reset();
+  displayed_fence_ = PageFence{};
+  page_present_ = false;
 }
 
 bool SemanticController::ensure_semantic_ready() {
@@ -284,19 +293,95 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
-  const auto batch = real_backend_->send(stimulus);
   decision.symbolic = "fcitx:" + std::to_string(stimulus.keysym);
+  dispatch_real(stimulus, decision);
+  return decision;
+}
+
+SemanticDecision SemanticController::begin_candidate_action(CandidateAction action,
+                                                            std::int32_t index) {
+  SemanticDecision decision;
+  // Candidate actions exist only on the real frontend: the Mock Backend has no
+  // candidate list, so there is nothing to project and nothing to select.
+  if (!real_backend_) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  if (!ensure_semantic_ready()) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  if (backend_reset_pending_) {
+    backend_ready_ = real_backend_->reset(core_.binding());
+    backend_reset_pending_ = false;
+  }
+  if (!backend_ready_ || !real_backend_->healthy()) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  // A candidate action is meaningful only against a currently displayed page. The
+  // fence guard rejects a page whose dispatch identity no longer matches the live
+  // session/binding/incarnation/connection, so a stale page is never acted on.
+  if (!page_present_) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  const LinkStatus link = real_backend_->link_status();
+  if (displayed_fence_.backend_session_id != real_backend_->session_id() ||
+      displayed_fence_.binding != core_.binding() ||
+      displayed_fence_.host_incarnation != link.host_incarnation ||
+      displayed_fence_.connection_generation != link.connection_generation) {
+    clear_displayed_page();
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  // The engine re-checks bounds against its current list; this rejects a hit
+  // outside the page the user was actually shown before the stimulus is sent.
+  if (action == CandidateAction::Select &&
+      (index < 0 || static_cast<std::size_t>(index) >= displayed_page_->entries.size())) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  retire_terminals();
+  constexpr std::size_t callback_bound = frontend_operation_bound;
+  if (core_.records().size() + callback_bound + recovery_reserve_ > core_.capacity() ||
+      core_.probe_pass() == Pass::RecoveryRequired) {
+    decision.route = SemanticDecision::Route::FailOpen;
+    return decision;
+  }
+  BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  switch (action) {
+  case CandidateAction::Select:
+    stimulus.type = BackendStimulus::Type::SelectCandidate;
+    stimulus.candidate_index = index;
+    break;
+  case CandidateAction::PageNext:
+    stimulus.type = BackendStimulus::Type::PageNext;
+    break;
+  case CandidateAction::PagePrev:
+    stimulus.type = BackendStimulus::Type::PagePrev;
+    break;
+  }
+  // A non-key stimulus carries no key identity: keysym and modifiers stay zero.
+  decision.symbolic = "candidate-action";
+  dispatch_real(stimulus, decision);
+  return decision;
+}
+
+void SemanticController::dispatch_real(const BackendStimulus &stimulus,
+                                       SemanticDecision &decision) {
+  const auto batch = real_backend_->send(stimulus);
   decision.backend_session_id = batch.backend_session_id;
   decision.stimulus_id = batch.stimulus_id;
   decision.operation_count = batch.operations.size();
   bool valid = batch.backend_session_id == real_backend_->session_id() &&
                batch.binding == stimulus.binding && batch.stimulus_id == stimulus.stimulus_id &&
                batch.disposition != BackendBatch::Disposition::Reject &&
-               batch.operations.size() <= callback_bound;
+               batch.operations.size() <= frontend_operation_bound;
   bool original_forward = false;
   for (const auto &operation : batch.operations) {
     if (operation.type == BackendOperation::Type::CandidateSnapshot)
-      continue;
+      continue; // presentation projection, not a document callback
     if (original_forward)
       valid = false; // no callback may follow the natural key
     if (operation.type == BackendOperation::Type::ForwardKey) {
@@ -312,14 +397,19 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     backend_ready_ = real_backend_->reset(core_.binding());
     buffer_.clear();
     state_dependency_ = 0;
-    return decision;
+    clear_displayed_page();
+    return;
   }
   decision.forward = original_forward || batch.disposition == BackendBatch::Disposition::Forward;
   decision.eaten = !decision.forward;
+  std::optional<CandidatePage> captured;
   for (const auto &operation : batch.operations) {
-    if (operation.type == BackendOperation::Type::CandidateSnapshot ||
-        operation.type == BackendOperation::Type::ForwardKey)
-      continue; // retained by BackendBatch; Stage 3B has no candidate renderer
+    if (operation.type == BackendOperation::Type::CandidateSnapshot) {
+      captured = operation.page; // the page as of this dispatch; last snapshot wins
+      continue;
+    }
+    if (operation.type == BackendOperation::Type::ForwardKey)
+      continue; // the natural key is answered by the route, not a record
     const bool effect = operation.type == BackendOperation::Type::CommitText;
     auto key = core_.own(effect ? Kind::Effect : Kind::State, true);
     if (!key) { // reserved capacity and readiness were checked before dispatch
@@ -329,7 +419,8 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
         (void)host_.cancel(work.key);
       decision.frontend.clear();
       backend_ready_ = real_backend_->reset(core_.binding());
-      return decision;
+      clear_displayed_page();
+      return;
     }
     decision.frontend.push_back({operation, *key});
     if (effect) {
@@ -341,6 +432,17 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
       buffer_ = operation.text;
     }
   }
+  // Update the candidate projection only after the batch passed validation and
+  // its records were admitted: a rejected dispatch must not resurrect a page. An
+  // empty page is the hide signal — present in the decision, absent in the fence.
+  if (captured) {
+    decision.page = captured;
+    const LinkStatus link = real_backend_->link_status();
+    page_present_ = !captured->empty();
+    displayed_page_ = page_present_ ? captured : std::nullopt;
+    displayed_fence_ = PageFence{batch.backend_session_id, stimulus.binding, batch.stimulus_id,
+                                 link.host_incarnation, link.connection_generation};
+  }
   if (decision.frontend.empty()) {
     if (!decision.forward) {
       // Consumed without a document callback still receives an explicit terminal.
@@ -350,7 +452,7 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     }
     decision.route =
         decision.forward ? SemanticDecision::Route::Pass : SemanticDecision::Route::State;
-    return decision;
+    return;
   }
   const auto &first = decision.frontend.front();
   decision.key = first.key;
@@ -360,7 +462,6 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
                        : SemanticDecision::Route::State;
   decision.intent =
       decision.route == SemanticDecision::Route::Effect ? Intent::Commit : Intent::Preedit;
-  return decision;
 }
 
 Result SemanticController::propose_effect(Key key) {
@@ -535,6 +636,9 @@ void SemanticController::note_composition_terminated() {
     backend_reset_pending_ = true; // defer Host work until outside EditSession
   buffer_.clear();
   state_dependency_ = 0;
+  // External termination removed the composition the candidates belonged to; the
+  // projected page is no longer current and must not be shown or acted on.
+  clear_displayed_page();
   // External termination is an authority event: queued work reaches explicit
   // terminals (cancel), never a silent drop.
   std::vector<PendingWork> queued = std::move(pending_);
@@ -569,6 +673,7 @@ Result SemanticController::replace_context(std::uint64_t context_id) {
     state_dependency_ = 0;
     buffer_.clear();
     clear_pending();
+    clear_displayed_page();
   }
   return result;
 }
@@ -583,6 +688,7 @@ void SemanticController::destroy() {
   core_.destroy_context();
   buffer_.clear();
   clear_pending();
+  clear_displayed_page();
 }
 
 } // namespace fusion::tsf

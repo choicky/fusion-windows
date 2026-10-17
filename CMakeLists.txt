@@ -38,6 +38,7 @@ if(WIN32 AND MSVC)
     src/tsf/key_map.cpp
     src/tsf/diag.cpp
     src/tsf/semantic.cpp
+    src/tsf/candidate_view.cpp
     src/tsf/service.cpp
     src/tsf/register.cpp
     src/tsf/dll.cpp
@@ -48,7 +49,7 @@ if(WIN32 AND MSVC)
   set_target_properties(FusionTsf PROPERTIES CXX_EXTENSIONS OFF)
   target_compile_options(FusionTsf PRIVATE /W4 /WX /utf-8)
   target_compile_definitions(FusionTsf PRIVATE UNICODE _UNICODE)
-  target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
+  target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32 gdi32)
   if(FUSION_WITH_FCITX5)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
     # Client side only: the TSF DLL never hosts a pipe server.
@@ -212,6 +213,37 @@ if(BUILD_TESTING)
                identity_across_focus context_isolation)
     add_test(NAME tsf_lifecycle_${test} COMMAND tsf_lifecycle ${test})
   endforeach()
+  # Stage 5 candidate projection/action decisions are platform-free controller
+  # logic (the Win32 surface is smoke-tested on the real product path), so they
+  # build with the same portable sources as tsf_lifecycle.
+  add_executable(stage5_candidates tests/stage5_candidates.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+  target_link_libraries(stage5_candidates PRIVATE MockBackend FusionMock)
+  target_include_directories(stage5_candidates PRIVATE src)
+  if(MSVC)
+    target_compile_options(stage5_candidates PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(stage5_candidates PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  foreach(test page select refuse paging truncation focus)
+    add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
+  endforeach()
+  # Blocker-1 regression: the extracted candidate projection driven against the
+  # real Fcitx5 engine (system libraries). Non-Windows only, and registered
+  # only when Fcitx5 development libraries are found; the Windows build already
+  # compiles the same source into FusionHost.exe and smoke-tests it on the
+  # product path, so the pinned Windows topology is not perturbed here.
+  if(NOT WIN32)
+    find_package(Fcitx5Core QUIET CONFIG)
+    if(Fcitx5Core_FOUND)
+      add_executable(fcitx_candidate_filter
+        tests/fcitx_candidate_filter.cpp src/fcitx/candidate_projection.cpp)
+      target_include_directories(fcitx_candidate_filter PRIVATE src include)
+      target_link_libraries(fcitx_candidate_filter PRIVATE Fcitx5::Core)
+      target_compile_features(fcitx_candidate_filter PRIVATE cxx_std_20)
+      target_compile_options(fcitx_candidate_filter PRIVATE -Wall -Wextra -Wpedantic -Werror)
+      add_test(NAME fcitx_candidate_filter COMMAND fcitx_candidate_filter)
+    endif()
+  endif()
   foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference)
     add_test(NAME rg0_${test} COMMAND rg0 ${test})
   endforeach()

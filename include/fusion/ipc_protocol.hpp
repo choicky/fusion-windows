@@ -22,6 +22,15 @@
 // pipe instance is served by exactly one Host process incarnation.
 // `protocol_version` was raised 1 -> 2 for this envelope so an old/new pairing
 // fails the handshake instead of misparsing.
+//
+// Stage 5 raised it 2 -> 3: BackendStimulus gained the non-key candidate action
+// types plus a page-local index, and CandidateSnapshot's payload became a
+// CandidatePage (labelled entries + page-local cursor + pager truth) instead of a
+// flat string list. Same framing, same Send/Batch channel, same fencing — there is
+// no candidate-specific transport — but the payload shape changed, so a mixed
+// Stage 4B/Stage 5 pairing must fail the handshake rather than misparse it.
+// The numbers below remain engineering constants: D072 keeps wire format and
+// numerical thresholds UNFROZEN.
 
 #include "fusion/backend.hpp"
 #include "fusion/core.hpp"
@@ -35,7 +44,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 2;
+inline constexpr std::uint32_t protocol_version = 3;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -162,6 +171,7 @@ inline void serialize(std::vector<std::uint8_t> &buf, const BackendStimulus &s) 
   detail::write_u8(buf, static_cast<std::uint8_t>(s.character));
   detail::write_u32(buf, s.keysym);
   detail::write_u32(buf, s.modifiers);
+  detail::write_u32(buf, static_cast<std::uint32_t>(s.candidate_index));
 }
 
 inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *data,
@@ -173,26 +183,113 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
   auto character = r.read_u8();
   auto keysym = r.read_u32();
   auto modifiers = r.read_u32();
-  if (!binding || !stimulus_id || !type_byte || !character || !keysym || !modifiers || !r.at_end())
+  auto index_bits = r.read_u32();
+  if (!binding || !stimulus_id || !type_byte || !character || !keysym || !modifiers ||
+      !index_bits || !r.at_end())
     return std::nullopt;
-  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::Return))
+  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::PagePrev))
     return std::nullopt;
+  const auto type = static_cast<BackendStimulus::Type>(*type_byte);
+  const auto index = static_cast<std::int32_t>(*index_bits);
+  // Fail closed on an index that cannot address a page slot, and on a key
+  // stimulus that claims one.
+  if (type == BackendStimulus::Type::SelectCandidate) {
+    if (index < 0 || static_cast<std::size_t>(index) >= max_vector_length)
+      return std::nullopt;
+  } else if (index != -1) {
+    return std::nullopt;
+  }
   BackendStimulus s;
   s.binding = *binding;
   s.stimulus_id = *stimulus_id;
-  s.type = static_cast<BackendStimulus::Type>(*type_byte);
+  s.type = type;
   s.character = static_cast<char>(*character);
   s.keysym = *keysym;
   s.modifiers = *modifiers;
+  s.candidate_index = index;
   return s;
+}
+
+inline void serialize(std::vector<std::uint8_t> &buf, const CandidateEntry &entry) {
+  detail::write_string(buf, entry.label);
+  detail::write_string(buf, entry.text);
+  detail::write_string(buf, entry.comment);
+  detail::write_u8(buf, entry.placeholder ? 1 : 0);
+}
+
+inline std::optional<CandidateEntry> deserialize_entry(detail::Reader &r) {
+  auto label = r.read_string();
+  auto text = r.read_string();
+  auto comment = r.read_string();
+  auto placeholder = r.read_u8();
+  if (!label || !text || !comment || !placeholder)
+    return std::nullopt;
+  CandidateEntry entry;
+  entry.label = std::move(*label);
+  entry.text = std::move(*text);
+  entry.comment = std::move(*comment);
+  entry.placeholder = *placeholder != 0;
+  return entry;
+}
+
+inline void serialize(std::vector<std::uint8_t> &buf, const CandidatePage &page) {
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.entries.size()));
+  for (const auto &entry : page.entries)
+    serialize(buf, entry);
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.cursor_index));
+  detail::write_u8(buf, static_cast<std::uint8_t>(page.layout));
+  detail::write_u8(buf, page.has_prev ? 1 : 0);
+  detail::write_u8(buf, page.has_next ? 1 : 0);
+  detail::write_u8(buf, page.truncated ? 1 : 0);
+}
+
+inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
+  auto count = r.read_u32();
+  if (!count || *count > max_vector_length)
+    return std::nullopt;
+  CandidatePage page;
+  page.entries.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto entry = deserialize_entry(r);
+    if (!entry)
+      return std::nullopt;
+    page.entries.push_back(std::move(*entry));
+  }
+  auto cursor_bits = r.read_u32();
+  auto layout = r.read_u8();
+  auto has_prev = r.read_u8();
+  auto has_next = r.read_u8();
+  auto truncated = r.read_u8();
+  if (!cursor_bits || !layout || !has_prev || !has_next || !truncated)
+    return std::nullopt;
+  if (*layout > static_cast<std::uint8_t>(CandidateLayout::Horizontal))
+    return std::nullopt;
+  const auto cursor = static_cast<std::int32_t>(*cursor_bits);
+  // -1 (nothing highlighted) is the only legal negative value.
+  if (cursor < -1 ||
+      (!page.entries.empty() && cursor >= static_cast<std::int32_t>(page.entries.size())))
+    return std::nullopt;
+  if (page.entries.empty() && cursor >= 0)
+    return std::nullopt;
+  page.cursor_index = cursor;
+  page.layout = static_cast<CandidateLayout>(*layout);
+  page.has_prev = *has_prev != 0;
+  page.has_next = *has_next != 0;
+  page.truncated = *truncated != 0;
+  return page;
 }
 
 inline void serialize(std::vector<std::uint8_t> &buf, const BackendOperation &op) {
   detail::write_u8(buf, static_cast<std::uint8_t>(op.type));
   detail::write_string(buf, op.text);
-  detail::write_u32(buf, static_cast<std::uint32_t>(op.candidates.size()));
-  for (const auto &c : op.candidates)
-    detail::write_string(buf, c);
+  // The page is only present for CandidateSnapshot, so the reader knows the shape
+  // from the type byte alone.
+  if (op.type == BackendOperation::Type::CandidateSnapshot) {
+    if (op.page)
+      serialize(buf, *op.page);
+    else
+      serialize(buf, CandidatePage{});
+  }
   detail::write_u8(buf, op.original_key ? 1 : 0);
 }
 
@@ -201,16 +298,14 @@ inline std::optional<BackendOperation> deserialize_operation(detail::Reader &r) 
   if (!type_byte || *type_byte > static_cast<std::uint8_t>(BackendOperation::Type::ForwardKey))
     return std::nullopt;
   auto text = r.read_string();
-  auto cand_count = r.read_u32();
-  if (!text || !cand_count || *cand_count > max_vector_length)
+  if (!text)
     return std::nullopt;
-  std::vector<std::string> candidates;
-  candidates.reserve(*cand_count);
-  for (std::uint32_t i = 0; i < *cand_count; ++i) {
-    auto c = r.read_string();
-    if (!c)
+  std::optional<CandidatePage> page;
+  if (*type_byte == static_cast<std::uint8_t>(BackendOperation::Type::CandidateSnapshot)) {
+    auto parsed = deserialize_page(r);
+    if (!parsed)
       return std::nullopt;
-    candidates.push_back(std::move(*c));
+    page = std::move(*parsed);
   }
   auto original_key = r.read_u8();
   if (!original_key)
@@ -218,7 +313,7 @@ inline std::optional<BackendOperation> deserialize_operation(detail::Reader &r) 
   BackendOperation op;
   op.type = static_cast<BackendOperation::Type>(*type_byte);
   op.text = std::move(*text);
-  op.candidates = std::move(candidates);
+  op.page = std::move(page);
   op.original_key = *original_key != 0;
   return op;
 }
