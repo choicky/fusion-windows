@@ -231,10 +231,14 @@ bool SemanticController::ensure_semantic_ready() {
 }
 
 bool SemanticController::routes_key(const KeyAction &action) const {
+  // Key-class eligibility only. Readiness is deliberately not part of it: it is
+  // re-established (reconnect + rebind) only on the K path, and an application
+  // that consults T skips K after a FALSE, so a readiness term here would leave a
+  // non-ready context unrecoverable in such applications. K still requires
+  // readiness before admission and fails open without it.
   if (real_backend_)
-    return semantic_ready() && real_backend_->healthy() && !action.modified &&
-           (action.keysym != 0 || action.type != KeyAction::Type::Pass ||
-            action.virtual_key == kVkReturn);
+    return !action.modified && (action.keysym != 0 || action.type != KeyAction::Type::Pass ||
+                                action.virtual_key == kVkReturn);
   return action.type == KeyAction::Type::AppendChar ||
          (action.type != KeyAction::Type::Pass && !buffer_.empty());
 }
