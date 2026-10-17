@@ -15,6 +15,7 @@
 // whatever remained unresolved.
 
 #include "mock_backend.hpp"
+#include "tsf/candidate_view.hpp"
 #include "tsf/com_ptr.hpp"
 #include "tsf/lifecycle.hpp"
 #include "tsf/orchestration.hpp"
@@ -65,6 +66,14 @@ struct ContextEntry {
 
   ContextEntry(std::uint64_t context_id, std::size_t capacity, ServiceBackend &backend,
                ITfDocumentMgr *dim, ITfContext *pic);
+
+  // Stage 5 candidate presentation. Real frontend only: the view is created
+  // lazily when a non-empty page must be shown and hidden on an empty page or a
+  // fenced projection. candidate_anchor remembers the last caret position the
+  // read-only probe resolved, so paging keeps the popup glued to the text.
+  std::unique_ptr<CandidateView> candidates;
+  POINT candidate_anchor{};
+  bool candidate_anchor_valid = false;
 };
 
 class TextService final : public ITfTextInputProcessor,
@@ -104,6 +113,12 @@ public:
   // ITfCompositionSink
   STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition *pComposition) override;
 
+  // Stage 5 candidate click entry point (called by CandidateView's window
+  // procedure). Validates the owning entry through the same stale-entry fence the
+  // edit sessions use, then dispatches the non-key action on the product path.
+  void on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,
+                        std::int32_t index);
+
   // --- internal API used by the edit-session objects ---
   ContextEntry *find_entry(ITfContext *pic);
   std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
@@ -136,6 +151,14 @@ public:
 private:
   ContextEntry *resolve_or_create_entry(ITfContext *pic);
   void handle_pass_key(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
+  // Shared real-frontend settlement for a key dispatch and a candidate click:
+  // enqueue the ordered callbacks, run one synchronous frontend session, apply the
+  // natural-forward/PASS answer when a physical key is present (pfEaten nullable).
+  void settle_frontend_work(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
+  // Show, reposition or hide the candidate surface from the controller projection.
+  void sync_candidate_view(ContextEntry &entry);
+  bool request_readonly_sync(ContextEntry &entry, ITfEditSession *session, HRESULT &outer,
+                             HRESULT &inner);
   void drain_prior_effect(ContextEntry &entry);
   void cancel_current_key(ContextEntry &entry, BOOL *pfEaten);
   void handle_owned_state(ContextEntry &entry, const SemanticDecision &decision);

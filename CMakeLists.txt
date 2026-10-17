@@ -38,6 +38,7 @@ if(WIN32 AND MSVC)
     src/tsf/key_map.cpp
     src/tsf/diag.cpp
     src/tsf/semantic.cpp
+    src/tsf/candidate_view.cpp
     src/tsf/service.cpp
     src/tsf/register.cpp
     src/tsf/dll.cpp
@@ -48,7 +49,7 @@ if(WIN32 AND MSVC)
   set_target_properties(FusionTsf PROPERTIES CXX_EXTENSIONS OFF)
   target_compile_options(FusionTsf PRIVATE /W4 /WX /utf-8)
   target_compile_definitions(FusionTsf PRIVATE UNICODE _UNICODE)
-  target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32)
+  target_link_libraries(FusionTsf PRIVATE FusionCore MockBackend ole32 advapi32 user32 gdi32)
   if(FUSION_WITH_FCITX5)
     target_compile_definitions(FusionTsf PRIVATE FUSION_WITH_FCITX5)
     # Client side only: the TSF DLL never hosts a pipe server.
@@ -211,6 +212,20 @@ if(BUILD_TESTING)
   foreach(test obligation teardown_clean teardown_unresolved composition_terminated
                identity_across_focus context_isolation)
     add_test(NAME tsf_lifecycle_${test} COMMAND tsf_lifecycle ${test})
+  endforeach()
+  # Stage 5 candidate projection/action decisions are platform-free controller
+  # logic (the Win32 surface is smoke-tested on the real product path), so they
+  # build with the same portable sources as tsf_lifecycle.
+  add_executable(stage5_candidates tests/stage5_candidates.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+  target_link_libraries(stage5_candidates PRIVATE MockBackend FusionMock)
+  target_include_directories(stage5_candidates PRIVATE src)
+  if(MSVC)
+    target_compile_options(stage5_candidates PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(stage5_candidates PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  foreach(test page select refuse paging)
+    add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
   endforeach()
   foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference)
     add_test(NAME rg0_${test} COMMAND rg0 ${test})

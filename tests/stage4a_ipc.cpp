@@ -370,7 +370,7 @@ void test_protocol() {
     require(!decoded, "batch trailing byte rejected");
   }
 
-  // Batch with candidates
+  // Batch with a candidate page snapshot
   {
     BackendBatch batch;
     batch.backend_session_id = 1;
@@ -379,17 +379,73 @@ void test_protocol() {
     batch.disposition = BackendBatch::Disposition::Consumed;
     BackendOperation op;
     op.type = BackendOperation::Type::CandidateSnapshot;
-    op.text = "candidates";
-    op.candidates = {"a", "b", "c"};
+    CandidatePage page;
+    page.cursor_index = 1;
+    page.layout = CandidateLayout::Horizontal;
+    page.has_next = true;
+    CandidateEntry a;
+    a.label = "1";
+    a.text = "a";
+    CandidateEntry b;
+    b.label = "2";
+    b.text = "b";
+    b.comment = "cmt";
+    b.placeholder = true;
+    page.entries = {a, b};
+    op.page = page;
     batch.operations.push_back(op);
     std::vector<std::uint8_t> buf;
     serialize(buf, batch);
     auto decoded = deserialize_batch(buf.data(), buf.size());
-    require(decoded && decoded->operations.size() == 1 &&
-                decoded->operations[0].candidates.size() == 3 &&
-                decoded->operations[0].candidates[0] == "a" &&
-                decoded->operations[0].candidates[2] == "c",
-            "batch with candidates round-trip");
+    require(decoded && decoded->operations.size() == 1 && decoded->operations[0].page &&
+                decoded->operations[0].page->entries.size() == 2 &&
+                decoded->operations[0].page->entries[0].text == "a" &&
+                decoded->operations[0].page->entries[1].placeholder &&
+                decoded->operations[0].page->entries[1].comment == "cmt" &&
+                decoded->operations[0].page->cursor_index == 1 &&
+                decoded->operations[0].page->layout == CandidateLayout::Horizontal &&
+                decoded->operations[0].page->has_next,
+            "batch with candidate page round-trip");
+  }
+
+  // Malformed candidate page: cursor beyond the entry count is fail-closed.
+  {
+    std::vector<std::uint8_t> buf;
+    detail::write_u64(buf, 1); // session
+    detail::write_binding(buf, Binding{1, 1, 1});
+    detail::write_u64(buf, 1); // stimulus
+    detail::write_u8(buf, static_cast<std::uint8_t>(BackendBatch::Disposition::Consumed));
+    detail::write_u32(buf, 1); // one operation
+    detail::write_u8(buf, static_cast<std::uint8_t>(BackendOperation::Type::CandidateSnapshot));
+    detail::write_string(buf, std::string()); // op text
+    detail::write_u32(buf, 1);                // page entry count
+    detail::write_string(buf, "1");           // label
+    detail::write_string(buf, "x");           // text
+    detail::write_string(buf, "");            // comment
+    detail::write_u8(buf, 0);                 // placeholder
+    detail::write_u32(buf, 5);                // cursor_index 5 with 1 entry -> invalid
+    detail::write_u8(buf, 0);                 // layout
+    detail::write_u8(buf, 0);                 // has_prev
+    detail::write_u8(buf, 0);                 // has_next
+    detail::write_u8(buf, 0);                 // truncated
+    detail::write_u8(buf, 0);                 // original_key
+    auto decoded = deserialize_batch(buf.data(), buf.size());
+    require(!decoded, "candidate page cursor-out-of-range fail-closed");
+  }
+
+  // Key stimulus carrying a candidate index is fail-closed.
+  {
+    BackendStimulus s;
+    s.binding = {1, 1, 1};
+    s.stimulus_id = 1;
+    s.type = BackendStimulus::Type::Character;
+    s.character = 'a';
+    s.keysym = 0x61;
+    s.candidate_index = 3; // illegal for a key stimulus
+    std::vector<std::uint8_t> buf;
+    serialize(buf, s);
+    auto decoded = deserialize_stimulus(buf.data(), buf.size());
+    require(!decoded, "key stimulus with candidate index fail-closed");
   }
 
   // Bool round-trip
@@ -507,7 +563,8 @@ void test_protocol() {
 
   // Protocol version constant
   {
-    require(protocol_version == 2, "protocol_version is 2 (Stage 4B incarnation envelope)");
+    require(protocol_version == 3,
+            "protocol_version is 3 (Stage 5 candidate action/page payload shape)");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";
@@ -1423,6 +1480,55 @@ void test_integration() {
     }
   }
   require(committed == "你好", "integration nihao+space commit");
+
+  // Stage 5 discriminating real-engine evidence: start a fresh composition and
+  // select a projected candidate. The commit must be the candidate page's OWN
+  // text, proving selection goes through Backend::select() rather than a synthetic
+  // numeric candidate key, and that the real pinyin page survives the v3 IPC wire.
+  for (char c : std::string("nihao")) {
+    auto k = controller.begin_key(physical(c), true);
+    require(k.route != SemanticDecision::Route::CancelledRecovery,
+            "integration second-round pinyin key reached Fcitx");
+    for (const auto &work : k.frontend) {
+      if (work.operation.type == BackendOperation::Type::CommitText) {
+        auto ticket = controller.open_effect(work.key);
+        if (ticket)
+          controller.settle_effect(*ticket, EditResult::AppliedReadback);
+      } else if (work.operation.type == BackendOperation::Type::SetPreedit) {
+        controller.settle_state(work.key, EditResult::AppliedReadback);
+      }
+    }
+  }
+  const auto projected = controller.displayed_page();
+  require(projected.has_value() && !projected->entries.empty(),
+          "integration real engine projected a non-empty candidate page over IPC");
+  std::int32_t pick = -1;
+  std::string pick_text;
+  for (std::size_t i = 0; i < projected->entries.size(); ++i) {
+    if (projected->entries[i].placeholder || projected->entries[i].text.empty())
+      continue;
+    pick = static_cast<std::int32_t>(i);
+    pick_text = projected->entries[i].text;
+    break;
+  }
+  require(pick >= 0, "integration candidate page had a selectable entry");
+  auto sel = controller.begin_candidate_action(CandidateAction::Select, pick);
+  require(sel.route == SemanticDecision::Route::Effect,
+          "integration candidate select routed to an EFFECT");
+  std::string selected_commit;
+  for (const auto &work : sel.frontend) {
+    if (work.operation.type == BackendOperation::Type::CommitText) {
+      selected_commit += work.operation.text;
+      auto ticket = controller.open_effect(work.key);
+      require(ticket.has_value(), "integration candidate select EFFECT ticket");
+      controller.settle_effect(*ticket, EditResult::AppliedReadback);
+    } else if (work.operation.type == BackendOperation::Type::SetPreedit) {
+      controller.settle_state(work.key, EditResult::AppliedReadback);
+    }
+  }
+  require(!selected_commit.empty() && selected_commit == pick_text,
+          "integration candidate select committed the projected entry's own text");
+  std::cout << "PASS integration candidate select committed the projected candidate\n";
 
   controller.destroy();
   std::cout << "PASS integration with real Fcitx over IPC\n";

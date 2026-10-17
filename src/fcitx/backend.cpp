@@ -38,8 +38,19 @@ std::once_flag paths_initialized;
 constexpr std::size_t operation_bound = frontend_operation_bound;
 constexpr std::size_t payload_bound = 4096;
 constexpr std::size_t context_bound = 64;
+// Transport bounds for one candidate page, not a semantic page size: the visible
+// page width belongs to the engine (pinyin configures 7, constrained 3-10).
+// D072 keeps numerical thresholds OPEN, so these are engineering constants and
+// exceeding them is recorded by CandidatePage::truncated rather than hidden.
+constexpr std::size_t candidate_page_entries = 10;
+constexpr std::size_t candidate_page_bytes = 4096;
 // Engineering bounds for this PoC only; D072 numerical policy remains OPEN.
 constexpr auto request_wait = std::chrono::seconds(2);
+
+inline bool is_candidate_action(BackendStimulus::Type type) {
+  return type == BackendStimulus::Type::SelectCandidate ||
+         type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev;
+}
 
 class InputContext final : public fcitx::InputContext {
 public:
@@ -74,6 +85,95 @@ public:
       return;
     }
     batch->operations.push_back(std::move(operation));
+  }
+  // Pull the engine's current candidate page after a dispatch or a candidate
+  // action. The snapshot is always emitted — including an explicitly empty page —
+  // because Fcitx has no hide signal: the empty candidate slot of an updated panel
+  // IS the signal to close the presentation (InputPanel::empty()).
+  void observe_candidate_page() {
+    if (invalid)
+      return;
+    CandidatePage page;
+    auto list = inputPanel().candidateList();
+    if (list) {
+      page.cursor_index = list->cursorIndex();
+      page.layout = static_cast<CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint()));
+      if (auto *pager = list->toPageable()) {
+        page.has_prev = pager->hasPrev();
+        page.has_next = pager->hasNext();
+      }
+      const int visible = list->size();
+      std::size_t used = 0;
+      for (int index = 0; index < visible; ++index) {
+        if (page.entries.size() >= candidate_page_entries) {
+          page.truncated = true;
+          break;
+        }
+        const auto &word = list->candidate(index);
+        CandidateEntry entry;
+        entry.placeholder = word.isPlaceHolder();
+        entry.text = word.text().toString();
+        entry.comment = word.comment().toString();
+        // Labels are page-local and only padded to ten; an engine with a wider
+        // page has no label for the extra slots rather than a different candidate.
+        if (index < 10) {
+          entry.label = list->label(index).toString();
+        }
+        used += entry.label.size() + entry.text.size() + entry.comment.size();
+        if (used > candidate_page_bytes) {
+          page.truncated = true;
+          break;
+        }
+        for (const auto &field : {entry.label, entry.text, entry.comment}) {
+          if (!field.empty() && !fcitx::utf8::validate(field)) {
+            invalid = true;
+            return;
+          }
+          if (field.size() > payload_bound) {
+            invalid = true;
+            return;
+          }
+        }
+        page.entries.push_back(std::move(entry));
+      }
+    }
+    BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
+    operation.page = std::move(page);
+    observe(std::move(operation));
+  }
+  // Candidate actions are the engine's own operations, executed on the Fcitx
+  // thread against the *current* list. Index bounds are re-checked here because a
+  // page can be rebuilt by select() (partial selection replaces the list).
+  bool apply_candidate_action(const BackendStimulus &stimulus) {
+    auto list = inputPanel().candidateList();
+    if (!list)
+      return false;
+    switch (stimulus.type) {
+    case BackendStimulus::Type::SelectCandidate:
+      if (stimulus.candidate_index < 0 || stimulus.candidate_index >= list->size())
+        return false;
+      list->candidate(stimulus.candidate_index).select(this);
+      return true;
+    case BackendStimulus::Type::PageNext: {
+      auto *pager = list->toPageable();
+      if (!pager || !pager->hasNext())
+        return false;
+      pager->next();
+      // Fcitx paging emits no signal of its own; the UI re-read is the contract.
+      updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+      return true;
+    }
+    case BackendStimulus::Type::PagePrev: {
+      auto *pager = list->toPageable();
+      if (!pager || !pager->hasPrev())
+        return false;
+      pager->prev();
+      updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+      return true;
+    }
+    default:
+      return false;
+    }
   }
   fcitx::Key dispatched_key;
   Binding binding;
@@ -138,32 +238,30 @@ public:
           if (!context || context->invalid || stimulus.stimulus_id <= context->last_stimulus)
             return false;
           context->last_stimulus = stimulus.stimulus_id;
-          const auto name = key_name(stimulus);
           context->batch = output.get();
           try {
-            const auto key = stimulus.keysym
-                                 ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
-                                              fcitx::KeyStates(stimulus.modifiers))
-                                 : fcitx::Key(name);
-            context->dispatched_key = key;
-            fcitx::KeyEvent event(context, key, false);
-            const bool consumed = context->keyEvent(event);
-            output->disposition =
-                consumed ? BackendBatch::Disposition::Consumed : BackendBatch::Disposition::Forward;
-            if (auto list = context->inputPanel().candidateList()) {
-              BackendOperation snapshot{BackendOperation::Type::CandidateSnapshot};
-              // Snapshot only the visible page; no candidate ranking/paging implementation.
-              for (int index = 0; index < list->size() && index < 10; ++index) {
-                auto text = list->candidate(index).text().toString();
-                if ((!text.empty() && !fcitx::utf8::validate(text)) ||
-                    text.size() > payload_bound) {
-                  context->invalid = true;
-                  break;
-                }
-                snapshot.candidates.push_back(std::move(text));
+            if (is_candidate_action(stimulus.type)) {
+              // A non-key stimulus carries no key identity, so it is never a
+              // Forward: either the engine performed the operation, or nothing was
+              // admitted and the caller receives a Reject with an empty batch.
+              if (!context->apply_candidate_action(stimulus)) {
+                context->batch = nullptr;
+                return false;
               }
-              context->observe(std::move(snapshot));
+              output->disposition = BackendBatch::Disposition::Consumed;
+            } else {
+              const auto name = key_name(stimulus);
+              const auto key = stimulus.keysym
+                                   ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
+                                                fcitx::KeyStates(stimulus.modifiers))
+                                   : fcitx::Key(name);
+              context->dispatched_key = key;
+              fcitx::KeyEvent event(context, key, false);
+              const bool consumed = context->keyEvent(event);
+              output->disposition = consumed ? BackendBatch::Disposition::Consumed
+                                             : BackendBatch::Disposition::Forward;
             }
+            context->observe_candidate_page();
           } catch (...) {
             context->batch = nullptr;
             context->invalid = true;
@@ -189,6 +287,10 @@ private:
       return "Escape";
     case BackendStimulus::Type::Return:
       return "Return";
+    case BackendStimulus::Type::SelectCandidate:
+    case BackendStimulus::Type::PageNext:
+    case BackendStimulus::Type::PagePrev:
+      break; // not a key: apply_candidate_action handled it
     }
     throw std::runtime_error("unsupported backend stimulus");
   }

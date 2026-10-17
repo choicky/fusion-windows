@@ -482,6 +482,77 @@ private:
   std::uint64_t generation_;
 };
 
+// Read-only caret probe for the Stage 5 candidate surface. It resolves the live
+// composition range (or the default selection when no composition exists yet)
+// through ITfContextView and records the screen-space anchor on the entry. The
+// popup itself is positioned outside the session, where UI calls belong.
+class AnchorProbeSession final : public ITfEditSession {
+public:
+  AnchorProbeSession(TextService &service, ContextEntry &entry)
+      : service_(&service), entry_(&entry), generation_(entry.generation) {
+    hold_ = service.hold_entry(&entry);
+    service.AddRef();
+  }
+  ~AnchorProbeSession() { service_->Release(); }
+  AnchorProbeSession(const AnchorProbeSession &) = delete;
+  AnchorProbeSession &operator=(const AnchorProbeSession &) = delete;
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfEditSession)) {
+      *ppv = static_cast<ITfEditSession *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0)
+      delete this;
+    return count;
+  }
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+    ContextEntry *entry = service_->find_entry_alive(entry_, generation_);
+    if (entry == nullptr)
+      return S_OK;
+    entry->candidate_anchor_valid = false;
+    auto view = qi<ITfContextView>(entry->context, IID_ITfContextView);
+    if (!view)
+      return S_OK;
+    ComRef<ITfRange> range;
+    if (entry->composition != nullptr && SUCCEEDED(entry->composition->GetRange(range.out())) &&
+        range) {
+      // Composition range is the caret while preedit text is present.
+    } else {
+      TF_SELECTION selection{};
+      ULONG fetched = 0;
+      if (FAILED(entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) ||
+          fetched == 0 || selection.range == nullptr)
+        return S_OK;
+      range = ComRef<ITfRange>(selection.range); // takes over the GetSelection reference
+    }
+    RECT rect{};
+    BOOL at_start = FALSE;
+    if (FAILED(view->GetTextExt(ec, range.get(), &rect, &at_start)))
+      return S_OK;
+    entry->candidate_anchor = POINT{rect.right, rect.bottom};
+    entry->candidate_anchor_valid = true;
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> ref_count_{1};
+  std::shared_ptr<ContextEntry> hold_;
+  TextService *service_;
+  ContextEntry *entry_;
+  std::uint64_t generation_;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -652,8 +723,10 @@ void TextService::reconcile_context_teardown(ContextEntry &entry, const char *re
   const TeardownSummary summary =
       summarize_teardown(entry.semantic.core().records(), entry.semantic.pending().size());
   const std::uint64_t context_id = entry.semantic.context_id();
-  entry.semantic.destroy(); // unbind the Host context; Core::fence() -> explicit terminals
-  entry.generation++;       // late edit sessions / pumps can no longer match this entry
+  if (entry.candidates)
+    entry.candidates->hide(); // no candidate page survives its context teardown
+  entry.semantic.destroy();   // unbind the Host context; Core::fence() -> explicit terminals
+  entry.generation++;         // late edit sessions / pumps can no longer match this entry
   if (summary.needs_audit()) {
     ++unresolved_teardowns_;
     std::size_t fenced_uncertain = 0;
@@ -843,34 +916,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
           decision.backend_session_id, decision.stimulus_id, decision.operation_count);
   if (entry->semantic.real_frontend() && decision.route != SemanticDecision::Route::FailOpen &&
       decision.route != SemanticDecision::Route::CancelledRecovery) {
-    for (const auto &work : decision.frontend) {
-      if (GetEnvironmentVariableW(L"FUSION_TSF_FRONTEND_TRACE", nullptr, 0))
-        diagf("FRONTEND_OP", "stimulus=%" PRIu64 " seq=%" PRIu64 " type=%d text=%s",
-              decision.stimulus_id, work.key.sequence, static_cast<int>(work.operation.type),
-              work.operation.text.c_str());
-      if (work.operation.type == BackendOperation::Type::CommitText)
-        entry->semantic.enqueue_effect(work.key, work.operation.text);
-      else
-        entry->semantic.enqueue_state(work.key, work.operation.text);
-    }
-    if (!entry->semantic.pending().empty()) {
-      auto *session = new FrontendEditSession(*this, *entry);
-      HRESULT outer = E_FAIL, inner = E_FAIL;
-      request_sync_session(*entry, session, outer, inner);
-      session->Release();
-      schedule_async_pump(*entry);
-    }
-    if (decision.forward) {
-      // Only the original physical key passes naturally, after its preceding
-      // callbacks and prior effects have actually settled. No replay.
-      if (entry->semantic.pending().empty() && entry->semantic.finish_pass())
-        *pfEaten = FALSE;
-      else
-        cancel_current_key(*entry, pfEaten);
-    } else {
-      *pfEaten = TRUE;
-    }
-    entry->semantic.retire_terminals();
+    settle_frontend_work(*entry, decision, pfEaten);
+    sync_candidate_view(*entry);
     handling_key_ = false;
     return S_OK;
   }
@@ -901,6 +948,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
     *pfEaten = TRUE;
     break;
   }
+  if (entry->semantic.real_frontend())
+    sync_candidate_view(*entry); // a fenced/failed real dispatch hides a stale page
   entry->semantic.retire_terminals();
   handling_key_ = false;
   return S_OK;
@@ -1023,6 +1072,8 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
       // and pending work reaches explicit terminals, never silent loss.
       entry->composition->Release();
       entry->composition = nullptr;
+      if (entry->candidates)
+        entry->candidates->hide(); // the composition the candidates belonged to is gone
       diagf("COMPOSITION_TERMINATED",
             "cid=%" PRIu64 " owned=%zu pending_effects=%zu uncertain=%zu queued=%zu remaining=%zu",
             entry->semantic.context_id(), before.records, before.pending_effects, before.uncertain,
@@ -1396,6 +1447,103 @@ bool TextService::apply_frontend(ContextEntry &entry, TfEditCookie ec) {
     progress = true;
   }
   return progress;
+}
+
+void TextService::settle_frontend_work(ContextEntry &entry, const SemanticDecision &decision,
+                                       BOOL *pfEaten) {
+  for (const auto &work : decision.frontend) {
+    if (GetEnvironmentVariableW(L"FUSION_TSF_FRONTEND_TRACE", nullptr, 0))
+      diagf("FRONTEND_OP", "stimulus=%" PRIu64 " seq=%" PRIu64 " type=%d text=%s",
+            decision.stimulus_id, work.key.sequence, static_cast<int>(work.operation.type),
+            work.operation.text.c_str());
+    if (work.operation.type == BackendOperation::Type::CommitText)
+      entry.semantic.enqueue_effect(work.key, work.operation.text);
+    else
+      entry.semantic.enqueue_state(work.key, work.operation.text);
+  }
+  if (!entry.semantic.pending().empty()) {
+    auto *session = new FrontendEditSession(*this, entry);
+    HRESULT outer = E_FAIL, inner = E_FAIL;
+    request_sync_session(entry, session, outer, inner);
+    session->Release();
+    schedule_async_pump(entry);
+  }
+  if (decision.forward) {
+    // Only the original physical key passes naturally, after its preceding
+    // callbacks and prior effects have actually settled. A candidate action never
+    // forwards (the engine consumed it), so the click path has no pfEaten to set.
+    if (pfEaten == nullptr)
+      return;
+    if (entry.semantic.pending().empty() && entry.semantic.finish_pass())
+      *pfEaten = FALSE;
+    else
+      cancel_current_key(entry, pfEaten);
+  } else if (pfEaten != nullptr) {
+    *pfEaten = TRUE;
+  }
+  entry.semantic.retire_terminals();
+}
+
+bool TextService::request_readonly_sync(ContextEntry &entry, ITfEditSession *session,
+                                        HRESULT &outer, HRESULT &inner) {
+  inner = E_FAIL;
+  outer =
+      entry.context->RequestEditSession(client_id_, session, TF_ES_SYNC | TF_ES_READWRITE, &inner);
+  diagf("SYNC_READ", "outer=0x%08lX inner=0x%08lX", static_cast<unsigned long>(outer),
+        static_cast<unsigned long>(inner));
+  return SUCCEEDED(outer) && SUCCEEDED(inner);
+}
+
+void TextService::sync_candidate_view(ContextEntry &entry) {
+  if (!entry.semantic.real_frontend())
+    return;
+  const auto page = entry.semantic.displayed_page();
+  if (!page) {
+    // No displayed projection: an empty page (hide signal) or a fenced dispatch.
+    if (entry.candidates)
+      entry.candidates->hide();
+    return;
+  }
+  if (!entry.candidates)
+    entry.candidates = std::make_unique<CandidateView>();
+  if (!entry.candidates->ensure_created(this, &entry, entry.generation)) {
+    diagf("CANDIDATE_VIEW", "create-failed cid=%" PRIu64, entry.semantic.context_id());
+    return;
+  }
+  // Resolve the caret through a read-only session; position the popup after the
+  // session returns (UI calls belong outside the edit session).
+  auto *session = new AnchorProbeSession(*this, entry);
+  HRESULT outer = E_FAIL, inner = E_FAIL;
+  request_readonly_sync(entry, session, outer, inner);
+  session->Release();
+  if (entry.candidate_anchor_valid)
+    entry.candidates->show(*page, entry.candidate_anchor);
+  else
+    entry.candidates->hide(); // never show a page we cannot place near its text
+}
+
+void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,
+                                   std::int32_t index) {
+  ContextEntry *target = find_entry_alive(entry, generation);
+  if (target == nullptr) {
+    diagf("FENCE", "kind=candidate stale-entry gen=%" PRIu64, generation);
+    return;
+  }
+  if (handling_key_) {
+    // Serialized on the UI thread, but a candidate action is never nested in a
+    // key dispatch; refuse rather than re-enter ownership handling.
+    diagf("CANDIDATE_REENTRANT", "index=%d", static_cast<int>(index));
+    return;
+  }
+  auto lifetime_guard = hold_entry(target);
+  handling_key_ = true;
+  const SemanticDecision decision = target->semantic.begin_candidate_action(action, index);
+  diagf("CANDIDATE_ACTION", "action=%d index=%d route=%s eaten=%d", static_cast<int>(action),
+        static_cast<int>(index), route_name(decision.route), decision.eaten ? 1 : 0);
+  if (decision.route != SemanticDecision::Route::FailOpen)
+    settle_frontend_work(*target, decision, nullptr);
+  sync_candidate_view(*target);
+  handling_key_ = false;
 }
 
 void TextService::drain_prior_effect(ContextEntry &entry) {

@@ -9,7 +9,9 @@ development shell (`FusionTsf`). Stage 3B/3C provide the real Fcitx5 backend PoC
 and faithful frontend path. Stage 4A adds an out-of-process Fcitx Host
 (`FusionHost.exe`) connected by length-prefixed binary IPC over a local Named Pipe;
 Stage 4B adds Host-incarnation identity, a bounded product-path reconnect, explicit
-semantic readiness and incarnation fencing.
+semantic readiness and incarnation fencing. Stage 5 projects the engine's candidate
+page across that same IPC path and renders a first minimal in-process candidate
+surface that turns a pointer hit into an explicit non-key candidate action.
 There is no end-user Windows input product yet; independent review is required
 before further integration.
 
@@ -34,10 +36,10 @@ repository entry point only.
 
 - `include/fusion/core.hpp` — portable FusionCore public model (Key/Kind/Result/Ticket, …).
 - `include/fusion/host.hpp` — Stage 2 `fusion::Host` Host-side boundary (backend `Intent` → Core operations).
-- `include/fusion/backend.hpp` — Stage 3B/4A `fusion::Backend` interface and `BackendStimulus`/`BackendBatch`/`BackendOperation` types.
-- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free).
+- `include/fusion/backend.hpp` — Stage 3B/4A/5 `fusion::Backend` interface and `BackendStimulus`/`BackendBatch`/`BackendOperation` types, plus the Stage 5 `CandidatePage`/`CandidateEntry`/`CandidateLayout` page projection and the non-key candidate action stimulus types.
+- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free). `protocol_version` is 3 since Stage 5 (candidate action types + `CandidatePage` payload shape).
 - `src/core.cpp` — FusionCore implementation.
-- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests. The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
+- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests; `candidate_view.{hpp,cpp}` (Stage 5) is the minimal in-process candidate surface that renders the projected page and reports a pointer hit as a non-key action (the DLL links only GDI32/USER32 for it, never Fcitx/LibIME). The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
 - `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server, Host-side only), `pipe_security.{hpp,cpp}` (per-user pipe name, server identity verification, security descriptor), `ipc_backend.{hpp,cpp}` (Backend over IPC).
 - `src/host/` — Stage 4A FusionHost.exe: `main.cpp` (entry point), `host_server.{hpp,cpp}` (multi-client accept loop, per-connection threads, backend mutex, context remapping).
 - `tests/mock.{hpp,cpp}` — deterministic FusionMock scheduler, fault harness and oracles.
@@ -49,6 +51,7 @@ repository entry point only.
 - `tests/stage4a_ipc.cpp` — Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer (multi-client, transport-failure separation, clean shutdown) and the FusionHost.exe integration mode. The first three modes run in the Mock-only build too; only the integration mode needs `FUSION_WITH_FCITX5=ON`.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
 - `tests/tsf_lifecycle.cpp` — Stage 4C lifecycle obligation and teardown-reconciliation tests (context identity, unresolved responsibility, external termination, cross-context isolation).
+- `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal. Runs in the Mock-only build; the Win32 candidate surface is covered on the real product path.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -232,10 +235,10 @@ backend and serves IPC requests from connected TSF DLL clients.
 payload_length][1 byte: message_type][N bytes: payload]`. Strict
 request/response alternation per connection. All deserialization is fail-closed
 and rejects trailing bytes. Message types: Hello, Bind, Reset, Unbind, Send.
-The Hello handshake exchanges `protocol_version` (currently 2) and the backend
+The Hello handshake exchanges `protocol_version` (currently 3) and the backend
 `session_id`; since Stage 4B every Host response payload is prefixed with the
 responding Host incarnation (`[8 bytes: host_incarnation]`). Version mismatch
-returns version=0 and the client disconnects, so a mixed Stage 4A/4B pairing
+returns version=0 and the client disconnects, so a mixed Stage 4B/Stage 5 pairing
 fails the handshake instead of misparsing it.
 
 **Pipe name and security.** The default pipe name is computed from the user SID
@@ -308,7 +311,7 @@ existing `FusionCore` ledger.
 **Identity.** `HostServer` owns one incarnation identity per Host process/instance
 (a PoC engineering value from process id + monotonic clock + a process-local sequence; 0 is
 reserved for "no incarnation"). The Hello response publishes it and every Host response
-payload is prefixed with it (`[8 bytes: host_incarnation]`, `protocol_version` 2). The
+payload is prefixed with it (`[8 bytes: host_incarnation]`, `protocol_version` raised to 2 in Stage 4B, 3 since Stage 5). The
 client refuses a response whose incarnation is not the one its connection established, and
 `LinkStatus` exposes `{state, host_incarnation, connection_generation}` — the two causal
 distinctions D072 §11 already named.
@@ -412,3 +415,58 @@ Run with `ctest --test-dir build -R tsf_lifecycle`.
 P0-A/P0-B/P0-D remain OPEN. Stage 4C does not decide the user-visible disposition of work that a teardown
 had to leave unresolved, and does not freeze whether push/pop or transitory contexts constitute a
 semantic discontinuity.
+
+## Stage 5 — Candidate page projection and a first non-key candidate action
+
+Stage 5 closes the loop between the engine's candidate list and the Windows client on the real Stage 4A/4B
+product path. It adds no engine, ledger or recovery policy and chooses no final presentation authority: it
+projects the engine's *current candidate page* across the existing IPC and turns a pointer hit back into an
+explicit **non-key** candidate action.
+
+**Projection is STATE, not a second ledger.** `Backend::send` now always appends one `CandidateSnapshot`
+operation whose payload is a `CandidatePage` (`src/fcitx/backend.cpp::observe_candidate_page`): labelled
+entries that stay index-aligned with `CandidateList::candidate(i)`, a page-local cursor, the canonical
+`PageableCandidateList` pager truth, and a `truncated` bound flag. Fcitx has no explicit hide signal, so the
+snapshot of an *empty* candidate slot is the authoritative close. The controller records that projection as
+display text on `SemanticDecision::page`; it never owns a Core record and is never a second copy of semantic
+state. `SemanticController::displayed_page()` is the current projection.
+
+**Actions are explicit stimuli, never a simulated key.** `BackendStimulus::Type` gained
+`SelectCandidate`/`PageNext`/`PagePrev` with a page-local `candidate_index` (and `keysym`/`modifiers` stay
+zero). `SemanticController::begin_candidate_action` reuses the exact admission, batch-validation, ordered
+Core-record and incarnation/connection fencing of a real key dispatch, so a selection commits and its EFFECT
+is ordered after the preceding STATE like any other effect. On the Fcitx side the selection calls the
+candidate's own `select()` (partial selection rebuilds the list); paging calls the pager and re-reads the
+panel. `ipc_protocol` raised `protocol_version` 2→3 for the new payload shape, so a mixed Stage 4B/5 pairing
+fails the handshake rather than misparsing; the wire format and numerical bounds stay UNFROZEN (D072 §16, P0 set).
+
+**A stale page is never acted on.** A `PageFence` (session id, binding, stimulus id, host incarnation,
+connection generation) records which dispatch produced the displayed page. `begin_candidate_action` refuses
+fail-open before dispatch when the fence no longer matches the live link, the index is outside the page the
+user was shown, or no page is present; `fence_previous_incarnation`, external composition termination,
+context replacement and destroy all drop the projection, so a page can never materialize or fire against a
+new context or incarnation.
+
+**Minimal in-process surface.** `src/tsf/candidate_view.{hpp,cpp}` is a non-activating, owned `WS_POPUP`
+that paints the projected page (horizontal/vertical layout, placeholder indices preserved, cursor
+highlight) and maps a `WM_LBUTTONUP` hit to a page-local index or a pager request. It owns no semantic state
+and no engine; a click reports the index+generation and the service re-validates it through the same
+stale-entry fence the edit sessions use before dispatching. `dumpbin /dependents` confirms the TSF DLL links
+only Windows system libs plus the new `GDI32` — never Fcitx or LibIME; the engine stays solely in
+`FusionHost.exe`. This is the first seam only because it needs no anchor-over-IPC and keeps the Host
+headless; D072 §16 renderer placement remains **UNFROZEN** and is not decided here.
+
+**Tests.** `tests/stage5_candidates.cpp` drives the real `SemanticController` real-frontend path against a
+deterministic scripted Backend and asserts, without Fcitx/TSF/windows.h, page STATE and placeholder alignment,
+select→EFFECT ordered after STATE with zero key identity, paging cursor/pager truth, and the out-of-range and
+stale-incarnation refusals that must dispatch nothing (`ctest -R stage5_candidates`, Mock-only build too).
+`tests/stage4a_ipc.cpp` extends the protocol tests to the `CandidatePage` round-trip and two new fail-closed
+cases (cursor out of range, key stimulus claiming an index) and pins `protocol_version == 3`; its integration
+mode adds real-engine evidence: typing `nihao` over the live `FusionHost` projects a non-empty pinyin page
+across v3 IPC, and selecting a projected entry commits that entry's own text — proving selection is `select()`,
+not a numeric candidate key.
+
+P0-A/P0-B/P0-D remain OPEN. Stage 5 does not freeze D072 §16 renderer placement or the wire format, does not
+implement the segmented `FormattedPreedit`/style model, and does not decide multi-window/fixed-position or
+full keyboard-candidate UX; it establishes the first reviewable candidate projection/action seam on the
+existing single causal model.
