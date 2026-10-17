@@ -96,12 +96,39 @@ HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name,
     : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)),
       incarnation_(incarnation == 0 ? generate_incarnation() : incarnation) {}
 
-HostServer::~HostServer() { stop(); }
+HostServer::~HostServer() {
+  // Idempotent, and always the owner's thread: main() has normally already run
+  // stop() and shutdown_backend(), which clears backend_. This only covers early
+  // returns, and it keeps backend destruction behind backend_mutex_ either way.
+  stop();
+  shutdown_backend();
+}
 
 bool HostServer::start() {
   if (!backend_)
     return false;
   return true;
+}
+
+void HostServer::request_stop() {
+  stopping_ = true;
+  running_ = false;
+  // ConnectNamedPipe is called without a timeout, so the accept loop cannot observe
+  // running_ by itself: one short-lived client connection completes the pending call
+  // and lets the loop exit. Nothing here touches connections or the backend, so a
+  // console control handler cannot race the owner's shutdown.
+  wake_accept_loop();
+}
+
+void HostServer::stop() {
+  request_stop();
+  {
+    // Do not drain while the accept loop could still spawn a connection.
+    std::unique_lock lock(accept_done_mutex_);
+    accept_done_cv_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return !accept_loop_active_.load(); });
+  }
+  drain_connections();
 }
 
 void HostServer::run() {
@@ -114,22 +141,6 @@ void HostServer::run() {
   accept_loop_active_ = false;
   std::lock_guard lock(accept_done_mutex_);
   accept_done_cv_.notify_all();
-}
-
-void HostServer::stop() {
-  stopping_ = true;
-  running_ = false;
-  // ConnectNamedPipe is called without a timeout, so the accept loop cannot
-  // observe running_ by itself: one short-lived client connection completes the
-  // pending call and lets the loop exit.
-  wake_accept_loop();
-  {
-    // Do not drain while the accept loop could still spawn a connection.
-    std::unique_lock lock(accept_done_mutex_);
-    accept_done_cv_.wait_for(lock, std::chrono::seconds(5),
-                             [this] { return !accept_loop_active_.load(); });
-  }
-  drain_connections();
 }
 
 void HostServer::shutdown_backend() {

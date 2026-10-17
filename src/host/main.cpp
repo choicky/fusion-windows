@@ -25,11 +25,11 @@
 #endif
 #include <windows.h>
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace {
@@ -62,38 +62,48 @@ bool env_flag(const char *name) {
   return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 }
 
-// The Host instance the console handler may stop. Set for the lifetime of run().
-std::atomic<fusion::ipc::HostServer *> host_server{nullptr};
+// The Host instance the console handler may ask to stop. The pointer is guarded by
+// `host_server_mutex`: the handler holds the lock while it uses the server, and main
+// holds it when it clears the pointer, so the handler can never call into a destroyed
+// HostServer.
+std::mutex host_server_mutex;
+fusion::ipc::HostServer *host_server = nullptr;
 
-// Signals that main() has finished the orderly exit (backend destroyed, Fcitx's own
-// save completed). A console close/logoff/shutdown handler waits on it, bounded,
-// instead of destroying the backend itself: main() is the single owner of backend
-// destruction, so no second thread can race it or cut the save short.
+// Signals that main() has finished the orderly exit (accept loop ended, connections
+// drained and joined, backend destroyed and Fcitx's own save completed). A console
+// close/logoff/shutdown handler waits on it, bounded, instead of shutting anything
+// down itself: main() is the single thread that performs the ordered shutdown.
 HANDLE exit_complete = nullptr;
 
 // Windows allows about 5 s between a console close event and forced termination.
 constexpr DWORD console_exit_timeout_ms = 4000;
 
+// Requests the stop; never drains, joins or touches the backend.
+void request_host_stop() {
+  std::lock_guard lock(host_server_mutex);
+  if (host_server != nullptr)
+    host_server->request_stop();
+}
+
 BOOL WINAPI console_control(DWORD type) {
-  auto *server = host_server.load();
-  if (server == nullptr)
-    return FALSE;
   switch (type) {
   case CTRL_C_EVENT:
   case CTRL_BREAK_EVENT:
     // main() keeps running after this handler, so only request the stop; main() then
-    // runs the backend shutdown and Fcitx's own save on its own thread.
-    server->stop();
+    // performs the whole ordered shutdown on its own thread.
+    request_host_stop();
     return TRUE;
   case CTRL_CLOSE_EVENT:
   case CTRL_LOGOFF_EVENT:
   case CTRL_SHUTDOWN_EVENT:
-    // Windows terminates the process when this handler returns, so wait (bounded) for
-    // main() to finish the orderly shutdown, including Fcitx's save. On timeout the
-    // process is terminating anyway and Fcitx's forced-termination semantics apply.
+    // Windows terminates the process when this handler returns, so request the stop
+    // and wait (bounded) for main() to finish it, including Fcitx's save. The wait
+    // never holds host_server_mutex, so main can clear the pointer and destroy the
+    // server while this thread is only waiting. On timeout the process is terminating
+    // anyway and Fcitx's forced-termination semantics apply.
     std::fprintf(stderr, "[FusionHost] console control %lu: waiting for the orderly exit\n",
                  static_cast<unsigned long>(type));
-    server->stop();
+    request_host_stop();
     if (exit_complete != nullptr)
       WaitForSingleObject(exit_complete, console_exit_timeout_ms);
     return TRUE;
@@ -149,8 +159,8 @@ int main(int argc, char *argv[]) {
 
   exit_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-  // The server lives in its own scope: main() is the single owner of backend
-  // destruction, and the exit signal is set only after the server is gone.
+  // The server lives in its own scope: main() is the single thread that performs the
+  // ordered shutdown, and the exit signal is set only after the server is gone.
   {
     fusion::ipc::HostServer server(std::move(backend), pipe_name, 0);
     if (!server.start()) {
@@ -162,15 +172,25 @@ int main(int argc, char *argv[]) {
     std::fprintf(stderr, "[FusionHost] incarnation=%llu\n",
                  static_cast<unsigned long long>(server.incarnation()));
 
-    host_server.store(&server);
+    {
+      std::lock_guard lock(host_server_mutex);
+      host_server = &server;
+    }
     SetConsoleCtrlHandler(console_control, TRUE);
     std::fprintf(stderr, "[FusionHost] entering accept loop\n");
     server.run();
-    // Runs the backend's orderly shutdown — and therefore Fcitx's own save on
-    // instance exit — on this thread. No other thread may destroy the backend, so a
-    // console close handler cannot race the save or cut it short; it only waits.
+    // Ordered shutdown, entirely on this thread: end the accept loop and join every
+    // connection thread first, then destroy the backend — which runs its orderly
+    // shutdown and therefore Fcitx's own save on instance exit. A console handler can
+    // only have requested the stop, so it cannot race the drain or the save.
+    server.stop();
     server.shutdown_backend();
-    host_server.store(nullptr);
+    {
+      // No handler can be inside the server after this point, so leaving the scope
+      // (and destroying it) is safe.
+      std::lock_guard lock(host_server_mutex);
+      host_server = nullptr;
+    }
   }
 
   SetConsoleCtrlHandler(console_control, FALSE);

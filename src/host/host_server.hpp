@@ -100,12 +100,18 @@ public:
 
   bool start();
   void run();
+  // Asks the server to stop: sets the stop flags and wakes the accept loop. It does
+  // not drain, join or touch the backend, so it is safe from any thread (the console
+  // control handler) and idempotent. The server's own thread performs the ordered
+  // shutdown afterwards: stop() → shutdown_backend().
+  void request_stop();
   // Stops accepting, disconnects every client and joins every connection
-  // thread before returning. Idempotent; never leaves a running thread.
+  // thread before returning. Idempotent; never leaves a running thread. Only the
+  // thread that runs the server should call it.
   void stop();
   // Destroys the backend now, after stop(), so the backend's orderly shutdown
   // (and Fcitx's own save on instance exit) runs while the caller can still wait
-  // for it — used by the console close/logoff path. Idempotent.
+  // for it. Idempotent; only the thread that runs the server should call it.
   void shutdown_backend();
 
   // Development/test observable: number of tracked connections (live plus any

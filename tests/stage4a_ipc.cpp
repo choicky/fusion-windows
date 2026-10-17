@@ -1,7 +1,7 @@
 // Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
 // end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <protocol|loopback|hostserver|wp3singleton|integration>
+// Usage: stage4a <protocol|loopback|hostserver|wp3singleton|wp3shutdown|integration>
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
@@ -1521,6 +1521,94 @@ void test_singleton_claim() {
   std::cout << "PASS WP3 singleton: claimed before the backend, second claim refused\n";
 }
 
+// Stage 6 WP3: the console control handler may only request the stop; exactly one
+// thread (main) performs the ordered shutdown — stop() (end accept loop, disconnect
+// and join every connection thread), then shutdown_backend() (destroy the backend),
+// then destruction. This drives that sequence with a client connected and watches
+// the backend: destroyed exactly once, after every connection thread ended, never
+// during a call.
+class ShutdownWatchBackend final : public Backend {
+public:
+  static void reset() {
+    destroyed_.store(0);
+    destroyed_during_call_.store(false);
+    in_call_.store(0);
+  }
+  static int destroyed() { return destroyed_.load(); }
+  static bool destroyed_during_call() { return destroyed_during_call_.load(); }
+  static int in_call() { return in_call_.load(); }
+
+  ~ShutdownWatchBackend() override {
+    if (in_call_.load() > 0)
+      destroyed_during_call_.store(true);
+    destroyed_.fetch_add(1);
+  }
+
+  bool bind(Binding) override {
+    CallGuard guard;
+    return true;
+  }
+  bool reset(Binding) override {
+    CallGuard guard;
+    return true;
+  }
+  void unbind(Binding) override { CallGuard guard; }
+  bool healthy() const override { return true; }
+  std::uint64_t session_id() const override { return 777; }
+  BackendBatch send(const BackendStimulus &stimulus) override {
+    CallGuard guard;
+    return BackendBatch{session_id(), stimulus.binding, stimulus.stimulus_id};
+  }
+
+private:
+  struct CallGuard {
+    CallGuard() { in_call_.fetch_add(1); }
+    ~CallGuard() { in_call_.fetch_sub(1); }
+  };
+  inline static std::atomic<int> in_call_{0};
+  inline static std::atomic<int> destroyed_{0};
+  inline static std::atomic<bool> destroyed_during_call_{false};
+};
+
+void test_shutdown_order() {
+  const auto pipe_name = test_pipe_name(L"wp3-shutdown");
+  ShutdownWatchBackend::reset();
+  {
+    auto backend = std::make_unique<ShutdownWatchBackend>();
+    HostServer server(std::move(backend), pipe_name);
+    require(server.start(), "shutdown start");
+    std::thread runner([&server] { server.run(); });
+    auto client = connect_client(pipe_name);
+    require(client != nullptr, "shutdown client connected");
+    require(client->bind(Binding{1, 1, 1}), "shutdown bind");
+
+    // What the console handler does: request the stop from another thread and return
+    // without draining, joining or touching the backend.
+    const auto begin = std::chrono::steady_clock::now();
+    std::thread handler([&server] { server.request_stop(); });
+    handler.join();
+    require(std::chrono::steady_clock::now() - begin < std::chrono::seconds(2),
+            "request_stop returns promptly and does not drain");
+
+    // What main() does, in order, on one thread.
+    if (runner.joinable())
+      runner.join();
+    server.stop();
+    require(server.tracked_connection_count() == 0, "no connection thread survives the drain");
+    require(ShutdownWatchBackend::in_call() == 0, "no backend call is in flight after the drain");
+    require(ShutdownWatchBackend::destroyed() == 0,
+            "the backend is still alive before its shutdown");
+    server.shutdown_backend();
+    require(ShutdownWatchBackend::destroyed() == 1, "the backend is destroyed exactly once");
+    require(!ShutdownWatchBackend::destroyed_during_call(),
+            "the backend is never destroyed during a call");
+  }
+  require(ShutdownWatchBackend::destroyed() == 1,
+          "leaving the scope does not destroy the backend a second time");
+  std::cout << "PASS WP3 shutdown: handler requests the stop, one thread drains then destroys the "
+               "backend, no connection thread survives\n";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1652,9 +1740,10 @@ int main(int argc, char *argv[]) {
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
 #ifdef FUSION_WITH_FCITX5
-  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|wp3singleton|integration>\n";
+  const char *usage =
+      "Usage: stage4a <protocol|loopback|hostserver|wp3singleton|wp3shutdown|integration>\n";
 #else
-  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|wp3singleton>\n";
+  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|wp3singleton|wp3shutdown>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -1670,6 +1759,8 @@ int main(int argc, char *argv[]) {
       test_hostserver();
     else if (mode == "wp3singleton")
       test_singleton_claim();
+    else if (mode == "wp3shutdown")
+      test_shutdown_order();
     else if (mode == "integration") {
 #ifdef FUSION_WITH_FCITX5
       test_integration();
