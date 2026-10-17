@@ -148,6 +148,12 @@ HRESULT RegisterServer(HMODULE module) {
   if (SUCCEEDED(result))
     result = category_raw->RegisterCategory(CLSID_FusionTsfTextService, GUID_TFCAT_TIP_KEYBOARD,
                                             CLSID_FusionTsfTextService);
+  // Stage 5: TSF consults ITfDisplayAttributeProvider only for TIPs in this
+  // category (composition styling of the Fcitx preedit format).
+  if (SUCCEEDED(result))
+    result = category_raw->RegisterCategory(CLSID_FusionTsfTextService,
+                                            GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
+                                            CLSID_FusionTsfTextService);
   category_raw->Release();
   profile_mgr_raw->Release();
   profiles_raw->Release();
@@ -184,6 +190,8 @@ HRESULT UnregisterServer() {
   };
   observe(category_raw->UnregisterCategory(CLSID_FusionTsfTextService, GUID_TFCAT_TIP_KEYBOARD,
                                            CLSID_FusionTsfTextService));
+  observe(category_raw->UnregisterCategory(
+      CLSID_FusionTsfTextService, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, CLSID_FusionTsfTextService));
   for (LANGID langid : installed_langids()) {
     observe(profile_mgr_raw->UnregisterProfile(CLSID_FusionTsfTextService, langid,
                                                GUID_FusionTsfProfile, 0));

@@ -69,8 +69,8 @@ enum class CandidateLayout : std::uint8_t { NotSet = 0, Vertical = 1, Horizontal
 // One list slot of the visible page. entries[i] always corresponds to
 // CandidateList::candidate(i): a placeholder keeps its index (it is never
 // displayed, but hit-testing must not shift the list index out of alignment with
-// select()). label/text/comment are flattened UTF-8 display text; the segmented
-// FormattedPreedit/Text style model is not carried by this projection yet.
+// select()). label/text/comment are flattened UTF-8 display text (each already
+// passed through Instance::outputFilter by the projection).
 struct CandidateEntry {
   std::string label;
   std::string text;
@@ -78,9 +78,12 @@ struct CandidateEntry {
   bool placeholder = false;
 };
 
-// STATE for one candidate page. An empty page is the authoritative "no candidates"
-// projection: Fcitx has no explicit hide signal, so the page snapshot of an empty
-// InputPanel candidate slot is what closes the presentation.
+// STATE for one InputPanel update as the popup presentation shows it: the visible
+// candidate page plus the panel text rows a mature Fcitx panel renders around it
+// (classic-ui: upper row = auxUp + panel preedit, lower row = auxDown). The
+// client preedit is not part of it: that is the in-document composition and is
+// carried by SetPreedit. Fcitx has no explicit hide signal; the snapshot of an
+// InputPanel whose displayed parts are all empty is what closes the presentation.
 struct CandidatePage {
   std::vector<CandidateEntry> entries;
   std::int32_t cursor_index = -1; // page-local highlight, -1 = nothing highlighted
@@ -88,7 +91,22 @@ struct CandidatePage {
   bool has_prev = false; // canonical pager truth (PageableCandidateList)
   bool has_next = false;
   bool truncated = false; // transport bound hit, not a semantic decision
+  // Panel text rows, flattened UTF-8 after Instance::outputFilter. Empty when the
+  // engine left the field empty.
+  std::string aux_up;
+  std::string panel_preedit; // InputPanel::preedit(), the server-side preedit row
+  std::string aux_down;
+  // No candidate slots: candidate actions have nothing to act on.
   bool empty() const { return entries.empty(); }
+  // Nothing the panel presentation would show (classic-ui visibility rule: a
+  // non-placeholder candidate or non-empty upper/lower row). This, not
+  // empty(), is the hide signal.
+  bool panel_empty() const {
+    for (const auto &entry : entries)
+      if (!entry.placeholder)
+        return false;
+    return aux_up.empty() && panel_preedit.empty() && aux_down.empty();
+  }
   // Transport/presentation normalization for a page that a bound truncated to a
   // retained prefix: an engine cursor referring to an entry that was not
   // retained becomes no-highlight (-1); a cursor inside the retained prefix is
@@ -102,13 +120,52 @@ struct CandidatePage {
   }
 };
 
+// Mirror of fcitx::TextFormatFlag bit values (textformatflags.h). Windows carries
+// the engine's bits; it does not define its own style vocabulary.
+namespace text_format {
+inline constexpr std::uint32_t underline = 1u << 3;
+inline constexpr std::uint32_t highlight = 1u << 4;
+inline constexpr std::uint32_t dont_commit = 1u << 5;
+inline constexpr std::uint32_t bold = 1u << 6;
+inline constexpr std::uint32_t strike = 1u << 7;
+inline constexpr std::uint32_t italic = 1u << 8;
+inline constexpr std::uint32_t known = underline | highlight | dont_commit | bold | strike | italic;
+} // namespace text_format
+
+// One fcitx::Text piece of the displayed preedit: its UTF-8 byte length inside
+// BackendOperation::text and its TextFormatFlag bits. Segments tile the text in
+// order, so they never duplicate the string itself.
+struct TextSegment {
+  std::uint32_t bytes = 0;
+  std::uint32_t format = 0;
+};
+
+// The fcitx::Text contract of the displayed (client) preedit after
+// Instance::outputFilter: the segment/format list and the engine cursor as a
+// UTF-8 byte offset into the flattened text, -1 = hidden (text.h).
+struct FormattedPreedit {
+  std::vector<TextSegment> segments;
+  std::int32_t cursor = -1;
+  // Segments tile exactly `text`, and the cursor is hidden or inside it.
+  bool consistent_with(const std::string &text) const {
+    std::size_t total = 0;
+    for (const auto &segment : segments)
+      total += segment.bytes;
+    return total == text.size() && cursor >= -1 &&
+           (cursor < 0 || static_cast<std::size_t>(cursor) <= text.size());
+  }
+};
+
 struct BackendOperation {
   enum class Type { SetPreedit, CandidateSnapshot, CommitText, ForwardKey };
   Type type = Type::SetPreedit;
-  std::string text;
+  std::string text; // SetPreedit: the flattened displayed preedit
   // Set only for CandidateSnapshot; never a second copy of the candidate state.
   std::optional<CandidatePage> page;
   bool original_key = false; // ForwardKey refers exactly to the current physical event
+  // Set only for SetPreedit from a frontend that observes the fcitx::Text contract.
+  // Absent means plain text with the caret at its end (Mock Backend, test doubles).
+  std::optional<FormattedPreedit> preedit;
 };
 struct BackendBatch {
   enum class Disposition { Consumed, Forward, Reject };

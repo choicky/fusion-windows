@@ -11,9 +11,15 @@
 //      this input context;
 //   3. filtering disturbs nothing else: engine index identity, placeholder
 //      slots, cursor and pager truth are preserved exactly as before.
-// CMake registers this target only on non-Windows builds and only when the
-// Fcitx5 development libraries are present; the Windows product path covers
-// the same code inside FusionHost.exe.
+// Stage 5 closure adds the preedit and panel boundaries:
+//   4. the displayed client preedit is the engine-filtered clientPreedit() Text
+//      (dbusfrontend updatePreeditImpl), with its segments, format flags and byte
+//      cursor; an unusable cursor is hidden; the engine's own password masking
+//      applies, which it does only for the InputPanel's own Text reference;
+//   5. the panel rows (auxUp, server-side preedit, auxDown) are engine-filtered
+//      like classic-ui, and an empty InputPanel projects no rows.
+// CMake registers this target on Windows FUSION_WITH_FCITX5 builds (pinned
+// runtime) and on non-Windows builds when Fcitx5 development libraries exist.
 
 #include <cstdio>
 #include <functional>
@@ -22,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <fcitx-utils/capabilityflags.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputpanel.h>
@@ -153,6 +160,101 @@ int main() {
     CHECK(page->entries.size() == 1);
     CHECK(page->entries[0].text == "F:你好");
     CHECK(page->cursor_index == -1);
+  }
+
+  // 4/5. Preedit and panel rows. Replace the rewriting consumer with a
+  //      structure-preserving one (ASCII upper-casing keeps every segment length
+  //      and the byte cursor), so the checks see both "filtered" and "intact".
+  connection.disconnect();
+  int filtered_calls = 0;
+  auto structural = instance.connect<fcitx::Instance::OutputFilter>(
+      std::function<void(fcitx::InputContext *, fcitx::Text &)>(
+          [&](fcitx::InputContext *, fcitx::Text &orig) {
+            ++filtered_calls;
+            fcitx::Text upper;
+            for (int i = 0, e = static_cast<int>(orig.size()); i < e; ++i) {
+              std::string piece = orig.stringAt(i);
+              for (auto &ch : piece)
+                if (ch >= 'a' && ch <= 'z')
+                  ch = static_cast<char>(ch - 'a' + 'A');
+              upper.append(std::move(piece), orig.formatAt(i));
+            }
+            upper.setCursor(orig.cursor());
+            orig = std::move(upper);
+          }));
+  (void)structural;
+  {
+    fcitx::Text client;
+    client.append("ni", fcitx::TextFormatFlags{fcitx::TextFormatFlag::HighLight,
+                                               fcitx::TextFormatFlag::Underline});
+    client.append("你hao", fcitx::TextFormatFlag::Underline);
+    client.setCursor(2);
+    frontend.inputPanel().setClientPreedit(client);
+    filtered_calls = 0;
+    const auto projected = fusion::project_client_preedit(instance, &frontend, 4096, 16);
+    CHECK(projected.has_value());
+    CHECK(filtered_calls == 1);                    // filtered exactly once
+    CHECK(projected->text == "NI你HAO");           // the engine-filtered display text
+    CHECK(projected->format.segments.size() == 2); // segments survive the filter
+    CHECK(projected->format.segments[0].bytes == 2);
+    CHECK(projected->format.segments[0].format ==
+          (fusion::text_format::highlight | fusion::text_format::underline));
+    CHECK(projected->format.segments[1].bytes == 6);
+    CHECK(projected->format.segments[1].format == fusion::text_format::underline);
+    CHECK(projected->format.cursor == 2); // engine byte cursor
+    CHECK(projected->format.consistent_with(projected->text));
+
+    client.setCursor(-1);
+    frontend.inputPanel().setClientPreedit(client);
+    CHECK(fusion::project_client_preedit(instance, &frontend, 4096, 16)->format.cursor == -1);
+    client.setCursor(3); // inside 你 (bytes 2..4): not displayable, shown hidden
+    frontend.inputPanel().setClientPreedit(client);
+    CHECK(fusion::project_client_preedit(instance, &frontend, 4096, 16)->format.cursor == -1);
+    client.setCursor(100); // past the end: hidden (classic-ui rule)
+    frontend.inputPanel().setClientPreedit(client);
+    CHECK(fusion::project_client_preedit(instance, &frontend, 4096, 16)->format.cursor == -1);
+    client.setCursor(8); // end
+    frontend.inputPanel().setClientPreedit(client);
+    CHECK(fusion::project_client_preedit(instance, &frontend, 4096, 16)->format.cursor == 8);
+
+    // Bounds fail closed rather than truncating the composition.
+    CHECK(!fusion::project_client_preedit(instance, &frontend, 4, 16).has_value());
+    CHECK(!fusion::project_client_preedit(instance, &frontend, 4096, 1).has_value());
+
+    // The engine masks a password field's preedit only for the panel's own
+    // Text reference: masking proves the projection hands it that reference.
+    frontend.setCapabilityFlags(fcitx::CapabilityFlag::Password);
+    const auto masked = fusion::project_client_preedit(instance, &frontend, 4096, 16);
+    CHECK(masked.has_value());
+    CHECK(masked->text.find("NI") == std::string::npos);
+    CHECK(masked->text.find("\xE2\x80\xA2") != std::string::npos);
+    frontend.setCapabilityFlags(fcitx::CapabilityFlags{});
+  }
+  {
+    frontend.inputPanel().reset();
+    fusion::CandidatePage empty_rows;
+    filtered_calls = 0;
+    CHECK(fusion::project_panel_text(instance, &frontend, empty_rows, 4096));
+    CHECK(filtered_calls == 0); // an empty InputPanel displays nothing
+    CHECK(empty_rows.aux_up.empty() && empty_rows.panel_preedit.empty() &&
+          empty_rows.aux_down.empty());
+    CHECK(empty_rows.panel_empty());
+
+    frontend.inputPanel().setAuxUp(text("[stroke]h"));
+    frontend.inputPanel().setPreedit(text("ni hao"));
+    frontend.inputPanel().setAuxDown(text("down"));
+    fusion::CandidatePage rows;
+    CHECK(fusion::project_panel_text(instance, &frontend, rows, 4096));
+    CHECK(filtered_calls == 3);
+    CHECK(rows.aux_up == "[STROKE]H");
+    CHECK(rows.panel_preedit == "NI HAO");
+    CHECK(rows.aux_down == "DOWN");
+    CHECK(rows.empty());        // no candidate slot ...
+    CHECK(!rows.panel_empty()); // ... yet the panel is displayed
+
+    fusion::CandidatePage bounded;
+    CHECK(!fusion::project_panel_text(instance, &frontend, bounded, 3)); // fail closed
+    frontend.inputPanel().reset();
   }
 
   if (failures != 0) {

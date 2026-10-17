@@ -45,6 +45,9 @@ constexpr std::size_t context_bound = 64;
 // exceeding them is recorded by CandidatePage::truncated rather than hidden.
 constexpr std::size_t candidate_page_entries = 10;
 constexpr std::size_t candidate_page_bytes = 4096;
+// Segment bound for one displayed preedit (after Text::normalize()); an
+// engineering transport bound like the others, not a semantic limit.
+constexpr std::size_t preedit_segment_bound = 16;
 // Engineering bounds for this PoC only; D072 numerical policy remains OPEN.
 constexpr auto request_wait = std::chrono::seconds(2);
 
@@ -66,8 +69,19 @@ public:
   void commitStringImpl(const std::string &text) override {
     observe({BackendOperation::Type::CommitText, text, {}});
   }
+  // The displayed client preedit: engine outputFilter, segments/format flags and
+  // the engine byte cursor (project_client_preedit), never a bare toString().
   void updatePreeditImpl() override {
-    observe({BackendOperation::Type::SetPreedit, inputPanel().clientPreedit().toString(), {}});
+    if (lifecycle)
+      return; // fenced bind/reset/close: observe() would drop it anyway
+    auto projected = project_client_preedit(*instance_, this, payload_bound, preedit_segment_bound);
+    if (!projected) {
+      invalid = true;
+      return;
+    }
+    BackendOperation operation{BackendOperation::Type::SetPreedit, std::move(projected->text)};
+    operation.preedit = std::move(projected->format);
+    observe(std::move(operation));
   }
   void forwardKeyImpl(const fcitx::ForwardKeyEvent &event) override {
     BackendOperation operation{BackendOperation::Type::ForwardKey, event.rawKey().toString(), {}};
@@ -88,10 +102,10 @@ public:
     }
     batch->operations.push_back(std::move(operation));
   }
-  // Pull the engine's current candidate page after a dispatch or a candidate
-  // action. The snapshot is always emitted — including an explicitly empty page —
-  // because Fcitx has no hide signal: the empty candidate slot of an updated panel
-  // IS the signal to close the presentation (InputPanel::empty()).
+  // Pull the engine's current candidate page and panel rows after a dispatch or a
+  // candidate action. The snapshot is always emitted — including an explicitly
+  // empty one — because Fcitx has no hide signal: an updated panel with nothing
+  // to display IS the signal to close the presentation (InputPanel::empty()).
   void observe_candidate_page() {
     if (invalid)
       return;
@@ -104,6 +118,12 @@ public:
         return;
       }
       page = std::move(*projected);
+    }
+    // The panel rows of the same InputPanel update (auxUp / preedit / auxDown):
+    // with them the snapshot can tell "no candidates" from "nothing to show".
+    if (!project_panel_text(*instance_, this, page, payload_bound)) {
+      invalid = true;
+      return;
     }
     BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
     operation.page = std::move(page);

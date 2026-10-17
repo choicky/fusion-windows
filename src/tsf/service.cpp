@@ -606,6 +606,8 @@ STDMETHODIMP TextService::QueryInterface(REFIID riid, void **ppv) {
     *ppv = static_cast<ITfThreadMgrEventSink *>(this);
   } else if (IsEqualIID(riid, IID_ITfCompositionSink)) {
     *ppv = static_cast<ITfCompositionSink *>(this);
+  } else if (IsEqualIID(riid, IID_ITfDisplayAttributeProvider)) {
+    *ppv = static_cast<ITfDisplayAttributeProvider *>(this);
   } else {
     *ppv = nullptr;
     return E_NOINTERFACE;
@@ -653,6 +655,11 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   thread_mgr_ = ComRef<ITfThreadMgr>(ptim);
   thread_mgr_->AddRef();
   client_id_ = tid;
+  // Composition styling is presentation only: without atoms the preedit is still
+  // projected (text + caret), just unstyled.
+  display_atoms_ = register_display_attribute_atoms();
+  if (!display_atoms_.valid())
+    diagf("DISPLAY_ATTRIBUTE", "atoms-unavailable");
   auto keystroke_mgr = thread_mgr_.as<ITfKeystrokeMgr>(IID_ITfKeystrokeMgr);
   // fForeground=TRUE: the sink takes the foreground key-event position, which
   // is how a keyboard TIP actually receives OnKeyDown deliveries.
@@ -1072,12 +1079,23 @@ STDMETHODIMP TextService::OnPopContext(ITfContext *pic) {
 }
 
 // ---------------------------------------------------------------------------
+// TextService — ITfDisplayAttributeProvider
+// ---------------------------------------------------------------------------
+
+STDMETHODIMP TextService::EnumDisplayAttributeInfo(IEnumTfDisplayAttributeInfo **ppEnum) {
+  return create_display_attribute_enum(ppEnum);
+}
+
+STDMETHODIMP TextService::GetDisplayAttributeInfo(REFGUID guid, ITfDisplayAttributeInfo **ppInfo) {
+  return create_display_attribute_info(guid, ppInfo);
+}
+
+// ---------------------------------------------------------------------------
 // TextService — ITfCompositionSink
 // ---------------------------------------------------------------------------
 
 STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
                                                   ITfComposition *pComposition) {
-  (void)ecWrite;
   for (auto &entry : entries_) {
     const auto callback_identity = qi<IUnknown>(pComposition, IID_IUnknown);
     const auto live_identity = qi<IUnknown>(entry->composition, IID_IUnknown);
@@ -1095,7 +1113,14 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
         return S_OK;
       }
       // External authority event (D072 §9): reconcile the projection; queued
-      // and pending work reaches explicit terminals, never silent loss.
+      // and pending work reaches explicit terminals, never silent loss. The text
+      // the app keeps loses its composition styling (presentation only).
+      ITfRange *terminated_range = nullptr;
+      if (SUCCEEDED(entry->composition->GetRange(&terminated_range)) && terminated_range) {
+        ComRef<ITfRange> held(terminated_range);
+        if (!clear_display_attributes(entry->context, held.get(), ecWrite))
+          diagf("DISPLAY_ATTRIBUTE", "clear-failed terminated");
+      }
       entry->composition->Release();
       entry->composition = nullptr;
       if (entry->candidates)
@@ -1236,7 +1261,8 @@ bool TextService::hard_policy_allows(ContextEntry &entry) {
 }
 
 fusion::EditResult TextService::apply_state_text(ContextEntry &entry, TfEditCookie ec,
-                                                 const std::wstring &text, bool &mutated) {
+                                                 const std::wstring &text, bool &mutated,
+                                                 const PreeditPresentation *presentation) {
   mutated = false;
   if (entry.composition == nullptr) {
     if (text.empty()) {
@@ -1292,7 +1318,19 @@ fusion::EditResult TextService::apply_state_text(ContextEntry &entry, TfEditCook
     diagf("STATE_READBACK", "mismatch len=%lu want=%zu", length, text.size());
     return observed_edit(true, false, false);
   }
-  if (!move_caret(entry.context, composition_range.get(), ec)) {
+  if (presentation != nullptr && !text.empty() &&
+      !apply_display_attributes(entry.context, composition_range.get(), ec, *presentation,
+                                display_atoms_)) {
+    // Presentation only: the composition text itself is applied and read back.
+    diagf("DISPLAY_ATTRIBUTE", "apply-failed ranges=%zu", presentation->ranges.size());
+  }
+  // The caret is part of the Fcitx preedit contract (engine byte cursor, mapped
+  // to UTF-16 by layout_preedit); a hidden or absent cursor keeps it at the end.
+  const bool caret_placed = presentation != nullptr && presentation->caret
+                                ? place_caret_in_composition(entry.context, composition_range.get(),
+                                                             ec, *presentation->caret)
+                                : move_caret(entry.context, composition_range.get(), ec);
+  if (!caret_placed) {
     return observed_edit(true, true, false);
   }
   if (text.empty() && !end_composition(entry, ec)) {
@@ -1324,6 +1362,9 @@ fusion::EditResult TextService::apply_effect_text(ContextEntry &entry, TfEditCoo
       diagf("EFFECT_INDETERMINATE", "readback len=%lu want=%zu", length, text.size());
       return observed_edit(true, false, false);
     }
+    // Committed text keeps no composition styling (presentation only).
+    if (!clear_display_attributes(entry.context, composition_range.get(), ec))
+      diagf("DISPLAY_ATTRIBUTE", "clear-failed");
     if (!move_caret(entry.context, composition_range.get(), ec)) {
       return observed_edit(true, true, false);
     }
@@ -1462,7 +1503,11 @@ bool TextService::apply_frontend(ContextEntry &entry, TfEditCookie ec) {
     } else {
       if (!entry.semantic.state_applicable(work.key))
         break;
-      observed = apply_state_text(entry, ec, widen(work.text), mutated);
+      std::optional<PreeditPresentation> presentation;
+      if (work.preedit)
+        presentation = layout_preedit(work.text, *work.preedit);
+      observed = apply_state_text(entry, ec, widen(work.text), mutated,
+                                  presentation ? &*presentation : nullptr);
       entry.semantic.settle_front_state(work.key, observed);
     }
     if (GetEnvironmentVariableW(L"FUSION_TSF_FRONTEND_TRACE", nullptr, 0))
@@ -1485,7 +1530,7 @@ void TextService::settle_frontend_work(ContextEntry &entry, const SemanticDecisi
     if (work.operation.type == BackendOperation::Type::CommitText)
       entry.semantic.enqueue_effect(work.key, work.operation.text);
     else
-      entry.semantic.enqueue_state(work.key, work.operation.text);
+      entry.semantic.enqueue_state(work.key, work.operation.text, work.operation.preedit);
   }
   if (!entry.semantic.pending().empty()) {
     auto *session = new FrontendEditSession(*this, entry);

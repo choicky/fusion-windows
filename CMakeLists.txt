@@ -39,6 +39,7 @@ if(WIN32 AND MSVC)
     src/tsf/diag.cpp
     src/tsf/semantic.cpp
     src/tsf/candidate_view.cpp
+    src/tsf/display_attribute.cpp
     src/tsf/service.cpp
     src/tsf/register.cpp
     src/tsf/dll.cpp
@@ -92,6 +93,30 @@ if(BUILD_TESTING)
     target_compile_options(stage3c PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
+
+    # Stage 5 closure: preedit contract / aux producers / hide signal against the
+    # real pinned pinyin engine (in-process FusionFcitxHost, no TSF).
+    add_executable(stage5_real_projection tests/stage5_real_projection.cpp)
+    target_include_directories(stage5_real_projection PRIVATE src include)
+    target_compile_features(stage5_real_projection PRIVATE cxx_std_20)
+    target_compile_options(stage5_real_projection PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(stage5_real_projection PRIVATE FusionFcitxHost)
+    add_test(NAME stage5_real_projection COMMAND stage5_real_projection)
+
+    # The candidate/preedit/panel outputFilter contract against the real pinned
+    # Fcitx5 core: same projection source FusionHost.exe compiles, built with the
+    # Host's own compiler settings, driven with engine-side OutputFilter consumers.
+    add_executable(fcitx_candidate_filter
+      tests/fcitx_candidate_filter.cpp src/fcitx/candidate_projection.cpp)
+    target_include_directories(fcitx_candidate_filter PRIVATE src include
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fcitx-native/compat" "${PThreads4W_INCLUDE_DIR}")
+    target_compile_features(fcitx_candidate_filter PRIVATE cxx_std_20)
+    target_compile_definitions(fcitx_candidate_filter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+      _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+    target_compile_options(fcitx_candidate_filter PRIVATE /W4 /WX /utf-8 /Zc:preprocessor
+      /Zc:__cplusplus "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/fcitx-native/compat/unistd.h")
+    target_link_libraries(fcitx_candidate_filter PRIVATE Fcitx5::Core)
+    add_test(NAME fcitx_candidate_filter COMMAND fcitx_candidate_filter)
 
     # Dependency portability regression for the two MSVC empty-range guards in
     # cmake/patches/fcitx5-msvc.patch (fcitx-utils/utf8.h). Drives the real Fcitx
@@ -224,14 +249,13 @@ if(BUILD_TESTING)
   else()
     target_compile_options(stage5_candidates PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
-  foreach(test page select refuse paging truncation focus)
+  foreach(test page select refuse paging truncation focus utf16 preedit panel comment)
     add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
   endforeach()
-  # Blocker-1 regression: the extracted candidate projection driven against the
-  # real Fcitx5 engine (system libraries). Non-Windows only, and registered
-  # only when Fcitx5 development libraries are found; the Windows build already
-  # compiles the same source into FusionHost.exe and smoke-tests it on the
-  # product path, so the pinned Windows topology is not perturbed here.
+  # The projection outputFilter contract against the real Fcitx5 engine (system
+  # libraries) on non-Windows builds, registered only when Fcitx5 development
+  # libraries are found. The Windows FUSION_WITH_FCITX5 build registers the same
+  # test against the pinned runtime above.
   if(NOT WIN32)
     find_package(Fcitx5Core QUIET CONFIG)
     if(Fcitx5Core_FOUND)

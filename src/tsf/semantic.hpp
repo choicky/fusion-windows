@@ -82,6 +82,9 @@ struct PendingWork {
   Kind kind = Kind::State;
   Key key{};
   std::string text; // Real frontend: immutable callback; Mock STATE: latest-wins
+  // Real frontend SetPreedit only: the displayed preedit's segments/format and
+  // engine cursor (fcitx::Text contract). Absent = plain text, caret at end.
+  std::optional<FormattedPreedit> preedit;
 };
 
 class SemanticController {
@@ -131,7 +134,8 @@ public:
   Key cancel_pass_recovery();
 
   // Fallback queue after a refused synchronous session (state or effect).
-  void enqueue_state(Key key, std::string text);
+  void enqueue_state(Key key, std::string text,
+                     std::optional<FormattedPreedit> preedit = std::nullopt);
   void enqueue_effect(Key key, std::string text);
   const std::vector<PendingWork> &pending() const { return pending_; }
   // Async execution: settles queued STATE work latest-wins — every pending
@@ -150,9 +154,10 @@ public:
   void note_composition_terminated();
   const std::string &raw_buffer() const { return buffer_; }
 
-  // The candidate page the last admitted dispatch projected, or nullopt when no
-  // page is displayed (nothing projected, or an empty page acted as the hide
-  // signal). The renderer consumes this; it is display text, not semantic state.
+  // The panel snapshot (candidate page + panel rows) the last admitted dispatch
+  // projected, or nullopt when nothing is displayed (nothing projected, or a
+  // panel_empty() snapshot acted as the hide signal). The renderer consumes this;
+  // it is display text, not semantic state.
   const std::optional<CandidatePage> &displayed_page() const { return displayed_page_; }
 
   // Discontinuity plumbing (context replacement), delegated to Core.
@@ -205,8 +210,8 @@ private:
   std::vector<PendingWork> pending_;
   // Currently displayed candidate page projection and the identity of the dispatch
   // that produced it. page_present_ is false both when nothing was ever projected
-  // and when the latest projection was an empty page (the hide signal); only a
-  // present, unfenced page can be acted on.
+  // and when the latest projection had nothing to display (the hide signal); only
+  // a present, unfenced page with candidate slots can be acted on.
   std::optional<CandidatePage> displayed_page_;
   PageFence displayed_fence_;
   bool page_present_ = false;

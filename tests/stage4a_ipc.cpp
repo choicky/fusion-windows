@@ -428,9 +428,80 @@ void test_protocol() {
     detail::write_u8(buf, 0);                 // has_prev
     detail::write_u8(buf, 0);                 // has_next
     detail::write_u8(buf, 0);                 // truncated
+    detail::write_string(buf, "");            // aux_up
+    detail::write_string(buf, "");            // panel_preedit
+    detail::write_string(buf, "");            // aux_down
     detail::write_u8(buf, 0);                 // original_key
     auto decoded = deserialize_batch(buf.data(), buf.size());
     require(!decoded, "candidate page cursor-out-of-range fail-closed");
+  }
+
+  // Stage 5 closure: the displayed preedit's fcitx::Text contract and the panel
+  // rows round-trip exactly; an absent projection stays absent.
+  {
+    BackendBatch batch;
+    batch.backend_session_id = 1;
+    batch.binding = {1, 1, 1};
+    batch.stimulus_id = 1;
+    batch.disposition = BackendBatch::Disposition::Consumed;
+    BackendOperation styled{BackendOperation::Type::SetPreedit, "\xE4\xBD\xA0hao"};
+    styled.preedit = FormattedPreedit{
+        {{3, text_format::highlight | text_format::underline}, {3, text_format::underline}}, 3};
+    batch.operations.push_back(styled);
+    batch.operations.push_back({BackendOperation::Type::SetPreedit, "plain", {}, false});
+    BackendOperation panel;
+    panel.type = BackendOperation::Type::CandidateSnapshot;
+    CandidatePage page;
+    page.aux_up = "[Stroke Filtering]h";
+    page.panel_preedit = "ni hao";
+    page.aux_down = "down";
+    panel.page = page;
+    batch.operations.push_back(panel);
+    std::vector<std::uint8_t> buf;
+    serialize(buf, batch);
+    auto decoded = deserialize_batch(buf.data(), buf.size());
+    require(decoded && decoded->operations.size() == 3, "preedit/panel batch decoded");
+    const auto &p0 = decoded->operations[0];
+    require(p0.preedit && p0.preedit->cursor == 3 && p0.preedit->segments.size() == 2 &&
+                p0.preedit->segments[0].bytes == 3 &&
+                p0.preedit->segments[0].format ==
+                    (text_format::highlight | text_format::underline) &&
+                p0.preedit->segments[1].bytes == 3 &&
+                p0.preedit->segments[1].format == text_format::underline,
+            "preedit segments/format/cursor round-trip");
+    require(!decoded->operations[1].preedit, "absent preedit projection stays absent");
+    const auto &p2 = decoded->operations[2];
+    require(p2.page && p2.page->aux_up == "[Stroke Filtering]h" &&
+                p2.page->panel_preedit == "ni hao" && p2.page->aux_down == "down" &&
+                p2.page->entries.empty(),
+            "panel rows round-trip");
+  }
+
+  // Preedit projection that does not tile its text, or whose cursor is past
+  // it, or that carries unknown format bits, is fail-closed.
+  {
+    const auto encode = [](const FormattedPreedit &format, const std::string &text) {
+      BackendBatch batch;
+      batch.backend_session_id = 1;
+      batch.binding = {1, 1, 1};
+      batch.stimulus_id = 1;
+      batch.disposition = BackendBatch::Disposition::Consumed;
+      BackendOperation op{BackendOperation::Type::SetPreedit, text};
+      op.preedit = format;
+      batch.operations.push_back(op);
+      std::vector<std::uint8_t> buf;
+      serialize(buf, batch);
+      return buf;
+    };
+    auto short_tiling = encode(FormattedPreedit{{{2, 0}}, -1}, "abc");
+    require(!deserialize_batch(short_tiling.data(), short_tiling.size()),
+            "preedit segments not tiling the text fail-closed");
+    auto past_end = encode(FormattedPreedit{{{3, 0}}, 4}, "abc");
+    require(!deserialize_batch(past_end.data(), past_end.size()),
+            "preedit cursor past the text fail-closed");
+    auto bad_flags = encode(FormattedPreedit{{{3, 1u << 12}}, -1}, "abc");
+    require(!deserialize_batch(bad_flags.data(), bad_flags.size()),
+            "preedit unknown format bits fail-closed");
   }
 
   // Key stimulus carrying a candidate index is fail-closed.
@@ -563,8 +634,8 @@ void test_protocol() {
 
   // Protocol version constant
   {
-    require(protocol_version == 3,
-            "protocol_version is 3 (Stage 5 candidate action/page payload shape)");
+    require(protocol_version == 4,
+            "protocol_version is 4 (Stage 5 closure preedit/panel payload shape)");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";
