@@ -4,9 +4,11 @@
 // deterministic scripted Backend double. They assert the projection/fencing
 // decisions only: candidate page STATE, placeholder index alignment, the
 // select-to-EFFECT ordered settlement, paging highlight, stale-page refusal after
-// an incarnation move, and out-of-range refusal. The Win32 presentation surface
-// (src/tsf/candidate_view.cpp) is exercised by the real product-path smoke, not
-// here; nothing in this file needs Fcitx, TSF, or windows.h.
+// an incarnation move, out-of-range refusal, truncated-page cursor
+// normalization, and the focus-loss/presentation-failure invariants (hide only,
+// semantics intact). The Win32 presentation surface (src/tsf/candidate_view.cpp)
+// is exercised by the real product-path smoke, not here; nothing in this file
+// needs Fcitx, TSF, or windows.h.
 
 #include "fusion/backend.hpp"
 #include "mock_backend.hpp"
@@ -38,7 +40,8 @@ CandidateEntry entry(std::string label, std::string text, bool placeholder = fal
 }
 
 BackendOperation snapshot(CandidatePage page) {
-  BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
+  BackendOperation operation;
+  operation.type = BackendOperation::Type::CandidateSnapshot;
   operation.page = std::move(page);
   return operation;
 }
@@ -229,11 +232,114 @@ void mode_paging() {
   CHECK(backend.last_stimulus().candidate_index == -1);
 }
 
+// F3 regression: when a transport/product bound truncates the page to a
+// retained prefix, the cursor must never refer outside that prefix. A valid
+// cursor is preserved; a removed cursor target becomes no-highlight (-1), never
+// a different highlighted entry; the engine's own cursor is not touched.
+void mode_truncation() {
+  {
+    CandidatePage page;
+    page.entries = {entry("1", "你"), entry("2", "祢"), entry("3", "倪")};
+    page.cursor_index = 1; // inside the retained prefix
+    page.truncated = true;
+    page.normalize_cursor_to_retained_prefix();
+    CHECK(page.cursor_index == 1);
+  }
+  {
+    CandidatePage page;
+    page.entries = {entry("1", "你"), entry("2", "祢")};
+    page.cursor_index = 2; // exactly at the truncation boundary: not retained
+    page.truncated = true;
+    page.normalize_cursor_to_retained_prefix();
+    CHECK(page.cursor_index == -1);
+  }
+  {
+    CandidatePage page;
+    page.entries = {entry("1", "你")};
+    page.cursor_index = 7; // beyond the retained prefix
+    page.truncated = true;
+    page.normalize_cursor_to_retained_prefix();
+    CHECK(page.cursor_index == -1);
+  }
+  {
+    CandidatePage page; // no cursor stays no-highlight
+    page.entries = {entry("1", "你"), entry("2", "祢")};
+    page.cursor_index = -1;
+    page.normalize_cursor_to_retained_prefix();
+    CHECK(page.cursor_index == -1);
+  }
+  {
+    CandidatePage page; // empty page: the hide signal can carry no addressable cursor
+    page.cursor_index = 0;
+    page.normalize_cursor_to_retained_prefix();
+    CHECK(page.empty());
+    CHECK(page.cursor_index == -1);
+  }
+  // Pipeline level: the controller displays a normalized truncated page and a
+  // still-valid cursor survives the projection unchanged.
+  {
+    ScriptBackend backend;
+    SemanticController controller(1, 64, backend);
+    CandidatePage page = make_page({entry("1", "你"), entry("2", "祢"), entry("3", "倪")}, 2, true);
+    page.truncated = true;
+    page.normalize_cursor_to_retained_prefix();
+    backend.queue({preedit("ni"), snapshot(std::move(page))});
+    const auto decision = controller.begin_key(char_key('n'), true);
+    CHECK(decision.route == SemanticDecision::Route::State);
+    CHECK(controller.displayed_page().has_value());
+    CHECK(controller.displayed_page()->truncated);
+    CHECK(controller.displayed_page()->cursor_index == 2);
+    CHECK(controller.displayed_page()->cursor_index <
+          static_cast<std::int32_t>(controller.displayed_page()->entries.size()));
+  }
+}
+
+// F2 regression (controller-side invariant): focus loss hides the candidate
+// presentation in the TSF shell and that is the whole obligation — presentation
+// only. The semantic controller receives no call, so context identity, Host
+// binding, records and the projected page survive (focus != semantic
+// incarnation, D072 §9); no engine event is invented. A normal dispatch after
+// focus returns may re-present, and actions still fence on. A presentation
+// failure (no active view for the anchor) is the same shape: hide, keep
+// semantics, invent nothing.
+void mode_focus() {
+  ScriptBackend backend;
+  SemanticController controller(1, 64, backend);
+  backend.queue(
+      {preedit("ni"), snapshot(make_page({entry("1", "你"), entry("2", "祢")}, 0, true))});
+  CHECK(controller.begin_key(char_key('n'), true).route == SemanticDecision::Route::State);
+  const std::uint64_t context_id = controller.context_id();
+  const Binding binding = controller.core().binding();
+  const std::size_t records = controller.core().records().size();
+  const int sends = backend.sends();
+  const int binds = backend.bind_calls_;
+  const int resets = backend.reset_calls_;
+
+  // Focus loss: the shell hides the popup; nothing reaches the controller.
+  CHECK(controller.displayed_page().has_value()); // projected, just not shown
+  CHECK(controller.context_id() == context_id);   // no semantic incarnation advance
+  CHECK(controller.core().binding() == binding);  // Host context neither unbound nor rebound
+  CHECK(controller.core().records().size() == records);
+  CHECK(backend.sends() == sends); // no engine event invented by the transition
+  CHECK(backend.bind_calls_ == binds && backend.reset_calls_ == resets);
+
+  // Focus returns: a normal state/update re-presents and selection still works.
+  backend.queue(
+      {preedit("ni"), snapshot(make_page({entry("1", "你"), entry("2", "祢")}, 1, false))});
+  const auto again = controller.begin_key(char_key('i'), true);
+  CHECK(again.route == SemanticDecision::Route::State);
+  CHECK(again.page.has_value());
+  CHECK(controller.displayed_page()->cursor_index == 1);
+  backend.queue({commit("祢"), snapshot(CandidatePage{})});
+  const auto select = controller.begin_candidate_action(CandidateAction::Select, 1);
+  CHECK(select.route == SemanticDecision::Route::Effect);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: stage5_candidates <page|select|refuse|paging>\n");
+    std::fprintf(stderr, "usage: stage5_candidates <page|select|refuse|paging|truncation|focus>\n");
     return 2;
   }
   const std::string mode = argv[1];
@@ -245,6 +351,10 @@ int main(int argc, char **argv) {
     mode_refuse();
   else if (mode == "paging")
     mode_paging();
+  else if (mode == "truncation")
+    mode_truncation();
+  else if (mode == "focus")
+    mode_focus();
   else {
     std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
     return 2;

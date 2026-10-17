@@ -136,6 +136,10 @@ public:
         }
         page.entries.push_back(std::move(entry));
       }
+      // A transport bound may have dropped the entry the engine cursor referred
+      // to. Normalize the projection to the retained prefix before the page goes
+      // on the wire (presentation only; the engine keeps its own cursor).
+      page.normalize_cursor_to_retained_prefix();
     }
     BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
     operation.page = std::move(page);

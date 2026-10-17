@@ -484,8 +484,9 @@ private:
 
 // Read-only caret probe for the Stage 5 candidate surface. It resolves the live
 // composition range (or the default selection when no composition exists yet)
-// through ITfContextView and records the screen-space anchor on the entry. The
-// popup itself is positioned outside the session, where UI calls belong.
+// through the context's active view (ITfContext::GetActiveView) and records the
+// screen-space anchor on the entry. The popup itself is positioned outside the
+// session, where UI calls belong.
 class AnchorProbeSession final : public ITfEditSession {
 public:
   AnchorProbeSession(TextService &service, ContextEntry &entry)
@@ -521,8 +522,13 @@ public:
     if (entry == nullptr)
       return S_OK;
     entry->candidate_anchor_valid = false;
-    auto view = qi<ITfContextView>(entry->context, IID_ITfContextView);
-    if (!view)
+    // The authoritative live view is the context's active view: ITfContext is not
+    // queried for ITfContextView, it hands one out through GetActiveView. A
+    // failing HRESULT, a null view or no active view is a presentation failure
+    // only: the anchor stays invalid, the caller hides the page, and no engine
+    // semantic event is invented.
+    ComRef<ITfContextView> view;
+    if (FAILED(entry->context->GetActiveView(view.out())) || !view)
       return S_OK;
     ComRef<ITfRange> range;
     if (entry->composition != nullptr && SUCCEEDED(entry->composition->GetRange(range.out())) &&
@@ -768,8 +774,15 @@ bool TextService::context_reports_document(ContextEntry &entry, ITfDocumentMgr *
 STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
   // Thread-level foreground notification. D072 §9: focus is not a semantic
   // incarnation, so this only records the transition; no context is rebound,
-  // reset or ended.
+  // reset or ended. Losing the foreground is a presentation event: hide any
+  // candidate page we show, but keep the projected page and every semantic
+  // record intact so a later dispatch can re-present it.
   const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::ThreadForeground);
+  if (!fForeground) {
+    for (auto &entry : entries_)
+      if (entry->candidates)
+        entry->candidates->hide();
+  }
   diagf("FOCUS_FOREGROUND", "fg=%d entries=%zu end_context=%d", fForeground ? 1 : 0,
         entries_.size(), obligation.end_context ? 1 : 0);
   return S_OK;
@@ -1007,6 +1020,19 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
         "dim=%p prev=%p entries=%zu in_focus=%zu in_previous=%zu end_context=%d reset_epoch=0",
         static_cast<void *>(pdimFocus), static_cast<void *>(pdimPrevFocus), entries_.size(),
         in_focus, in_previous, obligation.end_context ? 1 : 0);
+  // Presentation only (D072 §9): a candidate page attached to the document that
+  // just lost focus must not stay visible or actionable in the wrong focused
+  // context. Hiding is the complete obligation here: no Host unbind, no
+  // incarnation advance, no projection or semantic-state discard. When focus
+  // returns, the next admitted dispatch re-presents through sync_candidate_view.
+  if (pdimPrevFocus != nullptr && pdimPrevFocus != pdimFocus) {
+    for (auto &entry : entries_) {
+      const bool was_in_previous =
+          entry->document_mgr == pdimPrevFocus || context_reports_document(*entry, pdimPrevFocus);
+      if (was_in_previous && entry->candidates)
+        entry->candidates->hide();
+    }
+  }
   return S_OK;
 }
 

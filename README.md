@@ -51,7 +51,7 @@ repository entry point only.
 - `tests/stage4a_ipc.cpp` — Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer (multi-client, transport-failure separation, clean shutdown) and the FusionHost.exe integration mode. The first three modes run in the Mock-only build too; only the integration mode needs `FUSION_WITH_FCITX5=ON`.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
 - `tests/tsf_lifecycle.cpp` — Stage 4C lifecycle obligation and teardown-reconciliation tests (context identity, unresolved responsibility, external termination, cross-context isolation).
-- `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal. Runs in the Mock-only build; the Win32 candidate surface is covered on the real product path.
+- `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal, truncated-page cursor normalization, and focus-loss/presentation-failure invariants. Runs in the Mock-only build; the Win32 candidate surface is covered on the real product path.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -384,10 +384,12 @@ shell to do with a Fusion context, and the sinks in `src/tsf/service.cpp` apply 
 `OnPopContext`, `OnUninitDocumentMgr`. An external `OnCompositionTerminated` reconciles the projection
 and settles queued/pending work but keeps the context identity and Host binding. Focus
 (`ITfThreadMgrEventSink::OnSetFocus`), thread foreground (`ITfKeyEventSink::OnSetFocus`), `OnPushContext`
-and `OnInitDocumentMgr` are recorded and change nothing: D072 §9 fixes that focus is not a semantic
+and `OnInitDocumentMgr` are recorded and change nothing semantic: D072 §9 fixes that focus is not a semantic
 incarnation and that focus loss alone is neither an epoch advance nor a composition termination, so push
-and focus must not silently become discontinuity policy. Whether push/pop and transitory contexts
-constitute a discontinuity remains **UNFROZEN** (§9/§18).
+and focus must not silently become discontinuity policy. Since Stage 5 a focus-loss event additionally hides
+a displayed candidate *presentation* — that is presentation only: no Host unbind, no incarnation advance, no
+projection or semantic-state discard, and a later admitted dispatch may re-present. Whether push/pop and
+transitory contexts constitute a discontinuity remains **UNFROZEN** (§9/§18).
 
 **Teardown reconciliation.** Every context teardown now (a) computes what is still unresolved (owned
 keys, unsettled or uncertain EFFECTs, owned callbacks never issued to the document), (b) fences the
@@ -426,7 +428,11 @@ explicit **non-key** candidate action.
 **Projection is STATE, not a second ledger.** `Backend::send` now always appends one `CandidateSnapshot`
 operation whose payload is a `CandidatePage` (`src/fcitx/backend.cpp::observe_candidate_page`): labelled
 entries that stay index-aligned with `CandidateList::candidate(i)`, a page-local cursor, the canonical
-`PageableCandidateList` pager truth, and a `truncated` bound flag. Fcitx has no explicit hide signal, so the
+`PageableCandidateList` pager truth, and a `truncated` bound flag. When a transport bound truncates the page
+to a retained prefix, the producer normalizes the engine cursor against the retained entries
+(`CandidatePage::normalize_cursor_to_retained_prefix`): a still-valid cursor is preserved, a cursor whose
+entry was dropped becomes no-highlight (-1), no different candidate is ever highlighted in its place, and the
+engine's own cursor is not touched. Fcitx has no explicit hide signal, so the
 snapshot of an *empty* candidate slot is the authoritative close. The controller records that projection as
 display text on `SemanticDecision::page`; it never owns a Core record and is never a second copy of semantic
 state. `SemanticController::displayed_page()` is the current projection.
@@ -453,13 +459,23 @@ highlight) and maps a `WM_LBUTTONUP` hit to a page-local index or a pager reques
 and no engine; a click reports the index+generation and the service re-validates it through the same
 stale-entry fence the edit sessions use before dispatching. `dumpbin /dependents` confirms the TSF DLL links
 only Windows system libs plus the new `GDI32` — never Fcitx or LibIME; the engine stays solely in
-`FusionHost.exe`. This is the first seam only because it needs no anchor-over-IPC and keeps the Host
+`FusionHost.exe`. The caret anchor is resolved inside the read-only probe session from the authoritative
+active view of the context itself (`ITfContext::GetActiveView`); a failing HRESULT, a null view or no active
+view is a presentation failure only — the page is hidden, never shown unanchored, and no engine semantic
+event is invented. Focus loss hides the displayed page in both `OnSetFocus` sinks (document-level and thread
+foreground): presentation only, the projected page, incarnation, records and Host binding all survive, and a
+normal dispatch after focus returns re-presents. `tests/stage5_candidates.cpp` locks the
+presentation-failure/focus invariants at the controller level. This is the first seam only because it needs
+no anchor-over-IPC and keeps the Host
 headless; D072 §16 renderer placement remains **UNFROZEN** and is not decided here.
 
 **Tests.** `tests/stage5_candidates.cpp` drives the real `SemanticController` real-frontend path against a
 deterministic scripted Backend and asserts, without Fcitx/TSF/windows.h, page STATE and placeholder alignment,
-select→EFFECT ordered after STATE with zero key identity, paging cursor/pager truth, and the out-of-range and
-stale-incarnation refusals that must dispatch nothing (`ctest -R stage5_candidates`, Mock-only build too).
+select→EFFECT ordered after STATE with zero key identity, paging cursor/pager truth, the out-of-range and
+stale-incarnation refusals that must dispatch nothing, truncated-page cursor normalization (inside boundary,
+exactly/outside boundary, no-cursor, empty page), and the focus-loss/presentation-failure invariants (hide
+only; context identity, binding, records and projection intact)
+(`ctest -R stage5_candidates`, Mock-only build too).
 `tests/stage4a_ipc.cpp` extends the protocol tests to the `CandidatePage` round-trip and two new fail-closed
 cases (cursor out of range, key stimulus claiming an index) and pins `protocol_version == 3`; its integration
 mode adds real-engine evidence: typing `nihao` over the live `FusionHost` projects a non-empty pinyin page

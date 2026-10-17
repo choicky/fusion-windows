@@ -89,6 +89,17 @@ struct CandidatePage {
   bool has_next = false;
   bool truncated = false; // transport bound hit, not a semantic decision
   bool empty() const { return entries.empty(); }
+  // Transport/presentation normalization for a page that a bound truncated to a
+  // retained prefix: an engine cursor referring to an entry that was not
+  // retained becomes no-highlight (-1); a cursor inside the retained prefix is
+  // preserved. It never highlights a different candidate in its place and never
+  // touches the Fcitx engine cursor — the next engine re-read projects the
+  // engine's own truth. Without this, a truncated page would carry a cursor the
+  // wire validator must reject, losing the whole presentation.
+  void normalize_cursor_to_retained_prefix() {
+    if (cursor_index >= static_cast<std::int32_t>(entries.size()))
+      cursor_index = -1;
+  }
 };
 
 struct BackendOperation {
