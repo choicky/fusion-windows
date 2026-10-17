@@ -227,6 +227,23 @@ if(BUILD_TESTING)
   foreach(test page select refuse paging truncation focus)
     add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
   endforeach()
+  # Blocker-1 regression: the extracted candidate projection driven against the
+  # real Fcitx5 engine (system libraries). Non-Windows only, and registered
+  # only when Fcitx5 development libraries are found; the Windows build already
+  # compiles the same source into FusionHost.exe and smoke-tests it on the
+  # product path, so the pinned Windows topology is not perturbed here.
+  if(NOT WIN32)
+    find_package(Fcitx5Core QUIET CONFIG)
+    if(Fcitx5Core_FOUND)
+      add_executable(fcitx_candidate_filter
+        tests/fcitx_candidate_filter.cpp src/fcitx/candidate_projection.cpp)
+      target_include_directories(fcitx_candidate_filter PRIVATE src include)
+      target_link_libraries(fcitx_candidate_filter PRIVATE Fcitx5::Core)
+      target_compile_features(fcitx_candidate_filter PRIVATE cxx_std_20)
+      target_compile_options(fcitx_candidate_filter PRIVATE -Wall -Wextra -Wpedantic -Werror)
+      add_test(NAME fcitx_candidate_filter COMMAND fcitx_candidate_filter)
+    endif()
+  endif()
   foreach(test loss duplicate context stale order bounds pass terminal cancelled retry reference)
     add_test(NAME rg0_${test} COMMAND rg0 ${test})
   endforeach()

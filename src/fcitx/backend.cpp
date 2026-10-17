@@ -1,4 +1,5 @@
 #include "fusion/backend.hpp"
+#include "candidate_projection.hpp"
 #include <atomic>
 #include <chrono>
 #include <fcitx-utils/environ.h>
@@ -56,6 +57,7 @@ class InputContext final : public fcitx::InputContext {
 public:
   InputContext(fcitx::Instance &instance, Binding value)
       : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value) {
+    instance_ = &instance;
     setCapabilityFlags(fcitx::CapabilityFlag::Preedit);
     created();
   }
@@ -94,52 +96,14 @@ public:
     if (invalid)
       return;
     CandidatePage page;
-    auto list = inputPanel().candidateList();
-    if (list) {
-      page.cursor_index = list->cursorIndex();
-      page.layout = static_cast<CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint()));
-      if (auto *pager = list->toPageable()) {
-        page.has_prev = pager->hasPrev();
-        page.has_next = pager->hasNext();
+    if (auto list = inputPanel().candidateList()) {
+      auto projected = project_candidate_page(*instance_, this, list, candidate_page_entries,
+                                              candidate_page_bytes, payload_bound);
+      if (!projected) {
+        invalid = true;
+        return;
       }
-      const int visible = list->size();
-      std::size_t used = 0;
-      for (int index = 0; index < visible; ++index) {
-        if (page.entries.size() >= candidate_page_entries) {
-          page.truncated = true;
-          break;
-        }
-        const auto &word = list->candidate(index);
-        CandidateEntry entry;
-        entry.placeholder = word.isPlaceHolder();
-        entry.text = word.text().toString();
-        entry.comment = word.comment().toString();
-        // Labels are page-local and only padded to ten; an engine with a wider
-        // page has no label for the extra slots rather than a different candidate.
-        if (index < 10) {
-          entry.label = list->label(index).toString();
-        }
-        used += entry.label.size() + entry.text.size() + entry.comment.size();
-        if (used > candidate_page_bytes) {
-          page.truncated = true;
-          break;
-        }
-        for (const auto &field : {entry.label, entry.text, entry.comment}) {
-          if (!field.empty() && !fcitx::utf8::validate(field)) {
-            invalid = true;
-            return;
-          }
-          if (field.size() > payload_bound) {
-            invalid = true;
-            return;
-          }
-        }
-        page.entries.push_back(std::move(entry));
-      }
-      // A transport bound may have dropped the entry the engine cursor referred
-      // to. Normalize the projection to the retained prefix before the page goes
-      // on the wire (presentation only; the engine keeps its own cursor).
-      page.normalize_cursor_to_retained_prefix();
+      page = std::move(*projected);
     }
     BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
     operation.page = std::move(page);
@@ -181,6 +145,7 @@ public:
   }
   fcitx::Key dispatched_key;
   Binding binding;
+  fcitx::Instance *instance_ = nullptr; // owned by the Host worker thread
   std::uint64_t last_stimulus = 0;
   BackendBatch *batch = nullptr;
   bool lifecycle = true;

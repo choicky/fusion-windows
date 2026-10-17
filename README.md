@@ -42,6 +42,7 @@ repository entry point only.
 - `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests; `candidate_view.{hpp,cpp}` (Stage 5) is the minimal in-process candidate surface that renders the projected page and reports a pointer hit as a non-key action (the DLL links only GDI32/USER32 for it, never Fcitx/LibIME). The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
 - `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server, Host-side only), `pipe_security.{hpp,cpp}` (per-user pipe name, server identity verification, security descriptor), `ipc_backend.{hpp,cpp}` (Backend over IPC).
 - `src/host/` — Stage 4A FusionHost.exe: `main.cpp` (entry point), `host_server.{hpp,cpp}` (multi-client accept loop, per-connection threads, backend mutex, context remapping).
+- `src/fcitx/` — Host-side real Fcitx backend: `backend.cpp` (Fcitx thread, InputContext frontend, dispatch and candidate actions) and `candidate_projection.{hpp,cpp}` (the engine's candidate page flattened to the transport `CandidatePage`, observing `Instance::outputFilter` per display field like the mature classic-ui display path).
 - `tests/mock.{hpp,cpp}` — deterministic FusionMock scheduler, fault harness and oracles.
 - `tests/mock_backend.{hpp,cpp}` — Stage 2 semantic Mock Backend (a test abstraction).
 - `tests/rg0.cpp` — Stage 1 RG-0 invariant tests.
@@ -52,6 +53,7 @@ repository entry point only.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
 - `tests/tsf_lifecycle.cpp` — Stage 4C lifecycle obligation and teardown-reconciliation tests (context identity, unresolved responsibility, external termination, cross-context isolation).
 - `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal, truncated-page cursor normalization, and focus-loss/presentation-failure invariants. Runs in the Mock-only build; the Win32 candidate surface is covered on the real product path.
+- `tests/fcitx_candidate_filter.cpp` — Stage 5 candidate display outputFilter contract against the real Fcitx5 engine (non-Windows build with Fcitx5 dev libraries; verifies `project_candidate_page` observes `Instance::outputFilter` exactly like the mature classic-ui display path).
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -426,13 +428,18 @@ projects the engine's *current candidate page* across the existing IPC and turns
 explicit **non-key** candidate action.
 
 **Projection is STATE, not a second ledger.** `Backend::send` now always appends one `CandidateSnapshot`
-operation whose payload is a `CandidatePage` (`src/fcitx/backend.cpp::observe_candidate_page`): labelled
+operation whose payload is a `CandidatePage` (`src/fcitx/candidate_projection.cpp::project_candidate_page`,
+called from `observe_candidate_page`): labelled
 entries that stay index-aligned with `CandidateList::candidate(i)`, a page-local cursor, the canonical
 `PageableCandidateList` pager truth, and a `truncated` bound flag. When a transport bound truncates the page
 to a retained prefix, the producer normalizes the engine cursor against the retained entries
 (`CandidatePage::normalize_cursor_to_retained_prefix`): a still-valid cursor is preserved, a cursor whose
 entry was dropped becomes no-highlight (-1), no different candidate is ever highlighted in its place, and the
-engine's own cursor is not touched. Fcitx has no explicit hide signal, so the
+engine's own cursor is not touched. Display fields pass through Fcitx's own
+`Instance::outputFilter` before flattening — label, text and comment each, the same per-field call the mature
+classic-ui panel display path makes (`src/ui/classic/inputwindow.cpp` at the pinned revision): candidate
+display data stays Fcitx-defined (D082), Windows adds no second filtering authority and nothing is filtered
+twice. Fcitx has no explicit hide signal, so the
 snapshot of an *empty* candidate slot is the authoritative close. The controller records that projection as
 display text on `SemanticDecision::page`; it never owns a Core record and is never a second copy of semantic
 state. `SemanticController::displayed_page()` is the current projection.
@@ -476,6 +483,11 @@ stale-incarnation refusals that must dispatch nothing, truncated-page cursor nor
 exactly/outside boundary, no-cursor, empty page), and the focus-loss/presentation-failure invariants (hide
 only; context identity, binding, records and projection intact)
 (`ctest -R stage5_candidates`, Mock-only build too).
+`tests/fcitx_candidate_filter.cpp` drives the extracted `project_candidate_page` against the real Fcitx5
+engine (system libraries; registered on non-Windows builds only when the Fcitx5 development package is
+present): projection identity when no consumer is connected, engine-filtered label/text/comment when one is,
+and index identity, placeholder slot, cursor and pager truth preserved through filtering — the candidate
+display outputFilter contract.
 `tests/stage4a_ipc.cpp` extends the protocol tests to the `CandidatePage` round-trip and two new fail-closed
 cases (cursor out of range, key stimulus claiming an index) and pins `protocol_version == 3`; its integration
 mode adds real-engine evidence: typing `nihao` over the live `FusionHost` projects a non-empty pinyin page
