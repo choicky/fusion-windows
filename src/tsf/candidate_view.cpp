@@ -216,6 +216,17 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
     }
     return 0;
   }
+  // A click must never activate the popup. WS_EX_NOACTIVATE alone does not stop
+  // DefWindowProc from answering MA_ACTIVATE / PA_ACTIVATE: the popup then takes
+  // activation and focus from the application, which ends the composition and
+  // hides the popup before the button-up that selects arrives (observed in
+  // Notepad, a pointer-input process, for both physical and injected clicks:
+  // the request came as WM_MOUSEACTIVATE). WM_POINTERACTIVATE is the same
+  // request for pointer-input activation and gets the same answer.
+  case WM_MOUSEACTIVATE:
+    return MA_NOACTIVATE;
+  case WM_POINTERACTIVATE:
+    return PA_NOACTIVATE;
   case WM_NCHITTEST:
     return HTCLIENT; // whole popup clickable, no resize border
   case WM_DESTROY:
