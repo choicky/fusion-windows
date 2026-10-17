@@ -18,6 +18,15 @@ namespace fusion::tsf {
 
 namespace {
 
+// InputScope.h declares these GUIDs as link-time symbols, but the desktop SDK
+// does not ship a separate msctf import library in all supported toolchains.
+// Keep the documented values local to the probe instead of changing the link
+// surface of the TIP.
+constexpr GUID kIidTfInputScope{0xfde1eaee, 0x6924, 0x4cdf,
+                                {0x91, 0xe7, 0xda, 0x38, 0xcf, 0xf5, 0x55, 0x9d}};
+constexpr GUID kGuidPropInputScope{0x1713dd5a, 0x68e7, 0x4a5b,
+                                   {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
+
 // QI helper: wraps the new reference (QI addref'd) in a ComRef.
 template <typename T> ComRef<T> qi(IUnknown *object, const IID &iid) {
   T *raw = nullptr;
@@ -1208,6 +1217,87 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
   return raw;
 }
 
+class InputScopeProbe final : public ITfEditSession {
+public:
+  explicit InputScopeProbe(ContextEntry &entry) : entry_(&entry) {}
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfEditSession)) {
+      *ppv = static_cast<ITfEditSession *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --refs_;
+    if (count == 0)
+      delete this;
+    return count;
+  }
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+    entry_->input_scope_known = false;
+    entry_->sensitive_scope = false;
+    ComRef<ITfProperty> property;
+    ComRef<ITfRange> range;
+    VARIANT value;
+    VariantInit(&value);
+    if (FAILED(entry_->context->GetProperty(kGuidPropInputScope, property.out())) || !property ||
+        FAILED(entry_->context->GetStart(ec, range.out())) || !range ||
+        FAILED(property->GetValue(ec, range.get(), &value))) {
+      VariantClear(&value);
+      return S_OK;
+    }
+    ComRef<ITfInputScope> scope;
+    if (value.vt == VT_UNKNOWN && value.punkVal != nullptr)
+      scope = qi<ITfInputScope>(value.punkVal, kIidTfInputScope);
+    if (scope) {
+      InputScope *values = nullptr;
+      UINT count = 0;
+      if (SUCCEEDED(scope->GetInputScopes(&values, &count))) {
+        entry_->input_scope_known = true;
+        for (UINT i = 0; i < count; ++i) {
+          if (values[i] == IS_PASSWORD || values[i] == IS_PRIVATE ||
+              values[i] == IS_NUMERIC_PASSWORD || values[i] == IS_NUMERIC_PIN ||
+              values[i] == IS_ALPHANUMERIC_PIN || values[i] == IS_ALPHANUMERIC_PIN_SET) {
+            entry_->sensitive_scope = true;
+            break;
+          }
+        }
+      }
+      if (values != nullptr)
+        CoTaskMemFree(values);
+    }
+    VariantClear(&value);
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> refs_{1};
+  ContextEntry *entry_;
+};
+
+void refresh_input_scope(TextService &service, ContextEntry &entry) {
+  if (entry.context == nullptr || service.client_id() == TF_CLIENTID_NULL)
+    return;
+  auto *probe = new InputScopeProbe(entry);
+  HRESULT inner = E_FAIL;
+  const HRESULT outer = entry.context->RequestEditSession(service.client_id(), probe, TF_ES_READ,
+                                                           &inner);
+  probe->Release();
+  if (FAILED(outer) || FAILED(inner)) {
+    diagf("INPUT_SCOPE", "known=0 request=failed");
+    return;
+  }
+  diagf("INPUT_SCOPE", "known=%d sensitive=%d", entry.input_scope_known ? 1 : 0,
+        entry.sensitive_scope ? 1 : 0);
+}
+
 bool TextService::hard_policy_allows(ContextEntry &entry) {
   // Minimal Windows hard policy (D072 §10): keyboard open/close on the thread
   // manager, keyboard-disabled and empty-context on the context. A
@@ -1234,6 +1324,11 @@ bool TextService::hard_policy_allows(ContextEntry &entry) {
         }
       }
     }
+  }
+  refresh_input_scope(*this, entry);
+  if (entry.sensitive_scope) {
+    diagf("SENSITIVE_SCOPE", "admission=blocked");
+    return false;
   }
   if (entry.context != nullptr) {
     auto compartments = qi<ITfCompartmentMgr>(entry.context, IID_ITfCompartmentMgr);

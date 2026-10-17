@@ -195,6 +195,15 @@ if(BUILD_TESTING)
   add_executable(rg0 tests/rg0.cpp)
   target_link_libraries(rg0 PRIVATE FusionMock)
 
+  if(WIN32 AND MSVC)
+    add_executable(diag_policy tests/diag_policy.cpp src/tsf/diag.cpp)
+    target_include_directories(diag_policy PRIVATE src)
+    target_compile_features(diag_policy PRIVATE cxx_std_20)
+    target_compile_options(diag_policy PRIVATE /W4 /WX /utf-8)
+    add_test(NAME diag_default_off COMMAND diag_policy default)
+    add_test(NAME diag_optin_redacted COMMAND diag_policy optin)
+  endif()
+
   add_executable(stage2 tests/stage2.cpp)
   target_link_libraries(stage2 PRIVATE MockBackend FusionMock)
 
