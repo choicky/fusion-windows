@@ -39,6 +39,8 @@ using ServiceBackend = fusion::Backend;
 using ServiceBackend = fusion::test::MockBackend;
 #endif
 
+enum class InputScopeClass { Unknown, Ordinary, Sensitive };
+
 struct ContextEntry {
   ~ContextEntry() {
     if (composition) {
@@ -61,10 +63,10 @@ struct ContextEntry {
   ComRef<IUnknown> cleanup_identity;
   SelfEnd self_end;
   bool async_in_flight = false;
-  // Cached TSF InputScope classification. A sensitive scope is never sent to
-  // Fcitx; unknown metadata remains ordinary-field behavior and is recorded.
-  bool input_scope_known = false;
-  bool sensitive_scope = false;
+  // The current selection's TSF InputScope classification. Sensitive scopes
+  // are never sent to Fcitx; unknown metadata preserves ordinary-field
+  // behavior but is recorded as unknown.
+  InputScopeClass input_scope = InputScopeClass::Unknown;
   // Last link identity observed for this context, purely for diagnostics: a
   // change means a disconnect, reconnect or incarnation/connection move.
   LinkStatus observed_link{};

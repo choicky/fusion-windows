@@ -6,6 +6,7 @@ The Release candidate was built from this worktree against the rebuilt `runtime-
 
 Diagnostics are disabled unless `FUSION_TSF_DIAGNOSTICS` is explicitly set to `1`, `true`, or `on`. Opt-in records technical lifecycle and ownership information only; key/text-bearing fields are redacted. The default-off and opt-in tests verify no diagnostic file by default and no `vk=` or `text=` content in the opt-in output.
 
-The TSF hard-policy path probes `GUID_PROP_INPUTSCOPE` through `ITfInputScope` and blocks password/private/numeric PIN scopes before backend admission. Unknown metadata is recorded as unknown; there is no heuristic password classification and no password PASS claim without metadata evidence. The mandatory physical Notepad baseline oracle passed for preedit, Space commit, Backspace cancellation, and empty-preedit Enter.
+The TSF hard-policy path probes `GUID_PROP_INPUTSCOPE` through `ITfInputScope` and blocks password/private/numeric PIN scopes before backend admission. Unknown metadata is recorded as unknown; there is no heuristic password classification and no password PASS claim without metadata evidence. The existing physical Notepad oracle is preserved as historical Stage 3B evidence; it is not used as proof of final-candidate WP2 Notepad validation.
 
 This record is validation evidence only. It does not authorize distribution, merge, or Stage 3C/WP3 work.
+

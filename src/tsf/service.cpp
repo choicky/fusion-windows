@@ -1219,7 +1219,8 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
 
 class InputScopeProbe final : public ITfEditSession {
 public:
-  explicit InputScopeProbe(ContextEntry &entry) : entry_(&entry) {}
+  InputScopeProbe(std::shared_ptr<ContextEntry> entry, std::uint64_t generation)
+      : entry_(std::move(entry)), generation_(generation) {}
 
   STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
     if (ppv == nullptr)
@@ -1241,18 +1242,29 @@ public:
   }
 
   STDMETHODIMP DoEditSession(TfEditCookie ec) override {
-    entry_->input_scope_known = false;
-    entry_->sensitive_scope = false;
+    if (!entry_ || entry_->generation != generation_ || entry_->context == nullptr) {
+      diagf("INPUT_SCOPE", "class=unknown reason=stale-entry");
+      return S_OK;
+    }
+    entry_->input_scope = InputScopeClass::Unknown;
     ComRef<ITfProperty> property;
     ComRef<ITfRange> range;
     VARIANT value;
     VariantInit(&value);
+    TF_SELECTION selection{};
+    ULONG fetched = 0;
     if (FAILED(entry_->context->GetProperty(kGuidPropInputScope, property.out())) || !property ||
-        FAILED(entry_->context->GetStart(ec, range.out())) || !range ||
+        FAILED(entry_->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) ||
+        fetched == 0 || selection.range == nullptr ||
+        FAILED(selection.range->QueryInterface(IID_ITfRange,
+                                                reinterpret_cast<void **>(range.out()))) ||
         FAILED(property->GetValue(ec, range.get(), &value))) {
+      if (selection.range != nullptr)
+        selection.range->Release();
       VariantClear(&value);
       return S_OK;
     }
+    selection.range->Release();
     ComRef<ITfInputScope> scope;
     if (value.vt == VT_UNKNOWN && value.punkVal != nullptr)
       scope = qi<ITfInputScope>(value.punkVal, kIidTfInputScope);
@@ -1260,12 +1272,12 @@ public:
       InputScope *values = nullptr;
       UINT count = 0;
       if (SUCCEEDED(scope->GetInputScopes(&values, &count))) {
-        entry_->input_scope_known = true;
+        entry_->input_scope = InputScopeClass::Ordinary;
         for (UINT i = 0; i < count; ++i) {
           if (values[i] == IS_PASSWORD || values[i] == IS_PRIVATE ||
               values[i] == IS_NUMERIC_PASSWORD || values[i] == IS_NUMERIC_PIN ||
               values[i] == IS_ALPHANUMERIC_PIN || values[i] == IS_ALPHANUMERIC_PIN_SET) {
-            entry_->sensitive_scope = true;
+            entry_->input_scope = InputScopeClass::Sensitive;
             break;
           }
         }
@@ -1279,23 +1291,37 @@ public:
 
 private:
   std::atomic<ULONG> refs_{1};
-  ContextEntry *entry_;
+  std::shared_ptr<ContextEntry> entry_;
+  std::uint64_t generation_;
 };
 
 void refresh_input_scope(TextService &service, ContextEntry &entry) {
   if (entry.context == nullptr || service.client_id() == TF_CLIENTID_NULL)
     return;
-  auto *probe = new InputScopeProbe(entry);
-  HRESULT inner = E_FAIL;
-  const HRESULT outer = entry.context->RequestEditSession(service.client_id(), probe, TF_ES_READ,
-                                                           &inner);
-  probe->Release();
-  if (FAILED(outer) || FAILED(inner)) {
-    diagf("INPUT_SCOPE", "known=0 request=failed");
+  auto hold = service.hold_entry(&entry);
+  if (!hold) {
+    entry.input_scope = InputScopeClass::Unknown;
+    diagf("INPUT_SCOPE", "class=unknown reason=entry-not-live");
     return;
   }
-  diagf("INPUT_SCOPE", "known=%d sensitive=%d", entry.input_scope_known ? 1 : 0,
-        entry.sensitive_scope ? 1 : 0);
+  auto *probe = new InputScopeProbe(std::move(hold), entry.generation);
+  HRESULT inner = E_FAIL;
+  // Admission consumes this result immediately. TF_ES_READ alone may queue
+  // the edit session and leave the previous classification in place.
+  const HRESULT outer = entry.context->RequestEditSession(
+      service.client_id(), probe, TF_ES_SYNC | TF_ES_READ, &inner);
+  probe->Release();
+  if (outer != S_OK || inner != S_OK) {
+    entry.input_scope = InputScopeClass::Unknown;
+    diagf("INPUT_SCOPE", "class=unknown request=non-sync outer=0x%08lX inner=0x%08lX",
+          static_cast<unsigned long>(outer), static_cast<unsigned long>(inner));
+    return;
+  }
+  const char *classification = entry.input_scope == InputScopeClass::Sensitive
+                                   ? "sensitive"
+                                   : entry.input_scope == InputScopeClass::Ordinary ? "ordinary"
+                                                                                    : "unknown";
+  diagf("INPUT_SCOPE", "class=%s", classification);
 }
 
 bool TextService::hard_policy_allows(ContextEntry &entry) {
@@ -1326,7 +1352,7 @@ bool TextService::hard_policy_allows(ContextEntry &entry) {
     }
   }
   refresh_input_scope(*this, entry);
-  if (entry.sensitive_scope) {
+  if (entry.input_scope == InputScopeClass::Sensitive) {
     diagf("SENSITIVE_SCOPE", "admission=blocked");
     return false;
   }
