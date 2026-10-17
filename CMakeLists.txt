@@ -249,7 +249,7 @@ if(BUILD_TESTING)
   else()
     target_compile_options(stage5_candidates PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
-  foreach(test page select refuse paging truncation focus)
+  foreach(test page select refuse paging truncation focus utf16 preedit panel comment)
     add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
   endforeach()
   # The projection outputFilter contract against the real Fcitx5 engine (system
