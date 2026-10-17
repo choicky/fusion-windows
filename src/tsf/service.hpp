@@ -23,6 +23,7 @@
 #include "tsf/semantic.hpp"
 
 #include <msctf.h>
+#include <InputScope.h>
 #include <windows.h>
 
 #include <atomic>
@@ -60,6 +61,10 @@ struct ContextEntry {
   ComRef<IUnknown> cleanup_identity;
   SelfEnd self_end;
   bool async_in_flight = false;
+  // Cached TSF InputScope classification. A sensitive scope is never sent to
+  // Fcitx; unknown metadata remains ordinary-field behavior and is recorded.
+  bool input_scope_known = false;
+  bool sensitive_scope = false;
   // Last link identity observed for this context, purely for diagnostics: a
   // change means a disconnect, reconnect or incarnation/connection move.
   LinkStatus observed_link{};
