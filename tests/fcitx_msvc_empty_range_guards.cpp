@@ -73,8 +73,19 @@ bool consumed(const BackendBatch &batch) {
   return batch.disposition == BackendBatch::Disposition::Consumed;
 }
 
+// A genuine forward: Forward disposition and no document callback. Since Stage 5 every
+// dispatch also carries the CandidatePage STATE snapshot, and for an idle key that snapshot
+// must be the empty-panel hide signal (no candidate, no panel text) — nothing else may ride
+// along with the original key.
 bool forwarded(const BackendBatch &batch) {
-  return batch.disposition == BackendBatch::Disposition::Forward && batch.operations.empty();
+  if (batch.disposition != BackendBatch::Disposition::Forward)
+    return false;
+  for (const auto &operation : batch.operations) {
+    if (operation.type != BackendOperation::Type::CandidateSnapshot || !operation.page ||
+        !operation.page->panel_empty())
+      return false;
+  }
+  return true;
 }
 
 // Every scenario uses its own logical context so engine state cannot leak.
