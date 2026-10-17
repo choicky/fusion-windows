@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <mutex>
 
@@ -15,6 +16,8 @@ struct LogState {
   std::mutex mutex;
   HANDLE file = INVALID_HANDLE_VALUE;
   std::size_t written = 0;
+  bool enabled = false;
+  bool initialized = false;
 };
 
 LogState &log_state() {
@@ -32,6 +35,18 @@ void close_locked(LogState &state) {
 
 // Bounded growth: once the file exceeds kMaxFileBytes it is recreated empty.
 void ensure_open_locked(LogState &state) {
+  if (!state.initialized) {
+    state.initialized = true;
+    wchar_t opt_in[16] = {};
+    const DWORD length = GetEnvironmentVariableW(L"FUSION_TSF_DIAGNOSTICS", opt_in,
+                                                  static_cast<DWORD>(std::size(opt_in)));
+    state.enabled = length > 0 && length < std::size(opt_in) &&
+                    (_wcsicmp(opt_in, L"1") == 0 || _wcsicmp(opt_in, L"true") == 0 ||
+                     _wcsicmp(opt_in, L"on") == 0);
+  }
+  if (!state.enabled) {
+    return;
+  }
   if (state.file != INVALID_HANDLE_VALUE && state.written < kMaxFileBytes) {
     return;
   }
@@ -76,11 +91,21 @@ void event(const char *name, const char *details) {
   if (state.file == INVALID_HANDLE_VALUE) {
     return;
   }
+  // Diagnostics are an explicit developer opt-in and remain content-free even
+  // when enabled. Callers that accidentally pass a key/text-bearing field are
+  // reduced to a technical privacy marker rather than written verbatim.
+  const char *safe_details = details ? details : "";
+  for (const char *marker : {"vk=", "symbolic=", "text=", "preedit=", "commit=", "candidate="}) {
+    if (std::strstr(safe_details, marker) != nullptr) {
+      safe_details = "privacy=redacted";
+      break;
+    }
+  }
   char line[1024];
   int length =
       std::snprintf(line, sizeof(line), "ts=%llu pid=%lu tid=%lu %s %s\r\n",
                     static_cast<unsigned long long>(GetTickCount64()), GetCurrentProcessId(),
-                    GetCurrentThreadId(), name, details ? details : "");
+                    GetCurrentThreadId(), name, safe_details);
   if (length <= 0) {
     return;
   }

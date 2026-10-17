@@ -23,6 +23,7 @@
 #include "tsf/semantic.hpp"
 
 #include <msctf.h>
+#include <InputScope.h>
 #include <windows.h>
 
 #include <atomic>
@@ -37,6 +38,8 @@ using ServiceBackend = fusion::Backend;
 #else
 using ServiceBackend = fusion::test::MockBackend;
 #endif
+
+enum class InputScopeClass { Unknown, Ordinary, Sensitive };
 
 struct ContextEntry {
   ~ContextEntry() {
@@ -60,6 +63,10 @@ struct ContextEntry {
   ComRef<IUnknown> cleanup_identity;
   SelfEnd self_end;
   bool async_in_flight = false;
+  // The current selection's TSF InputScope classification. Sensitive scopes
+  // are never sent to Fcitx; unknown metadata preserves ordinary-field
+  // behavior but is recorded as unknown.
+  InputScopeClass input_scope = InputScopeClass::Unknown;
   // Last link identity observed for this context, purely for diagnostics: a
   // change means a disconnect, reconnect or incarnation/connection move.
   LinkStatus observed_link{};
