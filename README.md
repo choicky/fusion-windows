@@ -10,8 +10,10 @@ and faithful frontend path. Stage 4A adds an out-of-process Fcitx Host
 (`FusionHost.exe`) connected by length-prefixed binary IPC over a local Named Pipe;
 Stage 4B adds Host-incarnation identity, a bounded product-path reconnect, explicit
 semantic readiness and incarnation fencing. Stage 5 projects the engine's candidate
-page across that same IPC path and renders a first minimal in-process candidate
-surface that turns a pointer hit into an explicit non-key candidate action.
+page, its panel text rows and the displayed preedit (format segments + engine cursor)
+across that same IPC path, presents the preedit as a styled TSF composition with the
+engine caret, and renders a first minimal in-process candidate surface that turns a
+pointer hit into an explicit non-key candidate action.
 There is no end-user Windows input product yet; independent review is required
 before further integration.
 
@@ -37,9 +39,9 @@ repository entry point only.
 - `include/fusion/core.hpp` — portable FusionCore public model (Key/Kind/Result/Ticket, …).
 - `include/fusion/host.hpp` — Stage 2 `fusion::Host` Host-side boundary (backend `Intent` → Core operations).
 - `include/fusion/backend.hpp` — Stage 3B/4A/5 `fusion::Backend` interface and `BackendStimulus`/`BackendBatch`/`BackendOperation` types, plus the Stage 5 `CandidatePage`/`CandidateEntry`/`CandidateLayout` page projection and the non-key candidate action stimulus types.
-- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free). `protocol_version` is 3 since Stage 5 (candidate action types + `CandidatePage` payload shape).
+- `include/fusion/ipc_protocol.hpp` — Stage 4A IPC protocol: length-prefixed binary framing and serialization (platform-free). `protocol_version` is 4 since the Stage 5 closure (3 added the candidate action types + `CandidatePage`; 4 added the preedit segment/format/cursor contract and the panel rows).
 - `src/core.cpp` — FusionCore implementation.
-- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests; `candidate_view.{hpp,cpp}` (Stage 5) is the minimal in-process candidate surface that renders the projected page and reports a pointer hit as a non-key action (the DLL links only GDI32/USER32 for it, never Fcitx/LibIME). The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
+- `src/tsf/` — Stage 2.5 real TSF/COM development shell (`FusionTsf` DLL): service, edit sessions, key map, semantic adapter, diagnostics, registration; `lifecycle.hpp` (Stage 4C) holds the lifecycle obligation table and the teardown summary shared by the sinks and their tests; `candidate_view.{hpp,cpp}` (Stage 5) is the minimal in-process candidate surface that paints the projected panel (geometry and hit testing live in the portable `candidate_layout.hpp`) and reports a pointer hit as a non-key action (the DLL links only GDI32/USER32 for it, never Fcitx/LibIME); `display_attribute.{hpp,cpp}` + `preedit_presentation.hpp` present the Fcitx preedit format as TSF display attributes and the engine cursor as the composition caret. The TSF DLL builds on WIN32+MSVC regardless of `FUSION_WITH_FCITX5`. When `FUSION_WITH_FCITX5` is ON, it additionally links the IPC backend to talk to FusionHost.exe.
 - `src/ipc/` — Stage 4A IPC transport: `pipe_client.{hpp,cpp}` (overlapped I/O client), `pipe_server.{hpp,cpp}` (per-connection multi-instance server, Host-side only), `pipe_security.{hpp,cpp}` (per-user pipe name, server identity verification, security descriptor), `ipc_backend.{hpp,cpp}` (Backend over IPC).
 - `src/host/` — Stage 4A FusionHost.exe: `main.cpp` (entry point), `host_server.{hpp,cpp}` (multi-client accept loop, per-connection threads, backend mutex, context remapping).
 - `src/fcitx/` — Host-side real Fcitx backend: `backend.cpp` (Fcitx thread, InputContext frontend, dispatch and candidate actions) and `candidate_projection.{hpp,cpp}` (the engine's candidate page flattened to the transport `CandidatePage`, observing `Instance::outputFilter` per display field like the mature classic-ui display path).
@@ -52,8 +54,9 @@ repository entry point only.
 - `tests/stage4a_ipc.cpp` — Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer (multi-client, transport-failure separation, clean shutdown) and the FusionHost.exe integration mode. The first three modes run in the Mock-only build too; only the integration mode needs `FUSION_WITH_FCITX5=ON`.
 - `tests/tsf_semantic.cpp` — Stage 2.5 deterministic tests for the key map and semantic adapter.
 - `tests/tsf_lifecycle.cpp` — Stage 4C lifecycle obligation and teardown-reconciliation tests (context identity, unresolved responsibility, external termination, cross-context isolation).
-- `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal, truncated-page cursor normalization, and focus-loss/presentation-failure invariants. Runs in the Mock-only build; the Win32 candidate surface is covered on the real product path.
-- `tests/fcitx_candidate_filter.cpp` — Stage 5 candidate display outputFilter contract against the real Fcitx5 engine (non-Windows build with Fcitx5 dev libraries; verifies `project_candidate_page` observes `Instance::outputFilter` exactly like the mature classic-ui display path).
+- `tests/stage5_candidates.cpp` — Stage 5 candidate projection/action tests (platform-free): page STATE, placeholder index alignment, select-to-EFFECT ordering, paging highlight, stale-page and out-of-range refusal, truncated-page cursor normalization, focus-loss/presentation-failure invariants, and the closure modes (`utf16`, `preedit`, `panel`, `comment`). Runs in the Mock-only build; the Win32 painting itself is covered on the real product path.
+- `tests/stage5_real_projection.cpp` — Stage 5 closure against the real pinned pinyin engine (in-process `FusionFcitxHost`, `FUSION_WITH_FCITX5` build): preedit segments/format/cursor and their movement with Left/Right, partial selection and continued composition, stroke-filter and QuickPhrase auxUp, and the empty-panel hide signal.
+- `tests/fcitx_candidate_filter.cpp` — Stage 5 display outputFilter contract against the real Fcitx5 core (Windows `FUSION_WITH_FCITX5` build against the pinned runtime, and non-Windows builds with Fcitx5 dev libraries): candidate label/text/comment like classic-ui, the client preedit like the dbus frontend (segments, flags, cursor, engine password masking), and the panel rows like classic-ui.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -237,7 +240,7 @@ backend and serves IPC requests from connected TSF DLL clients.
 payload_length][1 byte: message_type][N bytes: payload]`. Strict
 request/response alternation per connection. All deserialization is fail-closed
 and rejects trailing bytes. Message types: Hello, Bind, Reset, Unbind, Send.
-The Hello handshake exchanges `protocol_version` (currently 3) and the backend
+The Hello handshake exchanges `protocol_version` (currently 4) and the backend
 `session_id`; since Stage 4B every Host response payload is prefixed with the
 responding Host incarnation (`[8 bytes: host_incarnation]`). Version mismatch
 returns version=0 and the client disconnects, so a mixed Stage 4B/Stage 5 pairing
@@ -313,7 +316,7 @@ existing `FusionCore` ledger.
 **Identity.** `HostServer` owns one incarnation identity per Host process/instance
 (a PoC engineering value from process id + monotonic clock + a process-local sequence; 0 is
 reserved for "no incarnation"). The Hello response publishes it and every Host response
-payload is prefixed with it (`[8 bytes: host_incarnation]`, `protocol_version` raised to 2 in Stage 4B, 3 since Stage 5). The
+payload is prefixed with it (`[8 bytes: host_incarnation]`, `protocol_version` raised to 2 in Stage 4B, 3 in Stage 5, 4 at the Stage 5 closure). The
 client refuses a response whose incarnation is not the one its connection established, and
 `LinkStatus` exposes `{state, host_incarnation, connection_generation}` — the two causal
 distinctions D072 §11 already named.
@@ -484,17 +487,41 @@ exactly/outside boundary, no-cursor, empty page), and the focus-loss/presentatio
 only; context identity, binding, records and projection intact)
 (`ctest -R stage5_candidates`, Mock-only build too).
 `tests/fcitx_candidate_filter.cpp` drives the extracted `project_candidate_page` against the real Fcitx5
-engine (system libraries; registered on non-Windows builds only when the Fcitx5 development package is
+engine (the pinned runtime on Windows; on non-Windows builds only when the Fcitx5 development package is
 present): projection identity when no consumer is connected, engine-filtered label/text/comment when one is,
 and index identity, placeholder slot, cursor and pager truth preserved through filtering — the candidate
 display outputFilter contract.
 `tests/stage4a_ipc.cpp` extends the protocol tests to the `CandidatePage` round-trip and two new fail-closed
-cases (cursor out of range, key stimulus claiming an index) and pins `protocol_version == 3`; its integration
+cases (cursor out of range, key stimulus claiming an index) plus the closure preedit/panel round-trip and its fail-closed cases (segments not tiling the text, cursor past the text, unknown format bits), and pins `protocol_version == 4`; its integration
 mode adds real-engine evidence: typing `nihao` over the live `FusionHost` projects a non-empty pinyin page
 across v3 IPC, and selecting a projected entry commits that entry's own text — proving selection is `select()`,
 not a numeric candidate key.
 
-P0-A/P0-B/P0-D remain OPEN. Stage 5 does not freeze D072 §16 renderer placement or the wire format, does not
-implement the segmented `FormattedPreedit`/style model, and does not decide multi-window/fixed-position or
-full keyboard-candidate UX; it establishes the first reviewable candidate projection/action seam on the
-existing single causal model.
+**Stage 5 closure projection (the three accepted closure blockers).**
+- *Faithful preedit.* `updatePreeditImpl` no longer flattens `clientPreedit().toString()`: `project_client_preedit`
+  applies `Instance::outputFilter` to the InputPanel's own `clientPreedit()` Text (the dbus frontend boundary; the
+  engine identity-checks that reference for password masking), normalizes it, and ships the flattened text plus a
+  `FormattedPreedit` — segment byte lengths, `TextFormatFlag` bits and the engine byte cursor (-1 hidden; a cursor
+  outside the text or inside a code point is shown hidden, the classic-ui rule). On the Windows build the pinyin
+  defaults are `ComposingPinyin` with the cursor fixed at the beginning, so the HighLight|Underline segment is what
+  shows the engine cursor. The controller rejects a projection that does not tile its text or does not sit on code
+  points (CancelledRecovery, never re-interpreted); the TSF edit session maps it with `layout_preedit`
+  (`fusion/text_utf16.hpp`: UTF-8 byte → UTF-16 unit, never inside a code point or a surrogate pair), puts the
+  composition caret at the engine cursor (end when hidden or absent), and tags segments through
+  `GUID_PROP_ATTRIBUTE` — Underline → composition input attribute, HighLight → highlighted attribute; Bold/Italic/
+  Strike/DontCommit have no TSF display-attribute meaning and are not mapped. The text service is now an
+  `ITfDisplayAttributeProvider` and registers `GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER` (re-run `register.ps1`).
+  Attribute failures are presentation-only diagnostics; committed or externally terminated text keeps no styling.
+- *Aux/panel.* The same `CandidateSnapshot` STATE now carries the panel rows of the same InputPanel update —
+  `aux_up`, `panel_preedit` (server-side `preedit()`), `aux_down` — each through `Instance::outputFilter` and only
+  when the InputPanel is not empty (classic-ui `InputWindow::update`). The presentation hides on
+  `CandidatePage::panel_empty()` (no non-placeholder candidate and no row text), not on "no candidates": QuickPhrase
+  (`;`, auxUp only, zero candidates) and the stroke filter (`` ` ``) stay visible. Candidate actions still need a
+  candidate slot. No new identity or counter: the snapshot keeps the dispatch's `PageFence`.
+- *Comment.* The renderer paints the already-projected, already-filtered comment after the candidate text (one
+  space, the classic-ui default) in a secondary color; the slot rect covers label, text and comment, so the hit
+  index stays `CandidateList::candidate(i)`.
+
+P0-A/P0-B/P0-D remain OPEN. Stage 5 does not freeze D072 §16 renderer placement or the wire format, and does not
+decide multi-window/fixed-position or full keyboard-candidate UX; `customLabel`, `spaceBetweenComment`,
+`overlayMessage` and the other deferred capabilities stay as recorded in the controller's §25 disposition.

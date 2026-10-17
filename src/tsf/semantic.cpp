@@ -1,5 +1,7 @@
 #include "tsf/semantic.hpp"
 
+#include "fusion/text_utf16.hpp"
+
 #include <algorithm>
 #include <chrono>
 
@@ -322,7 +324,8 @@ SemanticDecision SemanticController::begin_candidate_action(CandidateAction acti
   // A candidate action is meaningful only against a currently displayed page. The
   // fence guard rejects a page whose dispatch identity no longer matches the live
   // session/binding/incarnation/connection, so a stale page is never acted on.
-  if (!page_present_) {
+  // A panel showing only text rows (aux/panel preedit) has no candidate slot.
+  if (!page_present_ || !displayed_page_ || displayed_page_->empty()) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
@@ -384,6 +387,14 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
       continue; // presentation projection, not a document callback
     if (original_forward)
       valid = false; // no callback may follow the natural key
+    if (operation.type == BackendOperation::Type::SetPreedit && operation.preedit) {
+      // The preedit contract must map onto TSF positions as delivered: segments
+      // tile the text and every boundary and the cursor sit on code points. A
+      // projection that cannot is malformed, never silently re-interpreted.
+      std::vector<Utf16Segment> segments;
+      std::optional<std::size_t> cursor;
+      valid = valid && project_preedit_utf16(operation.text, *operation.preedit, segments, cursor);
+    }
     if (operation.type == BackendOperation::Type::ForwardKey) {
       valid = valid && operation.original_key;
       original_forward = true;
@@ -433,12 +444,13 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
     }
   }
   // Update the candidate projection only after the batch passed validation and
-  // its records were admitted: a rejected dispatch must not resurrect a page. An
-  // empty page is the hide signal — present in the decision, absent in the fence.
+  // its records were admitted: a rejected dispatch must not resurrect a page. A
+  // panel with nothing to display (CandidatePage::panel_empty(), not merely "no
+  // candidates") is the hide signal — present in the decision, absent in the fence.
   if (captured) {
     decision.page = captured;
     const LinkStatus link = real_backend_->link_status();
-    page_present_ = !captured->empty();
+    page_present_ = !captured->panel_empty();
     displayed_page_ = page_present_ ? captured : std::nullopt;
     displayed_fence_ = PageFence{batch.backend_session_id, stimulus.binding, batch.stimulus_id,
                                  link.host_incarnation, link.connection_generation};
@@ -538,7 +550,8 @@ Key SemanticController::cancel_pass_recovery() {
   return key;
 }
 
-void SemanticController::enqueue_state(Key key, std::string text) {
+void SemanticController::enqueue_state(Key key, std::string text,
+                                       std::optional<FormattedPreedit> preedit) {
   const bool live =
       std::any_of(core_.records().begin(), core_.records().end(), [&](const Record &record) {
         return record.key == key && record.key.binding == core_.binding() &&
@@ -549,7 +562,7 @@ void SemanticController::enqueue_state(Key key, std::string text) {
   if (std::any_of(pending_.begin(), pending_.end(),
                   [&](const PendingWork &w) { return w.key == key; }))
     return;
-  pending_.push_back(PendingWork{Kind::State, key, std::move(text)});
+  pending_.push_back(PendingWork{Kind::State, key, std::move(text), std::move(preedit)});
 }
 
 void SemanticController::enqueue_effect(Key key, std::string text) {

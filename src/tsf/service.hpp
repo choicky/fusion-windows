@@ -17,6 +17,7 @@
 #include "mock_backend.hpp"
 #include "tsf/candidate_view.hpp"
 #include "tsf/com_ptr.hpp"
+#include "tsf/display_attribute.hpp"
 #include "tsf/lifecycle.hpp"
 #include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
@@ -79,7 +80,8 @@ struct ContextEntry {
 class TextService final : public ITfTextInputProcessor,
                           public ITfKeyEventSink,
                           public ITfThreadMgrEventSink,
-                          public ITfCompositionSink {
+                          public ITfCompositionSink,
+                          public ITfDisplayAttributeProvider {
 public:
   static constexpr std::size_t kLedgerCapacity = 64; // development bound
 
@@ -113,6 +115,11 @@ public:
   // ITfCompositionSink
   STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition *pComposition) override;
 
+  // ITfDisplayAttributeProvider (Stage 5: composition styling of the Fcitx
+  // preedit format; see tsf/display_attribute.hpp)
+  STDMETHODIMP EnumDisplayAttributeInfo(IEnumTfDisplayAttributeInfo **ppEnum) override;
+  STDMETHODIMP GetDisplayAttributeInfo(REFGUID guid, ITfDisplayAttributeInfo **ppInfo) override;
+
   // Stage 5 candidate click entry point (called by CandidateView's window
   // procedure). Validates the owning entry through the same stale-entry fence the
   // edit sessions use, then dispatches the non-key action on the product path.
@@ -124,8 +131,11 @@ public:
   std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
   ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
   bool hard_policy_allows(ContextEntry &entry);
+  // `presentation` (real frontend only) places the caret at the engine cursor
+  // and styles the composition; without it the caret goes to the end.
   fusion::EditResult apply_state_text(ContextEntry &entry, TfEditCookie ec,
-                                      const std::wstring &text, bool &mutated);
+                                      const std::wstring &text, bool &mutated,
+                                      const PreeditPresentation *presentation = nullptr);
   // Returns the fusion EditResult observed by the real mutation, and whether an
   // effect mutation happened (verified by readback) for reconcile purposes.
   fusion::EditResult apply_effect_text(ContextEntry &entry, TfEditCookie ec,
@@ -177,6 +187,7 @@ private:
   ComRef<ITfThreadMgr> thread_mgr_;
   TfClientId client_id_ = TF_CLIENTID_NULL;
   DWORD thread_event_cookie_ = 0;
+  DisplayAttributeAtoms display_atoms_; // registered on Activate
 #ifdef FUSION_WITH_FCITX5
   std::unique_ptr<Backend> backend_;
 #else

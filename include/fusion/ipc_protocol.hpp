@@ -29,6 +29,11 @@
 // flat string list. Same framing, same Send/Batch channel, same fencing — there is
 // no candidate-specific transport — but the payload shape changed, so a mixed
 // Stage 4B/Stage 5 pairing must fail the handshake rather than misparse it.
+//
+// Stage 5 closure raised it 3 -> 4: SetPreedit carries the displayed preedit's
+// fcitx::Text contract (segment byte lengths + TextFormatFlag bits + byte
+// cursor), and CandidatePage carries the panel rows (auxUp, panel preedit,
+// auxDown). Same framing and fencing; only the payload shapes grew.
 // The numbers below remain engineering constants: D072 keeps wire format and
 // numerical thresholds UNFROZEN.
 
@@ -44,7 +49,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 3;
+inline constexpr std::uint32_t protocol_version = 4;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -241,6 +246,9 @@ inline void serialize(std::vector<std::uint8_t> &buf, const CandidatePage &page)
   detail::write_u8(buf, page.has_prev ? 1 : 0);
   detail::write_u8(buf, page.has_next ? 1 : 0);
   detail::write_u8(buf, page.truncated ? 1 : 0);
+  detail::write_string(buf, page.aux_up);
+  detail::write_string(buf, page.panel_preedit);
+  detail::write_string(buf, page.aux_down);
 }
 
 inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
@@ -260,7 +268,11 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
   auto has_prev = r.read_u8();
   auto has_next = r.read_u8();
   auto truncated = r.read_u8();
-  if (!cursor_bits || !layout || !has_prev || !has_next || !truncated)
+  auto aux_up = r.read_string();
+  auto panel_preedit = r.read_string();
+  auto aux_down = r.read_string();
+  if (!cursor_bits || !layout || !has_prev || !has_next || !truncated || !aux_up ||
+      !panel_preedit || !aux_down)
     return std::nullopt;
   if (*layout > static_cast<std::uint8_t>(CandidateLayout::Horizontal))
     return std::nullopt;
@@ -276,7 +288,55 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
   page.has_prev = *has_prev != 0;
   page.has_next = *has_next != 0;
   page.truncated = *truncated != 0;
+  page.aux_up = std::move(*aux_up);
+  page.panel_preedit = std::move(*panel_preedit);
+  page.aux_down = std::move(*aux_down);
   return page;
+}
+
+// SetPreedit's fcitx::Text contract. An absent projection travels as "no
+// segments, hidden cursor" and is read back as absent, so plain-text producers
+// (Mock, test doubles) keep their caret-at-end meaning.
+inline void serialize(std::vector<std::uint8_t> &buf, const std::optional<FormattedPreedit> &p) {
+  detail::write_u8(buf, p ? 1 : 0);
+  if (!p)
+    return;
+  detail::write_u32(buf, static_cast<std::uint32_t>(p->segments.size()));
+  for (const auto &segment : p->segments) {
+    detail::write_u32(buf, segment.bytes);
+    detail::write_u32(buf, segment.format);
+  }
+  detail::write_u32(buf, static_cast<std::uint32_t>(p->cursor));
+}
+
+inline std::optional<std::optional<FormattedPreedit>>
+deserialize_preedit_format(detail::Reader &r, const std::string &text) {
+  auto present = r.read_u8();
+  if (!present || *present > 1)
+    return std::nullopt;
+  if (*present == 0)
+    return std::optional<FormattedPreedit>{};
+  auto count = r.read_u32();
+  if (!count || *count > max_vector_length)
+    return std::nullopt;
+  FormattedPreedit p;
+  p.segments.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto bytes = r.read_u32();
+    auto format = r.read_u32();
+    if (!bytes || !format || (*format & ~text_format::known) != 0)
+      return std::nullopt;
+    p.segments.push_back({*bytes, *format});
+  }
+  auto cursor_bits = r.read_u32();
+  if (!cursor_bits)
+    return std::nullopt;
+  p.cursor = static_cast<std::int32_t>(*cursor_bits);
+  // Fail closed: the segments must tile the text and the cursor must be hidden
+  // or inside it (code-point alignment is checked where it is converted).
+  if (!p.consistent_with(text))
+    return std::nullopt;
+  return std::optional<FormattedPreedit>{std::move(p)};
 }
 
 inline void serialize(std::vector<std::uint8_t> &buf, const BackendOperation &op) {
@@ -290,6 +350,8 @@ inline void serialize(std::vector<std::uint8_t> &buf, const BackendOperation &op
     else
       serialize(buf, CandidatePage{});
   }
+  if (op.type == BackendOperation::Type::SetPreedit)
+    serialize(buf, op.preedit);
   detail::write_u8(buf, op.original_key ? 1 : 0);
 }
 
@@ -307,6 +369,13 @@ inline std::optional<BackendOperation> deserialize_operation(detail::Reader &r) 
       return std::nullopt;
     page = std::move(*parsed);
   }
+  std::optional<FormattedPreedit> preedit;
+  if (*type_byte == static_cast<std::uint8_t>(BackendOperation::Type::SetPreedit)) {
+    auto parsed = deserialize_preedit_format(r, *text);
+    if (!parsed)
+      return std::nullopt;
+    preedit = std::move(*parsed);
+  }
   auto original_key = r.read_u8();
   if (!original_key)
     return std::nullopt;
@@ -315,6 +384,7 @@ inline std::optional<BackendOperation> deserialize_operation(detail::Reader &r) 
   op.text = std::move(*text);
   op.page = std::move(page);
   op.original_key = *original_key != 0;
+  op.preedit = std::move(preedit);
   return op;
 }
 

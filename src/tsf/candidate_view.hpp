@@ -14,6 +14,7 @@
 // headless; it is not a freeze of that boundary.
 
 #include "fusion/backend.hpp"
+#include "tsf/candidate_layout.hpp"
 
 #include <windows.h>
 
@@ -40,7 +41,8 @@ public:
   // stays with this object; DestroyWindow happens in destroy()/the destructor.
   bool ensure_created(TextService *service, void *entry, std::uint64_t generation);
 
-  // Replace the whole displayed page (STATE projection). An empty page hides.
+  // Replace the whole displayed panel (STATE projection): panel text rows and the
+  // candidate page. A panel with nothing to display (panel_empty()) hides.
   void show(const CandidatePage &page, POINT anchor);
   void hide();
   void destroy();
@@ -64,14 +66,11 @@ private:
   void *entry_ = nullptr; // ContextEntry identity; validated by the service
   std::uint64_t generation_ = 0;
   CandidatePage page_;
-  // Hit rectangles aligned to page_.entries indices: a placeholder keeps its
-  // index but has an empty (non-hit) rect, so select() is never shifted off the
-  // engine's own list index. prev_rect_/next_rect_ carry the pager arrows.
-  std::vector<RECT> slot_rects_;
-  RECT prev_rect_{};
-  RECT next_rect_{};
-  bool has_prev_button_ = false;
-  bool has_next_button_ = false;
+  // Geometry from layout_candidate_panel: slot rects aligned to page_.entries
+  // indices (a placeholder keeps its index with an empty, non-hit rect, so
+  // select() is never shifted off the engine's own list index), pager arrows and
+  // the panel text rows.
+  CandidatePanelLayout layout_;
 };
 
 } // namespace fusion::tsf

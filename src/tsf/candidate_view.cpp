@@ -15,10 +15,6 @@ namespace fusion::tsf {
 namespace {
 
 const wchar_t *const kWindowClassName = L"FusionCandidateWindow";
-constexpr int kRowHeight = 24;
-constexpr int kSideMargin = 6;
-constexpr int kItemGap = 12;
-constexpr int kPagerWidth = 20;
 
 std::wstring to_wide(const std::string &text) {
   if (text.empty())
@@ -34,13 +30,7 @@ std::wstring to_wide(const std::string &text) {
   return result;
 }
 
-std::wstring display_text(const CandidateEntry &entry) {
-  std::wstring value = to_wide(entry.label);
-  if (!value.empty())
-    value += L" ";
-  value += to_wide(entry.text);
-  return value;
-}
+RECT to_rect(const LayoutRect &rect) { return RECT{rect.left, rect.top, rect.right, rect.bottom}; }
 
 } // namespace
 
@@ -98,87 +88,33 @@ HFONT CandidateView::font() {
 }
 
 void CandidateView::show(const CandidatePage &page, POINT anchor) {
-  if (page.empty()) {
+  if (page.panel_empty()) {
     hide();
     return;
   }
   if (hwnd_ == nullptr)
     return;
   page_ = page;
-  has_prev_button_ = page_.has_prev;
-  has_next_button_ = page_.has_next;
-  slot_rects_.assign(page_.entries.size(), RECT{});
-  const bool horizontal = page_.layout == CandidateLayout::Horizontal;
 
   HDC dc = GetDC(hwnd_);
   HGDIOBJ previous_font = nullptr;
-  auto measure = [&](const std::wstring &text) {
+  if (dc != nullptr)
+    previous_font = SelectObject(dc, font());
+  const auto measure = [&](const std::string &utf8) {
+    const std::wstring text = to_wide(utf8);
     if (dc == nullptr)
       return 12 * static_cast<int>(text.size());
     SIZE extent{};
     GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &extent);
     return static_cast<int>(extent.cx);
   };
-  if (dc != nullptr)
-    previous_font = SelectObject(dc, font());
-
-  int width = 0;
-  int height = 0;
-  prev_rect_ = RECT{};
-  next_rect_ = RECT{};
-  if (horizontal) {
-    int x = kSideMargin;
-    if (has_prev_button_) {
-      prev_rect_ = RECT{x, kSideMargin, x + kPagerWidth, kRowHeight - kSideMargin};
-      x += kPagerWidth + kItemGap;
-    }
-    for (std::size_t index = 0; index < page_.entries.size(); ++index) {
-      const std::wstring text = display_text(page_.entries[index]);
-      // A placeholder takes an index but no displayed slot: measure nothing and
-      // leave an empty rect so the hit index stays aligned with candidate(index).
-      const int advance = page_.entries[index].placeholder ? 0 : measure(text) + kItemGap;
-      if (!page_.entries[index].placeholder)
-        slot_rects_[index] = RECT{x, kSideMargin, x + advance - kItemGap, kRowHeight - kSideMargin};
-      x += advance;
-    }
-    if (has_next_button_) {
-      next_rect_ = RECT{x, kSideMargin, x + kPagerWidth, kRowHeight - kSideMargin};
-      x += kPagerWidth;
-    }
-    width = x + kSideMargin;
-    height = kRowHeight;
-  } else {
-    const int band = (has_prev_button_ || has_next_button_) ? kRowHeight : 0;
-    width = 180;
-    for (const auto &entry : page_.entries)
-      if (!entry.placeholder)
-        width = (std::max)(width, measure(display_text(entry)) + 2 * kSideMargin + kPagerWidth);
-    int rows = 0;
-    for (const auto &entry : page_.entries)
-      if (!entry.placeholder)
-        ++rows;
-    height = band + rows * kRowHeight + kSideMargin;
-    int y = band;
-    for (std::size_t index = 0; index < page_.entries.size(); ++index) {
-      if (page_.entries[index].placeholder)
-        continue;
-      slot_rects_[index] = RECT{kSideMargin, y, width - kSideMargin, y + kRowHeight};
-      y += kRowHeight;
-    }
-    if (has_prev_button_)
-      prev_rect_ = RECT{kSideMargin, 0, kSideMargin + kPagerWidth, band};
-    if (has_next_button_)
-      next_rect_ = RECT{width - kSideMargin - kPagerWidth, 0, width - kSideMargin, band};
-  }
-
+  layout_ = layout_candidate_panel(page_, measure);
   if (previous_font != nullptr)
     SelectObject(dc, previous_font);
   if (dc != nullptr)
     ReleaseDC(hwnd_, dc);
-  if (width < 40)
-    width = 40;
 
-  SetWindowPos(hwnd_, HWND_TOP, anchor.x, anchor.y + 2, width, height,
+  SetWindowPos(hwnd_, HWND_TOP, anchor.x, anchor.y + 2, layout_.width, layout_.height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   relayout_and_paint();
 }
@@ -206,30 +142,47 @@ void CandidateView::draw(HDC dc) {
   SetBkMode(dc, TRANSPARENT);
   HGDIOBJ previous_font = SelectObject(dc, font());
 
-  auto draw_box = [&](const RECT &rect, const wchar_t *glyph, bool enabled) {
-    if (rect.right <= rect.left)
+  auto draw_text = [&](const LayoutRect &rect, const std::string &utf8, COLORREF color,
+                       UINT format) {
+    if (rect.empty() || utf8.empty())
       return;
-    SetTextColor(dc, enabled ? RGB(20, 20, 20) : RGB(160, 160, 160));
-    RECT cell = rect;
-    DrawTextW(dc, glyph, -1, &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dc, color);
+    RECT cell = to_rect(rect);
+    DrawTextW(dc, to_wide(utf8).c_str(), -1, &cell, format | DT_VCENTER | DT_SINGLELINE);
   };
-  draw_box(prev_rect_, L"<", has_prev_button_);
-  draw_box(next_rect_, L">", has_next_button_);
+  // Panel text rows (classic-ui upper: auxUp + panel preedit; lower: auxDown).
+  draw_text(layout_.upper, panel_upper_text(page_), RGB(0, 0, 0), DT_LEFT | DT_END_ELLIPSIS);
+  draw_text(layout_.lower, page_.aux_down, RGB(0, 0, 0), DT_LEFT | DT_END_ELLIPSIS);
+  draw_text(layout_.prev, "<", page_.has_prev ? RGB(20, 20, 20) : RGB(160, 160, 160), DT_CENTER);
+  draw_text(layout_.next, ">", page_.has_next ? RGB(20, 20, 20) : RGB(160, 160, 160), DT_CENTER);
 
-  for (std::size_t index = 0; index < page_.entries.size(); ++index) {
-    const RECT &rect = slot_rects_[index];
-    if (rect.right <= rect.left)
+  for (std::size_t index = 0; index < page_.entries.size() && index < layout_.slots.size();
+       ++index) {
+    const LayoutRect &slot = layout_.slots[index];
+    if (slot.empty())
       continue; // placeholder: index preserved, nothing drawn
+    const CandidateEntry &entry = page_.entries[index];
     const bool selected = static_cast<std::int32_t>(index) == page_.cursor_index;
-    if (selected) {
-      RECT fill = rect;
+    RECT fill = to_rect(slot);
+    if (selected)
       FillRect(dc, &fill, GetSysColorBrush(COLOR_HIGHLIGHT));
-    }
-    SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
-    RECT cell = rect;
+    // "label text", then the engine comment after one space in a secondary color.
+    const std::wstring main = to_wide(slot_main_text(entry));
+    RECT cell = fill;
     cell.left += 2;
-    DrawTextW(dc, display_text(page_.entries[index]).c_str(), -1, &cell,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
+    DrawTextW(dc, main.c_str(), -1, &cell, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (!entry.comment.empty()) {
+      SIZE extent{};
+      GetTextExtentPoint32W(dc, (main + L" ").c_str(), static_cast<int>(main.size() + 1), &extent);
+      RECT comment_cell = cell;
+      comment_cell.left += extent.cx;
+      if (comment_cell.left < comment_cell.right) {
+        SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(110, 110, 110));
+        DrawTextW(dc, to_wide(entry.comment).c_str(), -1, &comment_cell,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+      }
+    }
   }
   SelectObject(dc, previous_font);
 }
@@ -275,24 +228,22 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
 }
 
 bool CandidateView::hit_test(POINT client, int &action, std::int32_t &index) const {
-  if (has_prev_button_ && PtInRect(&prev_rect_, client)) {
+  const auto hit = hit_test_candidate_panel(layout_, client.x, client.y);
+  if (!hit)
+    return false;
+  switch (hit->kind) {
+  case PanelHit::Kind::PagePrev:
     action = static_cast<int>(CandidateAction::PagePrev);
-    index = -1;
-    return true;
-  }
-  if (has_next_button_ && PtInRect(&next_rect_, client)) {
+    break;
+  case PanelHit::Kind::PageNext:
     action = static_cast<int>(CandidateAction::PageNext);
-    index = -1;
-    return true;
+    break;
+  case PanelHit::Kind::Select:
+    action = static_cast<int>(CandidateAction::Select);
+    break;
   }
-  for (std::size_t slot = 0; slot < slot_rects_.size(); ++slot) {
-    if (slot_rects_[slot].left < slot_rects_[slot].right && PtInRect(&slot_rects_[slot], client)) {
-      action = static_cast<int>(CandidateAction::Select);
-      index = static_cast<std::int32_t>(slot);
-      return true;
-    }
-  }
-  return false;
+  index = hit->index;
+  return true;
 }
 
 void CandidateView::relayout_and_paint() {
