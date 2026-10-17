@@ -79,13 +79,17 @@ Invoke-Native 'cmake' @('--build',$taskLibimeBuild,'--parallel','8')
 Invoke-Native 'cmake' @('--install',$taskLibimeBuild)
 $taskChineseBuild=Join-Path $taskBuildRoot 'chinese'
 Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'chinese'),'-B',$taskChineseBuild)+$taskCommon+@('-DENABLE_TEST=OFF','-DENABLE_GUI=OFF','-DENABLE_BROWSER=OFF','-DENABLE_OPENCC=OFF','-DENABLE_CLOUDPINYIN=OFF','-DENABLE_DATA=OFF','-DENABLE_TOOLS=OFF','-DBUILD_SHARED_FCITX_ADDON=OFF'))
-Invoke-Native 'cmake' @('--build',$taskChineseBuild,'--parallel','8','--target','pinyin','pinyinhelper','punctuation','py-stroke-extract','py-table-extract','chinese/im/pinyin/pinyin-addon.conf','chinese/im/pinyin/pinyin.conf','chinese/modules/punctuation/punctuation.conf','chinese/modules/pinyinhelper/pinyinhelper.conf')
+Invoke-Native 'cmake' @('--build',$taskChineseBuild,'--parallel','8','--target','pinyin','pinyinhelper','punctuation','py-stroke-extract','py-table-extract','chinese/im/pinyin/pinyin-addon.conf','chinese/im/pinyin/pinyin.conf','chinese/im/pinyin/shuangpin.conf','chinese/modules/punctuation/punctuation.conf','chinese/modules/pinyinhelper/pinyinhelper.conf')
 $taskData=Join-Path $taskPrefix 'data\fcitx5'
 foreach($taskDirectory in @($taskData,(Join-Path $taskData 'addon'),(Join-Path $taskData 'inputmethod'),(Join-Path $taskData 'pinyin'),(Join-Path $taskData 'pinyinhelper'),(Join-Path $taskData 'punctuation'),(Join-Path $taskPrefix 'data\libime'),(Join-Path $taskPrefix 'lib\libime'))) {New-Item -ItemType Directory -Force $taskDirectory | Out-Null}
 Copy-Item (Join-Path $taskPrefix 'share\fcitx5\*') $taskData -Recurse -Force
 foreach($taskAddon in @('pinyin','pinyinhelper','punctuation')) {Copy-Item (Join-Path $taskChineseBuild ('lib\'+$taskAddon+'.lib')) (Join-Path $taskPrefix 'lib\fcitx5') -Force}
 Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin-addon.conf') (Join-Path $taskData 'addon\pinyin.conf') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin.conf') (Join-Path $taskData 'inputmethod\pinyin.conf') -Force
+# Shuangpin is a second input method of the same pinyin addon (upstream installs both
+# files to share/fcitx5/inputmethod). Without this definition Fcitx exposes only
+# Pinyin, so the profile could never select Shuangpin.
+Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\shuangpin.conf') (Join-Path $taskData 'inputmethod\shuangpin.conf') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\pinyinhelper\pinyinhelper.conf') (Join-Path $taskData 'addon') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\punctuation\punctuation.conf') (Join-Path $taskData 'addon') -Force
 Copy-Item (Join-Path $taskChinese 'im\pinyin\symbols') (Join-Path $taskData 'pinyin') -Force
