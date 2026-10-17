@@ -71,7 +71,7 @@ if(WIN32 AND MSVC)
     target_include_directories(FusionHostExe PRIVATE include src)
     target_compile_features(FusionHostExe PRIVATE cxx_std_20)
     set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost)
-    target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
     target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore)
   endif()
@@ -152,10 +152,15 @@ if(BUILD_TESTING)
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
     add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
+    add_test(NAME stage4a_ipc_wp3singleton COMMAND stage4a wp3singleton)
     if(FUSION_WITH_FCITX5)
       target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
       target_link_libraries(stage4a PRIVATE FusionFcitxHost)
       add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
+      # The spawned product Host must not read or write the real per-user Fcitx
+      # data (Stage 6 WP3 A2): the Host's own switch keeps it on the skipped path.
+      set_tests_properties(stage4a_ipc_integration PROPERTIES
+        ENVIRONMENT "FUSION_FCITX_SKIP_USER_PATH=1")
     endif()
 
     # Stage 4B reconnect / semantic-readiness / incarnation-fencing tests. They
@@ -187,6 +192,10 @@ if(BUILD_TESTING)
       target_link_libraries(stage4b PRIVATE FusionFcitxHost)
       add_test(NAME stage4b_hostprocess COMMAND stage4b hostprocess)
       add_test(NAME stage4b_silentdeath COMMAND stage4b silentdeath)
+      # These modes spawn the product Host; keep it off the real per-user path
+      # (Stage 6 WP3 A2).
+      set_tests_properties(stage4b_hostprocess stage4b_silentdeath PROPERTIES
+        ENVIRONMENT "FUSION_FCITX_SKIP_USER_PATH=1")
     endif()
   endif()
   add_library(FusionMock tests/mock.cpp)
@@ -247,6 +256,17 @@ if(BUILD_TESTING)
                identity_across_focus context_isolation)
     add_test(NAME tsf_lifecycle_${test} COMMAND tsf_lifecycle ${test})
   endforeach()
+  # Stage 6 WP3 input-method selection is a platform-free decision (no Fcitx
+  # instance), so it is tested without the engine.
+  add_executable(wp3_input_methods tests/wp3_input_methods.cpp)
+  target_include_directories(wp3_input_methods PRIVATE src)
+  target_compile_features(wp3_input_methods PRIVATE cxx_std_20)
+  if(MSVC)
+    target_compile_options(wp3_input_methods PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(wp3_input_methods PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  add_test(NAME wp3_input_methods COMMAND wp3_input_methods)
   # Stage 5 candidate projection/action decisions are platform-free controller
   # logic (the Win32 surface is smoke-tested on the real product path), so they
   # build with the same portable sources as tsf_lifecycle.

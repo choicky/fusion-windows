@@ -31,6 +31,66 @@ std::uint64_t generate_incarnation() {
 
 } // namespace
 
+HostClaim &HostClaim::operator=(HostClaim &&other) noexcept {
+  if (this != &other) {
+    release();
+    handle_ = other.handle_;
+    other.handle_ = nullptr;
+  }
+  return *this;
+}
+
+bool HostClaim::acquire(const std::wstring &pipe_name) {
+  release();
+  if (pipe_name.empty()) {
+    return false;
+  }
+  // Readable name in the per-session object namespace. The pipe name already
+  // carries the user SID and session id (compute_pipe_name), so stripping the
+  // well-known pipe prefix keeps the claim scoped to the same principal and makes
+  // the SID visible in tools such as WinObj.
+  std::wstring suffix = pipe_name;
+  const std::wstring prefix = default_pipe_name_prefix;
+  if (suffix.rfind(prefix, 0) == 0) {
+    suffix.erase(0, prefix.size());
+  }
+  // Sanitize only the prefix the pipe contributed; the `Local\` namespace marker must
+  // survive or the object would land on a name of its own.
+  for (wchar_t &character : suffix) {
+    if (character == L'\\' || character == L'/') {
+      character = L'-';
+    }
+  }
+  const std::wstring name = L"Local\\FusionHost-claim-" + suffix;
+  name_ = name;
+  // The pipe's own user-only DACL: another principal cannot pre-create the name and
+  // hold this Host down. Fail closed if the descriptor cannot be built.
+  SECURITY_ATTRIBUTES attributes = make_pipe_security();
+  if (attributes.lpSecurityDescriptor == nullptr) {
+    return false;
+  }
+  HANDLE handle = CreateEventW(&attributes, TRUE, FALSE, name.c_str());
+  const DWORD error = GetLastError();
+  free_pipe_security(attributes);
+  if (handle == nullptr) {
+    return false;
+  }
+  if (error == ERROR_ALREADY_EXISTS) {
+    // A live Host owns this principal's claim. Fail closed rather than share it.
+    CloseHandle(handle);
+    return false;
+  }
+  handle_ = handle;
+  return true;
+}
+
+void HostClaim::release() {
+  if (handle_ != nullptr) {
+    CloseHandle(static_cast<HANDLE>(handle_));
+    handle_ = nullptr;
+  }
+}
+
 HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name,
                        std::uint64_t incarnation)
     : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)),
@@ -70,6 +130,16 @@ void HostServer::stop() {
                              [this] { return !accept_loop_active_.load(); });
   }
   drain_connections();
+}
+
+void HostServer::shutdown_backend() {
+  // stop() has joined every connection thread, so no backend_ call is in flight.
+  std::unique_ptr<Backend> backend;
+  {
+    std::lock_guard lock(backend_mutex_);
+    backend = std::move(backend_);
+  }
+  // Destruction runs the backend's orderly shutdown; Fcitx saves on instance exit.
 }
 
 void HostServer::wake_accept_loop() {

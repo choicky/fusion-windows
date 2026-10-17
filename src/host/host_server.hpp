@@ -38,6 +38,56 @@
 
 namespace fusion::ipc {
 
+// Stage 6 WP3 A5: the Host singleton claim, acquired before any Backend exists so
+// that a Host which loses the claim never constructs Fcitx and never loads or
+// saves per-user data.
+//
+// Mechanism and scope:
+//   * Object type: a manual-reset, initially non-signalled **event**. Presence is
+//     the claim; the object is never waited on.
+//   * Name scope: `Local\FusionHost-claim-<pipe suffix>`. `Local\` is the
+//     per-session object namespace, and the pipe name it is derived from already
+//     carries the user SID and session id (compute_pipe_name), so the claim is per
+//     user SID x session — the same scope as the pipe it protects.
+//   * Security: the buffer's SECURITY_ATTRIBUTES is the pipe's own user-only DACL
+//     (make_pipe_security), so another principal cannot pre-create the name and
+//     hold the Host down.
+//   * Fail closed: `acquire` returns false when the descriptor cannot be built,
+//     when creation fails, or when the name already exists
+//     (ERROR_ALREADY_EXISTS) — a live second Host is always refused.
+//   * Abandoned owner: none by construction. A named event has no owner, and the
+//     object disappears when its last handle closes, so a Host that crashed or was
+//     killed releases the claim immediately; there is no WAIT_ABANDONED case to
+//     interpret, and a dead Host can never block the next one.
+//
+// The pipe's own FILE_FLAG_FIRST_PIPE_INSTANCE stays the final authority for the
+// name itself; this claim is what lets the loser exit before the engine exists.
+// The pipe instance is deliberately still created by the accept loop, after the
+// backend is ready: claiming the instance this early would make it connectable
+// before the Host serves it, and a client would then lose its first reconnect key
+// to a handshake timeout instead of a fast refused connect.
+class HostClaim {
+public:
+  HostClaim() = default;
+  ~HostClaim() { release(); }
+  HostClaim(const HostClaim &) = delete;
+  HostClaim &operator=(const HostClaim &) = delete;
+  HostClaim(HostClaim &&other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
+  HostClaim &operator=(HostClaim &&other) noexcept;
+
+  // True when this process is the first Host for this pipe name.
+  bool acquire(const std::wstring &pipe_name);
+  void release();
+  bool held() const { return handle_ != nullptr; }
+  // The kernel object name used by the last acquire() (empty before the first
+  // call). Reported by the Host so the claim's scope is auditable in its log.
+  const std::wstring &name() const { return name_; }
+
+private:
+  void *handle_ = nullptr;
+  std::wstring name_;
+};
+
 class HostServer {
 public:
   // `incarnation` 0 means "generate one for this instance" (tests may pin it).
@@ -53,6 +103,10 @@ public:
   // Stops accepting, disconnects every client and joins every connection
   // thread before returning. Idempotent; never leaves a running thread.
   void stop();
+  // Destroys the backend now, after stop(), so the backend's orderly shutdown
+  // (and Fcitx's own save on instance exit) runs while the caller can still wait
+  // for it — used by the console close/logoff path. Idempotent.
+  void shutdown_backend();
 
   // Development/test observable: number of tracked connections (live plus any
   // completed one not yet reaped). Not product semantics.

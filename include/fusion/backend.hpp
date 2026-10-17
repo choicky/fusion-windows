@@ -204,5 +204,12 @@ public:
 #else
 #define FUSION_FCITX_API
 #endif
-FUSION_FCITX_API std::unique_ptr<Backend> make_fcitx_backend();
+// Host backend options (Stage 6 WP3, owner decision U1). The standard Fcitx
+// per-user path is enabled only for the product Host; every in-process test and
+// fixture keeps the skipped path, because the pinned Fcitx has no user-directory
+// override on Windows and a test must never touch real per-user data.
+struct FcitxBackendOptions {
+  bool user_path = false;
+};
+FUSION_FCITX_API std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options = {});
 } // namespace fusion

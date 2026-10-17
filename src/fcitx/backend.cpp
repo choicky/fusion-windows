@@ -1,10 +1,13 @@
 #include "fusion/backend.hpp"
 #include "candidate_projection.hpp"
+#include "startup_group.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <fcitx-utils/environ.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/key.h>
+#include <fcitx-utils/standardpaths.h>
 #include <fcitx-utils/utf8.h>
 #include <fcitx/addonloader.h>
 #include <fcitx/addonmanager.h>
@@ -174,7 +177,8 @@ public:
 
 class FcitxBackend final : public Backend {
 public:
-  FcitxBackend() : session_(next_session.fetch_add(1)) {
+  explicit FcitxBackend(FcitxBackendOptions options)
+      : session_(next_session.fetch_add(1)), options_(options) {
     auto ready = startup_.get_future();
     thread_ = std::thread([this] { run(); });
     if (ready.wait_for(std::chrono::seconds(10)) != std::future_status::ready || !ready.get()) {
@@ -191,7 +195,15 @@ public:
         return false;
       auto context = std::make_unique<InputContext>(*instance_, binding);
       context->focusIn();
-      instance_->setCurrentInputMethod(context.get(), "pinyin", true);
+      // The profile decides the input method (U1): the bound context starts in the
+      // group's current input method (Items/0) as Fcitx resolves it, never in a
+      // hard-coded name. DefaultIM is Fcitx's fallback, not the selection.
+      const auto &group = instance_->inputMethodManager().currentGroup();
+      const auto names = method_names(group);
+      const auto method = selection::binding_input_method(
+          names.empty() ? std::string() : names.front(), group.defaultInputMethod());
+      if (!method.empty())
+        instance_->setCurrentInputMethod(context.get(), method, true);
       context->lifecycle = false;
       contexts_.emplace(binding.context, std::move(context));
       return true;
@@ -264,6 +276,63 @@ public:
   }
 
 private:
+  static std::vector<std::string> method_names(const fcitx::InputMethodGroup &group) {
+    std::vector<std::string> names;
+    names.reserve(group.inputMethodList().size());
+    for (const auto &item : group.inputMethodList()) {
+      names.push_back(item.name());
+    }
+    return names;
+  }
+  // Fcitx owns the profile: with a profile the loaded group is kept verbatim, and
+  // only a group that names no input method this runtime defines is replaced. With
+  // no profile at all this is a first run, and the first-run default is built
+  // explicitly (Pinyin default) instead of accepting Fcitx's built-in fallback,
+  // which depends on load order and layout availability.
+  static void ensure_usable_group(fcitx::Instance &instance) {
+    auto &manager = instance.inputMethodManager();
+    std::vector<std::string> available;
+    for (const char *name : {"pinyin", "shuangpin"}) {
+      if (manager.entry(name)) {
+        available.emplace_back(name);
+      }
+    }
+    const bool profile_present = !fcitx::StandardPaths::global()
+                                      .locate(fcitx::StandardPathsType::PkgConfig, "profile")
+                                      .empty();
+    const auto &current = manager.currentGroup();
+    const auto plan = selection::plan_startup_group(profile_present, current.defaultInputMethod(),
+                                                    method_names(current), available);
+    if (!plan.replace) {
+      log_group(instance, profile_present, false);
+      return;
+    }
+    auto group = current;
+    group.inputMethodList().clear();
+    for (const auto &name : plan.methods) {
+      group.inputMethodList().emplace_back(name);
+    }
+    group.setDefaultInputMethod(plan.default_method);
+    manager.setGroup(std::move(group));
+    log_group(instance, profile_present, true);
+  }
+  // Development observable for the WP3 verification: which input method a bound
+  // context will start in, and where the group came from. Selection itself stays
+  // Fcitx's (the profile); this line never decides anything.
+  static void log_group(const fcitx::Instance &instance, bool profile_present, bool replaced) {
+    const auto &group = instance.inputMethodManager().currentGroup();
+    std::string methods;
+    for (const auto &item : group.inputMethodList()) {
+      methods += (methods.empty() ? "" : ",") + item.name();
+    }
+    const auto current =
+        group.inputMethodList().empty() ? std::string() : group.inputMethodList().front().name();
+    std::fprintf(
+        stderr,
+        "[FusionHost] input method group: [%s] current=%s default=%s profile=%s source=%s\n",
+        methods.c_str(), current.c_str(), group.defaultInputMethod().c_str(),
+        profile_present ? "present" : "absent", replaced ? "first-run-default" : "loaded");
+  }
   static std::string key_name(const BackendStimulus &stimulus) {
     switch (stimulus.type) {
     case BackendStimulus::Type::Character:
@@ -319,9 +388,12 @@ private:
     try {
       // Normal Windows built-in resource resolution must use the backend runtime
       // DLL location, never Notepad.exe's installation directory.
-      std::call_once(paths_initialized, [] {
+      std::call_once(paths_initialized, [user_path = options_.user_path] {
         fcitx::mainInstanceHandle = GetModuleHandleW(L"Fcitx5Utils.dll");
-        fcitx::setEnvironment("SKIP_FCITX_USER_PATH", "1");
+        // U1: the product Host persists through Fcitx's own per-user paths. A test
+        // or fixture keeps the skipped path so it never reads or writes them.
+        if (!user_path)
+          fcitx::setEnvironment("SKIP_FCITX_USER_PATH", "1");
         fcitx::setEnvironment("SKIP_FCITX_SYSTEM_PATH", "1");
       });
       char program[] = "fusion-host", disable[] = "--disable=all";
@@ -357,11 +429,15 @@ private:
         }
         const bool available = instance.addonManager().addon("pinyin", true) != nullptr;
         if (available) {
-          auto group = instance.inputMethodManager().currentGroup();
-          group.inputMethodList().clear();
-          group.inputMethodList().emplace_back("pinyin");
-          group.setDefaultInputMethod("pinyin");
-          instance.inputMethodManager().setGroup(std::move(group));
+          ensure_usable_group(instance);
+          // Development observable for the WP3 verification: where Fcitx resolves its
+          // per-user directories (U1 storage). The group line is printed by
+          // ensure_usable_group together with where the group came from.
+          const auto &paths = fcitx::StandardPaths::global();
+          std::fprintf(stderr, "[FusionHost] fcitx user config: %s\n",
+                       paths.userDirectory(fcitx::StandardPathsType::Config).string().c_str());
+          std::fprintf(stderr, "[FusionHost] fcitx user data: %s\n",
+                       paths.userDirectory(fcitx::StandardPathsType::Data).string().c_str());
         }
         healthy_ = available;
         startup_.set_value(available);
@@ -426,6 +502,7 @@ private:
       thread_.join();
   }
   std::uint64_t session_;
+  const FcitxBackendOptions options_;
   std::atomic<bool> healthy_{false};
   std::atomic<bool> stopping_{false};
   std::mutex admission_, dispatch_;
@@ -435,5 +512,7 @@ private:
   std::map<std::uint64_t, std::unique_ptr<InputContext>> contexts_;
 };
 } // namespace
-std::unique_ptr<Backend> make_fcitx_backend() { return std::make_unique<FcitxBackend>(); }
+std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options) {
+  return std::make_unique<FcitxBackend>(options);
+}
 } // namespace fusion

@@ -1,7 +1,7 @@
 // Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
 // end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <protocol|loopback|hostserver|integration>
+// Usage: stage4a <protocol|loopback|hostserver|wp3singleton|integration>
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
@@ -1489,6 +1489,38 @@ void test_hostserver() {
                "failure separation, healthy() no IPC, connection reaping, clean stop/join\n";
 }
 
+// Stage 6 WP3 A5: the singleton is claimed before a backend exists, so a Host that
+// loses the claim never constructs the engine (and so never loads or saves
+// per-user data). The claim is released when the holder goes away.
+void test_singleton_claim() {
+  const auto pipe_name = test_pipe_name(L"wp3-singleton");
+  {
+    HostClaim first;
+    require(first.acquire(pipe_name), "first claim owns the host name");
+    require(first.held(), "claim reports held");
+    HostClaim second;
+    require(!second.acquire(pipe_name), "a second claim is refused");
+    require(!second.held(), "refused claim is not held");
+  }
+  HostClaim again;
+  require(again.acquire(pipe_name), "the claim is released with its holder");
+  again.release();
+  require(!again.held(), "release drops the claim");
+
+  // The claimed name still serves a real Host (the pipe is created by the accept
+  // loop, after the backend is ready).
+  const auto host_pipe = test_pipe_name(L"wp3-singleton-host");
+  HostClaim claim;
+  require(claim.acquire(host_pipe), "host claim");
+  auto backend = std::make_unique<FcitxLikeBackend>();
+  RunningHost host(std::move(backend), host_pipe);
+  require(host.start(), "host starts under the claim");
+  auto client = connect_client(host_pipe);
+  require(client != nullptr, "client connects");
+  require(client->bind(Binding{1, 1, 1}), "bind");
+  std::cout << "PASS WP3 singleton: claimed before the backend, second claim refused\n";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1620,9 +1652,9 @@ int main(int argc, char *argv[]) {
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
 #ifdef FUSION_WITH_FCITX5
-  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|integration>\n";
+  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|wp3singleton|integration>\n";
 #else
-  const char *usage = "Usage: stage4a <protocol|loopback|hostserver>\n";
+  const char *usage = "Usage: stage4a <protocol|loopback|hostserver|wp3singleton>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -1636,6 +1668,8 @@ int main(int argc, char *argv[]) {
       test_loopback();
     else if (mode == "hostserver")
       test_hostserver();
+    else if (mode == "wp3singleton")
+      test_singleton_claim();
     else if (mode == "integration") {
 #ifdef FUSION_WITH_FCITX5
       test_integration();
