@@ -1335,6 +1335,11 @@ void test_host_process() {
   require(wait_until([&] { return !host.running(); }, kWait), "the Host process terminated");
   observe_transport_loss(client, binding);
   require(!controller->semantic_ready(), "the Host failure fences semantic readiness");
+  // T eligibility is key-class only: an application that consults T must still
+  // deliver K, where the bounded reconnect and rebind run.
+  require(controller->routes_key(physical('n')),
+          "T eligibility of a Pinyin key must not depend on semantic readiness");
+  require(!controller->routes_key(unrouted_pass_key()), "an unrouted key stays ineligible");
 
   require(host.start(), "real FusionHost.exe restarted");
   require(wait_for_host_pipe(name, kWait), "the restarted Host listens");
