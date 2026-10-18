@@ -17,6 +17,13 @@
 # end. Run it non-elevated: every elevated action is launched through UAC by the
 # script itself.
 #
+# Fail fast: a step whose command exits non-zero stops the walkthrough at once — it
+# records the step, the command and the exit code, runs the safe cleanup and asks no
+# further question. Before any typing question the script asserts that the Host, the
+# HKLM registration and a freshly started Notepad all belong to the installed
+# version (path + manifest SHA-256), so a stale development DLL can never be
+# mistaken for the installed TIP.
+#
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File verify-wp4.ps1 -PackageDir <dir with the two zips>
 #   powershell -ExecutionPolicy Bypass -File verify-wp4.ps1 -Resume      # after sign-in
@@ -32,6 +39,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'host-state.ps1')
+. (Join-Path $PSScriptRoot 'walkthrough-assertions.ps1')
 
 $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -208,10 +216,14 @@ function Start-ElevatedProcess {
 # process writes the transcript itself, because a runas launch cannot redirect its
 # output. A small generated wrapper is used instead of -Command: an argument list is
 # joined with spaces, so a -Command script would be split.
+#
+# `Parameters` is a hashtable: Format-ArgumentList emits parameter names bare and
+# quotes only values, so `-PackageDir '<path>'` binds to the parameter and not to a
+# string that PowerShell would bind positionally.
 function Invoke-ElevatedScript {
-  param([string]$ScriptPath, [string[]]$Arguments, [string]$LogName)
+  param([string]$ScriptPath, [hashtable]$Parameters = @{}, [string]$LogName)
   $log = Join-Path $script:runDir $LogName
-  $argumentText = ($Arguments | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' '
+  $argumentText = Format-ArgumentList -Parameters $Parameters
   $wrapper = Join-Path $script:runDir ("elevated-" + [IO.Path]::GetFileNameWithoutExtension($LogName) + ".ps1")
   $lines = @(
     "Start-Transcript -Path '$log' -Force | Out-Null",
@@ -221,12 +233,102 @@ function Invoke-ElevatedScript {
     'exit $code'
   )
   Set-Content -LiteralPath $wrapper -Value $lines -Encoding UTF8
+  Add-Content -LiteralPath $script:logPath -Value ("`n### ELEVATED {0}: {1} {2}" -f $LogName, $ScriptPath, $argumentText) -Encoding UTF8
   $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
-  Add-Content -LiteralPath $script:logPath -Value "`n### ELEVATED $LogName exit=$code" -Encoding UTF8
+  Add-Content -LiteralPath $script:logPath -Value "### ELEVATED $LogName exit=$code" -Encoding UTF8
   if (Test-Path -LiteralPath $log) {
     Add-Content -LiteralPath $script:logPath -Value (Get-Content -LiteralPath $log -Raw) -Encoding UTF8
   }
   return $code
+}
+
+# --- fail fast -------------------------------------------------------------
+#
+# A step whose command exits non-zero stops the walkthrough immediately: the step,
+# the command and the exit code are recorded, the safe cleanup runs, and the owner
+# is never asked another question. The 11:55 run kept asking typing questions after
+# install.ps1 had exited 1; that must be impossible.
+
+function Invoke-SafeRestore {
+  param([string]$Step)
+  # 1. Stop a Host started from the install root, through its own stop event.
+  if (Test-Path -LiteralPath $installRoot) {
+    $stop = Stop-FusionHostOrderly -TimeoutMs 20000 -InstallRoot $installRoot
+    if ($stop.Found) {
+      Add-Result $Step '中止清理：停止已安装的 Host' ("signalled={0} exited={1} after {2} ms" -f $stop.Signalled, $stop.Exited, $stop.WaitedMs)
+    }
+  }
+  # 2. Put the development registration back only if this run changed it.
+  $dev = $null
+  if ($state) { $dev = $state.devRegistration }
+  if ($dev) {
+    $current = (Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' -and $_.Dll }).Dll
+    if ($current -and $current -ne $dev -and (Test-Path -LiteralPath $dev)) {
+      $code = Invoke-ElevatedScript -ScriptPath (Join-Path $repoRoot 'tools\tsf\register.ps1') `
+        -Parameters @{ DllPath = $dev } -LogName 'restore-registration-abort.log'
+      Add-Result $Step '中止清理：恢复开发注册' ("exit={0} dll={1}" -f $code, $dev)
+    } else {
+      Add-Result $Step '中止清理：开发注册无需恢复' ("current={0}" -f $current)
+    }
+  }
+  # %APPDATA%\Fcitx5 is never touched by cleanup.
+}
+
+function Stop-Walkthrough {
+  param([string]$Step, [string]$Command, [int]$Code, [string]$Detail = '')
+  $line = "command=$Command exit=$Code"
+  if ($Detail) { $line = "$line detail=$Detail" }
+  Add-Result $Step 'ABORT（中止走查）' $line
+  Write-Host ''
+  Write-Host ("走查中止（步骤 {0}）。" -f $Step) -ForegroundColor Red
+  Write-Host ("  命令：{0}" -f $Command) -ForegroundColor Red
+  Write-Host ("  退出码：{0}" -f $Code) -ForegroundColor Red
+  if ($Detail) { Write-Host ("  原因：{0}" -f $Detail) -ForegroundColor Red }
+  Write-Host '  不会再向你提任何问题。' -ForegroundColor Red
+  Invoke-SafeRestore -Step $Step
+  Write-Host ("证据目录：{0}" -f $script:runDir)
+  exit $Code
+}
+
+function Assert-StepExit {
+  param([string]$Step, [string]$Command, [int]$Code)
+  if ($Code -ne 0) { Stop-Walkthrough -Step $Step -Command $Command -Code $Code }
+}
+
+# The item-3 assertion, recorded and fatal on mismatch. Returns the check result so
+# the step can reuse the Notepad it started.
+#
+# A fresh Notepad loads the TIP only once the Fusion input method is active in it, so
+# a "not loaded" result first asks the owner to switch (Win+Space) and re-checks,
+# bounded. Any other failure stops immediately.
+function Assert-InstalledTipInUse {
+  param([string]$Step, [string]$VersionDir, [string]$ManifestPath, [int]$NotepadId = 0)
+  $result = Test-InstalledTipInUse -VersionDir $VersionDir -ManifestPath $ManifestPath -NotepadId $NotepadId
+  for ($attempt = 1; $attempt -le 2; $attempt++) {
+    $onlyNotLoaded = (-not $result.Ok) -and ($result.Failures.Count -eq 1) -and
+      ($result.Failures[0] -like 'Notepad: FusionTsf.dll is not loaded*')
+    if (-not $onlyNotLoaded) { break }
+    Write-Host ''
+    Write-Host '刚打开的记事本还没有加载 Fusion（新窗口只有在切换到该输入法时才加载它）。' -ForegroundColor Yellow
+    Write-Host '请在那个记事本里按 Win+空格 切换到 Fusion 输入法。'
+    if (-not (Ask-Enter '切换后按 Enter，脚本会重新核对加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+    $result = Test-InstalledTipInUse -VersionDir $VersionDir -ManifestPath $ManifestPath -NotepadId $result.Notepad.Id
+  }
+  if ($result.Host) {
+    Add-Result $Step '断言：Host' ("pid={0} path={1} integrity={2} session={3} user={4}" -f
+      $result.Host.Id, $result.Host.Path, $result.Host.Integrity, $result.Host.SessionId, $result.Host.User)
+  } else {
+    Add-Result $Step '断言：Host' 'none'
+  }
+  Add-Result $Step '断言：注册' ("HKLM={0} HKCU={1} expected={2}" -f
+    $result.Registration.Hklm, $(if ($result.Registration.Hkcu) { $result.Registration.Hkcu } else { '(none)' }), $result.Dll)
+  Add-Result $Step '断言：记事本模块' ("pid={0} loaded={1} expected={2} sha256={3}" -f
+    $result.Notepad.Id, $result.Loaded, $result.Dll, $result.Sha256)
+  if (-not $result.Ok) {
+    Stop-Walkthrough -Step $Step -Command ("assert installed TIP in use from $VersionDir") -Code 8 `
+      -Detail ($result.Failures -join '; ')
+  }
+  return $result
 }
 
 function Get-PackageVersion([string]$zipPath) {
@@ -329,25 +431,26 @@ $uninstall2 = Join-Path $version2Dir 'uninstall.ps1'
 if ($state.stage -eq 'a') {
   Write-Head '步骤 a：安装 wp4.1'
   Write-Host '接下来会弹出一次 UAC，请允许。安装完成后会自动启动 Host（无窗口、普通权限）。'
-  Write-Host '然后请在记事本中输入 nihao 并按空格，应得到“你好”。'
+  Write-Host '脚本随后会自己打开一个新的记事本，核对它加载的 DLL 与 Host，再请你输入。'
   if ($DryRun) {
     Write-Host ''
     Write-Host 'DRY RUN：已到达第一个所有者提示，未执行任何安装。' -ForegroundColor Yellow
-    Write-Host "将要执行的命令：powershell -File `"$install1`" -PackageDir `"$($state.package1Path)`"（提权）"
+    Write-Host ("将要执行的命令：powershell -File `"{0}`" {1}（提权）" -f $install1, (Format-ArgumentList -Parameters @{ PackageDir = $state.package1Path }))
     exit 0
   }
   if (-not (Ask-Enter '按 Enter 开始安装 wp4.1（UAC 确认后自动继续）。')) { Write-Host '已放弃。'; exit 0 }
-  $code = Invoke-ElevatedScript -ScriptPath $install1 -Arguments @('-PackageDir', $state.package1Path) -LogName 'install-wp4.1.log'
+  $install1Command = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package1Path })"
+  $code = Invoke-ElevatedScript -ScriptPath $install1 -Parameters @{ PackageDir = $state.package1Path } -LogName 'install-wp4.1.log'
   Add-Result 'a' 'install.ps1 退出码' $code
+  Assert-StepExit -Step 'a' -Command $install1Command -Code $code
   New-Snapshot 'after-install-wp4.1'
 
-  $hosts = @(Get-FusionHostState)
-  Add-Result 'a' 'Host 进程数' $hosts.Count
-  foreach ($process in $hosts) {
-    Add-Result 'a' "Host pid=$($process.Id)" "path=$($process.Path) integrity=$($process.Integrity) session=$($process.SessionId) user=$($process.User)"
-  }
   Write-Host ''
-  Write-Host '请在记事本中输入 nihao 并按空格。如果输入法不是 Fusion，请按 Win+空格 切换。'
+  Write-Host '请关闭所有已打开的记事本（旧的记事本仍加载着旧的 DLL），然后按 Enter。'
+  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本并核对它加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+  $check = Assert-InstalledTipInUse -Step 'a' -VersionDir $version1Dir -ManifestPath (Join-Path $state.package1Path 'package.json')
+  Write-Host ''
+  Write-Host '请在新打开的记事本中输入 nihao 并按空格。如果输入法不是 Fusion，请按 Win+空格 切换。'
   Add-Result 'a' '记事本 nihao → 你好' (Ask-YesNo '记事本里输入 nihao + 空格，是否得到“你好”？')
   Add-Result 'a' '默认为拼音（这台机器没有 WP3 学习数据，只有首次运行的默认配置）' (Ask-YesNo '当前输入法是拼音（不是双拼），且没有历史学习记录？')
   $state.stage = 'b'
@@ -398,8 +501,8 @@ if ($state.stage -eq 'c') {
   $hosts = @(Get-FusionHostState)
   Add-Result 'c' '造学习记录前的 Host 进程数' $hosts.Count
   if ($hosts.Count -eq 0) {
-    Write-Host '当前没有运行中的 Host，无法产生学习记录。请先重新运行步骤 b。' -ForegroundColor Red
-    exit 6
+    Stop-Walkthrough -Step 'c' -Command 'require a running Host before the learning prompt' -Code 8 `
+      -Detail 'no FusionHost is running; steps a/b did not leave one'
   }
   Write-Host '请打开记事本，用 Fusion 输入法输入一个词并选择一次候选（例如输入 shuangpin 后选一个候选），'
   Write-Host '注意选择前后该候选排在第几位。脚本会记录你报告的名次，再请你注销。'
@@ -424,13 +527,11 @@ if ($state.stage -eq 'c') {
 if ($state.stage -eq 'c-resume') {
   Write-Head '步骤 c（续）：登录后的状态'
   New-Snapshot 'after-signin'
-  $hosts = @(Get-FusionHostState)
-  Add-Result 'c' '登录后的 Host 进程数' $hosts.Count
-  foreach ($process in $hosts) {
-    Add-Result 'c' "Host pid=$($process.Id)" "path=$($process.Path) integrity=$($process.Integrity) session=$($process.SessionId) user=$($process.User)"
-  }
+  Write-Host '登录后任务应已启动 Host。请先关闭所有已打开的记事本，然后按 Enter。'
+  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本并核对它加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+  $check = Assert-InstalledTipInUse -Step 'c' -VersionDir $version1Dir -ManifestPath (Join-Path $state.package1Path 'package.json')
   Write-Host ''
-  Write-Host '请打开记事本，输入同样的拼音串，确认输入法仍可用，并检查刚才学习过的候选现在排第几位。'
+  Write-Host '请在新打开的记事本里输入同样的拼音串，确认输入法仍可用，并检查刚才学习过的候选现在排第几位。'
   Add-Result 'c' '登录后输入可用' (Ask-YesNo '登录后记事本里输入中文是否正常？')
   Add-Result 'c' '登录后该候选的名次' (Ask-Text '现在同一个候选排在第几位？' '例如 1')
   Add-Result 'c' '注销前的学习在登录后仍在（R26）' (Ask-YesNo '与注销前选择后的名次相比，学习结果是否保住了？')
@@ -449,8 +550,8 @@ if ($state.stage -eq 'c2') {
   $beforeIds = ($before | ForEach-Object { $_.Id } | Sort-Object) -join ','
   Add-Result 'c2' '取消注销前的 Host pid' $beforeIds
   if ($before.Count -eq 0) {
-    Write-Host '当前没有运行中的 Host，无法验证取消注销。' -ForegroundColor Red
-    exit 6
+    Stop-Walkthrough -Step 'c2' -Command 'require a running Host to cancel a logoff' -Code 8 `
+      -Detail 'no FusionHost is running'
   }
   $notepad = Start-UnsavedNotepad
   Add-Result 'c2' '用于触发保存提示的记事本 pid' $notepad.Id
@@ -475,24 +576,37 @@ if ($state.stage -eq 'c2') {
 if ($state.stage -eq 'd') {
   Write-Head '步骤 d：在记事本保持打开的情况下升级到 wp4.2'
   Write-Host '请保持当前记事本窗口打开（不要关闭），然后按 Enter。升级会先请求旧 Host 有序停止，再安装新版本。'
+  # The Notepad that loaded the wp4.1 DLL: recorded before the upgrade so its
+  # behaviour afterwards can be checked without closing it.
+  $oldNotepads = @(Get-Process -Name notepad -ErrorAction SilentlyContinue)
+  $oldNotepadId = 0
+  if ($oldNotepads.Count -gt 0) { $oldNotepadId = $oldNotepads[0].Id }
+  Add-Result 'd' '升级前打开的记事本 pid' $oldNotepadId
+  if ($oldNotepadId -gt 0) {
+    $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
+    Add-Result 'd' '升级前旧记事本加载的 DLL' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
+  }
   if (-not (Ask-Enter '记事本保持打开，按 Enter 开始升级（UAC）。')) { Write-Host '已放弃。'; exit 0 }
   New-Snapshot 'before-upgrade'
-  $code = Invoke-ElevatedScript -ScriptPath $install2 -Arguments @('-PackageDir', $state.package2Path) -LogName 'install-wp4.2.log'
+  $install2Command = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
+  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } -LogName 'install-wp4.2.log'
   Add-Result 'd' 'install.ps1 (wp4.2) 退出码' $code
+  Assert-StepExit -Step 'd' -Command $install2Command -Code $code
   New-Snapshot 'after-upgrade'
 
-  $hosts = @(Get-FusionHostState)
-  Add-Result 'd' '升级后的 Host 进程数' $hosts.Count
-  foreach ($process in $hosts) {
-    Add-Result 'd' "Host pid=$($process.Id)" "path=$($process.Path) integrity=$($process.Integrity)"
-  }
-  Add-Result 'd' '新 Host 来自 wp4.2 目录' (@($hosts | Where-Object { $_.Path -and $_.Path.StartsWith($version2Dir, [StringComparison]::OrdinalIgnoreCase) }).Count)
+  # Host and registration must belong to wp4.2; the fresh Notepad proves the new
+  # registration is what applications actually load. The old Notepad stays open.
+  $check = Assert-InstalledTipInUse -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
   Add-Result 'd' 'wp4.1 目录是否仍存在' (Test-Path -LiteralPath $version1Dir)
+  if ($oldNotepadId -gt 0) {
+    $oldStill = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
+    Add-Result 'd' '升级后旧记事本仍加载 wp4.1 的 DLL' ("ok={0} loaded={1} {2}" -f $oldStill.Ok, $oldStill.Loaded, $oldStill.Reason)
+  }
 
   Write-Host ''
   Write-Host '现在请在“仍然打开的那个记事本窗口”里输入中文（它加载的是旧 DLL）。'
   Add-Result 'd' '旧记事本（旧 DLL）仍可输入' (Ask-YesNo '仍然打开的那个记事本，输入中文是否正常？')
-  Write-Host '再新开一个记事本，输入中文（它加载的是新 DLL）。'
+  Write-Host '刚才脚本新开的那个记事本加载的是新 DLL，请在那里输入中文。'
   Add-Result 'd' '新记事本（新 DLL）可输入' (Ask-YesNo '新开的记事本，输入中文是否正常？')
 
   Write-Host ''
@@ -515,8 +629,9 @@ if ($state.stage -eq 'e') {
   Write-Host '脚本会请 Host 有序停止，然后反注册、删除计划任务、删除未被占用的版本目录。'
   Write-Host '%APPDATA%\Fcitx5 应保留。'
   if (-not (Ask-Enter '按 Enter 开始卸载（UAC）。')) { Write-Host '已放弃。'; exit 0 }
-  $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -Arguments @() -LogName 'uninstall-keep-data.log'
+  $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log'
   Add-Result 'e' 'uninstall.ps1 退出码' $code
+  Assert-StepExit -Step 'e' -Command 'uninstall.ps1' -Code $code
   New-Snapshot 'after-uninstall-keep-data'
 
   $stateNow = Get-FusionRegistrationState
@@ -529,8 +644,15 @@ if ($state.stage -eq 'e') {
 
   $checkState = Join-Path $repoRoot 'tools\tsf\check-state.ps1'
   $checkLog = Join-Path $script:runDir 'check-state-after-uninstall.txt'
+  # A native tool writing to stderr is a terminating error while the preference is
+  # 'Stop'; here the exit code is the contract, and the output is evidence.
+  $previousPreference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checkState *>&1 | Tee-Object -FilePath $checkLog
-  Add-Result 'e' 'check-state 输出已记录' $checkLog
+  $checkCode = $LASTEXITCODE
+  $ErrorActionPreference = $previousPreference
+  Add-Result 'e' 'check-state 输出已记录' ("$checkLog exit=$checkCode")
+  Assert-StepExit -Step 'e' -Command "check-state.ps1" -Code $checkCode
   $state.stage = 'f'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -543,12 +665,16 @@ if ($state.stage -eq 'f') {
   Write-Head '步骤 f：重装 wp4.2，再带 -RemoveUserData 卸载'
   Write-Host '请先关闭所有记事本窗口（否则版本目录会被占用而保留）。'
   if (-not (Ask-Enter '关闭所有记事本后按 Enter（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
-  $code = Invoke-ElevatedScript -ScriptPath $install2 -Arguments @('-PackageDir', $state.package2Path) -LogName 'reinstall-wp4.2.log'
+  $reinstallCommand = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
+  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } -LogName 'reinstall-wp4.2.log'
   Add-Result 'f' '重装退出码' $code
+  Assert-StepExit -Step 'f' -Command $reinstallCommand -Code $code
   New-Snapshot 'after-reinstall-wp4.2'
 
-  $code = Invoke-ElevatedScript -ScriptPath (Join-Path $version2Dir 'uninstall.ps1') -Arguments @('-RemoveUserData') -LogName 'uninstall-remove-data.log'
+  $removeCommand = "uninstall.ps1 $(Format-ArgumentList -Parameters @{ RemoveUserData = $true })"
+  $code = Invoke-ElevatedScript -ScriptPath (Join-Path $version2Dir 'uninstall.ps1') -Parameters @{ RemoveUserData = $true } -LogName 'uninstall-remove-data.log'
   Add-Result 'f' '带 -RemoveUserData 卸载退出码' $code
+  Assert-StepExit -Step 'f' -Command $removeCommand -Code $code
   New-Snapshot 'after-uninstall-remove-data'
 
   Add-Result 'f' 'HKLM COM 仍存在' ((Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' }).ComKey)
@@ -573,8 +699,10 @@ if ($state.stage -eq 'restore') {
     Write-Host "恢复：$dev"
     if (Test-Path -LiteralPath $dev) {
       $register = Join-Path $repoRoot 'tools\tsf\register.ps1'
-      $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register, '-DllPath', $dev)
+      $restoreCommand = "register.ps1 $(Format-ArgumentList -Parameters @{ DllPath = $dev })"
+      $code = Invoke-ElevatedScript -ScriptPath $register -Parameters @{ DllPath = $dev } -LogName 'restore-registration.log'
       Add-Result 'restore' 'register.ps1 退出码' $code
+      Assert-StepExit -Step 'restore' -Command $restoreCommand -Code $code
     } else {
       Add-Result 'restore' '开发注册 DLL 不存在，无法恢复' $dev
     }

@@ -40,7 +40,9 @@ if (-not $VerifyOnly -and -not (Test-FusionElevated)) {
 }
 
 $manifestPath = Join-Path $PackageDir 'package.json'
-if (-not (Test-Path -LiteralPath $manifestPath)) { throw "package.json not found in $PackageDir" }
+if (-not (Test-Path -LiteralPath $manifestPath)) {
+  throw ("No package.json in the -PackageDir value received: '{0}'. Pass the extracted package directory (the one that contains bin\, data\, lib\ and package.json)." -f $PackageDir)
+}
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $version = $manifest.version
 if ($version -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]*$') { throw "Refusing unexpected version identifier: $version" }
