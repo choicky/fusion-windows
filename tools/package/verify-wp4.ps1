@@ -82,21 +82,21 @@ function Ask-Text([string]$question, [string]$hint) {
   return $answer.Trim()
 }
 
-# Starts Notepad with one typed character so the logoff asks to save and can be
-# cancelled. If the synthetic keystroke does not land, the prompt asks the owner to
-# type a character themselves.
+# Starts Notepad, resolves the process that owns its window (the launcher is not it),
+# and tries to type one character so a logoff asks to save and can be cancelled. If the
+# synthetic keystroke does not land, the prompt asks the owner to type it.
 function Start-UnsavedNotepad {
-  $process = [System.Diagnostics.Process]::Start('notepad.exe')
-  Start-Sleep -Seconds 2
+  $started = Start-NotepadForCheck
+  if (-not $started.Window) { return $null }
   try {
     $shell = New-Object -ComObject WScript.Shell
-    [void]$shell.AppActivate($process.Id)
+    [void]$shell.AppActivate($started.Window.Id)
     Start-Sleep -Milliseconds 400
     $shell.SendKeys('x')
   } catch {
     # The owner types the character instead; the prompt says so.
   }
-  return $process
+  return $started.Window
 }
 
 function Add-Result([string]$step, [string]$question, $answer) {
@@ -253,6 +253,75 @@ function Stop-Walkthrough {
 function Assert-StepExit {
   param([string]$Step, [string]$Command, [int]$Code)
   if ($Code -ne 0) { Stop-Walkthrough -Step $Step -Command $Command -Code $Code }
+}
+
+# Host and registration only - no Notepad. Used after the upgrade in step (d): every
+# Notepad window on this machine lives in one process, and the still-open window keeps
+# the wp4.1 DLL loaded in it, so a Notepad module assertion at that point could only
+# fail. The new DLL is proven later, in a process started after the old one exited.
+function Assert-HostAndRegistration {
+  param([string]$Step, [string]$VersionDir, [string]$ManifestPath)
+  $result = Test-InstalledTipInUse -VersionDir $VersionDir -ManifestPath $ManifestPath -SkipNotepad
+  if ($result.Host) {
+    Add-Result $Step '断言：Host' ("pid={0} path={1} integrity={2} session={3} user={4}" -f
+      $result.Host.Id, $result.Host.Path, $result.Host.Integrity, $result.Host.SessionId, $result.Host.User)
+  } else {
+    Add-Result $Step '断言：Host' 'none'
+  }
+  Add-Result $Step '断言：注册' ("HKLM={0} HKCU={1} expected={2}" -f
+    $result.Registration.Hklm, $(if ($result.Registration.Hkcu) { $result.Registration.Hkcu } else { '(none)' }), $result.Dll)
+  Add-Result $Step '断言：记事本模块（本步不查）' $result.NotepadReason
+  if (-not $result.Ok) {
+    Stop-Walkthrough -Step $Step -Command ("assert Host and registration for $VersionDir") -Code 8 `
+      -Detail ($result.Failures -join '; ')
+  }
+  return $result
+}
+
+# Asks the owner to close every Notepad window and waits, bounded, until no Notepad
+# window is open and no Notepad process holds a Fusion DLL that would poison the next
+# check. Nothing is ever killed.
+#
+# `ExpectedDll` is the build the next check wants (a process that already has it is
+# harmless); `RequireNoFusionDll` is for the steps that need the files released.
+function Confirm-NoNotepad {
+  param(
+    [string]$Step,
+    [string]$ExpectedDll = '',
+    [switch]$RequireNoFusionDll,
+    [switch]$Fatal = $true,
+    [int]$Rounds = 3,
+    [int]$TimeoutMs = 30000
+  )
+  # Not `$state`: that is the walkthrough's own state object at script scope.
+  $notepadState = $null
+  for ($round = 1; $round -le $Rounds; $round++) {
+    if ($round -eq 1) {
+      Write-Host '请关闭每一个记事本窗口。如果窗口里有多个标签页，先逐个关掉（Ctrl+W），'
+      Write-Host '或者在关闭窗口时确认“关闭所有标签页”——否则这个进程不会退出。'
+      Write-Host '然后按 Enter。'
+    } else {
+      Write-Host '还有记事本没有关掉（脚本不会替你关闭）：' -ForegroundColor Yellow
+      foreach ($window in $notepadState.Windows) { Write-Host ("  窗口 pid={0} 标题='{1}'" -f $window.Id, $window.Title) }
+      foreach ($foreign in $notepadState.Foreign) { Write-Host ("  进程 pid={0} 仍加载 {1}" -f $foreign.Id, $foreign.Loaded) }
+      Write-Host '请全部关闭后按 Enter。'
+    }
+    if (-not (Ask-Enter '关闭后按 Enter，脚本会再核对一次。')) { Write-Host '已放弃。'; exit 0 }
+    $notepadState = Wait-NotepadStateClear -ExpectedDll $ExpectedDll -RequireNoFusionDll:$RequireNoFusionDll -TimeoutMs $TimeoutMs
+    if ($notepadState.Clear) {
+      Add-Result $Step '记事本状态：已全部关闭，且没有进程占着旧 DLL' ("round={0} remaining processes={1}" -f $round, $notepadState.Processes.Count)
+      return $notepadState
+    }
+  }
+  Add-Result $Step '记事本状态：仍有窗口或旧 DLL 被占用' ("windows={0} foreign={1}" -f
+    (($notepadState.Windows | ForEach-Object { "$($_.Id)" }) -join ','),
+    (($notepadState.Foreign | ForEach-Object { "$($_.Id):$($_.Loaded)" }) -join ','))
+  if ($Fatal) {
+    Stop-Walkthrough -Step $Step -Command 'wait until every Notepad window is closed and no old DLL is loaded' -Code 8 `
+      -Detail ("still open: " + (($notepadState.Windows | ForEach-Object { "pid=$($_.Id) '$($_.Title)'" }) -join '; ') +
+        "; still holding a Fusion DLL: " + (($notepadState.Foreign | ForEach-Object { "pid=$($_.Id) $($_.Loaded)" }) -join '; '))
+  }
+  return $notepadState
 }
 
 # The item-3 assertion, recorded and fatal on mismatch. Returns the check result so
@@ -436,8 +505,9 @@ if ($state.stage -eq 'a') {
     $(if ($survivors.Count -gt 0) { $survivors -join ',' } else { 'none' }))
 
   Write-Host ''
-  Write-Host '请关闭所有已打开的记事本（旧的记事本仍加载着旧的 DLL），然后按 Enter。'
-  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本。')) { Write-Host '已放弃。'; exit 0 }
+  Write-Host '接下来脚本会自己打开一个新的记事本。请先关掉所有记事本窗口：'
+  Write-Host '这台机器上所有记事本窗口都在同一个进程里，旧窗口会让新窗口继续加载旧的 DLL。'
+  $null = Confirm-NoNotepad -Step 'a' -ExpectedDll (Join-Path $version1Dir 'bin\FusionTsf.dll')
   Write-Host '新记事本打开后：先看任务栏右下角的输入指示器——已经是 Fusion 就不要按 Win+空格（会切走），'
   Write-Host '只有不是 Fusion 时才按一次；然后在记事本里输入几个字母（例如 nihao），再回到本窗口按 Enter。'
   $check = Assert-InstalledTipInUse -Step 'a' -VersionDir $version1Dir -ManifestPath (Join-Path $state.package1Path 'package.json')
@@ -540,8 +610,8 @@ if ($state.stage -eq 'c') {
 if ($state.stage -eq 'c-resume') {
   Write-Head '步骤 c（续）：登录后的状态'
   New-Snapshot 'after-signin'
-  Write-Host '登录后任务应已启动 Host。请先关闭所有已打开的记事本，然后按 Enter。'
-  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本并核对它加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+  Write-Host '登录后任务应已启动 Host。接下来脚本会自己打开一个新的记事本，请先关掉所有记事本窗口。'
+  $null = Confirm-NoNotepad -Step 'c' -ExpectedDll (Join-Path $version1Dir 'bin\FusionTsf.dll')
   $check = Assert-InstalledTipInUse -Step 'c' -VersionDir $version1Dir -ManifestPath (Join-Path $state.package1Path 'package.json')
   Write-Host ''
   Write-Host '请在新打开的记事本里输入同样的拼音串，确认输入法仍可用，并检查刚才学习过的候选现在排第几位。'
@@ -567,7 +637,11 @@ if ($state.stage -eq 'c2') {
       -Detail 'no FusionHost is running'
   }
   $notepad = Start-UnsavedNotepad
-  Add-Result 'c2' '用于触发保存提示的记事本 pid' $notepad.Id
+  Add-Result 'c2' '用于触发保存提示的记事本进程' $(if ($notepad) {
+      "pid={0} title='{1}'" -f $notepad.Id, $notepad.Title
+    } else {
+      'no Notepad window appeared'
+    })
   Write-Host '脚本已打开一个记事本并输入了一个字符（若记事本里没有字符，请手动输入一个），不要保存。'
   if (-not (Ask-Enter '现在：开始菜单 → 用户头像 → 注销；Windows 提示“记事本有未保存的更改”时点“取消”中止注销，回到桌面后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
   Start-Sleep -Seconds 3
@@ -589,23 +663,23 @@ if ($state.stage -eq 'c2') {
 if ($state.stage -eq 'd') {
   Write-Head '步骤 d：在记事本保持打开的情况下升级到 wp4.2'
   Write-Host '请保持当前记事本窗口打开（不要关闭），然后按 Enter。升级会先请求旧 Host 有序停止，再安装新版本。'
-  # The Notepad that loaded the wp4.1 DLL: recorded before the upgrade so its
-  # behaviour afterwards can be checked without closing it. Resolved through the
-  # window owner, not through the first `notepad` process: the packaged Notepad's
-  # launcher is a different PID.
+  # 1. Before the upgrade: the Notepad that has the wp4.1 DLL loaded, resolved by
+  # window ownership (the packaged Notepad's launcher is a different PID).
   $oldWindow = Resolve-NotepadWindow -TimeoutMs 1500
   $oldNotepadId = 0
   if ($oldWindow.Window) { $oldNotepadId = $oldWindow.Window.Id }
-  Add-Result 'd' '升级前打开的记事本 pid' $(if ($oldNotepadId -gt 0) {
+  Add-Result 'd' '升级前打开的记事本进程' $(if ($oldNotepadId -gt 0) {
       "pid={0} path={1} title='{2}' because={3}" -f $oldNotepadId, $oldWindow.Window.Path, $oldWindow.Window.Title, $oldWindow.Reason
     } else {
       "none ($($oldWindow.Reason))"
     })
   if ($oldNotepadId -gt 0) {
     $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
-    Add-Result 'd' '升级前旧记事本加载的 DLL' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
+    Add-Result 'd' '升级前该进程加载的 DLL（应为 wp4.1）' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
   }
   if (-not (Ask-Enter '记事本保持打开，按 Enter 开始升级（UAC）。')) { Write-Host '已放弃。'; exit 0 }
+
+  # 2. Upgrade with that window open; a failure stops the walkthrough here.
   New-Snapshot 'before-upgrade'
   $install2Command = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
   $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `
@@ -614,19 +688,33 @@ if ($state.stage -eq 'd') {
   Assert-StepExit -Step 'd' -Command $install2Command -Code $code
   New-Snapshot 'after-upgrade'
 
-  # Host and registration must belong to wp4.2; the fresh Notepad proves the new
-  # registration is what applications actually load. The old Notepad stays open.
-  $check = Assert-InstalledTipInUse -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
-  Add-Result 'd' 'wp4.1 目录是否仍存在' (Test-Path -LiteralPath $version1Dir)
-  if ($oldNotepadId -gt 0) {
-    $oldStill = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
-    Add-Result 'd' '升级后旧记事本仍加载 wp4.1 的 DLL' ("ok={0} loaded={1} {2}" -f $oldStill.Ok, $oldStill.Loaded, $oldStill.Reason)
-  }
+  # 3. Host and registration only. Every Notepad window shares one process here, and
+  # that process still has the wp4.1 DLL loaded, so asserting a Notepad module now
+  # could only fail - the new DLL is proven in step 5, in a process started after this
+  # one exited.
+  $null = Assert-HostAndRegistration -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
 
+  # 4. The still-open window: old DLL, new Host.
   Write-Host ''
-  Write-Host '现在请在“仍然打开的那个记事本窗口”里输入中文（它加载的是旧 DLL）。'
-  Add-Result 'd' '旧记事本（旧 DLL）仍可输入' (Ask-YesNo '仍然打开的那个记事本，输入中文是否正常？')
-  Write-Host '刚才脚本新开的那个记事本加载的是新 DLL，请在那里输入中文。'
+  Write-Host '现在请在“仍然打开的那个记事本窗口”里输入中文（它加载的是 wp4.1 的 DLL，Host 已经是 wp4.2）。'
+  Add-Result 'd' '旧记事本（旧 DLL + 新 Host）仍可输入' (Ask-YesNo '仍然打开的那个记事本，输入中文是否正常？')
+  if ($oldNotepadId -gt 0) {
+    $oldAlive = [bool](Get-Process -Id $oldNotepadId -ErrorAction SilentlyContinue)
+    Add-Result 'd' '升级后旧记事本进程是否仍存活' $oldAlive
+    $oldStill = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
+    Add-Result 'd' '升级后该进程加载的 DLL（应仍为 wp4.1）' ("ok={0} loaded={1} {2}" -f $oldStill.Ok, $oldStill.Loaded, $oldStill.Reason)
+  }
+  Add-Result 'd' 'wp4.1 版本目录仍存在（应为是：仍在使用）' (Test-Path -LiteralPath $version1Dir)
+  $inUseOld = Test-DirectoryInUse -Path $version1Dir
+  Add-Result 'd' 'wp4.1 目录当前是否被进程占用' ("inUse={0} pids={1}" -f $inUseOld.InUse, ($inUseOld.Pids -join ','))
+
+  # 5. A genuinely new process: close every Notepad, wait for the one holding the
+  # wp4.1 DLL to exit, then open one and assert the wp4.2 DLL in it.
+  Write-Host ''
+  Write-Host '接下来要打开一个“全新的”记事本。这台机器上所有记事本窗口都在同一个进程里，'
+  Write-Host '所以必须先让旧进程退出，否则新窗口仍会加载 wp4.1 的 DLL。'
+  $null = Confirm-NoNotepad -Step 'd' -ExpectedDll (Join-Path $version2Dir 'bin\FusionTsf.dll')
+  $check = Assert-InstalledTipInUse -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
   Add-Result 'd' '新记事本（新 DLL）可输入' (Ask-YesNo '新开的记事本，输入中文是否正常？')
 
   Write-Host ''
@@ -636,6 +724,12 @@ if ($state.stage -eq 'd') {
   Add-Result 'd' 'C 标点与 QuickPhrase' (Ask-YesNo 'C 输入 , . ; 得到 Fcitx 标点，且输入 www. 出现 QuickPhrase 提示？')
   Add-Result 'd' 'D 键盘选词与翻页' (Ask-YesNo 'D 数字键、空格、- = 、PageUp/PageDown、方向键选词都正确？')
   Add-Result 'd' 'E 焦点切换' (Ask-YesNo 'E 输入中途切换窗口/焦点，无跨窗口上屏、无崩溃？')
+
+  # 7. Record whether the wp4.1 directory is free now. It is not removed here: step
+  # (e)'s uninstall (or the next install) cleans it up.
+  $inUseAfter = Test-DirectoryInUse -Path $version1Dir
+  Add-Result 'd' 'wp4.1 目录现在是否可删除（本步不删）' ("present={0} inUse={1} pids={2}" -f
+    (Test-Path -LiteralPath $version1Dir), $inUseAfter.InUse, ($inUseAfter.Pids -join ','))
   $state.stage = 'e'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -648,6 +742,13 @@ if ($state.stage -eq 'e') {
   Write-Head '步骤 e：卸载（保留用户数据）'
   Write-Host '脚本会请 Host 有序停止，然后反注册、删除计划任务、删除未被占用的版本目录。'
   Write-Host '%APPDATA%\Fcitx5 应保留。'
+  # A running application keeps the DLL mapped, so its version directory cannot be
+  # removed. Ask for every Notepad to be closed first; if something else still holds
+  # it, uninstall reports the directory as kept and that is recorded, not forced.
+  $null = Confirm-NoNotepad -Step 'e' -RequireNoFusionDll -Fatal:$false
+  $inUseBeforeUninstall = Test-DirectoryInUse -Path $version2Dir
+  Add-Result 'e' '卸载前 wp4.2 目录是否被进程占用' ("inUse={0} pids={1}" -f
+    $inUseBeforeUninstall.InUse, ($inUseBeforeUninstall.Pids -join ','))
   if (-not (Ask-Enter '按 Enter 开始卸载（UAC）。')) { Write-Host '已放弃。'; exit 0 }
   $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log' `
     -TranscriptPath (Join-Path $script:runDir "uninstall-$version2.log")
@@ -694,8 +795,10 @@ if ($state.stage -eq 'e') {
 
 if ($state.stage -eq 'f') {
   Write-Head '步骤 f：重装 wp4.2，再带 -RemoveUserData 卸载'
-  Write-Host '请先关闭所有记事本窗口（否则版本目录会被占用而保留）。'
-  if (-not (Ask-Enter '关闭所有记事本后按 Enter（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
+  Write-Host '请先关闭所有记事本窗口（否则重装时无法覆盖已加载的 DLL，版本目录也会被占用）。'
+  $null = Confirm-NoNotepad -Step 'f' -RequireNoFusionDll
+  Write-Host '接下来会弹两次 UAC：先重装 wp4.2，再带 -RemoveUserData 卸载。'
+  if (-not (Ask-Enter '按 Enter 开始（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
   $reinstallCommand = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
   $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `
     -LogName 'reinstall-wp4.2.log' -TranscriptPath (Join-Path $script:runDir "install-$version2-reinstall.log")

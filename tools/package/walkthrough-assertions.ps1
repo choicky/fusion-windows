@@ -39,7 +39,7 @@ public static string[] VisibleWindows() {
     GetClassNameW(hWnd, cls, 256);
     uint pid;
     GetWindowThreadProcessId(hWnd, out pid);
-    list.Add(pid.ToString() + "|" + cls.ToString() + "|" + title.ToString());
+    list.Add(hWnd.ToInt64().ToString() + "|" + pid.ToString() + "|" + cls.ToString() + "|" + title.ToString());
     return true;
   }, System.IntPtr.Zero);
   return list.ToArray();
@@ -54,12 +54,14 @@ function Get-NotepadWindows {
   $result = @()
   $seen = @{}
   foreach ($raw in [FusionWindows]::VisibleWindows()) {
-    $parts = $raw -split '\|', 3
-    if ($parts.Count -lt 3) { continue }
+    $parts = $raw -split '\|', 4
+    if ($parts.Count -lt 4) { continue }
+    $handle = 0L
+    if (-not [long]::TryParse($parts[0], [ref]$handle)) { continue }
     $processId = 0
-    if (-not [int]::TryParse($parts[0], [ref]$processId)) { continue }
-    $class = $parts[1]
-    $title = $parts[2]
+    if (-not [int]::TryParse($parts[1], [ref]$processId)) { continue }
+    $class = $parts[2]
+    $title = $parts[3]
     # The window class is the reliable signal (classic and packaged Notepad both use
     # `Notepad`). The title fallback must end with "- Notepad": another editor called
     # "Notepad--" ends with "--" and must never be picked as the window to check.
@@ -77,6 +79,7 @@ function Get-NotepadWindows {
     try { $started = $process.StartTime } catch { }
     $result += [pscustomobject]@{
       Id        = $process.Id
+      Handle    = [IntPtr]$handle
       Path      = $path
       Title     = $title
       Class     = $class
@@ -263,6 +266,48 @@ function Start-NotepadForCheck {
   }
 }
 
+# Waits, bounded, until no Notepad window is open and no Notepad process holds a
+# FusionTsf.dll that would poison the next check.
+#
+# Every Notepad window on this machine lives in ONE packaged process (a second launch
+# adds a tab), so "open a fresh Notepad" only produces a new process after the old one
+# has exited. `ExpectedDll` is the build the next check wants: a process that already
+# has that DLL loaded is harmless, any *other* Fusion DLL is not. With
+# `RequireNoFusionDll`, every loaded FusionTsf.dll counts (used before an uninstall,
+# where the files must be released).
+function Wait-NotepadStateClear {
+  param(
+    [string]$ExpectedDll = '',
+    [switch]$RequireNoFusionDll,
+    [int]$TimeoutMs = 45000,
+    [int]$PollMs = 400
+  )
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  while ($true) {
+    $windows = @(Get-NotepadWindows)
+    $foreign = @()
+    foreach ($process in @(Get-Process -Name notepad -ErrorAction SilentlyContinue)) {
+      $loaded = @()
+      try { $loaded = @($process.Modules | Where-Object { $_.ModuleName -eq 'FusionTsf.dll' }) } catch { }
+      foreach ($module in $loaded) {
+        if (-not $RequireNoFusionDll -and $ExpectedDll -and
+            $module.FileName.Equals($ExpectedDll, [StringComparison]::OrdinalIgnoreCase)) {
+          continue
+        }
+        $foreign += [pscustomobject]@{ Id = $process.Id; Loaded = $module.FileName }
+      }
+    }
+    $processes = @(Get-Process -Name notepad -ErrorAction SilentlyContinue)
+    if ($windows.Count -eq 0 -and $foreign.Count -eq 0) {
+      return [pscustomobject]@{ Clear = $true; Windows = @(); Foreign = @(); Processes = $processes }
+    }
+    if ((Get-Date) -ge $deadline) {
+      return [pscustomobject]@{ Clear = $false; Windows = $windows; Foreign = $foreign; Processes = $processes }
+    }
+    Start-Sleep -Milliseconds $PollMs
+  }
+}
+
 # The whole item-3 assertion: the Host that serves typing comes from the expected
 # version directory, the registration points at that version's DLL, and a Notepad
 # really loaded that DLL (path + manifest hash).
@@ -275,7 +320,8 @@ function Test-InstalledTipInUse {
   param(
     [string]$VersionDir,
     [string]$ManifestPath,
-    [int]$NotepadId = 0
+    [int]$NotepadId = 0,
+    [switch]$SkipNotepad
   )
   $failures = @()
 
@@ -303,7 +349,9 @@ function Test-InstalledTipInUse {
   $notepadCandidates = @()
   $launcherPid = 0
   $module = $null
-  if ($failures.Count -eq 0) {
+  if ($SkipNotepad) {
+    $notepadReason = 'not checked (-SkipNotepad: this step asserts Host and registration only)'
+  } elseif ($failures.Count -eq 0) {
     if ($NotepadId -gt 0) {
       # Reuse the process the previous attempt resolved. It is rebuilt into the same
       # shape as a resolved window (Id/Path/Title/Class/StartTime) so callers never
@@ -318,6 +366,7 @@ function Test-InstalledTipInUse {
         try { $existingStarted = $existing.StartTime } catch { }
         $notepad = [pscustomobject]@{
           Id        = $existing.Id
+          Handle    = [IntPtr]::Zero
           Path      = $existingPath
           Title     = $existingTitle
           Class     = 'Notepad'
