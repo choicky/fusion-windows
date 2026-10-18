@@ -159,10 +159,28 @@ function New-Snapshot([string]$label) {
   return $text
 }
 
+# Starts a script elevated through UAC and returns its exit code. ProcessStartInfo
+# with UseShellExecute + runas is used instead of Start-Process: Start-Process
+# builds an environment dictionary and fails on a machine that has both `http_proxy`
+# and `HTTP_PROXY` defined.
+function Start-ElevatedProcess {
+  param([string[]]$Arguments)
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = 'powershell.exe'
+  $startInfo.Arguments = ($Arguments | ForEach-Object {
+      if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }) -join ' '
+  $startInfo.UseShellExecute = $true
+  $startInfo.Verb = 'runas'
+  $process = [System.Diagnostics.Process]::Start($startInfo)
+  $process.WaitForExit()
+  return $process.ExitCode
+}
+
 # Runs an elevated script through UAC and captures its transcript. The elevated
-# process writes the transcript itself, because Start-Process cannot redirect the
-# output of a runas launch. A small generated wrapper is used instead of -Command:
-# an argument list is joined with spaces, so a -Command script would be split.
+# process writes the transcript itself, because a runas launch cannot redirect its
+# output. A small generated wrapper is used instead of -Command: an argument list is
+# joined with spaces, so a -Command script would be split.
 function Invoke-ElevatedScript {
   param([string]$ScriptPath, [string[]]$Arguments, [string]$LogName)
   $log = Join-Path $script:runDir $LogName
@@ -176,13 +194,12 @@ function Invoke-ElevatedScript {
     'exit $code'
   )
   Set-Content -LiteralPath $wrapper -Value $lines -Encoding UTF8
-  $process = Start-Process -FilePath 'powershell.exe' -Verb runas -Wait -PassThru `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapper + '"'))
-  Add-Content -LiteralPath $script:logPath -Value "`n### ELEVATED $LogName exit=$($process.ExitCode)" -Encoding UTF8
+  $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
+  Add-Content -LiteralPath $script:logPath -Value "`n### ELEVATED $LogName exit=$code" -Encoding UTF8
   if (Test-Path -LiteralPath $log) {
     Add-Content -LiteralPath $script:logPath -Value (Get-Content -LiteralPath $log -Raw) -Encoding UTF8
   }
-  return $process.ExitCode
+  return $code
 }
 
 function Get-PackageVersion([string]$zipPath) {
@@ -489,9 +506,8 @@ if ($state.stage -eq 'restore') {
     Write-Host "恢复：$dev"
     if (Test-Path -LiteralPath $dev) {
       $register = Join-Path $repoRoot 'tools\tsf\register.ps1'
-      $process = Start-Process -FilePath 'powershell.exe' -Verb runas -Wait -PassThru `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register, '-DllPath', $dev)
-      Add-Result 'restore' 'register.ps1 退出码' $process.ExitCode
+      $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register, '-DllPath', $dev)
+      Add-Result 'restore' 'register.ps1 退出码' $code
     } else {
       Add-Result 'restore' '开发注册 DLL 不存在，无法恢复' $dev
     }
