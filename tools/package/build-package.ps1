@@ -68,13 +68,13 @@ try {
 
   # bin: the Host, the TSF DLL, the Host's own module and every runtime DLL. The
   # post-build step already staged the runtime beside the binaries, so this is
-  # exactly the set the Host resolves without any PATH change (A3).
-  foreach ($file in Get-ChildItem -LiteralPath $binDir -File) {
-    if ($file.Extension -in @('.dll', '.exe')) {
-      if ($file.Name -in @('FusionTsfProfile.exe')) { continue } # development tool, not product
-      Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage 'bin') -Force
-    }
+  # exactly the set the Host resolves without any PATH change (A3). Test
+  # executables and the development activation helper are not product files and
+  # are deliberately left out.
+  foreach ($file in Get-ChildItem -LiteralPath $binDir -File -Filter '*.dll') {
+    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage 'bin') -Force
   }
+  Copy-Item -LiteralPath (Join-Path $binDir 'FusionHost.exe') -Destination (Join-Path $stage 'bin') -Force
   foreach ($name in @('FusionHost.exe', 'FusionTsf.dll', 'FusionFcitxHost.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $stage "bin\$name"))) {
       throw "Release build did not produce bin\$name"
