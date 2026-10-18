@@ -488,3 +488,228 @@ function Invoke-ElevatedScript {
   }
   return $code
 }
+
+# --- shutdown blocker (step c2) ---------------------------------------------
+#
+# Step (c2) needs a sign-out that can be cancelled. The packaged Windows 11 Notepad
+# restores unsaved text and does not prompt on sign-out, so it cannot hold one; the
+# blocker must be something the walkthrough owns. This is a visible top-level window on
+# its own thread that registers a shutdown block reason and answers FALSE to
+# WM_QUERYENDSESSION, so Windows shows its "these apps are preventing you from signing
+# out" screen and the owner can click Cancel.
+#
+# It is a harness object only: it never runs during an install and it is closed before
+# the step ends.
+if (-not ('FusionShutdownBlocker' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public static class FusionShutdownBlocker
+{
+    private const uint WM_QUERYENDSESSION = 0x0011;
+    private const uint WM_ENDSESSION = 0x0016;
+    private const uint WM_CLOSE = 0x0010;
+    private const uint WM_DESTROY = 0x0002;
+    private const uint WS_OVERLAPPEDWINDOW = 0x00CF0000;
+    private const uint WS_VISIBLE = 0x10000000;
+    private const int CW_USEDEFAULT = unchecked((int)0x80000000);
+    private const int SW_SHOW = 5;
+    private const string ClassName = "FusionWp4ShutdownBlocker";
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASS
+    {
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpszMenuName;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpszClassName;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int x;
+        public int y;
+    }
+
+    private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern ushort RegisterClassW(ref WNDCLASS wc);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowExW(uint exStyle, string className, string windowName, uint style,
+        int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
+    [DllImport("user32.dll")]
+    private static extern IntPtr DefWindowProcW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool DestroyWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    private static extern void PostQuitMessage(int code);
+    [DllImport("user32.dll")]
+    private static extern int GetMessageW(out MSG msg, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref MSG msg);
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessageW(ref MSG msg);
+    [DllImport("user32.dll")]
+    private static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int command);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ShutdownBlockReasonQuery(IntPtr hWnd, StringBuilder reason, ref uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandleW(string name);
+
+    private static WndProcDelegate procDelegate;
+    private static IntPtr handle = IntPtr.Zero;
+    private static Thread thread;
+    private static ManualResetEvent ready = new ManualResetEvent(false);
+    private static string reasonText = "";
+    private static bool querySeen = false;
+    private static bool queryResult = true;
+
+    public static bool Start(string title, string reason, int timeoutMs)
+    {
+        reasonText = reason;
+        handle = IntPtr.Zero;
+        ready.Reset();
+        querySeen = false;
+        queryResult = true;
+        thread = new Thread(delegate() { Run(title); });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return ready.WaitOne(timeoutMs) && handle != IntPtr.Zero;
+    }
+
+    private static void Run(string title)
+    {
+        procDelegate = new WndProcDelegate(Proc);
+        WNDCLASS wc = new WNDCLASS();
+        wc.lpfnWndProc = Marshal.GetFunctionPointerForDelegate(procDelegate);
+        wc.hInstance = GetModuleHandleW(null);
+        wc.lpszClassName = ClassName;
+        wc.hbrBackground = (IntPtr)6;
+        if (RegisterClassW(ref wc) == 0) { ready.Set(); return; }
+        handle = CreateWindowExW(0, ClassName, title, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, 560, 150, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+        if (handle == IntPtr.Zero) { ready.Set(); return; }
+        ShowWindow(handle, SW_SHOW);
+        ShutdownBlockReasonCreate(handle, reasonText);
+        ready.Set();
+        MSG msg;
+        while (GetMessageW(out msg, IntPtr.Zero, 0, 0) > 0)
+        {
+            TranslateMessage(ref msg);
+            DispatchMessageW(ref msg);
+        }
+    }
+
+    private static IntPtr Proc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        switch (msg)
+        {
+            case WM_QUERYENDSESSION:
+                querySeen = true;
+                queryResult = false;
+                return IntPtr.Zero;
+            case WM_ENDSESSION:
+                return IntPtr.Zero;
+            case WM_CLOSE:
+                DestroyWindow(hWnd);
+                return IntPtr.Zero;
+            case WM_DESTROY:
+                PostQuitMessage(0);
+                return IntPtr.Zero;
+            default:
+                return DefWindowProcW(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    public static IntPtr Handle { get { return handle; } }
+    public static bool IsAlive { get { return handle != IntPtr.Zero && IsWindow(handle); } }
+    public static bool QuerySeen { get { return querySeen; } }
+    public static bool QueryResult { get { return queryResult; } }
+
+    public static string Reason()
+    {
+        if (handle == IntPtr.Zero) { return ""; }
+        uint size = 512;
+        StringBuilder text = new StringBuilder(512);
+        if (ShutdownBlockReasonQuery(handle, text, ref size)) { return text.ToString(); }
+        return "";
+    }
+
+    public static bool SendQueryEndSession()
+    {
+        if (handle == IntPtr.Zero) { return true; }
+        return SendMessageW(handle, WM_QUERYENDSESSION, IntPtr.Zero, IntPtr.Zero) != IntPtr.Zero;
+    }
+
+    public static void Stop()
+    {
+        if (handle != IntPtr.Zero) { PostMessageW(handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero); }
+        if (thread != null) { thread.Join(5000); }
+        handle = IntPtr.Zero;
+    }
+}
+'@
+}
+
+# Starts the blocker and reports what the OS accepted. `BlockRegistered` is the check
+# the step relies on before it asks the owner to sign out.
+function Start-ShutdownBlocker {
+  param(
+    [string]$Title = 'WP4 test: click Cancel',
+    [string]$Reason = 'WP4 test: click Cancel',
+    [int]$TimeoutMs = 10000
+  )
+  $started = [FusionShutdownBlocker]::Start($Title, $Reason, $TimeoutMs)
+  $state = Get-ShutdownBlockerState
+  return [pscustomobject]@{ Started = $started; Title = $Title; ReasonWanted = $Reason; State = $state }
+}
+
+function Get-ShutdownBlockerState {
+  $alive = [FusionShutdownBlocker]::IsAlive
+  $reason = ''
+  if ($alive) { $reason = [FusionShutdownBlocker]::Reason() }
+  return [pscustomobject]@{
+    Handle          = [FusionShutdownBlocker]::Handle
+    Alive           = $alive
+    Reason          = $reason
+    BlockRegistered = ($alive -and $reason.Length -gt 0)
+    QuerySeen       = [FusionShutdownBlocker]::QuerySeen
+    QueryResult     = [FusionShutdownBlocker]::QueryResult
+  }
+}
+
+# Sends WM_QUERYENDSESSION to the blocker and reports its answer. FALSE (blocks) is what
+# the step needs; it does not end the session.
+function Test-ShutdownBlockerBlocksSessionEnd {
+  $returnedTrue = [FusionShutdownBlocker]::SendQueryEndSession()
+  return [pscustomobject]@{ ReturnedTrue = $returnedTrue; Blocks = (-not $returnedTrue) }
+}
+
+function Stop-ShutdownBlocker {
+  [FusionShutdownBlocker]::Stop()
+}

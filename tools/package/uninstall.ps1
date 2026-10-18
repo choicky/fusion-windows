@@ -103,6 +103,26 @@ try {
         Write-Host "  removed $key"
       }
     }
+
+    # The per-user half outlives the machine-wide keys: EnableLanguageProfile writes
+    # HKCU\...\LanguageProfile\<lang>\<profile> Enable=1, which keeps this TIP in the
+    # user's input indicator after the DLL is gone - an entry the user can still select.
+    # Remove it for the current user only (and the language-list entry, if this user has
+    # one). Nothing else is touched and no other user is affected.
+    $userInput = Remove-FusionUserInputState
+    if ($userInput.TipKeyExisted) {
+      Write-Host ("  HKCU CTF\TIP present (Enable={0}); removed={1}" -f
+        $(if ($null -eq $userInput.EnableWas) { '(none)' } else { $userInput.EnableWas }), $userInput.TipKeyRemoved)
+      Write-Host "  removed $($userInput.TipKey)"
+    } else {
+      Write-Host '  no HKCU CTF\TIP key for this user'
+    }
+    if ($userInput.LanguageTipRemoved) {
+      Write-Host "  removed $($userInput.LanguageTip) from this user's language list"
+    } else {
+      Write-Host '  the language list does not contain this TIP; nothing to remove there'
+    }
+    if ($userInput.Warning) { Write-Host "  $($userInput.Warning)" -ForegroundColor Yellow }
   } elseif ($registered) {
     Write-Host "  HKLM registration points elsewhere ($registered); left untouched" -ForegroundColor Yellow
   } else {

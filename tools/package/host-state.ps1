@@ -173,6 +173,89 @@ function Get-FusionRegisteredDll {
   return [string]$dll
 }
 
+# The per-user input state that outlives the machine-wide registration: the HKCU
+# CTF\TIP key (written by EnableLanguageProfile, not by registration - it holds only
+# `Enable = 1` under LanguageProfile\<lang>\<profile>) and this user's language-list
+# tips. After an uninstall that removed only HKLM, the enable flag is what keeps a
+# "ghost" input method visible in the user's input indicator.
+function Get-FusionUserInputState {
+  $clsid = '{8B7C4A90-5E2D-4B1F-9A31-6C0F42D1E7A4}'
+  $profile = '{D4A1F6B2-3C58-4E77-8A90-1B5D9C06E4F1}'
+  $tipKey = "HKCU:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
+  $enableKey = "$tipKey\LanguageProfile\0x00000804\$profile"
+  $enable = $null
+  if (Test-Path -LiteralPath $enableKey) { $enable = (Get-Item -LiteralPath $enableKey).GetValue('Enable') }
+  $tips = @()
+  try {
+    foreach ($language in @(Get-WinUserLanguageList)) {
+      foreach ($entry in @($language.InputMethodTips)) { $tips += [string]$entry }
+    }
+  } catch {
+    # A read-only inventory must not fail an uninstall when the query is unavailable.
+  }
+  $needle = "0804:$clsid$profile"
+  $listed = @($tips | Where-Object { $_.ToUpperInvariant() -eq $needle.ToUpperInvariant() })
+  return [pscustomobject]@{
+    TipKey          = Test-Path -LiteralPath $tipKey
+    EnableKey       = Test-Path -LiteralPath $enableKey
+    Enable          = $enable
+    FusionTip       = $needle
+    FusionTipListed = ($listed.Count -gt 0)
+    Tips            = $tips
+  }
+}
+
+# Removes the per-user input state for one CLSID/profile: the HKCU CTF\TIP key and, if
+# this user has one, the language-list tip. Current user only; nothing else is touched.
+# `-Clsid`/`-Profile` exist so the proof can exercise this exact code against a
+# synthetic key instead of the real registration.
+function Remove-FusionUserInputState {
+  param(
+    [string]$Clsid = '{8B7C4A90-5E2D-4B1F-9A31-6C0F42D1E7A4}',
+    [string]$Profile = '{D4A1F6B2-3C58-4E77-8A90-1B5D9C06E4F1}'
+  )
+  $result = [pscustomobject]@{
+    TipKey         = "HKCU:\SOFTWARE\Microsoft\CTF\TIP\$Clsid"
+    TipKeyExisted  = $false
+    EnableWas      = $null
+    TipKeyRemoved  = $false
+    LanguageTip    = "0804:$Clsid$Profile"
+    LanguageTipRemoved = $false
+    Warning        = ''
+  }
+  if (Test-Path -LiteralPath $result.TipKey) {
+    $result.TipKeyExisted = $true
+    $enableKey = "$($result.TipKey)\LanguageProfile\0x00000804\$Profile"
+    if (Test-Path -LiteralPath $enableKey) {
+      $result.EnableWas = (Get-Item -LiteralPath $enableKey).GetValue('Enable')
+    }
+    Remove-Item -LiteralPath $result.TipKey -Recurse -Force
+    $result.TipKeyRemoved = -not (Test-Path -LiteralPath $result.TipKey)
+  }
+  # The language list is the other place a user could still see the input method. It is
+  # only rewritten when this user actually has the tip: rewriting it otherwise would
+  # touch settings for nothing, and a failure here must not fail an uninstall.
+  try {
+    $needle = $result.LanguageTip
+    $list = @(Get-WinUserLanguageList)
+    $found = $false
+    foreach ($language in $list) {
+      # InputMethodTips is a get-only StringCollection: remove from it, do not assign.
+      $tips = $language.InputMethodTips
+      $doomed = @($tips | Where-Object { $_.ToUpperInvariant() -eq $needle.ToUpperInvariant() })
+      foreach ($tip in $doomed) { [void]$tips.Remove($tip) }
+      if ($doomed.Count -gt 0) { $found = $true }
+    }
+    if ($found) {
+      Set-WinUserLanguageList -LanguageList $list -Force
+      $result.LanguageTipRemoved = $true
+    }
+  } catch {
+    $result.Warning = "the language list was not changed: $($_.Exception.Message)"
+  }
+  return $result
+}
+
 # Is any file under `Path` loaded as a module by a running process? Used before
 # removing a version directory: a directory whose DLL an application still holds is
 # kept and reported, never force-deleted (and never partially deleted, which a

@@ -82,27 +82,22 @@ function Ask-Text([string]$question, [string]$hint) {
   return $answer.Trim()
 }
 
-# Starts Notepad, resolves the process that owns its window (the launcher is not it),
-# and tries to type one character so a logoff asks to save and can be cancelled. If the
-# synthetic keystroke does not land, the prompt asks the owner to type it.
-function Start-UnsavedNotepad {
-  $started = Start-NotepadForCheck
-  if (-not $started.Window) { return $null }
-  try {
-    $shell = New-Object -ComObject WScript.Shell
-    [void]$shell.AppActivate($started.Window.Id)
-    Start-Sleep -Milliseconds 400
-    $shell.SendKeys('x')
-  } catch {
-    # The owner types the character instead; the prompt says so.
-  }
-  return $started.Window
-}
-
 function Add-Result([string]$step, [string]$question, $answer) {
   $line = "[{0}] {1} => {2}" -f $step, $question, $answer
   Add-Content -LiteralPath $script:logPath -Value $line -Encoding UTF8
   Write-Host "  记录：$line" -ForegroundColor DarkGray
+}
+
+# The per-user input state that an uninstall must also clear: HKCU CTF\TIP (the
+# EnableLanguageProfile flag) and this user's language-list tips. Recorded around the
+# uninstall steps and again after the development registration is restored.
+function Add-UserInputResult([string]$step, [string]$when) {
+  $userInput = Get-FusionUserInputState
+  Add-Result $step ("用户输入状态（{0}）" -f $when) ("HKCU_TIP={0} enable={1} languageListHasFusion={2} tips={3}" -f
+    $userInput.TipKey,
+    $(if ($null -eq $userInput.Enable) { '(none)' } else { $userInput.Enable }),
+    $userInput.FusionTipListed,
+    $(if ($userInput.Tips.Count -gt 0) { $userInput.Tips -join ',' } else { '(none)' }))
 }
 
 function Get-UserDataSummary {
@@ -628,7 +623,7 @@ if ($state.stage -eq 'c-resume') {
 
 if ($state.stage -eq 'c2') {
   Write-Head '步骤 c2：取消一次注销，Host 必须仍在运行'
-  Write-Host '注销可以在发出后仍被取消（例如记事本询问是否保存、用户点取消）。Host 不能在这种取消后消失。'
+  Write-Host '注销可以在发出后仍被取消。Host 不能在这种取消后消失。'
   $before = @(Get-FusionHostState)
   $beforeIds = ($before | ForEach-Object { $_.Id } | Sort-Object) -join ','
   Add-Result 'c2' '取消注销前的 Host pid' $beforeIds
@@ -636,22 +631,66 @@ if ($state.stage -eq 'c2') {
     Stop-Walkthrough -Step 'c2' -Command 'require a running Host to cancel a logoff' -Code 8 `
       -Detail 'no FusionHost is running'
   }
-  $notepad = Start-UnsavedNotepad
-  Add-Result 'c2' '用于触发保存提示的记事本进程' $(if ($notepad) {
-      "pid={0} title='{1}'" -f $notepad.Id, $notepad.Title
-    } else {
-      'no Notepad window appeared'
-    })
-  Write-Host '脚本已打开一个记事本并输入了一个字符（若记事本里没有字符，请手动输入一个），不要保存。'
-  if (-not (Ask-Enter '现在：开始菜单 → 用户头像 → 注销；Windows 提示“记事本有未保存的更改”时点“取消”中止注销，回到桌面后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+
+  # The blocker is ours, not the application's: the packaged Windows 11 Notepad
+  # restores unsaved text and does not prompt on sign-out, so it cannot hold one.
+  $blocker = Start-ShutdownBlocker
+  Add-Result 'c2' '阻断窗口已创建' ("started={0} alive={1} handle=0x{2:X}" -f
+    $blocker.Started, $blocker.State.Alive, $blocker.State.Handle.ToInt64())
+  Add-Result 'c2' '阻断窗口已登记阻止原因（ShutdownBlockReasonQuery）' ("reason='{0}' registered={1}" -f
+    $blocker.State.Reason, $blocker.State.BlockRegistered)
+  if (-not $blocker.Started -or -not $blocker.State.Alive -or -not $blocker.State.BlockRegistered) {
+    Stop-Walkthrough -Step 'c2' -Command 'start the shutdown blocker and register its block reason' -Code 8 `
+      -Detail ("started={0} alive={1} reason='{2}'" -f $blocker.Started, $blocker.State.Alive, $blocker.State.Reason)
+  }
+  $query = Test-ShutdownBlockerBlocksSessionEnd
+  Add-Result 'c2' '阻断窗口对 WM_QUERYENDSESSION 的回答' ("returnedTrue={0} blocks={1}" -f $query.ReturnedTrue, $query.Blocks)
+  if (-not $query.Blocks) {
+    Stop-Walkthrough -Step 'c2' -Command 'send WM_QUERYENDSESSION to the blocker' -Code 8 `
+      -Detail 'the blocker answered TRUE, so it would not hold the sign-out'
+  }
+
+  # Saved before the request: if the owner is signed out anyway, -Resume lands on
+  # 'c2-signout' and records that the blocker was ineffective instead of losing the run.
+  $state.stage = 'c2-signout'
+  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+  Write-Head '现在请注销，并在 Windows 的阻止界面里点“取消”'
+  Write-Host '1. 开始菜单 → 用户头像 → 注销。'
+  Write-Host '2. Windows 会显示“这些应用阻止你注销 / 关闭”之类的界面，其中一项是 "WP4 test: click Cancel"。'
+  Write-Host '3. 在那个界面点“取消”（不要点“仍要注销”/“强制注销”），回到桌面后按 Enter。'
+  if (-not (Ask-Enter '取消注销并回到桌面后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
   Start-Sleep -Seconds 3
+
   $after = @(Get-FusionHostState)
   $afterIds = ($after | ForEach-Object { $_.Id } | Sort-Object) -join ','
   Add-Result 'c2' '取消注销后的 Host 进程数' $after.Count
   Add-Result 'c2' '取消注销后的 Host pid' $afterIds
   Add-Result 'c2' '取消注销后仍是同一个 Host' ($afterIds -eq $beforeIds)
+  Add-Result 'c2' 'Host 仍来自 wp4.1 目录' (@($after | Where-Object {
+        $_.Path -and $_.Path.StartsWith((Join-Path $version1Dir 'bin'), [StringComparison]::OrdinalIgnoreCase) }).Count)
   Add-Result 'c2' '取消注销后输入仍可用' (Ask-YesNo '取消注销后，在记事本里输入中文是否仍然正常？')
+
+  Stop-ShutdownBlocker
+  $blockerAfter = Get-ShutdownBlockerState
+  Add-Result 'c2' '阻断窗口已关闭' (-not $blockerAfter.Alive)
   New-Snapshot 'after-cancelled-logoff'
+  $state.stage = 'd'
+  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+}
+
+# Reached only if the walkthrough was signed out during (c2): the blocker did not hold
+# the session. Recorded as "blocker ineffective" - neither a pass nor a product failure.
+if ($state.stage -eq 'c2-signout') {
+  Write-Head '步骤 c2（续）：注销没有被拦住'
+  Write-Host '这次注销没有被阻断窗口拦住，所以脚本被注销终止了。'
+  Add-Result 'c2' '取消注销的结果' 'sign-out was not blocked (blocker ineffective) — neither a pass nor a product failure'
+  $hostsNow = @(Get-FusionHostState)
+  Add-Result 'c2' '重新登录后的 Host 进程数' $hostsNow.Count
+  foreach ($process in $hostsNow) {
+    Add-Result 'c2' "Host pid=$($process.Id)" ("path={0} integrity={1} session={2}" -f $process.Path, $process.Integrity, $process.SessionId)
+  }
+  New-Snapshot 'after-signout-not-blocked'
   $state.stage = 'd'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -749,6 +788,7 @@ if ($state.stage -eq 'e') {
   $inUseBeforeUninstall = Test-DirectoryInUse -Path $version2Dir
   Add-Result 'e' '卸载前 wp4.2 目录是否被进程占用' ("inUse={0} pids={1}" -f
     $inUseBeforeUninstall.InUse, ($inUseBeforeUninstall.Pids -join ','))
+  Add-UserInputResult 'e' '卸载前'
   if (-not (Ask-Enter '按 Enter 开始卸载（UAC）。')) { Write-Host '已放弃。'; exit 0 }
   $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log' `
     -TranscriptPath (Join-Path $script:runDir "uninstall-$version2.log")
@@ -766,6 +806,7 @@ if ($state.stage -eq 'e') {
   $remaining = @(Get-VersionDirectories)
   Add-Result 'e' '卸载后残留的版本目录（被占用而保留的会出现在这里）' $(if ($remaining.Count -gt 0) { $remaining -join ', ' } else { '(none)' })
   Add-Result 'e' '%APPDATA%\Fcitx5 保留' (Test-Path -LiteralPath (Join-Path $env:APPDATA 'Fcitx5'))
+  Add-UserInputResult 'e' '卸载后'
 
   $checkState = Join-Path $repoRoot 'tools\tsf\check-state.ps1'
   $checkLog = Join-Path $script:runDir 'check-state-after-uninstall.txt'
@@ -798,6 +839,7 @@ if ($state.stage -eq 'f') {
   Write-Host '请先关闭所有记事本窗口（否则重装时无法覆盖已加载的 DLL，版本目录也会被占用）。'
   $null = Confirm-NoNotepad -Step 'f' -RequireNoFusionDll
   Write-Host '接下来会弹两次 UAC：先重装 wp4.2，再带 -RemoveUserData 卸载。'
+  Add-UserInputResult 'f' '重装前'
   if (-not (Ask-Enter '按 Enter 开始（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
   $reinstallCommand = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
   $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `
@@ -821,6 +863,7 @@ if ($state.stage -eq 'f') {
   Add-Result 'f' '安装根目录仍存在' (Test-Path -LiteralPath $installRoot)
   Add-Result 'f' '%APPDATA%\Fcitx5 已删除' (-not (Test-Path -LiteralPath (Join-Path $env:APPDATA 'Fcitx5')))
   Add-Result 'f' '%LOCALAPPDATA%\Fcitx5 已删除' (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Fcitx5')))
+  Add-UserInputResult 'f' '带 -RemoveUserData 卸载后'
   $state.stage = 'restore'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -848,6 +891,7 @@ if ($state.stage -eq 'restore') {
     Add-Result 'restore' '走查前没有开发注册' $true
   }
   New-Snapshot 'after-restore'
+  Add-UserInputResult 'restore' '恢复开发注册后'
   $state.stage = 'done'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
