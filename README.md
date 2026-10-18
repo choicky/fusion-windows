@@ -58,6 +58,7 @@ repository entry point only.
 - `tests/stage5_real_projection.cpp` — Stage 5 closure against the real pinned pinyin engine (in-process `FusionFcitxHost`, `FUSION_WITH_FCITX5` build): preedit segments/format/cursor and their movement with Left/Right, partial selection and continued composition, stroke-filter and QuickPhrase auxUp, and the empty-panel hide signal.
 - `tests/fcitx_candidate_filter.cpp` — Stage 5 display outputFilter contract against the real Fcitx5 core (Windows `FUSION_WITH_FCITX5` build against the pinned runtime, and non-Windows builds with Fcitx5 dev libraries): candidate label/text/comment like classic-ui, the client preedit like the dbus frontend (segments, flags, cursor, engine password masking), and the panel rows like classic-ui.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
+- `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers) and `verify-wp4.ps1` (the owner walkthrough).
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
 ## Local validation
@@ -525,3 +526,34 @@ not a numeric candidate key.
 P0-A/P0-B/P0-D remain OPEN. Stage 5 does not freeze D072 §16 renderer placement or the wire format, and does not
 decide multi-window/fixed-position or full keyboard-candidate UX; `customLabel`, `spaceBetweenComment`,
 `overlayMessage` and the other deferred capabilities stay as recorded in the controller's §25 disposition.
+
+## Stage 6 WP4 — packaging and lifecycle
+
+The packaged Host has no console window (`FusionHost.exe` is a Windows-subsystem binary). The console mode with its
+control handler stays available for development and tests through `--console`; a redirected stderr keeps working in
+both modes, because the CRT binds stdio to the inherited handle.
+
+Because there is no console, logoff/shutdown reaches the Host through a hidden **top-level** window (a message-only
+`HWND_MESSAGE` window receives no session-end broadcast): `WM_QUERYENDSESSION` / `WM_ENDSESSION` request the stop and
+wait, bounded (4 s, the same bound as the console path), for the ordered shutdown to finish. A named stop event
+(`Local\FusionHost-stop-<user SID>-<session id>`, the same user-only DACL as the pipe and the singleton claim) is the
+second non-console path: `install.ps1` / `uninstall.ps1` signal it instead of terminating the Host. All three paths
+only *request* the stop — `main()` remains the single thread that runs `stop()` → `shutdown_backend()` → Fcitx's own
+save on instance exit, and the singleton claim is held until the process exits.
+
+The package is a zip whose root maps onto the installed version directory `C:\Program Files\Fcitx5 Fusion\<version>\`:
+`bin\` (Host, TSF DLL, `FusionFcitxHost.dll`, every runtime DLL), `data\` (fcitx5 + libime data), `lib\libime\`
+(`zh_CN.lm`), `tools\` (the existing registration scripts), `install.ps1`, `uninstall.ps1` and `package.json`
+(version, source commit, runtime identity, SHA-256 of every file). Fcitx resolves its data from the parent of the
+directory that holds `Fcitx5Utils.dll`, which must therefore be named `bin`; every DLL sits beside the executable, so
+nothing depends on `PATH`. `install.ps1` copies to the version directory, registers the TIP from there, creates or
+updates the per-user logon task (interactive token, limited run level, no execution time limit, no second instance)
+and starts the Host for the current user; an upgrade stops the old Host orderly, installs a new directory, re-points
+registration and task, and leaves an old directory that is still locked by running applications for a later run.
+`uninstall.ps1` stops the Host orderly, unregisters, deletes the task and removes the version directories it can;
+`%APPDATA%\Fcitx5` is kept unless `-RemoveUserData` is given.
+
+Known limits at this scope: an old version directory stays locked until the applications that loaded its DLL exit;
+nothing restarts the Host after a crash (WP5/U7 evidence); the task, the pipe, the claim and the stop event are all
+single user × session, so a machine with several interactive users needs the install per user; and no MSI, signing or
+distribution channel is decided here (U4, WP8).

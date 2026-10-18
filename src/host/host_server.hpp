@@ -88,6 +88,56 @@ private:
   std::wstring name_;
 };
 
+// Stage 6 WP4: the named stop event, the second way (besides the console control
+// handler and the session-end window) to ask a running Host for an *orderly*
+// stop. An elevated install/upgrade/uninstall signals it instead of terminating
+// the process, so Fcitx's own save on instance exit still runs.
+//
+// Mechanism and scope:
+//   * Object type: a manual-reset, initially non-signalled event. The Host
+//     creates it and keeps the handle open for its whole lifetime, so the object
+//     disappears when the Host exits (a dead Host can never leave a stale event
+//     that a later install would signal).
+//   * Name scope: `Local\FusionHost-stop-<user SID>-<session id>` — exactly the
+//     principal and session the pipe and the claim are scoped to.
+//   * Security: the same user-only DACL as the pipe and HostClaim, so another
+//     principal can neither create nor signal it.
+//   * The event carries no request payload and no acknowledgement: signalling it
+//     means "perform the normal ordered shutdown". The HostClaim stays the
+//     authority for "only one Host per user x session".
+class HostStopEvent {
+public:
+  HostStopEvent() = default;
+  ~HostStopEvent() { release(); }
+  HostStopEvent(const HostStopEvent &) = delete;
+  HostStopEvent &operator=(const HostStopEvent &) = delete;
+
+  // Creates the event for this user x session. False when the descriptor cannot
+  // be built, creation fails, or the name already exists (another Host for this
+  // principal is alive; the claim has already refused this one).
+  //
+  // `scope` exists for tests, which need a name of their own on a machine that may
+  // already run the product Host; the product Host always uses the default (this
+  // user x session), exactly like the pipe name it is paired with.
+  bool create(const std::wstring &scope = std::wstring());
+  void release();
+  bool valid() const { return handle_ != nullptr; }
+  void *handle() const { return handle_; }
+  // The kernel object name used by the last create() (empty before the first
+  // call), so the Host's log states the scope an installer must target.
+  const std::wstring &name() const { return name_; }
+
+private:
+  void *handle_ = nullptr;
+  std::wstring name_;
+};
+
+// Waits until either the stop event is signalled (true: the caller requests the
+// stop) or the Host has finished its orderly exit (false). It never drains, joins
+// or touches the backend, so any thread may run it; main() remains the single
+// thread that performs the ordered shutdown.
+bool wait_for_stop_request(void *stop_event, void *exit_complete);
+
 class HostServer {
 public:
   // `incarnation` 0 means "generate one for this instance" (tests may pin it).

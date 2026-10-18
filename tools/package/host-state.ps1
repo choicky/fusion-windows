@@ -1,0 +1,200 @@
+# Stage 6 WP4 shared helpers for install.ps1 / uninstall.ps1 / verify-wp4.ps1.
+#
+# Everything here is read-only except Stop-FusionHostOrderly, which asks a running
+# Host for an *orderly* stop through the product's own named stop event. Nothing in
+# this file terminates a process, and nothing writes user data.
+
+Set-StrictMode -Version 2.0
+
+if (-not ('FusionNative' -as [type])) {
+  Add-Type -Namespace '' -Name 'FusionNative' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr OpenEventW(uint access, bool inherit, string name);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetEvent(System.IntPtr handle);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool CloseHandle(System.IntPtr handle);
+[System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+public static extern bool OpenProcessToken(System.IntPtr process, uint access, out System.IntPtr token);
+[System.Runtime.InteropServices.DllImport("advapi32.dll", SetLastError = true)]
+public static extern bool GetTokenInformation(System.IntPtr token, int infoClass, System.IntPtr info, int length, out int returned);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern System.IntPtr OpenProcess(uint access, bool inherit, int processId);
+[System.Runtime.InteropServices.DllImport("advapi32.dll")]
+public static extern System.IntPtr GetSidSubAuthority(System.IntPtr sid, uint index);
+[System.Runtime.InteropServices.DllImport("advapi32.dll")]
+public static extern System.IntPtr GetSidSubAuthorityCount(System.IntPtr sid);
+
+public static string IntegrityLevel(int processId) {
+  System.IntPtr process = OpenProcess(0x1000, false, processId); // PROCESS_QUERY_LIMITED_INFORMATION
+  if (process == System.IntPtr.Zero) { return "unknown"; }
+  System.IntPtr token = System.IntPtr.Zero;
+  try {
+    if (!OpenProcessToken(process, 0x0008, out token)) { return "unknown"; }
+    int size = 0;
+    GetTokenInformation(token, 25, System.IntPtr.Zero, 0, out size); // TokenIntegrityLevel
+    if (size <= 0) { return "unknown"; }
+    System.IntPtr buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal(size);
+    try {
+      int returned = 0;
+      if (!GetTokenInformation(token, 25, buffer, size, out returned)) { return "unknown"; }
+      System.IntPtr sid = System.Runtime.InteropServices.Marshal.ReadIntPtr(buffer);
+      System.IntPtr countPointer = GetSidSubAuthorityCount(sid);
+      byte count = System.Runtime.InteropServices.Marshal.ReadByte(countPointer);
+      System.IntPtr ridPointer = GetSidSubAuthority(sid, (uint)(count - 1));
+      int rid = System.Runtime.InteropServices.Marshal.ReadInt32(ridPointer);
+      switch (rid) {
+        case 0x0000: return "untrusted";
+        case 0x1000: return "low";
+        case 0x2000: return "medium";
+        case 0x2100: return "medium-plus";
+        case 0x3000: return "high";
+        case 0x4000: return "system";
+        case 0x5000: return "protected";
+        default: return "0x" + rid.ToString("X");
+      }
+    } finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer); }
+  } finally {
+    if (token != System.IntPtr.Zero) { CloseHandle(token); }
+    CloseHandle(process);
+  }
+}
+'@
+}
+
+# The stop-event name the product Host creates: per user SID x session, in Local\.
+# The elevated scripts compute it from their own token, which under UAC is the same
+# user and session as the Host they must stop.
+function Get-FusionStopEventName {
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $session = (Get-Process -Id $PID).SessionId
+  return "Local\FusionHost-stop-$sid-$session"
+}
+
+function Test-FusionElevated {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+  return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Running Hosts, with the identity the evidence record needs: path, user, session
+# and integrity level.
+function Get-FusionHostState {
+  $result = @()
+  foreach ($process in @(Get-Process -Name FusionHost -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $process.Path } catch { }
+    $owner = ''
+    try {
+      $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+      if ($cim) {
+        $who = Invoke-CimMethod -InputObject $cim -MethodName GetOwner -ErrorAction Stop
+        if ($who -and $who.User) { $owner = "$($who.Domain)\$($who.User)" }
+      }
+    } catch { }
+    $result += [pscustomobject]@{
+      Id        = $process.Id
+      Path      = $path
+      User      = $owner
+      SessionId = $process.SessionId
+      Integrity = [FusionNative]::IntegrityLevel($process.Id)
+      StartTime = $process.StartTime
+    }
+  }
+  return $result
+}
+
+# Registration inventory (same keys tools/tsf/check-state.ps1 inspects), as data.
+function Get-FusionRegistrationState {
+  $clsid = '{8B7C4A90-5E2D-4B1F-9A31-6C0F42D1E7A4}'
+  $profile = '{D4A1F6B2-3C58-4E77-8A90-1B5D9C06E4F1}'
+  $result = @()
+  foreach ($hive in @('HKLM', 'HKCU')) {
+    $com = "${hive}:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32"
+    $tip = "${hive}:\SOFTWARE\Microsoft\CTF\TIP\$clsid"
+    $dll = $null
+    if (Test-Path -LiteralPath $com) { $dll = (Get-Item -LiteralPath $com).GetValue('') }
+    $languages = @()
+    if (Test-Path -LiteralPath "$tip\LanguageProfile") {
+      foreach ($language in Get-ChildItem -LiteralPath "$tip\LanguageProfile") {
+        $languages += [pscustomobject]@{
+          Language = $language.PSChildName
+          Profile  = Test-Path -LiteralPath (Join-Path $language.PSPath $profile)
+        }
+      }
+    }
+    $result += [pscustomobject]@{
+      Hive      = $hive
+      ComKey    = Test-Path -LiteralPath $com
+      Dll       = $dll
+      DllExists = if ($dll) { Test-Path -LiteralPath $dll } else { $false }
+      TipKey    = Test-Path -LiteralPath $tip
+      Category  = Test-Path -LiteralPath "$tip\Category"
+      Languages = $languages
+    }
+  }
+  return $result
+}
+
+function Get-FusionScheduledTask {
+  $task = Get-ScheduledTask -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  if (-not $task) { return $null }
+  $info = Get-ScheduledTaskInfo -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  return [pscustomobject]@{
+    TaskName  = $task.TaskName
+    State     = [string]$task.State
+    Execute   = ($task.Actions | ForEach-Object { $_.Execute }) -join ';'
+    Arguments = ($task.Actions | ForEach-Object { $_.Arguments }) -join ';'
+    UserId    = $task.Principal.UserId
+    GroupId   = $task.Principal.GroupId
+    LogonType = [string]$task.Principal.LogonType
+    RunLevel  = [string]$task.Principal.RunLevel
+    Instances = [string]$task.Settings.MultipleInstances
+    TimeLimit = [string]$task.Settings.ExecutionTimeLimit
+    LastResult = if ($info) { $info.LastTaskResult } else { $null }
+  }
+}
+
+# Asks the running Host for an orderly stop through the product's own stop event
+# and waits, bounded, for the process to exit. Never terminates anything: if the
+# event cannot be opened (another principal, or no Host), it reports that instead.
+function Stop-FusionHostOrderly {
+  param([int]$TimeoutMs = 20000, [string]$InstallRoot = '')
+  $eventName = Get-FusionStopEventName
+  $hosts = @(Get-FusionHostState)
+  if ($InstallRoot) {
+    $hosts = @($hosts | Where-Object { $_.Path -and $_.Path.StartsWith($InstallRoot, [StringComparison]::OrdinalIgnoreCase) })
+  }
+  $result = [pscustomobject]@{
+    EventName = $eventName
+    Found     = ($hosts.Count -gt 0)
+    Pids      = @($hosts | ForEach-Object { $_.Id })
+    Signalled = $false
+    Exited    = $true
+    WaitedMs  = 0
+    Error     = $null
+  }
+  if ($hosts.Count -eq 0) { return $result }
+
+  $handle = [FusionNative]::OpenEventW(0x0002, $false, $eventName) # EVENT_MODIFY_STATE
+  if ($handle -eq [IntPtr]::Zero) {
+    $result.Signalled = $false
+    $result.Exited = $false
+    $result.Error = "cannot open the stop event for this principal (Win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+    return $result
+  }
+  try {
+    $result.Signalled = [FusionNative]::SetEvent($handle)
+  } finally {
+    [void][FusionNative]::CloseHandle($handle)
+  }
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
+    $alive = @($result.Pids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($alive.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  $result.WaitedMs = [int]$watch.ElapsedMilliseconds
+  $result.Exited = (@($result.Pids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -eq 0)
+  return $result
+}
