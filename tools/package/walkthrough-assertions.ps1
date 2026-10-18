@@ -240,7 +240,15 @@ function Start-ElevatedProcess {
 # be a leftover from an earlier native command.
 function Invoke-ElevatedScript {
   param([string]$ScriptPath, [hashtable]$Parameters = @{}, [string]$LogName, [string]$TranscriptPath = '', [switch]$RunAsCurrentUser)
-  $argumentText = Format-ArgumentList -Parameters $Parameters
+  # TranscriptPath is this helper's own parameter *and* an argument of the callee
+  # (install.ps1 / uninstall.ps1 write their own log), so it is added to the forwarded
+  # list rather than only steering this wrapper.
+  $forward = $Parameters
+  if ($TranscriptPath) {
+    $forward = $Parameters.Clone()
+    $forward['TranscriptPath'] = $TranscriptPath
+  }
+  $argumentText = Format-ArgumentList -Parameters $forward
   $wrapper = Join-Path $script:runDir ("elevated-" + [IO.Path]::GetFileNameWithoutExtension($LogName) + ".ps1")
   $wrapperLog = Join-Path $script:runDir $LogName
   $lines = @()
