@@ -171,6 +171,21 @@ std::intptr_t SessionEndHandler::handle(unsigned int message, std::uintptr_t wpa
   }
 }
 
+bool SessionEndHandler::close_keeps_window() {
+  if (exit_complete_ != nullptr &&
+      WaitForSingleObject(static_cast<HANDLE>(exit_complete_), 0) == WAIT_OBJECT_0) {
+    return false; // main() has finished the orderly exit: this close is its own
+  }
+  // An external close before the exit would otherwise leave the Host running with no
+  // logoff/shutdown path. Ask for the same orderly stop a session end would, and keep
+  // the window: main() closes it after exit_complete is set.
+  std::fprintf(stderr, "[FusionHost] window close: requesting the orderly exit\n");
+  if (request_stop_) {
+    request_stop_();
+  }
+  return true;
+}
+
 HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name,
                        std::uint64_t incarnation)
     : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)),

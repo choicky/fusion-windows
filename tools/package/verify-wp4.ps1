@@ -72,6 +72,31 @@ function Ask-YesNo([string]$question) {
   }
 }
 
+# A before→after rank pair ("5→1"). A single number is rejected: the WP4 run recorded
+# only "1", so the pair came from the tester's report and could not be checked, and a
+# candidate that was already rank 1 proves nothing about learning.
+function Ask-RankChange([string]$question, [string]$example) {
+  while ($true) {
+    Write-Host ''
+    Write-Host $question -ForegroundColor Cyan
+    $answer = (Read-Host $example).Trim()
+    if ($answer -match '^(\d+)\s*(?:→|->|=>|到)\s*(\d+)$') {
+      $before = [int]$Matches[1]
+      $after = [int]$Matches[2]
+      if ($before -le 1) {
+        Write-Host '  选择前必须不在第 1 位：请换一个候选（或换一个词）再试。' -ForegroundColor Yellow
+        continue
+      }
+      if ($after -ge $before) {
+        Write-Host '  选择后的名次应更靠前（数字更小）。请确认后重新输入。' -ForegroundColor Yellow
+        continue
+      }
+      return "$before→$after"
+    }
+    Write-Host '  需要“选择前→选择后”两个数字，例如 5→1。' -ForegroundColor Yellow
+  }
+}
+
 # A short free-text answer (a rank, a pinyin string). It is recorded verbatim, so a
 # reported observation is never reduced to "Enter".
 function Ask-Text([string]$question, [string]$hint) {
@@ -499,6 +524,17 @@ if ($state.stage -eq 'a') {
   Add-Result 'a' '安装后是否清掉了旧版本目录' ("leftover-before={0} still-present={1}" -f
     $(if ($leftovers.Count -gt 0) { $leftovers -join ',' } else { 'none' }),
     $(if ($survivors.Count -gt 0) { $survivors -join ',' } else { 'none' }))
+  # R34: the task must carry the logon trigger and the User32 1077 event trigger; the
+  # walkthrough records both, so a missing event trigger is visible in the evidence.
+  $task = Get-FusionScheduledTask
+  Add-Result 'a' '计划任务（登录触发器 + R34 取消注销事件触发器）' $(if ($task) {
+      "triggers=$($task.Triggers) count=$($task.TriggerCount) instances=$($task.Instances) runLevel=$($task.RunLevel) subscription=$($task.EventSubscription)"
+    } else { 'absent' })
+  if (-not $task -or $task.EventSubscription -notmatch 'EventID=1077') {
+    Stop-Walkthrough -Step 'a' -Command 'require the User32 1077 event trigger on the task' -Code 8 `
+      -Detail ("triggers={0} subscription='{1}'" -f $(if ($task) { $task.Triggers } else { 'absent' }),
+        $(if ($task) { $task.EventSubscription } else { '' }))
+  }
 
   Write-Host ''
   Write-Host '接下来脚本会自己打开一个新的记事本。请先关掉所有记事本窗口：'
@@ -583,10 +619,10 @@ if ($state.stage -eq 'c') {
     Stop-Walkthrough -Step 'c' -Command 'require a running Host before the learning prompt' -Code 8 `
       -Detail 'no FusionHost is running; steps a/b did not leave one'
   }
-  Write-Host '请打开记事本，用 Fusion 输入法输入一个词并选择一次候选（例如输入 shuangpin 后选一个候选），'
-  Write-Host '注意选择前后该候选排在第几位。脚本会记录你报告的名次，再请你注销。'
+  Write-Host '请打开记事本，用 Fusion 输入法输入一个词，**选一个不在第 1 位的候选**（例如输入 shuangpin，'
+  Write-Host '它的候选不止一个），并记住选择前它是第几位、选择后升到第几位。脚本会记录你报告的名次，再请你注销。'
   Add-Result 'c' '学习用的拼音串' (Ask-Text '你输入的拼音串是什么？' '直接输入拼音串，例如 shuangpin')
-  Add-Result 'c' '候选名次变化（选择前→选择后）' (Ask-Text '该候选学习前在第几位、选择后升到第几位？' '例如 5→1')
+  Add-Result 'c' '候选名次变化（选择前→选择后）' (Ask-RankChange '该候选学习前在第几位、选择后升到第几位？' '例如 5→1')
   if (-not (Ask-Enter '记录好名次后按 Enter，脚本会保存当前用户数据状态。')) { Write-Host '已放弃。'; exit 0 }
   New-Snapshot 'before-signout'
   $state.stage = 'c-resume'
@@ -651,49 +687,99 @@ if ($state.stage -eq 'c2') {
       -Detail 'the blocker answered TRUE, so it would not hold the sign-out'
   }
 
-  # Saved before the request: if the owner is signed out anyway, -Resume lands on
-  # 'c2-signout' and records that the blocker was ineffective instead of losing the run.
+  # The baseline for the evidence-based verdict. The WP4 run decided "was the sign-out
+  # cancelled?" from the tester's impression and got it wrong, because the terminal closed
+  # even though Cancel worked: the session, its logon time and the User32 1077 record are
+  # what settle it.
+  $session = Get-SessionIdentity
+  $lastCancel = Get-LastCancelledLogoff
+  $saveBefore = Get-FusionSaveStamp
+  Add-Result 'c2' '注销前的会话（session id + 登录时间）' ("session={0} logon={1}" -f $session.SessionId, $session.LogonText)
+  Add-Result 'c2' '注销前最近一次 User32 1077（取消注销）' $(if ($lastCancel) {
+      "time=$($lastCancel.Time.ToString('yyyy-MM-dd HH:mm:ss')) record=$($lastCancel.RecordId)"
+    } else { '(none)' })
+  Add-Result 'c2' '注销前的用户数据保存时间' $(if ($saveBefore) { "$($saveBefore.NewestText) $($saveBefore.File)" } else { '(no user data)' })
+
+  # Saved before the request: if the terminal dies with the sign-out, -Resume lands on
+  # 'c2-signout' and evaluates the same evidence.
   $state.stage = 'c2-signout'
-  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+  $state.c2 = [pscustomobject]@{
+    SessionId      = $session.SessionId
+    LogonText      = $session.LogonText
+    LastCancelRecord = $(if ($lastCancel) { [long]$lastCancel.RecordId } else { [long]0 })
+    HostPids       = $beforeIds
+    SaveStamp      = $(if ($saveBefore) { $saveBefore.NewestText } else { '' })
+  }
+  $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
 
   Write-Head '现在请注销，并在 Windows 的阻止界面里点“取消”'
   Write-Host '1. 开始菜单 → 用户头像 → 注销。'
   Write-Host '2. Windows 会显示“这些应用阻止你注销 / 关闭”之类的界面，其中一项是 "WP4 test: click Cancel"。'
-  Write-Host '3. 在那个界面点“取消”（不要点“仍要注销”/“强制注销”），回到桌面后按 Enter。'
-  if (-not (Ask-Enter '取消注销并回到桌面后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
-  Start-Sleep -Seconds 3
-
-  $after = @(Get-FusionHostState)
-  $afterIds = ($after | ForEach-Object { $_.Id } | Sort-Object) -join ','
-  Add-Result 'c2' '取消注销后的 Host 进程数' $after.Count
-  Add-Result 'c2' '取消注销后的 Host pid' $afterIds
-  Add-Result 'c2' '取消注销后仍是同一个 Host' ($afterIds -eq $beforeIds)
-  Add-Result 'c2' 'Host 仍来自 wp4.1 目录' (@($after | Where-Object {
-        $_.Path -and $_.Path.StartsWith((Join-Path $version1Dir 'bin'), [StringComparison]::OrdinalIgnoreCase) }).Count)
-  Add-Result 'c2' '取消注销后输入仍可用' (Ask-YesNo '取消注销后，在记事本里输入中文是否仍然正常？')
-
-  Stop-ShutdownBlocker
-  $blockerAfter = Get-ShutdownBlockerState
-  Add-Result 'c2' '阻断窗口已关闭' (-not $blockerAfter.Alive)
-  New-Snapshot 'after-cancelled-logoff'
-  $state.stage = 'd'
-  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+  Write-Host '3. 在那个界面点“取消”（不要点“仍要注销”/“强制注销”）。'
+  Write-Host ''
+  Write-Host '注意：即使取消成功，本终端窗口也可能被注销流程关掉。那不代表注销成功。' -ForegroundColor Yellow
+  Write-Host '脚本用证据判断：取消会写一条 User32 1077，且会话号和登录时间不变。'
+  Write-Host '如果本窗口被关掉，请重新打开 PowerShell 运行：'
+  Write-Host ("   powershell -ExecutionPolicy Bypass -File `"{0}`" -Resume" -f $PSCommandPath) -ForegroundColor Yellow
+  if (-not (Ask-Enter '取消注销后（或重新打开终端后）按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+  # Fall through to the c2-signout block, which evaluates the evidence for both paths.
 }
 
-# Reached only if the walkthrough was signed out during (c2): the blocker did not hold
-# the session. Recorded as "blocker ineffective" - neither a pass nor a product failure.
+# The evidence-based (c2) verdict, reached either directly after the Cancel or through
+# -Resume when the terminal died with the sign-out.
 if ($state.stage -eq 'c2-signout') {
-  Write-Head '步骤 c2（续）：注销没有被拦住'
-  Write-Host '这次注销没有被阻断窗口拦住，所以脚本被注销终止了。'
-  Add-Result 'c2' '取消注销的结果' 'sign-out was not blocked (blocker ineffective) — neither a pass nor a product failure'
-  $hostsNow = @(Get-FusionHostState)
-  Add-Result 'c2' '重新登录后的 Host 进程数' $hostsNow.Count
-  foreach ($process in $hostsNow) {
-    Add-Result 'c2' "Host pid=$($process.Id)" ("path={0} integrity={1} session={2}" -f $process.Path, $process.Integrity, $process.SessionId)
+  Write-Head '步骤 c2（续）：从证据判断注销是否被取消'
+  $baseline = $state.c2
+  $session = Get-SessionIdentity
+  $cancel = Get-LastCancelledLogoff
+  $sameSession = ($session.SessionId -eq [int]$baseline.SessionId) -and ($session.LogonText -eq [string]$baseline.LogonText)
+  $newCancel = $false
+  if ($cancel) { $newCancel = ([long]$cancel.RecordId -gt [long]$baseline.LastCancelRecord) }
+  Add-Result 'c2' '注销后的会话（session id + 登录时间）' ("session={0} logon={1} same={2}" -f
+    $session.SessionId, $session.LogonText, $sameSession)
+  Add-Result 'c2' '注销后的 User32 1077（取消注销）' $(if ($cancel) {
+      "time=$($cancel.Time.ToString('yyyy-MM-dd HH:mm:ss')) record=$($cancel.RecordId) newerThanBaseline=$newCancel"
+    } else { '(none)' })
+
+  if (-not $sameSession) {
+    Add-Result 'c2' 'c2 结论' 'signed out — the session really ended, so the cancel was not performed; NOT EXERCISED (neither a pass nor a product failure)'
+  } elseif (-not $newCancel) {
+    Add-Result 'c2' 'c2 结论' 'same session but no new User32 1077 — no cancel was observed; NOT EXERCISED'
+  } else {
+    # The logoff was cancelled. This session must have a Host again; a new pid is expected
+    # because the old Host ended with the sign-out attempt.
+    $deadline = (Get-Date).AddSeconds(60)
+    $hosts = @()
+    while ((Get-Date) -lt $deadline) {
+      $hosts = @(Get-FusionHostState | Where-Object { $_.SessionId -eq $session.SessionId })
+      if ($hosts.Count -gt 0) { break }
+      Start-Sleep -Milliseconds 500
+    }
+    $newIds = ($hosts | ForEach-Object { $_.Id } | Sort-Object) -join ','
+    $saveAfter = Get-FusionSaveStamp
+    Add-Result 'c2' '取消注销后本会话的 Host pid' $newIds
+    Add-Result 'c2' '取消注销后本会话的 Host 路径/完整性' $(if ($hosts.Count -gt 0) {
+        ($hosts | ForEach-Object { "pid=$($_.Id) path=$($_.Path) integrity=$($_.Integrity)" }) -join '; '
+      } else { '(none)' })
+    Add-Result 'c2' 'Host pid 变化（新的 pid 是预期的）' ("before={0} after={1}" -f $baseline.HostPids, $newIds)
+    Add-Result 'c2' '用户数据保存时间（旧 Host 退出时应已保存）' $(if ($saveAfter) {
+        "$($baseline.SaveStamp) → $($saveAfter.NewestText)"
+      } else { '(no user data)' })
+    Stop-ShutdownBlocker
+    $blockerAfter = Get-ShutdownBlockerState
+    Add-Result 'c2' '阻断窗口已关闭' (-not $blockerAfter.Alive)
+    if ($hosts.Count -gt 0) {
+      Add-Result 'c2' 'c2 结论' 'PASS — the logoff was cancelled (User32 1077, same session) and a Host is running in this session'
+      Add-Result 'c2' '取消注销后输入仍可用' (Ask-YesNo '取消注销后，在记事本里输入中文是否仍然正常？')
+    } else {
+      Add-Result 'c2' 'c2 结论' 'FAIL — the logoff was cancelled (User32 1077) and no Host came back in this session'
+      Stop-Walkthrough -Step 'c2' -Command 'require a Host after a cancelled logoff' -Code 8 `
+        -Detail 'the logoff was cancelled (User32 1077, same session) and no FusionHost is running in this session'
+    }
   }
-  New-Snapshot 'after-signout-not-blocked'
+  New-Snapshot 'after-cancelled-logoff'
   $state.stage = 'd'
-  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+  $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
 
 # ---------------------------------------------------------------------------
@@ -726,6 +812,14 @@ if ($state.stage -eq 'd') {
     $oldNotepadId, $oldWindow.Window.Path, $oldWindow.Window.Title, $oldWindow.Reason)
   $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
   Add-Result 'd' '升级前该进程加载的 DLL（应为 wp4.1）' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
+  # 1b. The Host that must be stopped in order before the version switch. WP4 could not
+  # exercise this (no Host was running before its step (d)); the upgrade now normally
+  # starts from a running Host, because (c2) leaves one.
+  $oldHosts = @(Get-FusionHostState)
+  $oldHostIds = ($oldHosts | ForEach-Object { $_.Id } | Sort-Object) -join ','
+  $saveBeforeUpgrade = Get-FusionSaveStamp
+  Add-Result 'd' '升级前的 Host pid（应由 stop event 有序停止）' $(if ($oldHostIds) { $oldHostIds } else { '(none)' })
+  Add-Result 'd' '升级前的用户数据保存时间' $(if ($saveBeforeUpgrade) { "$($saveBeforeUpgrade.NewestText) $($saveBeforeUpgrade.File)" } else { '(no user data)' })
   if (-not (Ask-Enter '记事本保持打开，按 Enter 开始升级（UAC）。')) { Write-Host '已放弃。'; exit 0 }
 
   # 2. Upgrade with that window open; a failure stops the walkthrough here.
@@ -742,6 +836,25 @@ if ($state.stage -eq 'd') {
   # could only fail - the new DLL is proven in step 5, in a process started after this
   # one exited.
   $null = Assert-HostAndRegistration -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
+
+  # 3b. The old Host must have been stopped in order (stop event acknowledged, process
+  # gone, Fcitx saved) before the version switch, and the new Host must be a new process.
+  $oldHostAlive = @()
+  foreach ($id in @($oldHostIds -split ',' | Where-Object { $_ })) {
+    if (Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue) { $oldHostAlive += $id }
+  }
+  $saveAfterUpgrade = Get-FusionSaveStamp
+  $newHosts = @(Get-FusionHostState)
+  $newHostIds = ($newHosts | ForEach-Object { $_.Id } | Sort-Object) -join ','
+  Add-Result 'd' '升级后旧 Host 是否已退出' ("before={0} stillAlive={1}" -f
+    $(if ($oldHostIds) { $oldHostIds } else { '(none)' }),
+    $(if ($oldHostAlive.Count -gt 0) { $oldHostAlive -join ',' } else { 'none' }))
+  Add-Result 'd' '旧 Host 退出时已保存（保存时间前进）' $(if ($saveBeforeUpgrade -and $saveAfterUpgrade) {
+      "$($saveBeforeUpgrade.NewestText) → $($saveAfterUpgrade.NewestText) advanced=$($saveAfterUpgrade.NewestUtc -gt $saveBeforeUpgrade.NewestUtc)"
+    } else { 'not comparable (no user data before or after)' })
+  Add-Result 'd' '升级后是新 Host 进程' ("before={0} after={1} different={2}" -f
+    $(if ($oldHostIds) { $oldHostIds } else { '(none)' }), $newHostIds,
+    ($newHostIds -ne '' -and $newHostIds -ne $oldHostIds))
 
   # 4. The still-open window: old DLL, new Host.
   Write-Host ''
@@ -765,13 +878,16 @@ if ($state.stage -eq 'd') {
   Write-Host '所以必须先让旧进程退出，否则新窗口仍会加载 wp4.1 的 DLL。'
   $null = Confirm-NoNotepad -Step 'd' -ExpectedDll (Join-Path $version2Dir 'bin\FusionTsf.dll')
   $check = Assert-InstalledTipInUse -Step 'd' -VersionDir $version2Dir -ManifestPath (Join-Path $state.package2Path 'package.json')
+  Write-Host ''
+  Write-Host '如果这个新记事本里字母直接上屏、没有候选（新窗口的输入法可能是关闭的，R18），' -ForegroundColor Yellow
+  Write-Host '先按一次 Ctrl+Space 打开输入法，再回答下面的问题。' -ForegroundColor Yellow
   Add-Result 'd' '新记事本（新 DLL）可输入' (Ask-YesNo '新开的记事本，输入中文是否正常？')
 
   Write-Host ''
-  Write-Host 'Notepad A–E 回归（在新记事本里逐项确认）：'
+  Write-Host 'Notepad A–E 回归（在新记事本里逐项确认；同样地，字母直接上屏时先按 Ctrl+Space）：'
   Add-Result 'd' 'A 连续输入' (Ask-YesNo 'A 连续输入 nihao+空格 得到“你好”，无重复/丢失字符？')
   Add-Result 'd' 'B 部分选择后继续输入' (Ask-YesNo 'B 选部分候选后继续输入，最终文字正确？')
-  Add-Result 'd' 'C 标点与 QuickPhrase' (Ask-YesNo 'C 输入 , . ; 得到 Fcitx 标点，且输入 www. 出现 QuickPhrase 提示？')
+  Add-Result 'd' 'C 标点与 QuickPhrase' (Ask-YesNo 'C 输入 , 和 . 得到中文标点；输入 ; 和 www. 出现 QuickPhrase 提示？')
   Add-Result 'd' 'D 键盘选词与翻页' (Ask-YesNo 'D 数字键、空格、- = 、PageUp/PageDown、方向键选词都正确？')
   Add-Result 'd' 'E 焦点切换' (Ask-YesNo 'E 输入中途切换窗口/焦点，无跨窗口上屏、无崩溃？')
 
@@ -870,6 +986,10 @@ if ($state.stage -eq 'f') {
   Add-Result 'f' '重装退出码' $code
   Assert-StepExit -Step 'f' -Command $reinstallCommand -Code $code
   New-Snapshot 'after-reinstall-wp4.2'
+  $taskAfterReinstall = Get-FusionScheduledTask
+  Add-Result 'f' '重装后的计划任务触发器（事件触发器应仍在）' $(if ($taskAfterReinstall) {
+      "triggers=$($taskAfterReinstall.Triggers) subscription=$($taskAfterReinstall.EventSubscription)"
+    } else { 'absent' })
 
   $removeCommand = "uninstall.ps1 $(Format-ArgumentList -Parameters @{ RemoveUserData = $true })"
   $code = Invoke-ElevatedScript -ScriptPath (Join-Path $version2Dir 'uninstall.ps1') -Parameters @{ RemoveUserData = $true } `

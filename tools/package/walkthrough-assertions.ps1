@@ -713,3 +713,91 @@ function Test-ShutdownBlockerBlocksSessionEnd {
 function Stop-ShutdownBlocker {
   [FusionShutdownBlocker]::Stop()
 }
+
+# --- R34: session identity, cancel evidence, save stamp ---------------------
+#
+# Step (c2) used to decide "was the sign-out cancelled?" from the tester's impression,
+# and the WP4 run got that wrong: the terminal closed, the tester believed the session had
+# ended, and the product failure was recorded as a harness failure. These helpers let the
+# walkthrough decide from evidence instead.
+if (-not ('FusionWts' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class FusionWts
+{
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass,
+        out IntPtr buffer, out int bytes);
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr buffer);
+
+    private const int WTSLogonTime = 24;
+
+    // The session's logon time as a FILETIME value (0 when unavailable).
+    public static long LogonTimeUtc(int sessionId)
+    {
+        IntPtr buffer;
+        int bytes;
+        if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, WTSLogonTime, out buffer, out bytes))
+            return 0;
+        try
+        {
+            if (buffer == IntPtr.Zero || bytes < 8) { return 0; }
+            return Marshal.ReadInt64(buffer);
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { WTSFreeMemory(buffer); }
+        }
+    }
+}
+'@
+}
+
+# The session this script runs in, with its logon time. A sign-out produces a new session
+# id or a later logon time; a cancelled one leaves both unchanged.
+function Get-SessionIdentity {
+  $sessionId = (Get-Process -Id $PID).SessionId
+  $logon = [FusionWts]::LogonTimeUtc($sessionId)
+  $logonTime = $null
+  if ($logon -gt 0) { $logonTime = [DateTime]::FromFileTimeUtc($logon) }
+  return [pscustomobject]@{
+    SessionId    = $sessionId
+    LogonTimeUtc = $logonTime
+    LogonText    = if ($logonTime) { $logonTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '(unavailable)' }
+  }
+}
+
+# The newest User32 1077 ("user X attempted to log off computer Y and failed") in the
+# System log. Windows writes it when a logoff is cancelled and nothing when it completes
+# (measured 2026-10-18). Reading the System log needs no elevation.
+function Get-LastCancelledLogoff {
+  try {
+    $event = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'User32'; Id = 1077 } `
+      -MaxEvents 1 -ErrorAction Stop
+    if ($event) {
+      return [pscustomobject]@{ Time = $event.TimeCreated; RecordId = $event.RecordId; User = $event.UserId }
+    }
+  } catch {
+    # No event, or the log cannot be read: callers treat "no evidence" as "no cancel seen".
+  }
+  return $null
+}
+
+# The newest mtime among the Fcitx user-data files. An orderly stop saves, so this stamp
+# advancing proves the save ran (and did not, when it does not move).
+function Get-FusionSaveStamp {
+  $root = Join-Path $env:APPDATA 'Fcitx5'
+  if (-not (Test-Path -LiteralPath $root)) { return $null }
+  $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue)
+  if ($files.Count -eq 0) { return $null }
+  $newest = $files | Sort-Object -Property LastWriteTimeUtc -Descending | Select-Object -First 1
+  return [pscustomobject]@{
+    NewestUtc = $newest.LastWriteTimeUtc
+    NewestText = $newest.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+    File      = $newest.Name
+    FileCount = $files.Count
+  }
+}

@@ -140,6 +140,19 @@ try {
   Write-Step "creating or updating the logon task '$taskName'"
   $action = New-ScheduledTaskAction -Execute $hostExe -WorkingDirectory $versionDir
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  # R34: a cancelled logoff ends the Host, and the logon trigger cannot help because the
+  # session never ended. Windows writes User32 1077 ("attempted to log off ... and failed")
+  # when a logoff is cancelled and nothing when it completes (measured 2026-10-18), so an
+  # event trigger on it starts the Host again. Scoped to this user's SID; delayed so the
+  # previous Host has released HostClaim (its bounded orderly shutdown is 4 s) before the
+  # new instance starts. New-ScheduledTaskTrigger has no event form, hence the CIM class.
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">*[System[Provider[@Name='User32'] and EventID=1077 and @UserID='$sid']]</Select></Query></QueryList>"
+  $eventClass = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
+  $eventTrigger = New-CimInstance -CimClass $eventClass -ClientOnly
+  $eventTrigger.Enabled = $true
+  $eventTrigger.Subscription = $subscription
+  $eventTrigger.Delay = 'PT10S'
   # Interactive token + limited run level: the Host always runs as the logged-on
   # user at Medium integrity, never elevated. HostClaim, not the task, remains the
   # authority for "one Host per user x session", so IgnoreNew only avoids a queue of
@@ -147,11 +160,15 @@ try {
   $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable:$false
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
-    -Settings $settings -Force | Out-Null
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger, $eventTrigger) `
+    -Principal $principal -Settings $settings -Force | Out-Null
   $task = Get-FusionScheduledTask
   if (-not $task) { throw "the task '$taskName' was registered but cannot be read back" }
   Write-Host "  execute=$($task.Execute) args='$($task.Arguments)' user=$($task.UserId) logon=$($task.LogonType) runLevel=$($task.RunLevel) instances=$($task.Instances) timeLimit=$($task.TimeLimit)"
+  Write-Host "  triggers=$($task.Triggers) count=$($task.TriggerCount)"
+  if ($task.EventSubscription -notmatch 'EventID=1077') {
+    throw "the task was registered without the User32 1077 event trigger (subscription: '$($task.EventSubscription)')"
+  }
 
   $currentStep = 'start'
   if ($NoStart) {
