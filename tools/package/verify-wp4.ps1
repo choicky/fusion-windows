@@ -619,9 +619,10 @@ if ($state.stage -eq 'c') {
     Stop-Walkthrough -Step 'c' -Command 'require a running Host before the learning prompt' -Code 8 `
       -Detail 'no FusionHost is running; steps a/b did not leave one'
   }
-  Write-Host '请打开记事本，用 Fusion 输入法输入一个词，**选一个不在第 1 位的候选**（例如输入 shuangpin，'
-  Write-Host '它的候选不止一个），并记住选择前它是第几位、选择后升到第几位。脚本会记录你报告的名次，再请你注销。'
-  Add-Result 'c' '学习用的拼音串' (Ask-Text '你输入的拼音串是什么？' '直接输入拼音串，例如 shuangpin')
+  Write-Host '请打开记事本，用 Fusion 输入法输入一个词，**选一个不在第 1 位的候选**（例如输入 shi，'
+  Write-Host '它的候选不止一个，挑一个不在第 1 位的），并记住选择前它是第几位、选择后升到第几位。'
+  Write-Host '脚本会记录你报告的名次，再请你注销。'
+  Add-Result 'c' '学习用的拼音串' (Ask-Text '你输入的拼音串是什么？' '直接输入拼音串，例如 shi')
   Add-Result 'c' '候选名次变化（选择前→选择后）' (Ask-RankChange '该候选学习前在第几位、选择后升到第几位？' '例如 5→1')
   if (-not (Ask-Enter '记录好名次后按 Enter，脚本会保存当前用户数据状态。')) { Write-Host '已放弃。'; exit 0 }
   New-Snapshot 'before-signout'
@@ -855,6 +856,20 @@ if ($state.stage -eq 'd') {
   Add-Result 'd' '升级后是新 Host 进程' ("before={0} after={1} different={2}" -f
     $(if ($oldHostIds) { $oldHostIds } else { '(none)' }), $newHostIds,
     ($newHostIds -ne '' -and $newHostIds -ne $oldHostIds))
+  # The upgrade must have stopped the old Host and started a new one. A recorded-only
+  # result would let a failed version switch look like a pass.
+  if ($oldHostAlive.Count -gt 0) {
+    Stop-Walkthrough -Step 'd' -Command 'stop the old Host before the version switch' -Code 8 `
+      -Detail ("pid(s) {0} were still running after the upgrade" -f ($oldHostAlive -join ','))
+  }
+  if (-not $newHostIds) {
+    Stop-Walkthrough -Step 'd' -Command 'start a Host after the upgrade' -Code 8 `
+      -Detail 'no FusionHost is running from the wp4.2 directory after the upgrade'
+  }
+  if ($oldHostIds -and $newHostIds -eq $oldHostIds) {
+    Stop-Walkthrough -Step 'd' -Command 'restart the Host for the new version' -Code 8 `
+      -Detail ("the same pid {0} is still the only Host after the upgrade" -f $newHostIds)
+  }
 
   # 4. The still-open window: old DLL, new Host.
   Write-Host ''

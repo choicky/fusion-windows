@@ -151,8 +151,9 @@ LRESULT CALLBACK session_end_window_proc(HWND window, UINT message, WPARAM wpara
     // An external close (taskkill without /f, a window closer) must not silently remove
     // the Host's only logoff/shutdown path: before the exit it requests the orderly stop
     // and the window stays; after the exit this is main()'s own close and the window
-    // goes.
-    if (session_end_handler != nullptr && !session_end_handler->close_keeps_window()) {
+    // goes. With no handler (never in a started Host, but the branch must not hang the
+    // join) the window is destroyed as before.
+    if (session_end_handler == nullptr || !session_end_handler->close_keeps_window()) {
       DestroyWindow(window);
     }
     return 0;
