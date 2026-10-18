@@ -293,7 +293,6 @@ $version1Dir = Join-Path $installRoot $version1
 $version2Dir = Join-Path $installRoot $version2
 $install1 = Join-Path $state.package1Path 'install.ps1'
 $install2 = Join-Path $state.package2Path 'install.ps1'
-$uninstall1 = Join-Path $version1Dir 'uninstall.ps1'
 $uninstall2 = Join-Path $version2Dir 'uninstall.ps1'
 
 # ---------------------------------------------------------------------------

@@ -17,10 +17,12 @@
 #
 # Usage (elevated):
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-PackageDir <dir>] [-NoStart]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -VerifyOnly   # read-only check
 
 param(
   [string]$PackageDir = $PSScriptRoot,
-  [switch]$NoStart
+  [switch]$NoStart,
+  [switch]$VerifyOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,7 +34,7 @@ $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 
 
 function Write-Step([string]$message) { Write-Host "== $message" }
 
-if (-not (Test-FusionElevated)) {
+if (-not $VerifyOnly -and -not (Test-FusionElevated)) {
   Write-Host 'This script must run elevated: persistent TIP registration writes HKLM (R9).' -ForegroundColor Red
   exit 2
 }
@@ -67,6 +69,11 @@ if ($bad.Count -gt 0) {
   exit 4
 }
 Write-Host "  $($manifest.files.Count) files verified"
+
+if ($VerifyOnly) {
+  Write-Host "Package verified: $($manifest.files.Count) files match the manifest. Nothing was installed."
+  exit 0
+}
 
 Write-Step 'asking a running Host for an orderly stop'
 $stop = Stop-FusionHostOrderly -TimeoutMs 20000
