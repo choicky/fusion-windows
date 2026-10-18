@@ -29,6 +29,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -86,6 +87,85 @@ public:
 private:
   void *handle_ = nullptr;
   std::wstring name_;
+};
+
+// Stage 6 WP4: the named stop event, the second way (besides the console control
+// handler and the session-end window) to ask a running Host for an *orderly*
+// stop. An elevated install/upgrade/uninstall signals it instead of terminating
+// the process, so Fcitx's own save on instance exit still runs.
+//
+// Mechanism and scope:
+//   * Object type: a manual-reset, initially non-signalled event. The Host
+//     creates it and keeps the handle open for its whole lifetime, so the object
+//     disappears when the Host exits (a dead Host can never leave a stale event
+//     that a later install would signal).
+//   * Name scope: `Local\FusionHost-stop-<user SID>-<session id>` — exactly the
+//     principal and session the pipe and the claim are scoped to.
+//   * Security: the same user-only DACL as the pipe and HostClaim, so another
+//     principal can neither create nor signal it.
+//   * The event carries no request payload and no acknowledgement: signalling it
+//     means "perform the normal ordered shutdown". The HostClaim stays the
+//     authority for "only one Host per user x session".
+class HostStopEvent {
+public:
+  HostStopEvent() = default;
+  ~HostStopEvent() { release(); }
+  HostStopEvent(const HostStopEvent &) = delete;
+  HostStopEvent &operator=(const HostStopEvent &) = delete;
+
+  // Creates the event for this user x session. False when the descriptor cannot
+  // be built, creation fails, or the name already exists (another Host for this
+  // principal is alive; the claim has already refused this one).
+  //
+  // `scope` exists for tests, which need a name of their own on a machine that may
+  // already run the product Host; the product Host always uses the default (this
+  // user x session), exactly like the pipe name it is paired with.
+  bool create(const std::wstring &scope = std::wstring());
+  void release();
+  bool valid() const { return handle_ != nullptr; }
+  void *handle() const { return handle_; }
+  // The kernel object name used by the last create() (empty before the first
+  // call), so the Host's log states the scope an installer must target.
+  const std::wstring &name() const { return name_; }
+
+private:
+  void *handle_ = nullptr;
+  std::wstring name_;
+};
+
+// Waits until either the stop event is signalled (true: the caller requests the
+// stop) or the Host has finished its orderly exit (false). It never drains, joins
+// or touches the backend, so any thread may run it; main() remains the single
+// thread that performs the ordered shutdown.
+bool wait_for_stop_request(void *stop_event, void *exit_complete);
+
+// Stage 6 WP4: the session-end decision of the windowless Host's hidden window,
+// kept out of the window procedure so it can be driven without a real session end.
+//
+// A logoff or shutdown can still be cancelled *after* WM_QUERYENDSESSION (an
+// application asks to save and the user cancels). That message therefore answers
+// TRUE and stops nothing — a Host that stopped there would stay gone until the next
+// logon even though the session continues. Only WM_ENDSESSION with wParam TRUE means
+// the session is really ending: then the handler requests the stop and waits,
+// bounded, for main() to finish the ordered shutdown (Fcitx's save included).
+// WM_ENDSESSION with wParam FALSE (the session end was cancelled) does nothing.
+class SessionEndHandler {
+public:
+  using RequestStop = std::function<void()>;
+
+  SessionEndHandler(RequestStop request_stop, void *exit_complete, unsigned long timeout_ms)
+      : request_stop_(std::move(request_stop)), exit_complete_(exit_complete),
+        timeout_ms_(timeout_ms) {}
+
+  // True for the two session-end messages this handler owns.
+  static bool handles(unsigned int message);
+  // The value the window procedure must return for a message it owns.
+  std::intptr_t handle(unsigned int message, std::uintptr_t wparam);
+
+private:
+  RequestStop request_stop_;
+  void *exit_complete_;
+  unsigned long timeout_ms_;
 };
 
 class HostServer {

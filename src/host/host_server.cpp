@@ -29,6 +29,24 @@ std::uint64_t generate_incarnation() {
   return value == 0 ? 1 : value;
 }
 
+// The per-principal suffix of a pipe name: `<user SID>-<session id>`. The claim and
+// the stop event reuse it so all three kernel objects name exactly the same scope.
+std::wstring principal_suffix(const std::wstring &pipe_name) {
+  std::wstring suffix = pipe_name;
+  const std::wstring prefix = default_pipe_name_prefix;
+  if (suffix.rfind(prefix, 0) == 0) {
+    suffix.erase(0, prefix.size());
+  }
+  // Sanitize only the prefix the pipe contributed; the `Local\` namespace marker
+  // must survive or the object would land on a name of its own.
+  for (wchar_t &character : suffix) {
+    if (character == L'\\' || character == L'/') {
+      character = L'-';
+    }
+  }
+  return suffix;
+}
+
 } // namespace
 
 HostClaim &HostClaim::operator=(HostClaim &&other) noexcept {
@@ -49,19 +67,7 @@ bool HostClaim::acquire(const std::wstring &pipe_name) {
   // carries the user SID and session id (compute_pipe_name), so stripping the
   // well-known pipe prefix keeps the claim scoped to the same principal and makes
   // the SID visible in tools such as WinObj.
-  std::wstring suffix = pipe_name;
-  const std::wstring prefix = default_pipe_name_prefix;
-  if (suffix.rfind(prefix, 0) == 0) {
-    suffix.erase(0, prefix.size());
-  }
-  // Sanitize only the prefix the pipe contributed; the `Local\` namespace marker must
-  // survive or the object would land on a name of its own.
-  for (wchar_t &character : suffix) {
-    if (character == L'\\' || character == L'/') {
-      character = L'-';
-    }
-  }
-  const std::wstring name = L"Local\\FusionHost-claim-" + suffix;
+  const std::wstring name = L"Local\\FusionHost-claim-" + principal_suffix(pipe_name);
   name_ = name;
   // The pipe's own user-only DACL: another principal cannot pre-create the name and
   // hold this Host down. Fail closed if the descriptor cannot be built.
@@ -88,6 +94,80 @@ void HostClaim::release() {
   if (handle_ != nullptr) {
     CloseHandle(static_cast<HANDLE>(handle_));
     handle_ = nullptr;
+  }
+}
+
+bool HostStopEvent::create(const std::wstring &scope) {
+  release();
+  const std::wstring suffix = scope.empty() ? principal_suffix(compute_pipe_name()) : scope;
+  if (suffix.empty()) {
+    return false; // no principal: fail closed, there is nothing to name the event after
+  }
+  const std::wstring name = L"Local\\FusionHost-stop-" + suffix;
+  // The pipe's own user-only DACL, so another principal can neither create nor
+  // signal it. Fail closed if the descriptor cannot be built.
+  SECURITY_ATTRIBUTES attributes = make_pipe_security();
+  if (attributes.lpSecurityDescriptor == nullptr) {
+    return false;
+  }
+  HANDLE handle = CreateEventW(&attributes, TRUE, FALSE, name.c_str());
+  const DWORD error = GetLastError();
+  free_pipe_security(attributes);
+  if (handle == nullptr) {
+    return false;
+  }
+  if (error == ERROR_ALREADY_EXISTS) {
+    // Another Host for this principal is alive and owns the stop path.
+    CloseHandle(handle);
+    return false;
+  }
+  handle_ = handle;
+  name_ = name;
+  return true;
+}
+
+void HostStopEvent::release() {
+  if (handle_ != nullptr) {
+    CloseHandle(static_cast<HANDLE>(handle_));
+    handle_ = nullptr;
+  }
+}
+
+bool wait_for_stop_request(void *stop_event, void *exit_complete) {
+  if (stop_event == nullptr || exit_complete == nullptr) {
+    return false;
+  }
+  HANDLE handles[2] = {static_cast<HANDLE>(stop_event), static_cast<HANDLE>(exit_complete)};
+  return WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0;
+}
+
+bool SessionEndHandler::handles(unsigned int message) {
+  return message == WM_QUERYENDSESSION || message == WM_ENDSESSION;
+}
+
+std::intptr_t SessionEndHandler::handle(unsigned int message, std::uintptr_t wparam) {
+  switch (message) {
+  case WM_QUERYENDSESSION:
+    // Answer TRUE and stop nothing: the logoff/shutdown can still be cancelled
+    // after this message (an application asks to save and the user cancels), and a
+    // Host that stopped here would stay gone until the next logon.
+    return TRUE;
+  case WM_ENDSESSION:
+    if (wparam == FALSE) {
+      return 0; // the session end was cancelled: nothing to do
+    }
+    // The session is really ending. Request the stop and wait (bounded) for main()
+    // to finish the ordered shutdown, including Fcitx's own save.
+    std::fprintf(stderr, "[FusionHost] session end: waiting for the orderly exit\n");
+    if (request_stop_) {
+      request_stop_();
+    }
+    if (exit_complete_ != nullptr) {
+      WaitForSingleObject(static_cast<HANDLE>(exit_complete_), timeout_ms_);
+    }
+    return 0;
+  default:
+    return 0;
   }
 }
 

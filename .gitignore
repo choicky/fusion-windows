@@ -13,3 +13,7 @@
 # Local editor scratch (vim swap / backup); never project content.
 *.swp
 *~
+
+# Local agent/workspace data; never project content, and an untracked entry here
+# would make every package manifest look "dirty".
+/.workbuddy-ai/

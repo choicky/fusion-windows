@@ -70,10 +70,15 @@ if(WIN32 AND MSVC)
       src/ipc/pipe_security.cpp)
     target_include_directories(FusionHostExe PRIVATE include src)
     target_compile_features(FusionHostExe PRIVATE cxx_std_20)
-    set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost)
+    # Stage 6 WP4 A1: the packaged Host has no console window, so it is a Windows
+    # subsystem binary. Console mode stays available through `--console`, and a
+    # redirected stderr keeps working in both modes (the CRT binds stdio to the
+    # inherited handle). shell32 is for CommandLineToArgvW.
+    set_target_properties(FusionHostExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionHost
+      WIN32_EXECUTABLE TRUE)
     target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore)
+    target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore shell32)
   endif()
 endif()
 
@@ -154,6 +159,8 @@ if(BUILD_TESTING)
     add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
     add_test(NAME stage4a_ipc_wp3singleton COMMAND stage4a wp3singleton)
     add_test(NAME stage4a_ipc_wp3shutdown COMMAND stage4a wp3shutdown)
+    add_test(NAME stage4a_ipc_wp4stopevent COMMAND stage4a wp4stopevent)
+    add_test(NAME stage4a_ipc_wp4sessionend COMMAND stage4a wp4sessionend)
     if(FUSION_WITH_FCITX5)
       target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
       target_link_libraries(stage4a PRIVATE FusionFcitxHost)

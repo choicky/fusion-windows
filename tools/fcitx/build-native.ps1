@@ -9,7 +9,15 @@ $taskSupport=Join-Path $taskRepoRoot 'cmake\fcitx-native'
 $WorkRoot=[IO.Path]::GetFullPath($WorkRoot)
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
 function Invoke-Native([string]$Executable,[string[]]$Arguments) {
-  & $Executable @Arguments
+  # R23: Windows PowerShell 5.1 turns anything a native tool writes to stderr into a
+  # terminating NativeCommandError while $ErrorActionPreference is 'Stop' — a warning
+  # from CMake is enough, and `2>$null` does not prevent it. The exit code is the real
+  # contract for these tools, so relax the preference around the call, keep the output
+  # visible, and decide on $LASTEXITCODE alone.
+  $taskPrevious=$ErrorActionPreference
+  $ErrorActionPreference='Continue'
+  try { & $Executable @Arguments }
+  finally { $ErrorActionPreference=$taskPrevious }
   if($LASTEXITCODE -ne 0) {throw "$Executable failed with exit $LASTEXITCODE"}
 }
 # Import only build-tool environment variables; never print a process environment.
@@ -42,9 +50,20 @@ $taskLibime=Get-PinnedSource 'libime' 'https://github.com/fcitx/libime.git' '171
 Invoke-Native 'git' @('-C',$taskLibime,'submodule','update','--init','--depth','1')
 $taskLibimeDiff=& git -C $taskLibime status --porcelain
 if($taskLibimeDiff) {throw 'LibIME must remain unmodified'}
+function Test-NativePatchApplied([string]$Source,[string]$Patch) {
+  # R23: Windows PowerShell 5.1 turns a native command's stderr into a terminating
+  # NativeCommandError while $ErrorActionPreference is 'Stop', and `2>$null` does not
+  # prevent it. A fresh checkout makes the reverse probe fail (patch not applied yet),
+  # which aborted the whole script before the patch could be applied. Relax the
+  # preference for the probe only and decide on the exit code alone.
+  $taskPrevious=$ErrorActionPreference
+  $ErrorActionPreference='Continue'
+  try { & git -C $Source apply --reverse --check $Patch 2>&1 | Out-Null }
+  finally { $ErrorActionPreference=$taskPrevious }
+  return ($LASTEXITCODE -eq 0)
+}
 function Apply-NativePatch([string]$Source,[string]$Patch) {
-  & git -C $Source apply --reverse --check $Patch 2>$null
-  if($LASTEXITCODE -eq 0) {return}
+  if(Test-NativePatchApplied $Source $Patch) {return}
   Invoke-Native 'git' @('-C',$Source,'apply','--check',$Patch)
   Invoke-Native 'git' @('-C',$Source,'apply',$Patch)
 }
