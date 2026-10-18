@@ -322,8 +322,11 @@ function Assert-InstalledTipInUse {
   }
   Add-Result $Step '断言：注册' ("HKLM={0} HKCU={1} expected={2}" -f
     $result.Registration.Hklm, $(if ($result.Registration.Hkcu) { $result.Registration.Hkcu } else { '(none)' }), $result.Dll)
-  Add-Result $Step '断言：记事本模块' ("pid={0} loaded={1} expected={2} sha256={3}" -f
-    $result.Notepad.Id, $result.Loaded, $result.Dll, $result.Sha256)
+  Add-Result $Step '断言：记事本模块' $(if ($result.Notepad) {
+      "pid={0} loaded={1} expected={2} sha256={3}" -f $result.Notepad.Id, $result.Loaded, $result.Dll, $result.Sha256
+    } else {
+      'not checked (an earlier assertion failed)'
+    })
   if (-not $result.Ok) {
     Stop-Walkthrough -Step $Step -Command ("assert installed TIP in use from $VersionDir") -Code 8 `
       -Detail ($result.Failures -join '; ')

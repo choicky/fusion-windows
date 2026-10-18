@@ -171,11 +171,16 @@ function Test-InstalledTipInUse {
   $registration = Test-RegistrationPointsTo -DllPath $dll
   if (-not $registration.Ok) { $failures += $registration.Reason }
 
+  # Only start a Notepad when the Host and registration already match: opening a
+  # window on a run that is going to stop anyway helps nobody.
   $notepad = $null
-  if ($NotepadId -gt 0) { $notepad = Get-Process -Id $NotepadId -ErrorAction SilentlyContinue }
-  if (-not $notepad) { $notepad = Start-NotepadForCheck }
-  $module = Test-NotepadLoadedDll -ProcessId $notepad.Id -DllPath $dll -Sha256 $sha
-  if (-not $module.Ok) { $failures += "Notepad: $($module.Reason)" }
+  $module = $null
+  if ($failures.Count -eq 0) {
+    if ($NotepadId -gt 0) { $notepad = Get-Process -Id $NotepadId -ErrorAction SilentlyContinue }
+    if (-not $notepad) { $notepad = Start-NotepadForCheck }
+    $module = Test-NotepadLoadedDll -ProcessId $notepad.Id -DllPath $dll -Sha256 $sha
+    if (-not $module.Ok) { $failures += "Notepad: $($module.Reason)" }
+  }
 
   return [pscustomobject]@{
     Ok           = ($failures.Count -eq 0)
@@ -185,6 +190,6 @@ function Test-InstalledTipInUse {
     Notepad      = $notepad
     Dll          = $dll
     Sha256       = $sha
-    Loaded       = $module.Loaded
+    Loaded       = if ($module) { $module.Loaded } else { '' }
   }
 }
