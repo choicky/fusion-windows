@@ -29,6 +29,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -137,6 +138,35 @@ private:
 // or touches the backend, so any thread may run it; main() remains the single
 // thread that performs the ordered shutdown.
 bool wait_for_stop_request(void *stop_event, void *exit_complete);
+
+// Stage 6 WP4: the session-end decision of the windowless Host's hidden window,
+// kept out of the window procedure so it can be driven without a real session end.
+//
+// A logoff or shutdown can still be cancelled *after* WM_QUERYENDSESSION (an
+// application asks to save and the user cancels). That message therefore answers
+// TRUE and stops nothing — a Host that stopped there would stay gone until the next
+// logon even though the session continues. Only WM_ENDSESSION with wParam TRUE means
+// the session is really ending: then the handler requests the stop and waits,
+// bounded, for main() to finish the ordered shutdown (Fcitx's save included).
+// WM_ENDSESSION with wParam FALSE (the session end was cancelled) does nothing.
+class SessionEndHandler {
+public:
+  using RequestStop = std::function<void()>;
+
+  SessionEndHandler(RequestStop request_stop, void *exit_complete, unsigned long timeout_ms)
+      : request_stop_(std::move(request_stop)), exit_complete_(exit_complete),
+        timeout_ms_(timeout_ms) {}
+
+  // True for the two session-end messages this handler owns.
+  static bool handles(unsigned int message);
+  // The value the window procedure must return for a message it owns.
+  std::intptr_t handle(unsigned int message, std::uintptr_t wparam);
+
+private:
+  RequestStop request_stop_;
+  void *exit_complete_;
+  unsigned long timeout_ms_;
+};
 
 class HostServer {
 public:

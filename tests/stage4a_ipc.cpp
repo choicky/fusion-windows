@@ -1,7 +1,8 @@
 // Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
 // end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|integration>
+// Usage: stage4a <mode>, one of: protocol | loopback | hostserver | wp3singleton |
+// wp3shutdown | wp4stopevent | wp4sessionend | integration
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
@@ -16,6 +17,9 @@
 // - wp4stopevent: the named stop event an elevated install/uninstall signals
 //   instead of terminating the Host; the watcher only requests the stop and the
 //   owning thread still drains before the backend is destroyed (Stage 6 WP4).
+// - wp4sessionend: the session-end decision — a cancelled logoff (query only, or
+//   WM_ENDSESSION(FALSE)) stops nothing, only WM_ENDSESSION(TRUE) requests the stop
+//   and waits, bounded (Stage 6 WP4).
 // - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
 //   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
 //   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
@@ -1687,6 +1691,51 @@ void test_stop_event() {
                "requests the stop, one thread drains then destroys the backend\n";
 }
 
+// Stage 6 WP4: a logoff/shutdown can still be cancelled *after* WM_QUERYENDSESSION
+// (an application asks to save and the user cancels), so that message must not stop
+// the Host — a Host that stopped there would stay gone until the next logon. Only
+// WM_ENDSESSION with wParam TRUE means the session is really ending; it requests the
+// stop and waits, bounded, for the ordered shutdown.
+void test_session_end() {
+  HANDLE exit_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  require(exit_complete != nullptr, "session-end exit signal created");
+  int requests = 0;
+  constexpr unsigned long timeout_ms = 300;
+  fusion::ipc::SessionEndHandler handler([&requests] { requests++; }, exit_complete, timeout_ms);
+
+  require(fusion::ipc::SessionEndHandler::handles(WM_QUERYENDSESSION), "query-end is handled");
+  require(fusion::ipc::SessionEndHandler::handles(WM_ENDSESSION), "end-session is handled");
+  require(!fusion::ipc::SessionEndHandler::handles(WM_CLOSE), "window close is not a session end");
+
+  // A logoff that may still be cancelled: the query is answered TRUE, nothing stops.
+  require(handler.handle(WM_QUERYENDSESSION, 0) == TRUE, "WM_QUERYENDSESSION answers TRUE");
+  require(requests == 0, "WM_QUERYENDSESSION does not stop the Host");
+
+  // WM_ENDSESSION(FALSE): the session end was cancelled after the query.
+  require(handler.handle(WM_ENDSESSION, FALSE) == 0, "WM_ENDSESSION(FALSE) returns 0");
+  require(requests == 0, "a cancelled session end does not stop the Host");
+
+  // WM_ENDSESSION(TRUE): the session is ending. One request, then a bounded wait.
+  const auto begin = std::chrono::steady_clock::now();
+  require(handler.handle(WM_ENDSESSION, TRUE) == 0, "WM_ENDSESSION(TRUE) returns 0");
+  const auto waited = std::chrono::steady_clock::now() - begin;
+  require(requests == 1, "WM_ENDSESSION(TRUE) requests the stop exactly once");
+  require(waited >= std::chrono::milliseconds(timeout_ms - 100),
+          "WM_ENDSESSION(TRUE) waits for the ordered exit, bounded");
+
+  // With the exit already signalled the same call returns at once.
+  SetEvent(exit_complete);
+  const auto again = std::chrono::steady_clock::now();
+  require(handler.handle(WM_ENDSESSION, TRUE) == 0, "WM_ENDSESSION(TRUE) again returns 0");
+  require(std::chrono::steady_clock::now() - again < std::chrono::milliseconds(timeout_ms - 100),
+          "a finished exit releases the wait immediately");
+  require(requests == 2, "each WM_ENDSESSION(TRUE) requests the stop once");
+
+  CloseHandle(exit_complete);
+  std::cout << "PASS WP4 session end: a query or a cancelled end stops nothing, only "
+               "WM_ENDSESSION(TRUE) requests the stop and waits, bounded\n";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1820,10 +1869,11 @@ int main(int argc, char *argv[]) {
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
                       "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
-                      "integration>\n";
+                      "wp4sessionend|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
-                      "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent>\n";
+                      "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
+                      "wp4sessionend>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -1843,6 +1893,8 @@ int main(int argc, char *argv[]) {
       test_shutdown_order();
     else if (mode == "wp4stopevent")
       test_stop_event();
+    else if (mode == "wp4sessionend")
+      test_session_end();
     else if (mode == "integration") {
 #ifdef FUSION_WITH_FCITX5
       test_integration();

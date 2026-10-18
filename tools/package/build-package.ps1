@@ -99,7 +99,16 @@ try {
   $dirty = (& git -C $RepoRoot status --porcelain)
   if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
 
-  $runtime = [ordered]@{ identity = $RuntimeIdentity; patches = @('fcitx5-msvc.patch', 'chinese-addons-msvc.patch') }
+  $runtime = [ordered]@{
+    identity = $RuntimeIdentity
+    # Which machine produced this runtime. `runtime-wp3-20261018` exists as two
+    # builds from the same pins: WP3's on the 7700 and this one. They are not byte
+    # identical, so the machine and the file hashes below are the identity, never the
+    # directory name alone.
+    machine  = $env:COMPUTERNAME
+    rebuilt  = 'rebuilt on this machine from the WP3 pins; binary hashes differ from the 7700 build'
+    patches  = @('fcitx5-msvc.patch', 'chinese-addons-msvc.patch')
+  }
   if ($UpstreamRoot) {
     foreach ($pair in @(@('fcitx5', 'fcitx5'), @('fcitx5-chinese-addons', 'chineseAddons'), @('libime', 'libime'))) {
       $path = Join-Path $UpstreamRoot $pair[0]
@@ -126,6 +135,7 @@ try {
     sourceCommit  = $commit
     sourceDirty   = [bool]$dirty
     builtAt       = (Get-Date).ToString('o')
+    builtOn       = $env:COMPUTERNAME
     configuration = 'Release'
     runtime       = $runtime
     layout        = 'bin\ (Host + TSF DLL + runtime DLLs), data\, lib\libime\'

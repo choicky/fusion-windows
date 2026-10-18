@@ -132,29 +132,15 @@ HWND session_end_window = nullptr;
 DWORD session_end_window_thread = 0;
 std::mutex session_end_window_mutex;
 
+// Created before the window thread starts, read by the window procedure, released
+// after that thread has been joined.
+std::unique_ptr<fusion::ipc::SessionEndHandler> session_end_handler;
+
 LRESULT CALLBACK session_end_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   (void)lparam;
+  if (session_end_handler != nullptr && fusion::ipc::SessionEndHandler::handles(message))
+    return static_cast<LRESULT>(session_end_handler->handle(message, wparam));
   switch (message) {
-  case WM_QUERYENDSESSION:
-    // Windows allows a few seconds here, so this handler requests the stop and
-    // waits (bounded) for main() to finish the ordered shutdown, including Fcitx's
-    // own save, exactly like the console close path. Returning TRUE keeps the
-    // session end from being vetoed on the Host's behalf.
-    std::fprintf(stderr, "[FusionHost] session end: waiting for the orderly exit\n");
-    request_host_stop();
-    if (exit_complete != nullptr)
-      WaitForSingleObject(exit_complete, console_exit_timeout_ms);
-    return TRUE;
-  case WM_ENDSESSION:
-    // wparam FALSE: the session end was cancelled, nothing to do. TRUE: the
-    // shutdown was already requested by WM_QUERYENDSESSION; repeat the bounded
-    // wait so a Host that only observed WM_ENDSESSION still saves.
-    if (wparam != FALSE) {
-      request_host_stop();
-      if (exit_complete != nullptr)
-        WaitForSingleObject(exit_complete, console_exit_timeout_ms);
-    }
-    return 0;
   case WM_CLOSE:
     DestroyWindow(window);
     return 0;
@@ -283,6 +269,10 @@ int run(const std::vector<std::wstring> &arguments) {
   // session end (R26), so a failed window is fatal rather than silent.
   std::thread window_thread;
   if (!console_mode) {
+    // The window procedure only delegates the session-end decision; it is created
+    // before the window thread starts and released after that thread is joined.
+    session_end_handler = std::make_unique<fusion::ipc::SessionEndHandler>(
+        [] { request_host_stop(); }, exit_complete, console_exit_timeout_ms);
     HANDLE window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (window_ready == nullptr) {
       std::fprintf(stderr, "[FusionHost] cannot create the window-start signal\n");
@@ -357,6 +347,8 @@ int run(const std::vector<std::wstring> &arguments) {
 
   if (console_mode)
     SetConsoleCtrlHandler(console_control, FALSE);
+  // No window thread can be inside the handler after the join above.
+  session_end_handler.reset();
   CloseHandle(exit_complete);
   exit_complete = nullptr;
   std::fprintf(stderr, "[FusionHost] shutting down\n");

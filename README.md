@@ -534,12 +534,14 @@ control handler stays available for development and tests through `--console`; a
 both modes, because the CRT binds stdio to the inherited handle.
 
 Because there is no console, logoff/shutdown reaches the Host through a hidden **top-level** window (a message-only
-`HWND_MESSAGE` window receives no session-end broadcast): `WM_QUERYENDSESSION` / `WM_ENDSESSION` request the stop and
-wait, bounded (4 s, the same bound as the console path), for the ordered shutdown to finish. A named stop event
-(`Local\FusionHost-stop-<user SID>-<session id>`, the same user-only DACL as the pipe and the singleton claim) is the
-second non-console path: `install.ps1` / `uninstall.ps1` signal it instead of terminating the Host. All three paths
-only *request* the stop — `main()` remains the single thread that runs `stop()` → `shutdown_backend()` → Fcitx's own
-save on instance exit, and the singleton claim is held until the process exits.
+`HWND_MESSAGE` window receives no session-end broadcast). `WM_QUERYENDSESSION` only answers TRUE: a logoff can still
+be cancelled after it (an application asks to save and the user cancels), so nothing stops there. Only
+`WM_ENDSESSION` with `wParam` TRUE — the session is really ending — requests the stop and waits, bounded (4 s, the
+same bound as the console path), for the ordered shutdown; `WM_ENDSESSION` with `wParam` FALSE does nothing. A named
+stop event (`Local\FusionHost-stop-<user SID>-<session id>`, the same user-only DACL as the pipe and the singleton
+claim) is the second non-console path: `install.ps1` / `uninstall.ps1` signal it instead of terminating the Host. All
+paths only *request* the stop — `main()` remains the single thread that runs `stop()` → `shutdown_backend()` →
+Fcitx's own save on instance exit, and the singleton claim is held until the process exits.
 
 The package is a zip whose root maps onto the installed version directory `C:\Program Files\Fcitx5 Fusion\<version>\`:
 `bin\` (Host, TSF DLL, `FusionFcitxHost.dll`, every runtime DLL), `data\` (fcitx5 + libime data), `lib\libime\`

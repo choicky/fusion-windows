@@ -141,6 +141,36 @@ bool wait_for_stop_request(void *stop_event, void *exit_complete) {
   return WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0;
 }
 
+bool SessionEndHandler::handles(unsigned int message) {
+  return message == WM_QUERYENDSESSION || message == WM_ENDSESSION;
+}
+
+std::intptr_t SessionEndHandler::handle(unsigned int message, std::uintptr_t wparam) {
+  switch (message) {
+  case WM_QUERYENDSESSION:
+    // Answer TRUE and stop nothing: the logoff/shutdown can still be cancelled
+    // after this message (an application asks to save and the user cancels), and a
+    // Host that stopped here would stay gone until the next logon.
+    return TRUE;
+  case WM_ENDSESSION:
+    if (wparam == FALSE) {
+      return 0; // the session end was cancelled: nothing to do
+    }
+    // The session is really ending. Request the stop and wait (bounded) for main()
+    // to finish the ordered shutdown, including Fcitx's own save.
+    std::fprintf(stderr, "[FusionHost] session end: waiting for the orderly exit\n");
+    if (request_stop_) {
+      request_stop_();
+    }
+    if (exit_complete_ != nullptr) {
+      WaitForSingleObject(static_cast<HANDLE>(exit_complete_), timeout_ms_);
+    }
+    return 0;
+  default:
+    return 0;
+  }
+}
+
 HostServer::HostServer(std::unique_ptr<Backend> backend, std::wstring pipe_name,
                        std::uint64_t incarnation)
     : backend_(std::move(backend)), pipe_name_(std::move(pipe_name)),

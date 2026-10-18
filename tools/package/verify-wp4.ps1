@@ -64,6 +64,33 @@ function Ask-YesNo([string]$question) {
   }
 }
 
+# A short free-text answer (a rank, a pinyin string). It is recorded verbatim, so a
+# reported observation is never reduced to "Enter".
+function Ask-Text([string]$question, [string]$hint) {
+  Write-Host ''
+  Write-Host $question -ForegroundColor Cyan
+  $answer = Read-Host $hint
+  if ([string]::IsNullOrWhiteSpace($answer)) { return '(未填写)' }
+  return $answer.Trim()
+}
+
+# Starts Notepad with one typed character so the logoff asks to save and can be
+# cancelled. If the synthetic keystroke does not land, the prompt asks the owner to
+# type a character themselves.
+function Start-UnsavedNotepad {
+  $process = [System.Diagnostics.Process]::Start('notepad.exe')
+  Start-Sleep -Seconds 2
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    [void]$shell.AppActivate($process.Id)
+    Start-Sleep -Milliseconds 400
+    $shell.SendKeys('x')
+  } catch {
+    # The owner types the character instead; the prompt says so.
+  }
+  return $process
+}
+
 function Add-Result([string]$step, [string]$question, $answer) {
   $line = "[{0}] {1} => {2}" -f $step, $question, $answer
   Add-Content -LiteralPath $script:logPath -Value $line -Encoding UTF8
@@ -322,7 +349,7 @@ if ($state.stage -eq 'a') {
   Write-Host ''
   Write-Host '请在记事本中输入 nihao 并按空格。如果输入法不是 Fusion，请按 Win+空格 切换。'
   Add-Result 'a' '记事本 nihao → 你好' (Ask-YesNo '记事本里输入 nihao + 空格，是否得到“你好”？')
-  Add-Result 'a' '双拼/拼音选择与学习仍生效（沿用既有用户数据）' (Ask-YesNo '输入法列表里仍可选择双拼，且之前的候选排序/学习仍在？')
+  Add-Result 'a' '默认为拼音（这台机器没有 WP3 学习数据，只有首次运行的默认配置）' (Ask-YesNo '当前输入法是拼音（不是双拼），且没有历史学习记录？')
   $state.stage = 'b'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -365,16 +392,26 @@ if ($state.stage -eq 'b') {
 # ---------------------------------------------------------------------------
 
 if ($state.stage -eq 'c') {
-  Write-Head '步骤 c：注销并重新登录'
-  Write-Host '请先在记事本里用 Fusion 输入法造一条新的学习记录（例如输入 shuangpin 或一个词并选一次候选），'
-  Write-Host '确认候选顺序发生变化后，再按 Enter。脚本会记录当前用户数据状态，然后请你注销。'
-  if (-not (Ask-Enter '造好学习记录后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+  Write-Head '步骤 c：造学习记录，然后注销并重新登录'
+  # The learning must be produced with a Host that is already running, in the order
+  # the owner can actually do it.
+  $hosts = @(Get-FusionHostState)
+  Add-Result 'c' '造学习记录前的 Host 进程数' $hosts.Count
+  if ($hosts.Count -eq 0) {
+    Write-Host '当前没有运行中的 Host，无法产生学习记录。请先重新运行步骤 b。' -ForegroundColor Red
+    exit 6
+  }
+  Write-Host '请打开记事本，用 Fusion 输入法输入一个词并选择一次候选（例如输入 shuangpin 后选一个候选），'
+  Write-Host '注意选择前后该候选排在第几位。脚本会记录你报告的名次，再请你注销。'
+  Add-Result 'c' '学习用的拼音串' (Ask-Text '你输入的拼音串是什么？' '直接输入拼音串，例如 shuangpin')
+  Add-Result 'c' '候选名次变化（选择前→选择后）' (Ask-Text '该候选学习前在第几位、选择后升到第几位？' '例如 5→1')
+  if (-not (Ask-Enter '记录好名次后按 Enter，脚本会保存当前用户数据状态。')) { Write-Host '已放弃。'; exit 0 }
   New-Snapshot 'before-signout'
   $state.stage = 'c-resume'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 
   Write-Head '现在请注销，然后重新登录'
-  Write-Host '1. 关闭本窗口（或保持打开，注销会结束它）。'
+  Write-Host '1. 先保存或关闭记事本里要保留的内容；本脚本窗口会被注销结束。'
   Write-Host '2. 开始菜单 → 用户头像 → 注销。'
   Write-Host '3. 重新登录后，打开 PowerShell，运行：'
   Write-Host ''
@@ -393,9 +430,40 @@ if ($state.stage -eq 'c-resume') {
     Add-Result 'c' "Host pid=$($process.Id)" "path=$($process.Path) integrity=$($process.Integrity) session=$($process.SessionId) user=$($process.User)"
   }
   Write-Host ''
-  Write-Host '请打开记事本，确认输入法仍可用，并检查刚才学习过的候选是否仍排在前面。'
+  Write-Host '请打开记事本，输入同样的拼音串，确认输入法仍可用，并检查刚才学习过的候选现在排第几位。'
   Add-Result 'c' '登录后输入可用' (Ask-YesNo '登录后记事本里输入中文是否正常？')
-  Add-Result 'c' '注销前的学习在登录后仍在（R26）' (Ask-YesNo '注销前学习过的候选，登录后是否仍排在前面？')
+  Add-Result 'c' '登录后该候选的名次' (Ask-Text '现在同一个候选排在第几位？' '例如 1')
+  Add-Result 'c' '注销前的学习在登录后仍在（R26）' (Ask-YesNo '与注销前选择后的名次相比，学习结果是否保住了？')
+  $state.stage = 'c2'
+  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
+}
+
+# ---------------------------------------------------------------------------
+# c2. a cancelled logoff must not stop the Host
+# ---------------------------------------------------------------------------
+
+if ($state.stage -eq 'c2') {
+  Write-Head '步骤 c2：取消一次注销，Host 必须仍在运行'
+  Write-Host '注销可以在发出后仍被取消（例如记事本询问是否保存、用户点取消）。Host 不能在这种取消后消失。'
+  $before = @(Get-FusionHostState)
+  $beforeIds = ($before | ForEach-Object { $_.Id } | Sort-Object) -join ','
+  Add-Result 'c2' '取消注销前的 Host pid' $beforeIds
+  if ($before.Count -eq 0) {
+    Write-Host '当前没有运行中的 Host，无法验证取消注销。' -ForegroundColor Red
+    exit 6
+  }
+  $notepad = Start-UnsavedNotepad
+  Add-Result 'c2' '用于触发保存提示的记事本 pid' $notepad.Id
+  Write-Host '脚本已打开一个记事本并输入了一个字符（若记事本里没有字符，请手动输入一个），不要保存。'
+  if (-not (Ask-Enter '现在：开始菜单 → 用户头像 → 注销；Windows 提示“记事本有未保存的更改”时点“取消”中止注销，回到桌面后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+  Start-Sleep -Seconds 3
+  $after = @(Get-FusionHostState)
+  $afterIds = ($after | ForEach-Object { $_.Id } | Sort-Object) -join ','
+  Add-Result 'c2' '取消注销后的 Host 进程数' $after.Count
+  Add-Result 'c2' '取消注销后的 Host pid' $afterIds
+  Add-Result 'c2' '取消注销后仍是同一个 Host' ($afterIds -eq $beforeIds)
+  Add-Result 'c2' '取消注销后输入仍可用' (Ask-YesNo '取消注销后，在记事本里输入中文是否仍然正常？')
+  New-Snapshot 'after-cancelled-logoff'
   $state.stage = 'd'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
