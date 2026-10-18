@@ -58,7 +58,7 @@ repository entry point only.
 - `tests/stage5_real_projection.cpp` — Stage 5 closure against the real pinned pinyin engine (in-process `FusionFcitxHost`, `FUSION_WITH_FCITX5` build): preedit segments/format/cursor and their movement with Left/Right, partial selection and continued composition, stroke-filter and QuickPhrase auxUp, and the empty-panel hide signal.
 - `tests/fcitx_candidate_filter.cpp` — Stage 5 display outputFilter contract against the real Fcitx5 core (Windows `FUSION_WITH_FCITX5` build against the pinned runtime, and non-Windows builds with Fcitx5 dev libraries): candidate label/text/comment like classic-ui, the client preedit like the dbus frontend (segments, flags, cursor, engine password masking), and the panel rows like classic-ui.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
-- `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers) and `verify-wp4.ps1` (the owner walkthrough).
+- `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers), `walkthrough-assertions.ps1` (the argument formatter, the elevated launcher and the assertions on the installed TIP) and `verify-wp4.ps1` (the owner walkthrough).
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
 ## Local validation
@@ -553,7 +553,11 @@ updates the per-user logon task (interactive token, limited run level, no execut
 and starts the Host for the current user; an upgrade stops the old Host orderly, installs a new directory, re-points
 registration and task, and leaves an old directory that is still locked by running applications for a later run.
 `uninstall.ps1` stops the Host orderly, unregisters, deletes the task and removes the version directories it can;
-`%APPDATA%\Fcitx5` is kept unless `-RemoveUserData` is given.
+`%APPDATA%\Fcitx5` is kept unless `-RemoveUserData` is given. Both scripts set a step name before every phase and
+print `INSTALL FAILED at step '<x>': <message>` (or `UNINSTALL FAILED …`) with the script position before exiting 1,
+and both accept `-TranscriptPath <file>` so the whole run — including the part that only runs elevated — writes its own
+log. A version directory that a process still holds is kept and reported, never force-deleted; a `.ps1` call is checked
+with `$?`/`try`/`catch`, never with `$LASTEXITCODE` (a script call does not set it unless the callee calls `exit`).
 
 Known limits at this scope: an old version directory stays locked until the applications that loaded its DLL exit;
 nothing restarts the Host after a crash (WP5/U7 evidence); the task, the pipe, the claim and the stop event are all

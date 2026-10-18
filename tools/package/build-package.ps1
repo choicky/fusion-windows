@@ -94,8 +94,11 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination $stage -Force
   }
 
-  $commit = (& git -C $RepoRoot rev-parse HEAD).Trim()
+  # git is a native executable, so $LASTEXITCODE *is* the contract here - unlike a
+  # .ps1 call. The exit code is checked before the output is used.
+  $commit = (& git -C $RepoRoot rev-parse HEAD)
   if ($LASTEXITCODE -ne 0) { throw 'git rev-parse HEAD failed' }
+  $commit = ([string]$commit).Trim()
   $dirty = (& git -C $RepoRoot status --porcelain)
   if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
 
@@ -113,7 +116,8 @@ try {
     foreach ($pair in @(@('fcitx5', 'fcitx5'), @('fcitx5-chinese-addons', 'chineseAddons'), @('libime', 'libime'))) {
       $path = Join-Path $UpstreamRoot $pair[0]
       if (Test-Path -LiteralPath (Join-Path $path '.git')) {
-        $runtime[$pair[1]] = (& git -C $path rev-parse HEAD).Trim()
+        $head = (& git -C $path rev-parse HEAD)
+        if ($LASTEXITCODE -eq 0) { $runtime[$pair[1]] = ([string]$head).Trim() }
       }
     }
   }

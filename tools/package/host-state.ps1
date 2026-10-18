@@ -92,13 +92,17 @@ function Get-FusionHostState {
         if ($who -and $who.User) { $owner = "$($who.Domain)\$($who.User)" }
       }
     } catch { }
+    # StartTime throws for a process that exited between the enumeration and here
+    # (and for a protected one); it is evidence, not a reason to fail the caller.
+    $started = $null
+    try { $started = $process.StartTime } catch { }
     $result += [pscustomobject]@{
       Id        = $process.Id
       Path      = $path
       User      = $owner
       SessionId = $process.SessionId
       Integrity = [FusionNative]::IntegrityLevel($process.Id)
-      StartTime = $process.StartTime
+      StartTime = $started
     }
   }
   return $result
@@ -153,6 +157,69 @@ function Get-FusionScheduledTask {
     TimeLimit = [string]$task.Settings.ExecutionTimeLimit
     LastResult = if ($info) { $info.LastTaskResult } else { $null }
   }
+}
+
+# The DLL the machine-wide (HKLM) COM registration points at, or $null.
+#
+# `(Get-FusionRegistrationState | Where-Object {...}).Dll` is a trap under
+# Set-StrictMode -Version 2.0: when the filter matches nothing the pipeline yields
+# $null and the property read throws "cannot be found on this object". Every caller
+# that needs this value goes through here instead.
+function Get-FusionRegisteredDll {
+  $entries = @(Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' })
+  if ($entries.Count -eq 0) { return $null }
+  $dll = $entries[0].Dll
+  if ([string]::IsNullOrEmpty($dll)) { return $null }
+  return [string]$dll
+}
+
+# Is any file under `Path` loaded as a module by a running process? Used before
+# removing a version directory: a directory whose DLL an application still holds is
+# kept and reported, never force-deleted (and never partially deleted, which a
+# Remove-Item that fails halfway would do).
+function Test-DirectoryInUse {
+  param([string]$Path)
+  $prefix = $Path.TrimEnd('\') + '\'
+  $pids = @()
+  foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+    try {
+      foreach ($module in $process.Modules) {
+        if ($module.FileName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+          $pids += $process.Id
+          break
+        }
+      }
+    } catch {
+      # Access denied (another user, protected process): it cannot be holding a
+      # file in a directory only this user's installation wrote.
+    }
+  }
+  $unique = @($pids | Sort-Object -Unique)
+  return [pscustomobject]@{ InUse = ($unique.Count -gt 0); Pids = $unique }
+}
+
+# Calls another PowerShell script and reports success without ever reading
+# $LASTEXITCODE.
+#
+# `& script.ps1` does NOT set $LASTEXITCODE unless the callee calls `exit`, and when
+# it does set it the value can also be a leftover from an earlier native command
+# (the variable lives in the global scope, so it cannot even be cleared locally).
+# Reading it under Set-StrictMode -Version 2.0 throws when it is unset - that is how
+# a *successful* register.ps1 aborted the first elevated install (run 12:44). The
+# contract is therefore $? plus try/catch: both a `throw` and a non-zero `exit`
+# leave $? False.
+function Invoke-PackageScript {
+  param([string]$ScriptPath, [hashtable]$Parameters = @{})
+  $outcome = [pscustomobject]@{ Ok = $true; Threw = $false; Error = '' }
+  try {
+    & $ScriptPath @Parameters
+    $outcome.Ok = $?
+  } catch {
+    $outcome.Ok = $false
+    $outcome.Threw = $true
+    $outcome.Error = $_.Exception.Message
+  }
+  return $outcome
 }
 
 # Asks the running Host for an orderly stop through the product's own stop event

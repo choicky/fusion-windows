@@ -140,6 +140,14 @@ function Get-InstallRootSummary {
   return ($lines -join "`n")
 }
 
+# The version directories under the install root, as names. A leftover directory
+# from an earlier install is visible here before and after a step, which is how the
+# walkthrough records whether install.ps1's cleanup removed it.
+function Get-VersionDirectories {
+  if (-not (Test-Path -LiteralPath $installRoot)) { return @() }
+  return @(Get-ChildItem -LiteralPath $installRoot -Directory | ForEach-Object { $_.Name })
+}
+
 function New-Snapshot([string]$label) {
   $script:snapshotIndex++
   $name = '{0:d2}-{1}.txt' -f $script:snapshotIndex, $label
@@ -194,54 +202,6 @@ function New-Snapshot([string]$label) {
   return $text
 }
 
-# Starts a script elevated through UAC and returns its exit code. ProcessStartInfo
-# with UseShellExecute + runas is used instead of Start-Process: Start-Process
-# builds an environment dictionary and fails on a machine that has both `http_proxy`
-# and `HTTP_PROXY` defined.
-function Start-ElevatedProcess {
-  param([string[]]$Arguments)
-  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-  $startInfo.FileName = 'powershell.exe'
-  $startInfo.Arguments = ($Arguments | ForEach-Object {
-      if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
-    }) -join ' '
-  $startInfo.UseShellExecute = $true
-  $startInfo.Verb = 'runas'
-  $process = [System.Diagnostics.Process]::Start($startInfo)
-  $process.WaitForExit()
-  return $process.ExitCode
-}
-
-# Runs an elevated script through UAC and captures its transcript. The elevated
-# process writes the transcript itself, because a runas launch cannot redirect its
-# output. A small generated wrapper is used instead of -Command: an argument list is
-# joined with spaces, so a -Command script would be split.
-#
-# `Parameters` is a hashtable: Format-ArgumentList emits parameter names bare and
-# quotes only values, so `-PackageDir '<path>'` binds to the parameter and not to a
-# string that PowerShell would bind positionally.
-function Invoke-ElevatedScript {
-  param([string]$ScriptPath, [hashtable]$Parameters = @{}, [string]$LogName)
-  $log = Join-Path $script:runDir $LogName
-  $argumentText = Format-ArgumentList -Parameters $Parameters
-  $wrapper = Join-Path $script:runDir ("elevated-" + [IO.Path]::GetFileNameWithoutExtension($LogName) + ".ps1")
-  $lines = @(
-    "Start-Transcript -Path '$log' -Force | Out-Null",
-    "& '$ScriptPath' $argumentText",
-    '$code = $LASTEXITCODE',
-    'Stop-Transcript | Out-Null',
-    'exit $code'
-  )
-  Set-Content -LiteralPath $wrapper -Value $lines -Encoding UTF8
-  Add-Content -LiteralPath $script:logPath -Value ("`n### ELEVATED {0}: {1} {2}" -f $LogName, $ScriptPath, $argumentText) -Encoding UTF8
-  $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
-  Add-Content -LiteralPath $script:logPath -Value "### ELEVATED $LogName exit=$code" -Encoding UTF8
-  if (Test-Path -LiteralPath $log) {
-    Add-Content -LiteralPath $script:logPath -Value (Get-Content -LiteralPath $log -Raw) -Encoding UTF8
-  }
-  return $code
-}
-
 # --- fail fast -------------------------------------------------------------
 #
 # A step whose command exits non-zero stops the walkthrough immediately: the step,
@@ -262,7 +222,7 @@ function Invoke-SafeRestore {
   $dev = $null
   if ($state) { $dev = $state.devRegistration }
   if ($dev) {
-    $current = (Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' -and $_.Dll }).Dll
+    $current = Get-FusionRegisteredDll
     if ($current -and $current -ne $dev -and (Test-Path -LiteralPath $dev)) {
       $code = Invoke-ElevatedScript -ScriptPath (Join-Path $repoRoot 'tools\tsf\register.ps1') `
         -Parameters @{ DllPath = $dev } -LogName 'restore-registration-abort.log'
@@ -395,8 +355,7 @@ if (-not $Resume) {
   Add-Content -LiteralPath $script:logPath -Value "package2=$($second.Name) version=$($secondManifest.version) sha256=$((Get-FileHash -LiteralPath $second.FullName -Algorithm SHA256).Hash)" -Encoding UTF8
 
   # The development registration that exists before the run, restored at the end.
-  $before = Get-FusionRegistrationState
-  $dev = ($before | Where-Object { $_.Hive -eq 'HKLM' -and $_.Dll }).Dll
+  $dev = Get-FusionRegisteredDll
   Write-Host "走查前的开发注册: $dev"
   New-Snapshot 'before'
   $state = [pscustomobject]@{
@@ -442,11 +401,24 @@ if ($state.stage -eq 'a') {
     exit 0
   }
   if (-not (Ask-Enter '按 Enter 开始安装 wp4.1（UAC 确认后自动继续）。')) { Write-Host '已放弃。'; exit 0 }
+  # A version directory left behind by an earlier, failed install: recorded before
+  # and after, so the record shows whether install.ps1 removed it as an older,
+  # unused version.
+  $dirsBefore = @(Get-VersionDirectories)
+  Add-Result 'a' '安装前的版本目录' $(if ($dirsBefore.Count -gt 0) { $dirsBefore -join ', ' } else { '(none)' })
   $install1Command = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package1Path })"
-  $code = Invoke-ElevatedScript -ScriptPath $install1 -Parameters @{ PackageDir = $state.package1Path } -LogName 'install-wp4.1.log'
+  $code = Invoke-ElevatedScript -ScriptPath $install1 -Parameters @{ PackageDir = $state.package1Path } `
+    -LogName 'install-wp4.1.log' -TranscriptPath (Join-Path $script:runDir "install-$version1.log")
   Add-Result 'a' 'install.ps1 退出码' $code
   Assert-StepExit -Step 'a' -Command $install1Command -Code $code
   New-Snapshot 'after-install-wp4.1'
+
+  $dirsAfter = @(Get-VersionDirectories)
+  $leftovers = @($dirsBefore | Where-Object { $_ -ne $version1 })
+  $survivors = @($leftovers | Where-Object { $dirsAfter -contains $_ })
+  Add-Result 'a' '安装后是否清掉了旧版本目录' ("leftover-before={0} still-present={1}" -f
+    $(if ($leftovers.Count -gt 0) { $leftovers -join ',' } else { 'none' }),
+    $(if ($survivors.Count -gt 0) { $survivors -join ',' } else { 'none' }))
 
   Write-Host ''
   Write-Host '请关闭所有已打开的记事本（旧的记事本仍加载着旧的 DLL），然后按 Enter。'
@@ -469,6 +441,10 @@ if ($state.stage -eq 'b') {
   Write-Host '脚本会再运行一次计划任务，并直接启动一次 FusionHost.exe；两者都不应产生第二个服务端。'
   if (-not (Ask-Enter '按 Enter 继续（无需操作）。')) { Write-Host '已放弃。'; exit 0 }
 
+  if (-not (Get-FusionScheduledTask)) {
+    Stop-Walkthrough -Step 'b' -Command 'Get-ScheduledTask FusionHost' -Code 8 `
+      -Detail 'the logon task created in step a is missing'
+  }
   Start-ScheduledTask -TaskName 'FusionHost'
   Start-Sleep -Seconds 3
   $afterTask = @(Get-FusionHostState)
@@ -481,9 +457,26 @@ if ($state.stage -eq 'b') {
   $psi.RedirectStandardOutput = $true
   $psi.WorkingDirectory = $version1Dir
   $direct = [System.Diagnostics.Process]::Start($psi)
-  $stderr = $direct.StandardError.ReadToEnd()
-  $direct.WaitForExit()
-  Add-Result 'b' '直接启动 FusionHost.exe 的退出码' $direct.ExitCode
+  # Read asynchronously: a synchronous ReadToEnd would block forever if this process
+  # did *not* exit, and "it stayed alive" is exactly the failure this step looks for.
+  $stderrTask = $direct.StandardError.ReadToEndAsync()
+  $stdoutTask = $direct.StandardOutput.ReadToEndAsync()
+  $exited = $direct.WaitForExit(15000)
+  if (-not $exited) {
+    # Never kill it: if it really became a second server, ask it to stop the way
+    # install/uninstall do.
+    $stop = Stop-FusionHostOrderly -TimeoutMs 20000 -InstallRoot $version1Dir
+    Add-Result 'b' '第二次启动的进程 15 s 内没有退出（本应是第二个服务端被拒绝）' `
+      ("pid={0} stop-signalled={1} exited={2}" -f $direct.Id, $stop.Signalled, $stop.Exited)
+    $exited = $direct.WaitForExit(20000)
+  }
+  $stderr = ''
+  if ($exited) {
+    try { $stderr = $stderrTask.Result } catch { $stderr = "(stderr unavailable: $($_.Exception.Message))" }
+    Add-Result 'b' '直接启动 FusionHost.exe 的退出码' $direct.ExitCode
+  } else {
+    Add-Result 'b' '直接启动 FusionHost.exe 的退出码' 'still running after 35 s'
+  }
   Add-Result 'b' '直接启动的 stderr' ($stderr.Trim() -replace "`r?`n", ' | ')
   New-Snapshot 'after-second-start'
   $afterDirect = @(Get-FusionHostState)
@@ -592,7 +585,8 @@ if ($state.stage -eq 'd') {
   if (-not (Ask-Enter '记事本保持打开，按 Enter 开始升级（UAC）。')) { Write-Host '已放弃。'; exit 0 }
   New-Snapshot 'before-upgrade'
   $install2Command = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
-  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } -LogName 'install-wp4.2.log'
+  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `
+    -LogName 'install-wp4.2.log' -TranscriptPath (Join-Path $script:runDir "install-$version2.log")
   Add-Result 'd' 'install.ps1 (wp4.2) 退出码' $code
   Assert-StepExit -Step 'd' -Command $install2Command -Code $code
   New-Snapshot 'after-upgrade'
@@ -632,28 +626,39 @@ if ($state.stage -eq 'e') {
   Write-Host '脚本会请 Host 有序停止，然后反注册、删除计划任务、删除未被占用的版本目录。'
   Write-Host '%APPDATA%\Fcitx5 应保留。'
   if (-not (Ask-Enter '按 Enter 开始卸载（UAC）。')) { Write-Host '已放弃。'; exit 0 }
-  $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log'
+  $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log' `
+    -TranscriptPath (Join-Path $script:runDir "uninstall-$version2.log")
   Add-Result 'e' 'uninstall.ps1 退出码' $code
   Assert-StepExit -Step 'e' -Command 'uninstall.ps1' -Code $code
   New-Snapshot 'after-uninstall-keep-data'
 
-  $stateNow = Get-FusionRegistrationState
-  Add-Result 'e' 'HKLM COM 仍存在' (($stateNow | Where-Object { $_.Hive -eq 'HKLM' }).ComKey)
-  Add-Result 'e' 'HKLM TIP 仍存在' (($stateNow | Where-Object { $_.Hive -eq 'HKLM' }).TipKey)
+  $stateNow = @(Get-FusionRegistrationState)
+  $hklmNow = @($stateNow | Where-Object { $_.Hive -eq 'HKLM' })
+  Add-Result 'e' 'HKLM COM 仍存在' ($hklmNow.Count -gt 0 -and $hklmNow[0].ComKey)
+  Add-Result 'e' 'HKLM TIP 仍存在' ($hklmNow.Count -gt 0 -and $hklmNow[0].TipKey)
   Add-Result 'e' '计划任务仍存在' ([bool](Get-FusionScheduledTask))
   Add-Result 'e' 'Host 进程数' (@(Get-FusionHostState).Count)
   Add-Result 'e' '安装根目录仍存在' (Test-Path -LiteralPath $installRoot)
+  $remaining = @(Get-VersionDirectories)
+  Add-Result 'e' '卸载后残留的版本目录（被占用而保留的会出现在这里）' $(if ($remaining.Count -gt 0) { $remaining -join ', ' } else { '(none)' })
   Add-Result 'e' '%APPDATA%\Fcitx5 保留' (Test-Path -LiteralPath (Join-Path $env:APPDATA 'Fcitx5'))
 
   $checkState = Join-Path $repoRoot 'tools\tsf\check-state.ps1'
   $checkLog = Join-Path $script:runDir 'check-state-after-uninstall.txt'
   # A native tool writing to stderr is a terminating error while the preference is
-  # 'Stop'; here the exit code is the contract, and the output is evidence.
+  # 'Stop'; here the exit code is the contract, and the output is evidence. The
+  # preference is restored in finally so a failure cannot leave it lowered.
   $previousPreference = $ErrorActionPreference
+  $checkCode = 1
   $ErrorActionPreference = 'Continue'
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checkState *>&1 | Tee-Object -FilePath $checkLog
-  $checkCode = $LASTEXITCODE
-  $ErrorActionPreference = $previousPreference
+  try {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checkState *>&1 | Tee-Object -FilePath $checkLog
+    $checkCode = $LASTEXITCODE
+  } catch {
+    Add-Result 'e' 'check-state 调用失败' $_.Exception.Message
+  } finally {
+    $ErrorActionPreference = $previousPreference
+  }
   Add-Result 'e' 'check-state 输出已记录' ("$checkLog exit=$checkCode")
   Assert-StepExit -Step 'e' -Command "check-state.ps1" -Code $checkCode
   $state.stage = 'f'
@@ -669,19 +674,22 @@ if ($state.stage -eq 'f') {
   Write-Host '请先关闭所有记事本窗口（否则版本目录会被占用而保留）。'
   if (-not (Ask-Enter '关闭所有记事本后按 Enter（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
   $reinstallCommand = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
-  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } -LogName 'reinstall-wp4.2.log'
+  $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `
+    -LogName 'reinstall-wp4.2.log' -TranscriptPath (Join-Path $script:runDir "install-$version2-reinstall.log")
   Add-Result 'f' '重装退出码' $code
   Assert-StepExit -Step 'f' -Command $reinstallCommand -Code $code
   New-Snapshot 'after-reinstall-wp4.2'
 
   $removeCommand = "uninstall.ps1 $(Format-ArgumentList -Parameters @{ RemoveUserData = $true })"
-  $code = Invoke-ElevatedScript -ScriptPath (Join-Path $version2Dir 'uninstall.ps1') -Parameters @{ RemoveUserData = $true } -LogName 'uninstall-remove-data.log'
+  $code = Invoke-ElevatedScript -ScriptPath (Join-Path $version2Dir 'uninstall.ps1') -Parameters @{ RemoveUserData = $true } `
+    -LogName 'uninstall-remove-data.log' -TranscriptPath (Join-Path $script:runDir "uninstall-$version2-remove-userdata.log")
   Add-Result 'f' '带 -RemoveUserData 卸载退出码' $code
   Assert-StepExit -Step 'f' -Command $removeCommand -Code $code
   New-Snapshot 'after-uninstall-remove-data'
 
-  Add-Result 'f' 'HKLM COM 仍存在' ((Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' }).ComKey)
-  Add-Result 'f' 'HKLM TIP 仍存在' ((Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' }).TipKey)
+  $afterFinal = @(Get-FusionRegistrationState | Where-Object { $_.Hive -eq 'HKLM' })
+  Add-Result 'f' 'HKLM COM 仍存在' ($afterFinal.Count -gt 0 -and $afterFinal[0].ComKey)
+  Add-Result 'f' 'HKLM TIP 仍存在' ($afterFinal.Count -gt 0 -and $afterFinal[0].TipKey)
   Add-Result 'f' '计划任务仍存在' ([bool](Get-FusionScheduledTask))
   Add-Result 'f' 'Host 进程数' (@(Get-FusionHostState).Count)
   Add-Result 'f' '安装根目录仍存在' (Test-Path -LiteralPath $installRoot)

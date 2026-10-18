@@ -193,3 +193,79 @@ function Test-InstalledTipInUse {
     Loaded       = if ($module) { $module.Loaded } else { '' }
   }
 }
+
+# --- launching a child script ---------------------------------------------
+#
+# Lives here rather than in verify-wp4.ps1 so the walkthrough *and* the UAC-free
+# proof exercise the same wrapper: the same argument quoting, the same exit-code
+# rule, the same transcript hand-off. Both expect $script:runDir and $script:logPath
+# to be set by the caller.
+#
+# Starts a script elevated through UAC and returns its exit code. ProcessStartInfo
+# with UseShellExecute + runas is used instead of Start-Process: Start-Process
+# builds an environment dictionary and fails on a machine that has both `http_proxy`
+# and `HTTP_PROXY` defined.
+#
+# -NotElevated runs the same way without UAC. It exists so the walkthrough's own
+# wrapper (exit-code handling, transcript hand-off) can be exercised for
+# `install.ps1 -VerifyOnly`, which needs no elevation; it is not used by a step.
+function Start-ElevatedProcess {
+  param([string[]]$Arguments, [switch]$NotElevated)
+  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $startInfo.FileName = 'powershell.exe'
+  $startInfo.Arguments = ($Arguments | ForEach-Object {
+      if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }) -join ' '
+  $startInfo.UseShellExecute = $true
+  if (-not $NotElevated) { $startInfo.Verb = 'runas' }
+  $process = [System.Diagnostics.Process]::Start($startInfo)
+  $process.WaitForExit()
+  return $process.ExitCode
+}
+
+# Runs an elevated script through UAC and captures its transcript. A runas launch
+# cannot redirect its output, so the log is written by the elevated process itself.
+#
+# `Parameters` is a hashtable: Format-ArgumentList emits parameter names bare and
+# quotes only values, so `-PackageDir '<path>'` binds to the parameter and not to a
+# string that PowerShell would bind positionally.
+#
+# `TranscriptPath` is for install.ps1 / uninstall.ps1, which start their own
+# transcript (they must, so a failure inside the elevated span names its own step).
+# In that case this wrapper starts none - a second, nested Start-Transcript fails -
+# and appends the callee's file afterwards.
+#
+# The wrapper decides its exit code from `$?`, never from `$LASTEXITCODE` alone: a
+# .ps1 call only sets that variable when the callee calls `exit`, and the value can
+# be a leftover from an earlier native command.
+function Invoke-ElevatedScript {
+  param([string]$ScriptPath, [hashtable]$Parameters = @{}, [string]$LogName, [string]$TranscriptPath = '', [switch]$RunAsCurrentUser)
+  $argumentText = Format-ArgumentList -Parameters $Parameters
+  $wrapper = Join-Path $script:runDir ("elevated-" + [IO.Path]::GetFileNameWithoutExtension($LogName) + ".ps1")
+  $wrapperLog = Join-Path $script:runDir $LogName
+  $lines = @()
+  if (-not $TranscriptPath) {
+    $lines += "Start-Transcript -Path '$wrapperLog' -Force | Out-Null"
+  }
+  $lines += "& '$ScriptPath' $argumentText"
+  $lines += '$ok = $?'
+  $lines += '$code = 0'
+  $lines += 'if (-not $ok) {'
+  $lines += '  $code = 1'
+  $lines += '  $last = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue'
+  $lines += '  if ($last -and $last.Value -is [int] -and $last.Value -ne 0) { $code = $last.Value }'
+  $lines += '}'
+  if (-not $TranscriptPath) {
+    $lines += 'Stop-Transcript | Out-Null'
+  }
+  $lines += 'exit $code'
+  Set-Content -LiteralPath $wrapper -Value $lines -Encoding UTF8
+  Add-Content -LiteralPath $script:logPath -Value ("`n### ELEVATED {0}: {1} {2}" -f $LogName, $ScriptPath, $argumentText) -Encoding UTF8
+  $code = Start-ElevatedProcess -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrapper) -NotElevated:$RunAsCurrentUser
+  Add-Content -LiteralPath $script:logPath -Value "### ELEVATED $LogName exit=$code" -Encoding UTF8
+  $log = if ($TranscriptPath) { $TranscriptPath } else { $wrapperLog }
+  if (Test-Path -LiteralPath $log) {
+    Add-Content -LiteralPath $script:logPath -Value (Get-Content -LiteralPath $log -Raw) -Encoding UTF8
+  }
+  return $code
+}

@@ -4,6 +4,9 @@
 # registration plus the HKLM COM CLSID key. Verify cleanup afterwards with
 # check-state.ps1.
 #
+# Exit contract (relied on by uninstall.ps1 and verify-wp4.ps1): 0 on success,
+# 1 when regsvr32 failed, 2 when the DLL is missing. The script always exits.
+#
 # Usage: powershell -ExecutionPolicy Bypass -File unregister.ps1 <FusionTsf.dll>
 
 param(
@@ -12,11 +15,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$dll = Resolve-Path $DllPath
-if (-not $dll) {
-  Write-Error "DLL not found: $DllPath"
+
+if (-not (Test-Path -LiteralPath $DllPath)) {
+  Write-Host "DLL not found: $DllPath" -ForegroundColor Red
   exit 2
 }
+$dll = Resolve-Path -LiteralPath $DllPath
+
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = 'regsvr32.exe'
 $psi.Arguments = '/s /u "' + $dll.Path + '"'
@@ -29,3 +34,4 @@ if ($process.ExitCode -ne 0) {
   exit 1
 }
 Write-Host "Unregistered (elevated): $($dll.Path)"
+exit 0
