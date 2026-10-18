@@ -123,21 +123,10 @@ try {
   $currentStep = 'copy'
   Write-Step "installing files into $versionDir"
   New-Item -ItemType Directory -Force $versionDir | Out-Null
-  # Copy the *contents* of each directory into the matching subdirectory. Copying a
-  # directory onto an existing one would nest it (bin\bin) on a reinstall over a
-  # partially installed version, which is worse than merging over it.
-  foreach ($item in @('bin', 'data', 'lib', 'tools')) {
-    $source = Join-Path $PackageDir $item
-    if (-not (Test-Path -LiteralPath $source)) { continue }
-    if (@(Get-ChildItem -LiteralPath $source -Force).Count -eq 0) { continue }
-    $target = Join-Path $versionDir $item
-    New-Item -ItemType Directory -Force $target | Out-Null
-    Copy-Item -Path (Join-Path $source '*') -Destination $target -Recurse -Force
-  }
-  foreach ($file in @('package.json', 'install.ps1', 'uninstall.ps1', 'host-state.ps1')) {
-    Copy-Item -LiteralPath (Join-Path $PackageDir $file) -Destination $versionDir -Force
-  }
-  Write-Host "  $(@(Get-ChildItem -LiteralPath $versionDir -Recurse -File).Count) files installed"
+  $copy = Copy-FusionPackageFiles -PackageDir $PackageDir -VersionDir $versionDir -Entries $entries
+  if ($copy.Failure) { throw $copy.Failure }
+  Write-Host ("  {0} copied, {1} unchanged (identical SHA-256); {2} files present" -f
+    $copy.Copied, $copy.Skipped, $copy.Files)
 
   $currentStep = 'register'
   Write-Step 'registering the TIP from the installed directory'
@@ -202,7 +191,7 @@ try {
     }
     $inUse = Test-DirectoryInUse -Path $directory.FullName
     if ($inUse.InUse) {
-      Write-Host "  kept $($directory.Name): in use by pid(s) $($inUse.Pids -join ',')" -ForegroundColor Yellow
+      Write-Host ("  kept {0}: in use by {1}" -f $directory.Name, ($inUse.Names -join ', ')) -ForegroundColor Yellow
       continue
     }
     try {

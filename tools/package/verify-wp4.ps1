@@ -65,7 +65,7 @@ function Ask-YesNo([string]$question) {
   while ($true) {
     Write-Host ''
     Write-Host $question -ForegroundColor Cyan
-    $answer = Read-Host '请输入 y 或 n'
+    $answer = Read-Host '请输入 y 或 n（若这里出现拼音候选，按两次 Enter）'
     if ($answer -match '^\s*[yY](es)?\s*$') { return $true }
     if ($answer -match '^\s*[nN](o)?\s*$') { return $false }
     Write-Host '  只接受 y 或 n。' -ForegroundColor Yellow
@@ -410,6 +410,7 @@ if ($Resume) {
 Write-Head 'Stage 6 WP4 安装与生命周期走查'
 Write-Host "证据目录: $script:runDir"
 Write-Host "日志:     $script:logPath"
+Write-Host '提示：输入法是全局的。如果在本窗口输入 y/n 时出现拼音候选，按两次 Enter（先上屏、再确认）。'
 
 # ---------------------------------------------------------------------------
 # Fresh run: identify the packages and record the pre-run state
@@ -509,7 +510,7 @@ if ($state.stage -eq 'a') {
   Write-Host ''
   Write-Host '请在新打开的记事本中输入 nihao 并按空格。如果输入法不是 Fusion，请按 Win+空格 切换。'
   Add-Result 'a' '记事本 nihao → 你好' (Ask-YesNo '记事本里输入 nihao + 空格，是否得到“你好”？')
-  Add-Result 'a' '默认为拼音（这台机器没有 WP3 学习数据，只有首次运行的默认配置）' (Ask-YesNo '当前输入法是拼音（不是双拼），且没有历史学习记录？')
+  Add-Result 'a' '当前输入法是拼音（不是双拼）' (Ask-YesNo '当前输入法是拼音（不是双拼）？')
   $state.stage = 'b'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -703,19 +704,28 @@ if ($state.stage -eq 'd') {
   Write-Head '步骤 d：在记事本保持打开的情况下升级到 wp4.2'
   Write-Host '请保持当前记事本窗口打开（不要关闭），然后按 Enter。升级会先请求旧 Host 有序停止，再安装新版本。'
   # 1. Before the upgrade: the Notepad that has the wp4.1 DLL loaded, resolved by
-  # window ownership (the packaged Notepad's launcher is a different PID).
+  # window ownership (the packaged Notepad's launcher is a different PID). If no window
+  # is open, the step cannot test "old DLL against the new Host", so the owner opens one
+  # and types a few letters first - that is what loads the DLL.
   $oldWindow = Resolve-NotepadWindow -TimeoutMs 1500
   $oldNotepadId = 0
   if ($oldWindow.Window) { $oldNotepadId = $oldWindow.Window.Id }
-  Add-Result 'd' '升级前打开的记事本进程' $(if ($oldNotepadId -gt 0) {
-      "pid={0} path={1} title='{2}' because={3}" -f $oldNotepadId, $oldWindow.Window.Path, $oldWindow.Window.Title, $oldWindow.Reason
-    } else {
-      "none ($($oldWindow.Reason))"
-    })
-  if ($oldNotepadId -gt 0) {
-    $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
-    Add-Result 'd' '升级前该进程加载的 DLL（应为 wp4.1）' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
+  if ($oldNotepadId -eq 0) {
+    Write-Host ''
+    Write-Host '现在没有打开的记事本。这一步需要一个“升级前就已经加载 wp4.1 DLL”的窗口。'
+    Write-Host '请打开一个记事本，用 Fusion 输入几个字母（确认出中文），然后回到本窗口按 Enter。'
+    if (-not (Ask-Enter '打开记事本并输入几个字母后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+    $oldWindow = Resolve-NotepadWindow -TimeoutMs 10000
+    if ($oldWindow.Window) { $oldNotepadId = $oldWindow.Window.Id }
+    if ($oldNotepadId -eq 0) {
+      Stop-Walkthrough -Step 'd' -Command 'resolve a Notepad window before the upgrade' -Code 8 `
+        -Detail ("no Notepad window after the prompt: $($oldWindow.Reason)")
+    }
   }
+  Add-Result 'd' '升级前打开的记事本进程' ("pid={0} path={1} title='{2}' because={3}" -f
+    $oldNotepadId, $oldWindow.Window.Path, $oldWindow.Window.Title, $oldWindow.Reason)
+  $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
+  Add-Result 'd' '升级前该进程加载的 DLL（应为 wp4.1）' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)
   if (-not (Ask-Enter '记事本保持打开，按 Enter 开始升级（UAC）。')) { Write-Host '已放弃。'; exit 0 }
 
   # 2. Upgrade with that window open; a failure stops the walkthrough here.
@@ -745,7 +755,8 @@ if ($state.stage -eq 'd') {
   }
   Add-Result 'd' 'wp4.1 版本目录仍存在（应为是：仍在使用）' (Test-Path -LiteralPath $version1Dir)
   $inUseOld = Test-DirectoryInUse -Path $version1Dir
-  Add-Result 'd' 'wp4.1 目录当前是否被进程占用' ("inUse={0} pids={1}" -f $inUseOld.InUse, ($inUseOld.Pids -join ','))
+  Add-Result 'd' 'wp4.1 目录当前是否被进程占用（持有进程会列出，含 shell）' ("inUse={0} holders={1}" -f
+    $inUseOld.InUse, $(if ($inUseOld.Names.Count -gt 0) { $inUseOld.Names -join ', ' } else { '(none)' }))
 
   # 5. A genuinely new process: close every Notepad, wait for the one holding the
   # wp4.1 DLL to exit, then open one and assert the wp4.2 DLL in it.
@@ -767,8 +778,9 @@ if ($state.stage -eq 'd') {
   # 7. Record whether the wp4.1 directory is free now. It is not removed here: step
   # (e)'s uninstall (or the next install) cleans it up.
   $inUseAfter = Test-DirectoryInUse -Path $version1Dir
-  Add-Result 'd' 'wp4.1 目录现在是否可删除（本步不删）' ("present={0} inUse={1} pids={2}" -f
-    (Test-Path -LiteralPath $version1Dir), $inUseAfter.InUse, ($inUseAfter.Pids -join ','))
+  Add-Result 'd' 'wp4.1 目录现在是否可删除（本步不删）' ("present={0} inUse={1} holders={2}" -f
+    (Test-Path -LiteralPath $version1Dir), $inUseAfter.InUse,
+    $(if ($inUseAfter.Names.Count -gt 0) { $inUseAfter.Names -join ', ' } else { '(none)' }))
   $state.stage = 'e'
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
@@ -786,8 +798,9 @@ if ($state.stage -eq 'e') {
   # it, uninstall reports the directory as kept and that is recorded, not forced.
   $null = Confirm-NoNotepad -Step 'e' -RequireNoFusionDll -Fatal:$false
   $inUseBeforeUninstall = Test-DirectoryInUse -Path $version2Dir
-  Add-Result 'e' '卸载前 wp4.2 目录是否被进程占用' ("inUse={0} pids={1}" -f
-    $inUseBeforeUninstall.InUse, ($inUseBeforeUninstall.Pids -join ','))
+  Add-Result 'e' '卸载前 wp4.2 目录是否被进程占用（含 shell 进程）' ("inUse={0} holders={1}" -f
+    $inUseBeforeUninstall.InUse,
+    $(if ($inUseBeforeUninstall.Names.Count -gt 0) { $inUseBeforeUninstall.Names -join ', ' } else { '(none)' }))
   Add-UserInputResult 'e' '卸载前'
   if (-not (Ask-Enter '按 Enter 开始卸载（UAC）。')) { Write-Host '已放弃。'; exit 0 }
   $code = Invoke-ElevatedScript -ScriptPath $uninstall2 -LogName 'uninstall-keep-data.log' `
@@ -805,6 +818,12 @@ if ($state.stage -eq 'e') {
   Add-Result 'e' '安装根目录仍存在' (Test-Path -LiteralPath $installRoot)
   $remaining = @(Get-VersionDirectories)
   Add-Result 'e' '卸载后残留的版本目录（被占用而保留的会出现在这里）' $(if ($remaining.Count -gt 0) { $remaining -join ', ' } else { '(none)' })
+  $heldAfter = @()
+  foreach ($name in $remaining) {
+    $holders = Test-DirectoryInUse -Path (Join-Path $installRoot $name)
+    if ($holders.InUse) { $heldAfter += ("{0} held by {1}" -f $name, ($holders.Names -join ', ')) }
+  }
+  Add-Result 'e' '卸载后仍被占用的版本目录与持有进程（预期结果，不是失败）' $(if ($heldAfter.Count -gt 0) { $heldAfter -join '; ' } else { '(none)' })
   Add-Result 'e' '%APPDATA%\Fcitx5 保留' (Test-Path -LiteralPath (Join-Path $env:APPDATA 'Fcitx5'))
   Add-UserInputResult 'e' '卸载后'
 
@@ -840,6 +859,10 @@ if ($state.stage -eq 'f') {
   $null = Confirm-NoNotepad -Step 'f' -RequireNoFusionDll
   Write-Host '接下来会弹两次 UAC：先重装 wp4.2，再带 -RemoveUserData 卸载。'
   Add-UserInputResult 'f' '重装前'
+  $inUseBeforeReinstall = Test-DirectoryInUse -Path $version2Dir
+  Add-Result 'f' '重装前 wp4.2 目录是否被进程占用（相同文件会被跳过，不同文件才会写）' ("present={0} inUse={1} holders={2}" -f
+    (Test-Path -LiteralPath $version2Dir), $inUseBeforeReinstall.InUse,
+    $(if ($inUseBeforeReinstall.Names.Count -gt 0) { $inUseBeforeReinstall.Names -join ', ' } else { '(none)' }))
   if (-not (Ask-Enter '按 Enter 开始（UAC 两次）。')) { Write-Host '已放弃。'; exit 0 }
   $reinstallCommand = "install.ps1 $(Format-ArgumentList -Parameters @{ PackageDir = $state.package2Path })"
   $code = Invoke-ElevatedScript -ScriptPath $install2 -Parameters @{ PackageDir = $state.package2Path } `

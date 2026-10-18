@@ -260,15 +260,22 @@ function Remove-FusionUserInputState {
 # removing a version directory: a directory whose DLL an application still holds is
 # kept and reported, never force-deleted (and never partially deleted, which a
 # Remove-Item that fails halfway would do).
+#
+# Every process is checked, not only the ones a walkthrough starts: on Windows 11 the
+# input method is global, so once Fusion is used its DLL stays loaded in shell processes
+# (explorer.exe, WindowsTerminal.exe, ...) until sign-out, and those keep the directory
+# in use no matter how many Notepad windows are closed.
 function Test-DirectoryInUse {
   param([string]$Path)
   $prefix = $Path.TrimEnd('\') + '\'
   $pids = @()
+  $names = @()
   foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
     try {
       foreach ($module in $process.Modules) {
         if ($module.FileName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
           $pids += $process.Id
+          $names += "$($process.ProcessName)($($process.Id))"
           break
         }
       }
@@ -278,7 +285,87 @@ function Test-DirectoryInUse {
     }
   }
   $unique = @($pids | Sort-Object -Unique)
-  return [pscustomobject]@{ InUse = ($unique.Count -gt 0); Pids = $unique }
+  return [pscustomobject]@{
+    InUse = ($unique.Count -gt 0)
+    Pids  = $unique
+    Names = @($names | Sort-Object -Unique)
+  }
+}
+
+# Copies a package into a version directory, touching only what differs.
+#
+# A reinstall into an existing version directory must not touch an identical DLL that
+# processes still have mapped: on Windows 11 the input method is global, so
+# FusionTsf.dll stays loaded in shell processes (explorer.exe, WindowsTerminal.exe, ...)
+# until sign-out, and overwriting it would fail. A file whose SHA-256 already matches the
+# manifest is skipped; a file that really must change but is in use returns a failure
+# naming the file and every process holding it.
+function Copy-FusionPackageFiles {
+  param(
+    [Parameter(Mandatory = $true)][string]$PackageDir,
+    [Parameter(Mandatory = $true)][string]$VersionDir,
+    [Parameter(Mandatory = $true)]$Entries
+  )
+  $result = [pscustomobject]@{ Copied = 0; Skipped = 0; Files = 0; Failure = $null }
+  $expected = @{}
+  foreach ($entry in @($Entries)) { $expected[($entry.path -replace '/', '\')] = $entry.sha256 }
+  foreach ($relative in @($expected.Keys | Sort-Object)) {
+    $source = Join-Path $PackageDir $relative
+    $target = Join-Path $VersionDir $relative
+    if (Test-Path -LiteralPath $target) {
+      $existing = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+      if ($existing -eq $expected[$relative]) { $result.Skipped++; continue }
+    }
+    $parent = Split-Path -Parent $target
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+      New-Item -ItemType Directory -Force $parent | Out-Null
+    }
+    try {
+      Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+      $result.Copied++
+    } catch {
+      $holders = Get-FusionFileHolders -Path $target
+      $who = if ($holders.Names.Count -gt 0) {
+        $holders.Names -join ', '
+      } else {
+        'no process has it mapped; the file is locked by a handle this script cannot identify'
+      }
+      $result.Failure = ("cannot replace {0}: {1} (holding processes: {2})" -f
+        $relative, $_.Exception.Message.Trim(), $who)
+      return $result
+    }
+  }
+  # package.json is the manifest itself and is therefore not in its own file list.
+  $manifest = Join-Path $PackageDir 'package.json'
+  if (Test-Path -LiteralPath $manifest) {
+    Copy-Item -LiteralPath $manifest -Destination $VersionDir -Force
+  }
+  $result.Files = @(Get-ChildItem -LiteralPath $VersionDir -Recurse -File).Count
+  return $result
+}
+
+# The processes that have this exact file mapped as a module. Used by the installer when
+# a file that must change cannot be replaced: the error names the holders instead of
+# leaving a bare "access denied".
+function Get-FusionFileHolders {
+  param([string]$Path)
+  $pids = @()
+  $names = @()
+  foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+    try {
+      foreach ($module in $process.Modules) {
+        if ($module.FileName.Equals($Path, [StringComparison]::OrdinalIgnoreCase)) {
+          $pids += $process.Id
+          $names += "$($process.ProcessName)($($process.Id))"
+          break
+        }
+      }
+    } catch { }
+  }
+  return [pscustomobject]@{
+    Pids  = @($pids | Sort-Object -Unique)
+    Names = @($names | Sort-Object -Unique)
+  }
 }
 
 # Calls another PowerShell script and reports success without ever reading

@@ -148,7 +148,7 @@ try {
       $inUse = Test-DirectoryInUse -Path $directory.FullName
       if ($inUse.InUse) {
         $kept += $directory.Name
-        Write-Host "  kept $($directory.Name): in use by pid(s) $($inUse.Pids -join ',')" -ForegroundColor Yellow
+        Write-Host ("  kept {0}: in use by {1}" -f $directory.Name, ($inUse.Names -join ', ')) -ForegroundColor Yellow
         continue
       }
       try {
