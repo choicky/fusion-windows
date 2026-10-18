@@ -258,20 +258,28 @@ function Assert-StepExit {
 # The item-3 assertion, recorded and fatal on mismatch. Returns the check result so
 # the step can reuse the Notepad it started.
 #
-# A fresh Notepad loads the TIP only once the Fusion input method is active in it, so
-# a "not loaded" result first asks the owner to switch (Win+Space) and re-checks,
-# bounded. Any other failure stops immediately.
+# Two things this has to get right on this machine:
+#   * the process inspected is the one that owns the Notepad *window*, not the launcher
+#     PID that Process.Start returned (the packaged Windows 11 Notepad hands the window
+#     to another process and the launcher exits);
+#   * a Notepad loads the TIP only once the input method is active in it, so a "not
+#     loaded" result asks the owner to check the taskbar indicator first (Win+Space
+#     cycles, so it must only be pressed if Fusion is not already selected), then type
+#     a few letters, and only then re-checks — bounded. Any other failure stops at once.
 function Assert-InstalledTipInUse {
   param([string]$Step, [string]$VersionDir, [string]$ManifestPath, [int]$NotepadId = 0)
   $result = Test-InstalledTipInUse -VersionDir $VersionDir -ManifestPath $ManifestPath -NotepadId $NotepadId
-  for ($attempt = 1; $attempt -le 2; $attempt++) {
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
     $onlyNotLoaded = (-not $result.Ok) -and ($result.Failures.Count -eq 1) -and
-      ($result.Failures[0] -like 'Notepad: FusionTsf.dll is not loaded*')
+      ($result.Failures[0] -like '*FusionTsf.dll is not loaded*')
     if (-not $onlyNotLoaded) { break }
     Write-Host ''
-    Write-Host '刚打开的记事本还没有加载 Fusion（新窗口只有在切换到该输入法时才加载它）。' -ForegroundColor Yellow
-    Write-Host '请在那个记事本里按 Win+空格 切换到 Fusion 输入法。'
-    if (-not (Ask-Enter '切换后按 Enter，脚本会重新核对加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+    Write-Host '那个记事本窗口还没有加载 Fusion 的 DLL。请按这个顺序做（不要跳步）：' -ForegroundColor Yellow
+    Write-Host '  1. 先看任务栏右下角的输入指示器：如果它已经是 Fusion，就不要按 Win+空格（会切走）。'
+    Write-Host '     只有当它不是 Fusion 时，才按一次 Win+空格 切到 Fusion。'
+    Write-Host '  2. 在刚才那个记事本里输入几个字母（例如 nihao），让输入法真正被激活。'
+    Write-Host '  3. 再回到本窗口按 Enter，脚本会重新核对那个记事本进程加载的 DLL。'
+    if (-not (Ask-Enter '做完上面三步后按 Enter。')) { Write-Host '已放弃。'; exit 0 }
     $result = Test-InstalledTipInUse -VersionDir $VersionDir -ManifestPath $ManifestPath -NotepadId $result.Notepad.Id
   }
   if ($result.Host) {
@@ -282,6 +290,13 @@ function Assert-InstalledTipInUse {
   }
   Add-Result $Step '断言：注册' ("HKLM={0} HKCU={1} expected={2}" -f
     $result.Registration.Hklm, $(if ($result.Registration.Hkcu) { $result.Registration.Hkcu } else { '(none)' }), $result.Dll)
+  Add-Result $Step '断言：记事本进程的选择' $(if ($result.Notepad) {
+      "checked pid={0} path={1} title='{2}' because={3}; launcher pid={4}; visible Notepad windows={5}" -f
+        $result.Notepad.Id, $result.Notepad.Path, $result.Notepad.Title, $result.NotepadReason, $result.LauncherPid,
+        (($result.NotepadCandidates | ForEach-Object { "$($_.Id)" }) -join ',')
+    } else {
+      "not checked: $($result.NotepadReason)"
+    })
   Add-Result $Step '断言：记事本模块' $(if ($result.Notepad) {
       "pid={0} loaded={1} expected={2} sha256={3}" -f $result.Notepad.Id, $result.Loaded, $result.Dll, $result.Sha256
     } else {
@@ -393,7 +408,7 @@ $uninstall2 = Join-Path $version2Dir 'uninstall.ps1'
 if ($state.stage -eq 'a') {
   Write-Head '步骤 a：安装 wp4.1'
   Write-Host '接下来会弹出一次 UAC，请允许。安装完成后会自动启动 Host（无窗口、普通权限）。'
-  Write-Host '脚本随后会自己打开一个新的记事本，核对它加载的 DLL 与 Host，再请你输入。'
+  Write-Host '脚本随后会自己打开一个新的记事本，核对它的窗口所属进程加载的 DLL 与 Host，再请你输入。'
   if ($DryRun) {
     Write-Host ''
     Write-Host 'DRY RUN：已到达第一个所有者提示，未执行任何安装。' -ForegroundColor Yellow
@@ -422,7 +437,9 @@ if ($state.stage -eq 'a') {
 
   Write-Host ''
   Write-Host '请关闭所有已打开的记事本（旧的记事本仍加载着旧的 DLL），然后按 Enter。'
-  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本并核对它加载的 DLL。')) { Write-Host '已放弃。'; exit 0 }
+  if (-not (Ask-Enter '关闭所有记事本后按 Enter，脚本会自己打开一个新的记事本。')) { Write-Host '已放弃。'; exit 0 }
+  Write-Host '新记事本打开后：先看任务栏右下角的输入指示器——已经是 Fusion 就不要按 Win+空格（会切走），'
+  Write-Host '只有不是 Fusion 时才按一次；然后在记事本里输入几个字母（例如 nihao），再回到本窗口按 Enter。'
   $check = Assert-InstalledTipInUse -Step 'a' -VersionDir $version1Dir -ManifestPath (Join-Path $state.package1Path 'package.json')
   Write-Host ''
   Write-Host '请在新打开的记事本中输入 nihao 并按空格。如果输入法不是 Fusion，请按 Win+空格 切换。'
@@ -573,11 +590,17 @@ if ($state.stage -eq 'd') {
   Write-Head '步骤 d：在记事本保持打开的情况下升级到 wp4.2'
   Write-Host '请保持当前记事本窗口打开（不要关闭），然后按 Enter。升级会先请求旧 Host 有序停止，再安装新版本。'
   # The Notepad that loaded the wp4.1 DLL: recorded before the upgrade so its
-  # behaviour afterwards can be checked without closing it.
-  $oldNotepads = @(Get-Process -Name notepad -ErrorAction SilentlyContinue)
+  # behaviour afterwards can be checked without closing it. Resolved through the
+  # window owner, not through the first `notepad` process: the packaged Notepad's
+  # launcher is a different PID.
+  $oldWindow = Resolve-NotepadWindow -TimeoutMs 1500
   $oldNotepadId = 0
-  if ($oldNotepads.Count -gt 0) { $oldNotepadId = $oldNotepads[0].Id }
-  Add-Result 'd' '升级前打开的记事本 pid' $oldNotepadId
+  if ($oldWindow.Window) { $oldNotepadId = $oldWindow.Window.Id }
+  Add-Result 'd' '升级前打开的记事本 pid' $(if ($oldNotepadId -gt 0) {
+      "pid={0} path={1} title='{2}' because={3}" -f $oldNotepadId, $oldWindow.Window.Path, $oldWindow.Window.Title, $oldWindow.Reason
+    } else {
+      "none ($($oldWindow.Reason))"
+    })
   if ($oldNotepadId -gt 0) {
     $oldModule = Test-NotepadLoadedDll -ProcessId $oldNotepadId -DllPath (Join-Path $version1Dir 'bin\FusionTsf.dll') -Sha256 $null
     Add-Result 'd' '升级前旧记事本加载的 DLL' ("ok={0} loaded={1} {2}" -f $oldModule.Ok, $oldModule.Loaded, $oldModule.Reason)

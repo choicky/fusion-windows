@@ -10,6 +10,114 @@
 
 Set-StrictMode -Version 2.0
 
+# Enumerating visible top-level windows. Needed because on this machine notepad.exe is
+# the packaged Windows 11 Notepad (tabs): `Process.Start('notepad.exe')` returns a
+# launcher that hands the window to another process and exits, so the PID the harness
+# started is not the PID that owns the window the owner types in.
+if (-not ('FusionWindows' -as [type])) {
+  Add-Type -Namespace '' -Name 'FusionWindows' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool EnumWindows(EnumWindowsProc callback, System.IntPtr lParam);
+public delegate bool EnumWindowsProc(System.IntPtr hWnd, System.IntPtr lParam);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint processId);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool IsWindowVisible(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int GetWindowTextW(System.IntPtr hWnd, System.Text.StringBuilder text, int count);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int GetClassNameW(System.IntPtr hWnd, System.Text.StringBuilder text, int count);
+
+public static string[] VisibleWindows() {
+  var list = new System.Collections.Generic.List<string>();
+  EnumWindows(delegate(System.IntPtr hWnd, System.IntPtr lParam) {
+    if (!IsWindowVisible(hWnd)) { return true; }
+    var title = new System.Text.StringBuilder(512);
+    GetWindowTextW(hWnd, title, 512);
+    if (title.Length == 0) { return true; }
+    var cls = new System.Text.StringBuilder(256);
+    GetClassNameW(hWnd, cls, 256);
+    uint pid;
+    GetWindowThreadProcessId(hWnd, out pid);
+    list.Add(pid.ToString() + "|" + cls.ToString() + "|" + title.ToString());
+    return true;
+  }, System.IntPtr.Zero);
+  return list.ToArray();
+}
+'@
+}
+
+# Every Notepad window that is visible right now, as data. "Notepad window" means the
+# `Notepad` window class (both the classic and the packaged editor use it), with a
+# title check as a fallback if a future build renames the class.
+function Get-NotepadWindows {
+  $result = @()
+  $seen = @{}
+  foreach ($raw in [FusionWindows]::VisibleWindows()) {
+    $parts = $raw -split '\|', 3
+    if ($parts.Count -lt 3) { continue }
+    $processId = 0
+    if (-not [int]::TryParse($parts[0], [ref]$processId)) { continue }
+    $class = $parts[1]
+    $title = $parts[2]
+    # The window class is the reliable signal (classic and packaged Notepad both use
+    # `Notepad`). The title fallback must end with "- Notepad": another editor called
+    # "Notepad--" ends with "--" and must never be picked as the window to check.
+    if ($class -ne 'Notepad' -and $title -notlike '*- Notepad') { continue }
+    # The packaged app can report more than one top-level window with the same title;
+    # the record should list processes, not windows.
+    $key = "$processId|$title"
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if (-not $process) { continue }
+    $path = ''
+    try { $path = $process.Path } catch { }
+    $started = $null
+    try { $started = $process.StartTime } catch { }
+    $result += [pscustomobject]@{
+      Id        = $process.Id
+      Path      = $path
+      Title     = $title
+      Class     = $class
+      StartTime = $started
+    }
+  }
+  return @($result)
+}
+
+# The Notepad window the owner is looking at: the newest visible one, preferring a
+# window created at or after the launch (so an older Notepad the owner had open is not
+# mistaken for the one this run opened). Waits, bounded, for such a window to appear.
+function Resolve-NotepadWindow {
+  param(
+    [datetime]$StartedAfter = [datetime]::MinValue,
+    [int]$ExcludePid = 0,
+    [int]$TimeoutMs = 15000
+  )
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  while ($true) {
+    $candidates = @(Get-NotepadWindows | Where-Object { $_.Id -ne $ExcludePid })
+    $fresh = @($candidates | Where-Object { $_.StartTime -and $_.StartTime -ge $StartedAfter })
+    # @( ) around the if: an if-expression enumerates its output, so a one-element
+    # array would come back as a scalar and `.Count` would throw under strict mode.
+    $pool = @(if ($fresh.Count -gt 0) { $fresh } else { $candidates })
+    if ($pool.Count -gt 0) {
+      $chosen = $pool | Sort-Object -Property StartTime -Descending | Select-Object -First 1
+      $reason = if ($fresh.Count -gt 0) {
+        'newest visible Notepad window created at or after the launch'
+      } else {
+        'newest visible Notepad window (none was created after the launch)'
+      }
+      return [pscustomobject]@{ Window = $chosen; Reason = $reason; Candidates = $candidates }
+    }
+    if ((Get-Date) -ge $deadline) {
+      return [pscustomobject]@{ Window = $null; Reason = "no visible Notepad window within $TimeoutMs ms"; Candidates = $candidates }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+}
+
 # Builds a PowerShell argument list from a hashtable. Parameter NAMES are emitted
 # bare and only VALUES are quoted: a quoted '-PackageDir' is a string, so PowerShell
 # binds it positionally and the real value is lost (that is exactly how the 11:55
@@ -126,18 +234,33 @@ function Test-NotepadLoadedDll {
   return [pscustomobject]@{ Ok = [string]::IsNullOrEmpty($reason); Loaded = $loaded; Sha256 = $hash; Reason = $reason }
 }
 
-# Starts a Notepad and waits until its module list is readable.
+# Starts a Notepad the way the walkthrough always has and resolves the process that
+# actually owns its window.
+#
+# The returned object carries both PIDs: `LauncherPid` (what Process.Start returned,
+# which is dead within a second on the packaged Windows 11 Notepad) and `Window`
+# (the process to inspect). The caller checks `Window`, never the launcher.
 function Start-NotepadForCheck {
-  $process = [System.Diagnostics.Process]::Start('notepad.exe')
-  for ($attempt = 0; $attempt -lt 40; $attempt++) {
-    Start-Sleep -Milliseconds 250
-    try {
-      if ($process.Modules.Count -gt 0) { break }
-    } catch {
-      # The module list is not ready yet.
+  param([int]$TimeoutMs = 15000)
+  $launched = Get-Date
+  $launcher = [System.Diagnostics.Process]::Start('notepad.exe')
+  $resolution = Resolve-NotepadWindow -StartedAfter $launched.AddSeconds(-2) -TimeoutMs $TimeoutMs
+  $launcherAlive = $false
+  try { $launcherAlive = -not $launcher.HasExited } catch { }
+  $reason = $resolution.Reason
+  if ($resolution.Window) {
+    if ($launcher.Id -eq $resolution.Window.Id) {
+      $reason = "$reason; the launched pid is the window owner"
+    } else {
+      $reason = ("{0}; the launched pid {1} is not the window owner (alive={2})" -f $reason, $launcher.Id, $launcherAlive)
     }
   }
-  return $process
+  return [pscustomobject]@{
+    Window      = $resolution.Window
+    Reason      = $reason
+    Candidates  = $resolution.Candidates
+    LauncherPid = $launcher.Id
+  }
 }
 
 # The whole item-3 assertion: the Host that serves typing comes from the expected
@@ -145,7 +268,9 @@ function Start-NotepadForCheck {
 # really loaded that DLL (path + manifest hash).
 #
 # `NotepadId` reuses a Notepad the caller already started (step d keeps the old one
-# open on purpose); otherwise a fresh Notepad is started here.
+# open on purpose); otherwise a fresh Notepad is started here and the process that
+# owns its window is the one inspected - never the launcher PID that Process.Start
+# returned (see Start-NotepadForCheck).
 function Test-InstalledTipInUse {
   param(
     [string]$VersionDir,
@@ -174,23 +299,60 @@ function Test-InstalledTipInUse {
   # Only start a Notepad when the Host and registration already match: opening a
   # window on a run that is going to stop anyway helps nobody.
   $notepad = $null
+  $notepadReason = ''
+  $notepadCandidates = @()
+  $launcherPid = 0
   $module = $null
   if ($failures.Count -eq 0) {
-    if ($NotepadId -gt 0) { $notepad = Get-Process -Id $NotepadId -ErrorAction SilentlyContinue }
-    if (-not $notepad) { $notepad = Start-NotepadForCheck }
-    $module = Test-NotepadLoadedDll -ProcessId $notepad.Id -DllPath $dll -Sha256 $sha
-    if (-not $module.Ok) { $failures += "Notepad: $($module.Reason)" }
+    if ($NotepadId -gt 0) {
+      # Reuse the process the previous attempt resolved. It is rebuilt into the same
+      # shape as a resolved window (Id/Path/Title/Class/StartTime) so callers never
+      # depend on which source it came from.
+      $existing = Get-Process -Id $NotepadId -ErrorAction SilentlyContinue
+      if ($existing) {
+        $existingPath = ''
+        try { $existingPath = $existing.Path } catch { }
+        $existingTitle = ''
+        try { $existingTitle = $existing.MainWindowTitle } catch { }
+        $existingStarted = $null
+        try { $existingStarted = $existing.StartTime } catch { }
+        $notepad = [pscustomobject]@{
+          Id        = $existing.Id
+          Path      = $existingPath
+          Title     = $existingTitle
+          Class     = 'Notepad'
+          StartTime = $existingStarted
+        }
+        $notepadReason = 'the process the caller asked for'
+      }
+    }
+    if (-not $notepad) {
+      $started = Start-NotepadForCheck
+      $notepad = $started.Window
+      $notepadReason = $started.Reason
+      $notepadCandidates = @($started.Candidates)
+      $launcherPid = $started.LauncherPid
+    }
+    if (-not $notepad) {
+      $failures += "no Notepad window to check: $notepadReason"
+    } else {
+      $module = Test-NotepadLoadedDll -ProcessId $notepad.Id -DllPath $dll -Sha256 $sha
+      if (-not $module.Ok) { $failures += "Notepad pid $($notepad.Id) ($notepadReason): $($module.Reason)" }
+    }
   }
 
   return [pscustomobject]@{
-    Ok           = ($failures.Count -eq 0)
-    Failures     = $failures
-    Host         = $hostProcess
-    Registration = $registration
-    Notepad      = $notepad
-    Dll          = $dll
-    Sha256       = $sha
-    Loaded       = if ($module) { $module.Loaded } else { '' }
+    Ok                = ($failures.Count -eq 0)
+    Failures          = $failures
+    Host              = $hostProcess
+    Registration      = $registration
+    Notepad           = $notepad
+    NotepadReason     = $notepadReason
+    NotepadCandidates = $notepadCandidates
+    LauncherPid       = $launcherPid
+    Dll               = $dll
+    Sha256            = $sha
+    Loaded            = if ($module) { $module.Loaded } else { '' }
   }
 }
 
