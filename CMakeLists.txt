@@ -66,6 +66,7 @@ if(WIN32 AND MSVC)
     add_executable(FusionHostExe
       src/host/main.cpp
       src/host/host_server.cpp
+      src/host/host_diag.cpp
       src/ipc/pipe_server.cpp
       src/ipc/pipe_security.cpp)
     target_include_directories(FusionHostExe PRIVATE include src)
@@ -146,6 +147,7 @@ if(BUILD_TESTING)
       src/ipc/pipe_security.cpp
       src/ipc/ipc_backend.cpp
       src/host/host_server.cpp
+      src/host/host_diag.cpp
       src/tsf/key_map.cpp
       src/tsf/semantic.cpp)
     target_include_directories(stage4a PRIVATE src)
@@ -161,6 +163,7 @@ if(BUILD_TESTING)
     add_test(NAME stage4a_ipc_wp3shutdown COMMAND stage4a wp3shutdown)
     add_test(NAME stage4a_ipc_wp4stopevent COMMAND stage4a wp4stopevent)
     add_test(NAME stage4a_ipc_wp4sessionend COMMAND stage4a wp4sessionend)
+    add_test(NAME stage4a_ipc_hostdiag COMMAND stage4a hostdiag)
     if(FUSION_WITH_FCITX5)
       target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
       target_link_libraries(stage4a PRIVATE FusionFcitxHost)
@@ -182,6 +185,7 @@ if(BUILD_TESTING)
       src/ipc/pipe_security.cpp
       src/ipc/ipc_backend.cpp
       src/host/host_server.cpp
+      src/host/host_diag.cpp
       src/tsf/key_map.cpp
       src/tsf/semantic.cpp)
     target_include_directories(stage4b PRIVATE src)

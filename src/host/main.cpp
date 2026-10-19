@@ -32,6 +32,7 @@
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
+#include "host/host_diag.hpp"
 #include "host/host_server.hpp"
 #include "ipc/pipe_security.hpp"
 
@@ -96,8 +97,12 @@ HANDLE exit_complete = nullptr;
 // forced termination.
 constexpr DWORD console_exit_timeout_ms = 4000;
 
-// Requests the stop; never drains, joins or touches the backend.
-void request_host_stop() {
+// Requests the stop; never drains, joins or touches the backend. `path` names the
+// caller for the diagnostic log (R30): stop event, session end, window close or
+// console control. The log line is written before taking the server lock, so it can
+// never extend the session-end bounded wait.
+void request_host_stop(const char *path) {
+  fusion::host::diag::event("stop_requested", (std::string("path=") + path).c_str());
   std::lock_guard lock(host_server_mutex);
   if (host_server != nullptr)
     host_server->request_stop();
@@ -109,7 +114,8 @@ BOOL WINAPI console_control(DWORD type) {
   case CTRL_BREAK_EVENT:
     // main() keeps running after this handler, so only request the stop; main() then
     // performs the whole ordered shutdown on its own thread.
-    request_host_stop();
+    fusion::host::diag::event("console_control", ("type=" + std::to_string(type)).c_str());
+    request_host_stop("console_control");
     return TRUE;
   case CTRL_CLOSE_EVENT:
   case CTRL_LOGOFF_EVENT:
@@ -121,7 +127,8 @@ BOOL WINAPI console_control(DWORD type) {
     // anyway and Fcitx's forced-termination semantics apply.
     std::fprintf(stderr, "[FusionHost] console control %lu: waiting for the orderly exit\n",
                  static_cast<unsigned long>(type));
-    request_host_stop();
+    fusion::host::diag::event("console_control", ("type=" + std::to_string(type)).c_str());
+    request_host_stop("console_control");
     if (exit_complete != nullptr)
       WaitForSingleObject(exit_complete, console_exit_timeout_ms);
     return TRUE;
@@ -212,13 +219,16 @@ void prepare_console_mode() {
   }
 }
 
-int run(const std::vector<std::wstring> &arguments) {
+int run_host(const std::vector<std::wstring> &arguments) {
   const bool console_mode = has_switch(arguments, L"--console");
   if (console_mode)
     prepare_console_mode();
   auto pipe_name = parse_pipe_name(arguments);
   std::fprintf(stderr, "[FusionHost] starting with pipe: %ls\n", pipe_name.c_str());
   std::fprintf(stderr, "[FusionHost] mode: %s\n", console_mode ? "console" : "windowless");
+  fusion::host::diag::event("start", ("pipe=" + fusion::host::diag::utf8(pipe_name) +
+                                      " mode=" + (console_mode ? "console" : "windowless"))
+                                         .c_str());
 
   // A5: claim the Host singleton before creating the backend, so a Host that is
   // not the singleton never constructs Fcitx, which would load the user profile
@@ -228,9 +238,12 @@ int run(const std::vector<std::wstring> &arguments) {
   if (!claim.held()) {
     std::fprintf(stderr, "[FusionHost] another Host already owns this pipe name; exiting without "
                          "touching user data\n");
+    fusion::host::diag::event("singleton_claim", "ok=0 action=exit");
     return 1;
   }
   std::fprintf(stderr, "[FusionHost] singleton claim: %ls\n", claim.name().c_str());
+  fusion::host::diag::event("singleton_claim",
+                            ("ok=1 name=" + fusion::host::diag::utf8(claim.name())).c_str());
 
   // WP4: the named stop event is created before the backend exists, for the same
   // reason as the claim: a Host that cannot be stopped orderly must not start
@@ -240,9 +253,12 @@ int run(const std::vector<std::wstring> &arguments) {
     std::fprintf(stderr,
                  "[FusionHost] cannot create the stop event; refusing to run without an orderly "
                  "stop path\n");
+    fusion::host::diag::event("stop_event", "ok=0 action=exit");
     return 1;
   }
   std::fprintf(stderr, "[FusionHost] stop event: %ls\n", stop_event.name().c_str());
+  fusion::host::diag::event("stop_event",
+                            ("ok=1 name=" + fusion::host::diag::utf8(stop_event.name())).c_str());
 
   // U1: the product Host persists through Fcitx's own per-user paths. The skip
   // switch exists for automated tests and fixtures that spawn this Host; it is
@@ -251,10 +267,12 @@ int run(const std::vector<std::wstring> &arguments) {
   const bool user_path = !env_flag("FUSION_FCITX_SKIP_USER_PATH");
   if (user_path) {
     std::fprintf(stderr, "[FusionHost] Fcitx user path: standard (per-user Fcitx paths)\n");
+    fusion::host::diag::event("fcitx_user_path", "enabled=1");
   } else {
     std::fprintf(stderr,
                  "[FusionHost] WARNING: FUSION_FCITX_SKIP_USER_PATH is set - Fcitx user data is "
                  "DISABLED (no persistence, no user dictionary)\n");
+    fusion::host::diag::event("fcitx_user_path", "enabled=0");
   }
 
   std::unique_ptr<fusion::Backend> backend;
@@ -262,18 +280,23 @@ int run(const std::vector<std::wstring> &arguments) {
     backend = fusion::make_fcitx_backend(fusion::FcitxBackendOptions{user_path});
   } catch (const std::exception &e) {
     std::fprintf(stderr, "[FusionHost] Fcitx backend creation failed: %s\n", e.what());
+    fusion::host::diag::event("backend_create_failed", ("error=" + std::string(e.what())).c_str());
     return 1;
   }
   if (!backend) {
     std::fprintf(stderr, "[FusionHost] Fcitx backend creation returned null\n");
+    fusion::host::diag::event("backend_create_failed", "error=null");
     return 1;
   }
   std::fprintf(stderr, "[FusionHost] Fcitx backend ready, session=%llu\n",
                static_cast<unsigned long long>(backend->session_id()));
+  fusion::host::diag::event("backend_ready",
+                            ("session=" + std::to_string(backend->session_id())).c_str());
 
   exit_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (exit_complete == nullptr) {
     std::fprintf(stderr, "[FusionHost] cannot create the exit signal\n");
+    fusion::host::diag::event("exit_signal", "ok=0 action=exit");
     return 1;
   }
 
@@ -285,10 +308,11 @@ int run(const std::vector<std::wstring> &arguments) {
     // The window procedure only delegates the session-end decision; it is created
     // before the window thread starts and released after that thread is joined.
     session_end_handler = std::make_unique<fusion::ipc::SessionEndHandler>(
-        [] { request_host_stop(); }, exit_complete, console_exit_timeout_ms);
+        [](const char *path) { request_host_stop(path); }, exit_complete, console_exit_timeout_ms);
     HANDLE window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (window_ready == nullptr) {
       std::fprintf(stderr, "[FusionHost] cannot create the window-start signal\n");
+      fusion::host::diag::event("session_end_window", "ok=0 reason=start_signal action=exit");
       return 1;
     }
     window_thread = std::thread(run_session_end_window, window_ready);
@@ -298,6 +322,7 @@ int run(const std::vector<std::wstring> &arguments) {
       std::fprintf(stderr,
                    "[FusionHost] cannot create the session-end window; refusing to run without a "
                    "logoff/shutdown path\n");
+      fusion::host::diag::event("session_end_window", "ok=0 reason=create_window action=exit");
       SetEvent(exit_complete);
       window_thread.join();
       return 1;
@@ -310,6 +335,7 @@ int run(const std::vector<std::wstring> &arguments) {
     fusion::ipc::HostServer server(std::move(backend), pipe_name, 0);
     if (!server.start()) {
       std::fprintf(stderr, "[FusionHost] failed to initialize server\n");
+      fusion::host::diag::event("server_start", "ok=0 action=exit");
       SetEvent(exit_complete);
       if (window_thread.joinable()) {
         PostMessageW(session_end_window, WM_CLOSE, 0, 0);
@@ -321,6 +347,8 @@ int run(const std::vector<std::wstring> &arguments) {
     // one for client-side fencing; it is an engineering identity, not a frozen ID.
     std::fprintf(stderr, "[FusionHost] incarnation=%llu\n",
                  static_cast<unsigned long long>(server.incarnation()));
+    fusion::host::diag::event("incarnation",
+                              ("value=" + std::to_string(server.incarnation())).c_str());
 
     {
       std::lock_guard lock(host_server_mutex);
@@ -328,21 +356,29 @@ int run(const std::vector<std::wstring> &arguments) {
     }
     // The stop-event waiter only requests the stop; it never drains, joins or
     // touches the backend. It ends when the Host exits (exit_complete).
-    std::thread stop_watcher([&server, &stop_event] {
+    std::thread stop_watcher([&stop_event] {
       if (fusion::ipc::wait_for_stop_request(stop_event.handle(), exit_complete))
-        server.request_stop();
+        request_host_stop("stop_event");
     });
     if (console_mode)
       SetConsoleCtrlHandler(console_control, TRUE);
     std::fprintf(stderr, "[FusionHost] entering accept loop\n");
+    fusion::host::diag::event("accept_loop",
+                              ("pipe=" + fusion::host::diag::utf8(pipe_name)).c_str());
     server.run();
     // Ordered shutdown, entirely on this thread: end the accept loop and join every
     // connection thread first, then destroy the backend — which runs its orderly
     // shutdown and therefore Fcitx's own save on instance exit. The console handler,
     // the session-end window and the stop event can only have requested the stop, so
     // none of them can race the drain or the save.
+    fusion::host::diag::event("ordered_shutdown_begin", "accept_loop=ended");
     server.stop();
+    fusion::host::diag::event("backend_shutdown_begin", "fcitx_save=on_exit");
+    const ULONGLONG backend_shutdown_started = GetTickCount64();
     server.shutdown_backend();
+    fusion::host::diag::event(
+        "backend_shutdown_end",
+        ("elapsed_ms=" + std::to_string(GetTickCount64() - backend_shutdown_started)).c_str());
     {
       // No handler can be inside the server after this point, so leaving the scope
       // (and destroying it) is safe.
@@ -365,7 +401,17 @@ int run(const std::vector<std::wstring> &arguments) {
   CloseHandle(exit_complete);
   exit_complete = nullptr;
   std::fprintf(stderr, "[FusionHost] shutting down\n");
+  fusion::host::diag::event("shutting_down", "");
   return 0;
+}
+
+// R30: the opt-in is read exactly once, before anything else runs, and every exit
+// path (including the early refusals) records one exit line.
+int run(const std::vector<std::wstring> &arguments) {
+  fusion::host::diag::initialize();
+  const int code = run_host(arguments);
+  fusion::host::diag::event("exit", ("code=" + std::to_string(code)).c_str());
+  return code;
 }
 
 } // namespace

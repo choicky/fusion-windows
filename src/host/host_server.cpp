@@ -1,5 +1,7 @@
 #include "host/host_server.hpp"
 
+#include "host/host_diag.hpp"
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -11,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace fusion::ipc {
 
@@ -45,6 +48,17 @@ std::wstring principal_suffix(const std::wstring &pipe_name) {
     }
   }
   return suffix;
+}
+
+// R30: one technical detail line for a failed pipe operation. The kind says which
+// operation failed; the error is the Win32 code the transport recorded.
+std::string io_failure_detail(std::uint64_t connection_id, const char *kind, std::uint32_t error) {
+  std::string details = "connection=" + std::to_string(connection_id) + " kind=" + kind +
+                        " error=" + std::to_string(error);
+  if (error == ERROR_TIMEOUT) {
+    details += " timeout=1";
+  }
+  return details;
 }
 
 } // namespace
@@ -151,16 +165,21 @@ std::intptr_t SessionEndHandler::handle(unsigned int message, std::uintptr_t wpa
     // Answer TRUE and stop nothing: the logoff/shutdown can still be cancelled
     // after this message (an application asks to save and the user cancels), and a
     // Host that stopped here would stay gone until the next logon.
+    fusion::host::diag::event("session_end_decision", "query=answered_true action=none");
     return TRUE;
   case WM_ENDSESSION:
     if (wparam == FALSE) {
-      return 0; // the session end was cancelled: nothing to do
+      // The session end was cancelled: nothing to do.
+      fusion::host::diag::event("session_end_decision", "endsession=false action=none");
+      return 0;
     }
+    fusion::host::diag::event("session_end_decision",
+                              "endsession=true action=request_stop_and_wait");
     // The session is really ending. Request the stop and wait (bounded) for main()
     // to finish the ordered shutdown, including Fcitx's own save.
     std::fprintf(stderr, "[FusionHost] session end: waiting for the orderly exit\n");
     if (request_stop_) {
-      request_stop_();
+      request_stop_("session_end");
     }
     if (exit_complete_ != nullptr) {
       WaitForSingleObject(static_cast<HANDLE>(exit_complete_), timeout_ms_);
@@ -174,14 +193,16 @@ std::intptr_t SessionEndHandler::handle(unsigned int message, std::uintptr_t wpa
 bool SessionEndHandler::close_keeps_window() {
   if (exit_complete_ != nullptr &&
       WaitForSingleObject(static_cast<HANDLE>(exit_complete_), 0) == WAIT_OBJECT_0) {
+    fusion::host::diag::event("window_close", "decision=destroy reason=exit_complete");
     return false; // main() has finished the orderly exit: this close is its own
   }
   // An external close before the exit would otherwise leave the Host running with no
   // logoff/shutdown path. Ask for the same orderly stop a session end would, and keep
   // the window: main() closes it after exit_complete is set.
   std::fprintf(stderr, "[FusionHost] window close: requesting the orderly exit\n");
+  fusion::host::diag::event("window_close", "decision=keep_and_stop");
   if (request_stop_) {
-    request_stop_();
+    request_stop_("window_close");
   }
   return true;
 }
@@ -301,9 +322,15 @@ void HostServer::accept_loop() {
     if (!pipe->create()) {
       if (was_first) {
         std::fprintf(stderr, "[FusionHost] first pipe instance create failed, exiting\n");
+        fusion::host::diag::event(
+            "pipe_create",
+            ("first=1 ok=0 error=" + std::to_string(pipe->last_error()) + " action=exit").c_str());
         std::exit(1);
       }
       std::fprintf(stderr, "[FusionHost] pipe create failed, retrying...\n");
+      fusion::host::diag::event(
+          "pipe_create",
+          ("first=0 ok=0 error=" + std::to_string(pipe->last_error()) + " action=retry").c_str());
       Sleep(100);
       continue;
     }
@@ -315,9 +342,12 @@ void HostServer::accept_loop() {
     }
     if (!running_)
       break; // stop() woke this iteration: nothing to serve
+    const std::uint64_t connection_id = next_connection_id_.fetch_add(1);
     std::fprintf(stderr, "[FusionHost] client connected\n");
+    fusion::host::diag::event("client_connected",
+                              ("connection=" + std::to_string(connection_id)).c_str());
     auto connection = std::make_unique<Connection>(std::move(pipe), *backend_, backend_mutex_,
-                                                   next_host_context_, incarnation_);
+                                                   next_host_context_, incarnation_, connection_id);
     Connection *raw = connection.get();
     // A finished connection is reaped on the next accepted connection, so the
     // retained entries stay bounded by the live connections plus one completed
@@ -354,6 +384,8 @@ void HostServer::Connection::run() {
     auto frame = pipe->recv_frame(std::chrono::milliseconds(0)); // block indefinitely
     if (!frame) {
       std::fprintf(stderr, "[FusionHost] client read failed, disconnecting\n");
+      fusion::host::diag::event("client_read_failed",
+                                io_failure_detail(id, "recv", pipe->last_error()).c_str());
       break;
     }
     switch (frame->type) {
@@ -369,24 +401,41 @@ void HostServer::Connection::run() {
     case MessageType::SendRequest:
       handle_send(frame->payload);
       break;
-    default:
-      std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, disconnecting\n",
-                   static_cast<unsigned>(static_cast<std::uint8_t>(frame->type)));
+    default: {
+      const unsigned type = static_cast<unsigned>(static_cast<std::uint8_t>(frame->type));
+      std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, disconnecting\n", type);
+      char details[96];
+      std::snprintf(details, sizeof(details), "connection=%llu type=0x%02x",
+                    static_cast<unsigned long long>(id), type);
+      fusion::host::diag::event("unknown_message", details);
       pipe->disconnect_client();
       break;
+    }
     }
   }
 
   // Unbind all contexts owned by this connection.
   unbind_all();
   std::fprintf(stderr, "[FusionHost] client disconnected, contexts unbound\n");
+  fusion::host::diag::event("client_disconnected",
+                            ("connection=" + std::to_string(id) + " contexts_unbound=1").c_str());
 }
 
 void HostServer::Connection::handle_hello() {
   auto frame = pipe->recv_frame(std::chrono::milliseconds(5000));
-  if (!frame || frame->type != MessageType::HelloRequest) {
-    std::fprintf(stderr, "[FusionHost] expected Hello, got type=0x%02x\n",
-                 frame ? static_cast<unsigned>(static_cast<std::uint8_t>(frame->type)) : 0);
+  if (!frame) {
+    std::fprintf(stderr, "[FusionHost] expected Hello, got type=0x%02x\n", 0u);
+    fusion::host::diag::event("hello", io_failure_detail(id, "recv", pipe->last_error()).c_str());
+    pipe->disconnect_client();
+    return;
+  }
+  if (frame->type != MessageType::HelloRequest) {
+    const unsigned type = static_cast<unsigned>(static_cast<std::uint8_t>(frame->type));
+    std::fprintf(stderr, "[FusionHost] expected Hello, got type=0x%02x\n", type);
+    char details[96];
+    std::snprintf(details, sizeof(details), "connection=%llu kind=unexpected_type type=0x%02x",
+                  static_cast<unsigned long long>(id), type);
+    fusion::host::diag::event("hello", details);
     pipe->disconnect_client();
     return;
   }
@@ -399,6 +448,10 @@ void HostServer::Connection::handle_hello() {
   }
 
   std::vector<std::uint8_t> response_payload;
+  fusion::host::diag::event(
+      "hello", ("connection=" + std::to_string(id) + " version=" + std::to_string(*client_version) +
+                (*client_version == protocol_version ? " ok=1" : " ok=0 reason=version_mismatch"))
+                   .c_str());
   if (*client_version != protocol_version) {
     // Version mismatch: respond with version=0.
     detail::write_u32(response_payload, 0);
@@ -513,6 +566,8 @@ void HostServer::Connection::send_response(MessageType type,
   frame.payload = envelop_response(incarnation, payload);
   if (!pipe->send_frame(frame)) {
     std::fprintf(stderr, "[FusionHost] send failed, disconnecting client\n");
+    fusion::host::diag::event("send_failed",
+                              io_failure_detail(id, "send", pipe->last_error()).c_str());
     pipe->disconnect_client();
   }
 }

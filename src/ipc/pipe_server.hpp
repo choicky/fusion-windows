@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <string>
 
 namespace fusion::ipc {
@@ -33,6 +34,11 @@ public:
   std::optional<WireFrame>
   recv_frame(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
 
+  // R30: the Win32 error of the last failed operation on this instance (0 when the
+  // last one succeeded or did not fail). Technical only — the Host records it in its
+  // diagnostic log; it never changes behaviour.
+  std::uint32_t last_error() const { return last_error_.load(); }
+
 private:
   std::wstring pipe_name_;
   bool first_instance_;
@@ -40,6 +46,7 @@ private:
   // Owned by the serving thread, but also cleared from another thread when
   // HostServer::stop() disconnects the client.
   std::atomic<bool> client_connected_{false};
+  std::atomic<std::uint32_t> last_error_{0};
   SECURITY_ATTRIBUTES security_attrs_{};
 
   bool write_all(const void *data, std::size_t size);

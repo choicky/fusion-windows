@@ -22,6 +22,8 @@
 //   and waits, bounded; an external WM_CLOSE before the exit requests the same stop
 //   and keeps the window (Stage 6 WP4; R34 clarifies that surviving a cancelled end is
 //   the task's event trigger, not this decision).
+// - hostdiag: the R30 opt-in Host diagnostic log — off by default, file and line
+//   format when enabled, privacy-marker redaction, the size cap and retention.
 // - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
 //   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
 //   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
@@ -39,6 +41,7 @@
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
+#include "host/host_diag.hpp"
 #include "host/host_server.hpp"
 #include "ipc/ipc_backend.hpp"
 #include "ipc/pipe_security.hpp"
@@ -51,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -1709,7 +1713,8 @@ void test_session_end() {
   require(exit_complete != nullptr, "session-end exit signal created");
   int requests = 0;
   constexpr unsigned long timeout_ms = 300;
-  fusion::ipc::SessionEndHandler handler([&requests] { requests++; }, exit_complete, timeout_ms);
+  fusion::ipc::SessionEndHandler handler([&requests](const char *) { requests++; }, exit_complete,
+                                         timeout_ms);
 
   require(fusion::ipc::SessionEndHandler::handles(WM_QUERYENDSESSION), "query-end is handled");
   require(fusion::ipc::SessionEndHandler::handles(WM_ENDSESSION), "end-session is handled");
@@ -1746,8 +1751,8 @@ void test_session_end() {
     HANDLE close_exit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     require(close_exit != nullptr, "close-test exit signal created");
     int close_requests = 0;
-    fusion::ipc::SessionEndHandler close_handler([&close_requests] { close_requests++; },
-                                                 close_exit, timeout_ms);
+    fusion::ipc::SessionEndHandler close_handler(
+        [&close_requests](const char *) { close_requests++; }, close_exit, timeout_ms);
     require(close_handler.close_keeps_window(),
             "an external WM_CLOSE keeps the window before the exit");
     require(close_requests == 1, "an external WM_CLOSE requests the orderly stop");
@@ -1762,6 +1767,186 @@ void test_session_end() {
                "WM_ENDSESSION(TRUE) requests the stop and waits, bounded; an external "
                "WM_CLOSE before the exit requests the same stop instead of removing the "
                "window\n";
+}
+
+// ---------------------------------------------------------------------------
+// R30: the opt-in Host diagnostic log
+// ---------------------------------------------------------------------------
+//
+// The module keeps process-wide state, so the paths run in order in this one
+// process: off, opt-in, redaction, size cap, retention. %LOCALAPPDATA% is
+// redirected to a private root, so the real profile is never touched.
+
+namespace host_diag_test {
+
+bool exists(const std::string &path) {
+  return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::string read_all(const std::string &path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(input)), {});
+}
+
+unsigned long long size_of(const std::string &path) {
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data))
+    return 0;
+  ULARGE_INTEGER value{};
+  value.LowPart = data.nFileSizeLow;
+  value.HighPart = data.nFileSizeHigh;
+  return value.QuadPart;
+}
+
+void write_text(const std::string &path, const std::string &text) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << text;
+}
+
+// Gives a fixture an age so retention has a defined order.
+void set_age_hours(const std::string &path, int hours) {
+  HANDLE file = CreateFileA(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  require(file != INVALID_HANDLE_VALUE, "open a retention fixture");
+  FILETIME now{};
+  GetSystemTimeAsFileTime(&now);
+  ULARGE_INTEGER value{};
+  value.LowPart = now.dwLowDateTime;
+  value.HighPart = now.dwHighDateTime;
+  value.QuadPart -= static_cast<unsigned long long>(hours) * 3600ull * 10000000ull;
+  FILETIME stamp{};
+  stamp.dwLowDateTime = value.LowPart;
+  stamp.dwHighDateTime = value.HighPart;
+  SetFileTime(file, nullptr, nullptr, &stamp);
+  CloseHandle(file);
+}
+
+int count_logs(const std::string &directory) {
+  WIN32_FIND_DATAA data{};
+  HANDLE find = FindFirstFileA((directory + "\\fusion-host-*.log").c_str(), &data);
+  if (find == INVALID_HANDLE_VALUE)
+    return 0;
+  int count = 0;
+  do {
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+      ++count;
+  } while (FindNextFileA(find, &data) != 0);
+  FindClose(find);
+  return count;
+}
+
+void remove_tree(const std::string &directory) {
+  WIN32_FIND_DATAA data{};
+  HANDLE find = FindFirstFileA((directory + "\\*").c_str(), &data);
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      if (std::strcmp(data.cFileName, ".") == 0 || std::strcmp(data.cFileName, "..") == 0)
+        continue;
+      const std::string child = directory + "\\" + data.cFileName;
+      if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        remove_tree(child);
+      else
+        DeleteFileA(child.c_str());
+    } while (FindNextFileA(find, &data) != 0);
+    FindClose(find);
+  }
+  RemoveDirectoryA(directory.c_str());
+}
+
+} // namespace host_diag_test
+
+void test_host_diag() {
+  namespace diag = fusion::host::diag;
+  using namespace host_diag_test;
+
+  char temp[MAX_PATH]{};
+  require(GetTempPathA(MAX_PATH, temp) != 0, "GetTempPath failed");
+  const std::string root =
+      std::string(temp) + "fusion-host-diag-" + std::to_string(GetCurrentProcessId());
+  const std::string retention_root = root + "-retention";
+  remove_tree(root);
+  remove_tree(retention_root);
+  require(CreateDirectoryA(root.c_str(), nullptr) != 0, "create the diagnostic test root");
+  require(SetEnvironmentVariableA("LOCALAPPDATA", root.c_str()) != 0, "redirect LOCALAPPDATA");
+  const std::string directory = root + "\\fusion-host";
+  const std::string file =
+      directory + "\\fusion-host-" + std::to_string(GetCurrentProcessId()) + ".log";
+
+  // 1. Off by default: no directory, no file, no work.
+  diag::reset_for_tests();
+  SetEnvironmentVariableA("FUSION_HOST_DIAGNOSTICS", nullptr);
+  diag::initialize();
+  require(!diag::enabled(), "the Host log is on without the opt-in");
+  diag::event("off_probe", "x=1");
+  require(!exists(directory), "a directory was created while the log was off");
+  std::cout << "PASS R30 host diag: off by default (no directory, no file)\n";
+
+  // 2. Opt-in (case-insensitive), file created at startup.
+  diag::reset_for_tests();
+  SetEnvironmentVariableA("FUSION_HOST_DIAGNOSTICS", "On");
+  diag::initialize();
+  require(diag::enabled(), "the opt-in did not enable the Host log");
+  require(exists(file), "the log file was not created at startup");
+  diag::event("startup_probe", "x=1");
+  std::string contents = read_all(file);
+  require(contents.find("startup_probe x=1") != std::string::npos, "the startup event is missing");
+  require(contents.rfind("ts=", 0) == 0, "the line format does not start with ts=");
+  require(contents.find("pid=" + std::to_string(GetCurrentProcessId())) != std::string::npos,
+          "the line format does not carry the pid");
+  std::cout << "PASS R30 host diag: opt-in creates the file with the expected startup line\n";
+
+  // 3. Privacy markers are redacted.
+  diag::event("policy_probe", "vk=0x41 text=secret");
+  contents = read_all(file);
+  require(contents.find("policy_probe privacy=redacted") != std::string::npos,
+          "a marker-bearing detail was not redacted");
+  require(contents.find("vk=") == std::string::npos, "key data reached the Host log");
+  std::cout << "PASS R30 host diag: privacy markers are redacted\n";
+
+  // 4. Size cap: the file is recreated empty once it reaches the bound.
+  diag::event("before_cap", "x=1");
+  const std::string filler(900, 'a');
+  for (int i = 0; i < 3000; ++i)
+    diag::event("cap_probe", ("pad=" + filler).c_str());
+  const unsigned long long capped = size_of(file);
+  require(capped > 0 && capped <= diag::kMaxFileBytes, "the Host log exceeded its bound");
+  contents = read_all(file);
+  require(contents.find("before_cap") == std::string::npos, "the log was not truncated at the cap");
+  require(contents.find("cap_probe") != std::string::npos, "the log stopped writing after the cap");
+  std::cout << "PASS R30 host diag: the size cap truncates and keeps writing (" << capped
+            << " bytes)\n";
+
+  // 5. Retention: the newest four old files stay, older ones go, nothing else is touched.
+  require(CreateDirectoryA(retention_root.c_str(), nullptr) != 0, "create the retention root");
+  require(SetEnvironmentVariableA("LOCALAPPDATA", retention_root.c_str()) != 0,
+          "redirect LOCALAPPDATA");
+  const std::string retention_directory = retention_root + "\\fusion-host";
+  require(CreateDirectoryA(retention_directory.c_str(), nullptr) != 0,
+          "create the retention log directory");
+  for (int i = 0; i < 7; ++i) {
+    const std::string path = retention_directory + "\\fusion-host-90" + std::to_string(i) + ".log";
+    write_text(path, "old\n");
+    set_age_hours(path, 7 - i); // ...-900 is the oldest, ...-906 the newest
+  }
+  const std::string other = retention_directory + "\\keepme.txt";
+  write_text(other, "not a log\n");
+  diag::reset_for_tests();
+  diag::initialize();
+  require(diag::enabled(), "the opt-in was lost across the reset");
+  require(count_logs(retention_directory) == diag::kRetentionFiles,
+          "retention did not keep five files");
+  require(!exists(retention_directory + "\\fusion-host-900.log") &&
+              !exists(retention_directory + "\\fusion-host-901.log") &&
+              !exists(retention_directory + "\\fusion-host-902.log"),
+          "retention did not delete the oldest files");
+  require(exists(retention_directory + "\\fusion-host-906.log"), "retention deleted a newest file");
+  require(exists(other), "retention touched a file that is not a Host log");
+  std::cout << "PASS R30 host diag: retention keeps the newest five and nothing else\n";
+
+  diag::reset_for_tests();
+  SetEnvironmentVariableA("FUSION_HOST_DIAGNOSTICS", nullptr);
+  remove_tree(root);
+  remove_tree(retention_root);
 }
 
 } // namespace
@@ -1897,11 +2082,11 @@ int main(int argc, char *argv[]) {
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
                       "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
-                      "wp4sessionend|integration>\n";
+                      "wp4sessionend|hostdiag|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
                       "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
-                      "wp4sessionend>\n";
+                      "wp4sessionend|hostdiag>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -1923,6 +2108,8 @@ int main(int argc, char *argv[]) {
       test_stop_event();
     else if (mode == "wp4sessionend")
       test_session_end();
+    else if (mode == "hostdiag")
+      test_host_diag();
     else if (mode == "integration") {
 #ifdef FUSION_WITH_FCITX5
       test_integration();
