@@ -20,6 +20,7 @@
 
 #include "fusion/backend.hpp"
 #include "ipc/pipe_client.hpp"
+#include "win32/srw_mutex.hpp"
 
 #include <atomic>
 #include <memory>
@@ -57,7 +58,9 @@ public:
 
 private:
   PipeClient client_;
-  mutable std::mutex rpc_mutex_;
+  // Not std::mutex: this class is compiled into the TIP DLL, which must not hold
+  // CRT-owned synchronization state (see win32/srw_mutex.hpp).
+  mutable win32::SrwMutex rpc_mutex_;
   std::uint64_t cached_session_id_ = 0;
   // Link state is read without rpc_mutex_ (healthy() must not block a send).
   std::atomic<LinkState> link_state_{LinkState::Disconnected};

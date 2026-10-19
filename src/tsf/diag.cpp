@@ -1,19 +1,25 @@
 #include "tsf/diag.hpp"
 
+#include "win32/srw_mutex.hpp"
+
 #include <windows.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
-#include <mutex>
+#include <iterator>
+#include <mutex> // std::lock_guard only; the guarded object is win32::SrwMutex
 
 namespace fusion::tsf::diag {
 
 namespace {
 
+// This DLL is loaded into third-party processes, so it must not hold CRT-owned
+// synchronization state; see win32/srw_mutex.hpp for the measured failure. Do not
+// reintroduce std::mutex, std::condition_variable or iostreams here.
 struct LogState {
-  std::mutex mutex;
+  win32::SrwMutex mutex;
   HANDLE file = INVALID_HANDLE_VALUE;
   std::size_t written = 0;
   bool enabled = false;
@@ -86,7 +92,7 @@ void ensure_open_locked(LogState &state) {
 
 void event(const char *name, const char *details) {
   LogState &state = log_state();
-  std::lock_guard<std::mutex> guard(state.mutex);
+  std::lock_guard<win32::SrwMutex> guard(state.mutex);
   ensure_open_locked(state);
   if (state.file == INVALID_HANDLE_VALUE) {
     return;

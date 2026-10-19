@@ -7,6 +7,7 @@
 
 #include "fusion/ipc_protocol.hpp"
 #include "ipc/pipe_security.hpp"
+#include "win32/srw_mutex.hpp"
 
 #include <chrono>
 #include <mutex>
@@ -54,7 +55,9 @@ public:
 private:
   std::wstring pipe_name_;
   void *handle_ = reinterpret_cast<void *>(-1); // INVALID_HANDLE_VALUE
-  mutable std::mutex mutex_;
+  // Not std::mutex: this class is compiled into the TIP DLL, which must not hold
+  // CRT-owned synchronization state (see win32/srw_mutex.hpp).
+  mutable win32::SrwMutex mutex_;
   bool connected_ = false;
 
   WriteOutcome write_all(const void *data, std::size_t size);
