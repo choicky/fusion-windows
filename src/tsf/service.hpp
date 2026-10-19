@@ -19,6 +19,7 @@
 #include "tsf/com_ptr.hpp"
 #include "tsf/display_attribute.hpp"
 #include "tsf/lifecycle.hpp"
+#include "tsf/open_declaration.hpp"
 #include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
 
@@ -29,7 +30,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -208,11 +208,11 @@ private:
   fusion::test::MockBackend backend_;
 #endif
   std::vector<std::shared_ptr<ContextEntry>> entries_;
-  // U6: document managers whose window has already been given the open default. A
-  // pointer that is reused after release can only suppress one re-declaration, never
-  // force a window that the user closed; the set is cleared on Deactivate and capped.
-  std::set<ITfDocumentMgr *> open_declared_document_managers_;
-  static constexpr std::size_t kMaxOpenDeclaredDocumentManagers = 256;
+  // U6: document managers whose window has already been given the open default. An
+  // entry is released when TSF reports that document manager destroyed, so a reused
+  // identity counts as new; the set is cleared on Deactivate and bounded without
+  // forgetting a known window (see tsf/open_declaration.hpp).
+  OpenDeclarationTracker open_declarations_;
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;
   bool handling_key_ = false; // reentrancy guard (D072 §7.5)

@@ -2,7 +2,8 @@
 // the teardown accounting that keeps unresolved responsibility auditable.
 //
 // Usage: tsf_lifecycle <obligation|teardown_clean|teardown_unresolved|
-//                       composition_terminated|identity_across_focus|context_isolation>
+//                       composition_terminated|identity_across_focus|context_isolation|
+//                       open_declaration>
 //
 // These are the platform-free decisions the real TSF sinks apply. They assert
 // *transitions* (what ended, what was reconciled, what stayed current), never
@@ -10,6 +11,7 @@
 
 #include "mock.hpp"
 #include "tsf/lifecycle.hpp"
+#include "tsf/open_declaration.hpp"
 #include "tsf/semantic.hpp"
 
 #include <iostream>
@@ -301,12 +303,66 @@ void context_isolation() {
   std::cout << "PASS context_isolation\n";
 }
 
+// --- open_declaration ------------------------------------------------------
+
+// U6: which document manager counts as a new window, and what the capacity bound may
+// not do. The assertions are about identity lifetime and the bound; the compartment
+// write itself is the real TSF path, not this decision.
+void open_declaration() {
+  OpenDeclarationTracker tracker;
+  int window_a = 0;
+  int window_b = 0;
+  int window_c = 0;
+
+  require(tracker.mark_new(&window_a) == OpenDeclarationTracker::Mark::Added,
+          "a first-seen manager is new");
+  require(tracker.mark_new(&window_a) == OpenDeclarationTracker::Mark::AlreadyTracked,
+          "the same manager is not new again");
+  require(tracker.mark_new(&window_b) == OpenDeclarationTracker::Mark::Added,
+          "a different manager is new");
+
+  // Destroyed and reused identity: OnUninitDocumentMgr forgets the manager, so a later
+  // window at the same address is new again rather than looking already declared.
+  tracker.forget(&window_a);
+  require(tracker.mark_new(&window_a) == OpenDeclarationTracker::Mark::Added,
+          "a destroyed-and-reused manager identity is new again");
+
+  // Capacity: filling the bound forgets nothing, and past it a further manager is
+  // skipped instead of displacing a window that was already declared.
+  OpenDeclarationTracker bounded;
+  std::vector<int> held(OpenDeclarationTracker::kCapacity);
+  for (auto &slot : held)
+    require(bounded.mark_new(&slot) == OpenDeclarationTracker::Mark::Added,
+            "filling the bound adds each manager");
+  require(bounded.at_capacity(), "the tracker reports the bound");
+  require(bounded.mark_new(&window_c) == OpenDeclarationTracker::Mark::AtCapacity,
+          "past the bound a new manager is skipped");
+  require(bounded.size() == OpenDeclarationTracker::kCapacity,
+          "skipping does not forget a known manager");
+  require(bounded.mark_new(&held.front()) == OpenDeclarationTracker::Mark::AlreadyTracked,
+          "the first manager stays known after the bound");
+  require(bounded.mark_new(&held.back()) == OpenDeclarationTracker::Mark::AlreadyTracked,
+          "the last manager stays known after the bound");
+  // A closed window frees exactly its own slot.
+  bounded.forget(&held.front());
+  require(bounded.mark_new(&window_c) == OpenDeclarationTracker::Mark::Added,
+          "a closed window frees capacity for the next one");
+  require(bounded.size() == OpenDeclarationTracker::kCapacity, "the bound still holds");
+
+  // Deactivate starts a new tracking set.
+  bounded.clear();
+  require(bounded.mark_new(&held.front()) == OpenDeclarationTracker::Mark::Added,
+          "a new activation sees every manager as new");
+  std::cout << "PASS open_declaration\n";
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: tsf_lifecycle <obligation|teardown_clean|teardown_unresolved|"
-                 "composition_terminated|identity_across_focus|context_isolation>\n";
+                 "composition_terminated|identity_across_focus|context_isolation|"
+                 "open_declaration>\n";
     return 1;
   }
   const std::string mode = argv[1];
@@ -323,6 +379,8 @@ int main(int argc, char *argv[]) {
       identity_across_focus();
     else if (mode == "context_isolation")
       context_isolation();
+    else if (mode == "open_declaration")
+      open_declaration();
     else {
       std::cerr << "Unknown mode: " << mode << "\n";
       return 1;

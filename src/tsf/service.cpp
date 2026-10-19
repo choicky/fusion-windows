@@ -686,9 +686,9 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
     Deactivate();
     return E_FAIL;
   }
-  // U6: declare the thread's keyboard open/close compartment open at activation.
-  // Windows can reset it to closed when a new application context is created later;
-  // resolve_or_create_entry declares it again for exactly that case (see
+  // U6: declare the thread's keyboard open/close compartment open at activation. This
+  // covers the thread as it is at activation; a document manager that appears later is
+  // declared once in OnSetFocus, and no key path writes the compartment (see
   // declare_keyboard_open).
   declare_keyboard_open("activation");
   diagf("ACTIVATE", "tid=%lu", static_cast<unsigned long>(tid));
@@ -700,7 +700,7 @@ STDMETHODIMP TextService::Deactivate() {
         entries_.size());
   // U6: the next activation starts a new tracking set (the previous window pointers
   // are no longer meaningful).
-  open_declared_document_managers_.clear();
+  open_declarations_.clear();
   if (thread_mgr_) {
     if (auto keystroke_mgr = thread_mgr_.as<ITfKeystrokeMgr>(IID_ITfKeystrokeMgr)) {
       keystroke_mgr->UnadviseKeyEventSink(client_id_);
@@ -987,6 +987,11 @@ STDMETHODIMP TextService::OnInitDocumentMgr(ITfDocumentMgr *pdim) {
 
 STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr *pdim) {
   const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::DocumentDestroyed);
+  // U6: a destroyed document manager is no longer a window this service has declared.
+  // Forgetting it frees the identity (and, at the bound, the capacity) for a later
+  // window that reuses the same pointer value; keeping it would make that window look
+  // already-declared.
+  open_declarations_.forget(pdim);
   std::size_t reclaimed = 0;
   for (auto it = entries_.begin(); it != entries_.end();) {
     ContextEntry &entry = **it;
@@ -1029,13 +1034,20 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
   // U6: a document manager this service has not seen is a new application window.
   // Declaring the open default here (and never from a key path) means a new window
   // starts open while a Ctrl+Space close made before the first key still holds. A
-  // lazily created semantic entry is not used as the window signal.
+  // lazily created semantic entry is not used as the window signal. Tracking is
+  // released in OnUninitDocumentMgr, so a reused manager identity counts as new; at
+  // the capacity bound a further manager is left undeclared rather than forgetting one
+  // already declared.
   if (pdimFocus != nullptr && pdimFocus != pdimPrevFocus) {
-    if (open_declared_document_managers_.size() >= kMaxOpenDeclaredDocumentManagers) {
-      open_declared_document_managers_.clear();
-    }
-    if (open_declared_document_managers_.insert(pdimFocus).second) {
+    switch (open_declarations_.mark_new(pdimFocus)) {
+    case OpenDeclarationTracker::Mark::Added:
       declare_keyboard_open("new_document");
+      break;
+    case OpenDeclarationTracker::Mark::AlreadyTracked:
+      break; // this window was declared already: the user's choice stays final
+    case OpenDeclarationTracker::Mark::AtCapacity:
+      diagf("KEYBOARD_OPEN", "declared reason=new_document skipped=tracking-capacity");
+      break;
     }
   }
   // Presentation only (D072 §9): a candidate page attached to the document that

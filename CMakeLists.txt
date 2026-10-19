@@ -265,7 +265,7 @@ if(BUILD_TESTING)
     target_compile_options(tsf_lifecycle PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
   foreach(test obligation teardown_clean teardown_unresolved composition_terminated
-               identity_across_focus context_isolation)
+               identity_across_focus context_isolation open_declaration)
     add_test(NAME tsf_lifecycle_${test} COMMAND tsf_lifecycle ${test})
   endforeach()
   # Stage 6 WP3 input-method selection is a platform-free decision (no Fcitx
