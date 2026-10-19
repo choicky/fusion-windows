@@ -22,10 +22,10 @@ namespace {
 // does not ship a separate msctf import library in all supported toolchains.
 // Keep the documented values local to the probe instead of changing the link
 // surface of the TIP.
-constexpr GUID kIidTfInputScope{0xfde1eaee, 0x6924, 0x4cdf,
-                                {0x91, 0xe7, 0xda, 0x38, 0xcf, 0xf5, 0x55, 0x9d}};
-constexpr GUID kGuidPropInputScope{0x1713dd5a, 0x68e7, 0x4a5b,
-                                   {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
+constexpr GUID kIidTfInputScope{
+    0xfde1eaee, 0x6924, 0x4cdf, {0x91, 0xe7, 0xda, 0x38, 0xcf, 0xf5, 0x55, 0x9d}};
+constexpr GUID kGuidPropInputScope{
+    0x1713dd5a, 0x68e7, 0x4a5b, {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
 
 // QI helper: wraps the new reference (QI addref'd) in a ComRef.
 template <typename T> ComRef<T> qi(IUnknown *object, const IID &iid) {
@@ -686,24 +686,11 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
     Deactivate();
     return E_FAIL;
   }
-  // Initialize the real keyboard compartment. Windows can subsequently restore
-  // closed mode; the fixture honors that value. Use the OS mode command (Ctrl+Space
-  // on the validated machine) instead of overriding policy on each key.
-  if (auto compartments = qi<ITfCompartmentMgr>(thread_mgr_.get(), IID_ITfCompartmentMgr)) {
-    ComRef<ITfCompartment> compartment;
-    if (SUCCEEDED(
-            compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, compartment.out())) &&
-        compartment) {
-      VARIANT value;
-      VariantInit(&value);
-      value.vt = VT_I4;
-      value.lVal = 1;
-      if (SUCCEEDED(compartment->SetValue(client_id_, &value))) {
-        diagf("KEYBOARD_OPEN", "declared");
-      }
-      VariantClear(&value);
-    }
-  }
+  // U6: declare the thread's keyboard open/close compartment open at activation.
+  // Windows can reset it to closed when a new application context is created later;
+  // resolve_or_create_entry declares it again for exactly that case (see
+  // declare_keyboard_open).
+  declare_keyboard_open("activation");
   diagf("ACTIVATE", "tid=%lu", static_cast<unsigned long>(tid));
   return S_OK;
 }
@@ -1214,6 +1201,10 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
   entries_.push_back(std::move(entry));
   diagf("ENTRY_CREATE", "cid=%" PRIu64 " ctx=%p dim=%p entries=%zu", raw->semantic.context_id(),
         static_cast<void *>(pic), static_cast<void *>(dim), entries_.size());
+  // U6: a new application context starts with Fusion open (owner decision
+  // 2026-10-19). This runs before the same key's hard_policy_allows, so the first
+  // key of a new window is admitted without Ctrl+Space.
+  declare_keyboard_open("new_context");
   return raw;
 }
 
@@ -1257,7 +1248,7 @@ public:
         FAILED(entry_->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) ||
         fetched == 0 || selection.range == nullptr ||
         FAILED(selection.range->QueryInterface(IID_ITfRange,
-                                                reinterpret_cast<void **>(range.out()))) ||
+                                               reinterpret_cast<void **>(range.out()))) ||
         FAILED(property->GetValue(ec, range.get(), &value))) {
       if (selection.range != nullptr)
         selection.range->Release();
@@ -1308,8 +1299,8 @@ void refresh_input_scope(TextService &service, ContextEntry &entry) {
   HRESULT inner = E_FAIL;
   // Admission consumes this result immediately. TF_ES_READ alone may queue
   // the edit session and leave the previous classification in place.
-  const HRESULT outer = entry.context->RequestEditSession(
-      service.client_id(), probe, TF_ES_SYNC | TF_ES_READ, &inner);
+  const HRESULT outer = entry.context->RequestEditSession(service.client_id(), probe,
+                                                          TF_ES_SYNC | TF_ES_READ, &inner);
   probe->Release();
   if (outer != S_OK || inner != S_OK) {
     entry.input_scope = InputScopeClass::Unknown;
@@ -1317,11 +1308,62 @@ void refresh_input_scope(TextService &service, ContextEntry &entry) {
           static_cast<unsigned long>(outer), static_cast<unsigned long>(inner));
     return;
   }
-  const char *classification = entry.input_scope == InputScopeClass::Sensitive
-                                   ? "sensitive"
-                                   : entry.input_scope == InputScopeClass::Ordinary ? "ordinary"
-                                                                                    : "unknown";
+  const char *classification = entry.input_scope == InputScopeClass::Sensitive  ? "sensitive"
+                               : entry.input_scope == InputScopeClass::Ordinary ? "ordinary"
+                                                                                : "unknown";
   diagf("INPUT_SCOPE", "class=%s", classification);
+}
+
+// U6: the owner decided that a newly opened application window starts with Fusion
+// open. The compartment write at Activate alone does not achieve that: the diagnostic
+// log shows the thread compartment reading closed again on the first key of a new
+// context, with no service-side write and no Deactivate in between (2026-10-19,
+// fusion-tsf-2028.log: KEYBOARD_OPEN declared at activation, then HARD_POLICY
+// openclose=closed on the new context's first key). Windows/the application therefore
+// re-initialises the compartment when the context appears, after our activation write.
+//
+// The minimal correction is to declare it open once per *new context* as well. It is
+// deliberately not called on focus changes or per key, so the user's own Ctrl+Space
+// close still holds inside a context; only a new context starts open.
+bool TextService::declare_keyboard_open(const char *reason) {
+  if (!thread_mgr_)
+    return false;
+  auto compartments = qi<ITfCompartmentMgr>(thread_mgr_.get(), IID_ITfCompartmentMgr);
+  if (!compartments)
+    return false;
+  ComRef<ITfCompartment> compartment;
+  if (FAILED(
+          compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, compartment.out())) ||
+      !compartment) {
+    diagf("KEYBOARD_OPEN", "declared reason=%s unavailable=1", reason);
+    return false;
+  }
+  VARIANT current;
+  VariantInit(&current);
+  bool open = false;
+  if (SUCCEEDED(compartment->GetValue(&current))) {
+    open = (current.vt == VT_I4 && current.lVal != 0) ||
+           (current.vt == VT_UI4 && current.uintVal != 0) ||
+           (current.vt == VT_BOOL && current.boolVal != VARIANT_FALSE);
+  }
+  VariantClear(&current);
+  const bool was_closed = !open;
+  if (was_closed) {
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_I4;
+    value.lVal = 1;
+    const HRESULT hr = compartment->SetValue(client_id_, &value);
+    VariantClear(&value);
+    if (FAILED(hr)) {
+      diagf("KEYBOARD_OPEN", "declared reason=%s set_failed=0x%08lX", reason,
+            static_cast<unsigned long>(hr));
+      return false;
+    }
+    open = true;
+  }
+  diagf("KEYBOARD_OPEN", "declared reason=%s was_closed=%d", reason, was_closed ? 1 : 0);
+  return open;
 }
 
 bool TextService::hard_policy_allows(ContextEntry &entry) {

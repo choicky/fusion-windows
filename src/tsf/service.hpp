@@ -22,8 +22,8 @@
 #include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
 
-#include <msctf.h>
 #include <InputScope.h>
+#include <msctf.h>
 #include <windows.h>
 
 #include <atomic>
@@ -138,6 +138,12 @@ public:
   std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
   ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
   bool hard_policy_allows(ContextEntry &entry);
+  // U6: declares this thread's keyboard open/close compartment open, once per
+  // activation and once per new application context. Writing only when the value is
+  // closed keeps the user's own Ctrl+Space close effective inside a context; a new
+  // context is what the owner decided should start open. Returns true when the
+  // compartment reads open afterwards.
+  bool declare_keyboard_open(const char *reason);
   // `presentation` (real frontend only) places the caret at the engine cursor
   // and styles the composition; without it the caret goes to the end.
   fusion::EditResult apply_state_text(ContextEntry &entry, TfEditCookie ec,

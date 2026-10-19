@@ -207,6 +207,27 @@ try {
     throw "the task was registered without the User32 1077/1073 event trigger (subscription: '$($task.EventSubscription)')"
   }
 
+  $currentStep = 'shortcut'
+  Write-Step 'creating the Start Menu shortcut for the manual restart tool'
+  $restartScript = Join-Path $versionDir 'restart-host.ps1'
+  if (-not (Test-Path -LiteralPath $restartScript)) {
+    throw "the package does not contain restart-host.ps1 ($restartScript)"
+  }
+  $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Fusion'
+  New-Item -ItemType Directory -Force $startMenu | Out-Null
+  $shortcutPath = Join-Path $startMenu 'Restart FusionHost.lnk'
+  $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $shell.CreateShortcut($shortcutPath)
+  $shortcut.TargetPath = $powershellExe
+  $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$restartScript`" -Pause"
+  $shortcut.WorkingDirectory = $versionDir
+  $shortcut.IconLocation = "$powershellExe,0"
+  $shortcut.Description = 'Restart the Fusion Host for this user and session'
+  $shortcut.Save()
+  Write-Host "  $shortcutPath"
+  Write-Host "  -> $powershellExe $($shortcut.Arguments)"
+
   $currentStep = 'start'
   if ($NoStart) {
     Write-Step 'not starting the Host (-NoStart)'
