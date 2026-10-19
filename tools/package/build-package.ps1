@@ -90,7 +90,8 @@ try {
   foreach ($script in @('register.ps1', 'unregister.ps1', 'check-state.ps1')) {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "tools\tsf\$script") -Destination (Join-Path $stage 'tools') -Force
   }
-  foreach ($script in @('install.ps1', 'uninstall.ps1', 'host-state.ps1')) {
+  foreach ($script in @('install.ps1', 'uninstall.ps1', 'host-state.ps1', 'restart-host.ps1',
+      'host-diagnostics.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination $stage -Force
   }
 

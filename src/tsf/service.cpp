@@ -22,10 +22,10 @@ namespace {
 // does not ship a separate msctf import library in all supported toolchains.
 // Keep the documented values local to the probe instead of changing the link
 // surface of the TIP.
-constexpr GUID kIidTfInputScope{0xfde1eaee, 0x6924, 0x4cdf,
-                                {0x91, 0xe7, 0xda, 0x38, 0xcf, 0xf5, 0x55, 0x9d}};
-constexpr GUID kGuidPropInputScope{0x1713dd5a, 0x68e7, 0x4a5b,
-                                   {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
+constexpr GUID kIidTfInputScope{
+    0xfde1eaee, 0x6924, 0x4cdf, {0x91, 0xe7, 0xda, 0x38, 0xcf, 0xf5, 0x55, 0x9d}};
+constexpr GUID kGuidPropInputScope{
+    0x1713dd5a, 0x68e7, 0x4a5b, {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
 
 // QI helper: wraps the new reference (QI addref'd) in a ComRef.
 template <typename T> ComRef<T> qi(IUnknown *object, const IID &iid) {
@@ -686,24 +686,11 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
     Deactivate();
     return E_FAIL;
   }
-  // Initialize the real keyboard compartment. Windows can subsequently restore
-  // closed mode; the fixture honors that value. Use the OS mode command (Ctrl+Space
-  // on the validated machine) instead of overriding policy on each key.
-  if (auto compartments = qi<ITfCompartmentMgr>(thread_mgr_.get(), IID_ITfCompartmentMgr)) {
-    ComRef<ITfCompartment> compartment;
-    if (SUCCEEDED(
-            compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, compartment.out())) &&
-        compartment) {
-      VARIANT value;
-      VariantInit(&value);
-      value.vt = VT_I4;
-      value.lVal = 1;
-      if (SUCCEEDED(compartment->SetValue(client_id_, &value))) {
-        diagf("KEYBOARD_OPEN", "declared");
-      }
-      VariantClear(&value);
-    }
-  }
+  // U6: declare the thread's keyboard open/close compartment open at activation. This
+  // covers the thread as it is at activation; a document manager that appears later is
+  // declared once in OnSetFocus, and no key path writes the compartment (see
+  // declare_keyboard_open).
+  declare_keyboard_open("activation");
   diagf("ACTIVATE", "tid=%lu", static_cast<unsigned long>(tid));
   return S_OK;
 }
@@ -711,6 +698,9 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
 STDMETHODIMP TextService::Deactivate() {
   diagf("DEACTIVATE", "tid=%lu entries=%zu", static_cast<unsigned long>(client_id_),
         entries_.size());
+  // U6: the next activation starts a new tracking set (the previous window pointers
+  // are no longer meaningful).
+  open_declarations_.clear();
   if (thread_mgr_) {
     if (auto keystroke_mgr = thread_mgr_.as<ITfKeystrokeMgr>(IID_ITfKeystrokeMgr)) {
       keystroke_mgr->UnadviseKeyEventSink(client_id_);
@@ -997,6 +987,11 @@ STDMETHODIMP TextService::OnInitDocumentMgr(ITfDocumentMgr *pdim) {
 
 STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr *pdim) {
   const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::DocumentDestroyed);
+  // U6: a destroyed document manager is no longer a window this service has declared.
+  // Forgetting it frees the identity (and, at the bound, the capacity) for a later
+  // window that reuses the same pointer value; keeping it would make that window look
+  // already-declared.
+  open_declarations_.forget(pdim);
   std::size_t reclaimed = 0;
   for (auto it = entries_.begin(); it != entries_.end();) {
     ContextEntry &entry = **it;
@@ -1036,6 +1031,25 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
         "dim=%p prev=%p entries=%zu in_focus=%zu in_previous=%zu end_context=%d reset_epoch=0",
         static_cast<void *>(pdimFocus), static_cast<void *>(pdimPrevFocus), entries_.size(),
         in_focus, in_previous, obligation.end_context ? 1 : 0);
+  // U6: a document manager this service has not seen is a new application window.
+  // Declaring the open default here (and never from a key path) means a new window
+  // starts open while a Ctrl+Space close made before the first key still holds. A
+  // lazily created semantic entry is not used as the window signal. Tracking is
+  // released in OnUninitDocumentMgr, so a reused manager identity counts as new; at
+  // the capacity bound a further manager is left undeclared rather than forgetting one
+  // already declared.
+  if (pdimFocus != nullptr && pdimFocus != pdimPrevFocus) {
+    switch (open_declarations_.mark_new(pdimFocus)) {
+    case OpenDeclarationTracker::Mark::Added:
+      declare_keyboard_open("new_document");
+      break;
+    case OpenDeclarationTracker::Mark::AlreadyTracked:
+      break; // this window was declared already: the user's choice stays final
+    case OpenDeclarationTracker::Mark::AtCapacity:
+      diagf("KEYBOARD_OPEN", "declared reason=new_document skipped=tracking-capacity");
+      break;
+    }
+  }
   // Presentation only (D072 §9): a candidate page attached to the document that
   // just lost focus must not stay visible or actionable in the wrong focused
   // context. Hiding is the complete obligation here: no Host unbind, no
@@ -1257,7 +1271,7 @@ public:
         FAILED(entry_->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) ||
         fetched == 0 || selection.range == nullptr ||
         FAILED(selection.range->QueryInterface(IID_ITfRange,
-                                                reinterpret_cast<void **>(range.out()))) ||
+                                               reinterpret_cast<void **>(range.out()))) ||
         FAILED(property->GetValue(ec, range.get(), &value))) {
       if (selection.range != nullptr)
         selection.range->Release();
@@ -1308,8 +1322,8 @@ void refresh_input_scope(TextService &service, ContextEntry &entry) {
   HRESULT inner = E_FAIL;
   // Admission consumes this result immediately. TF_ES_READ alone may queue
   // the edit session and leave the previous classification in place.
-  const HRESULT outer = entry.context->RequestEditSession(
-      service.client_id(), probe, TF_ES_SYNC | TF_ES_READ, &inner);
+  const HRESULT outer = entry.context->RequestEditSession(service.client_id(), probe,
+                                                          TF_ES_SYNC | TF_ES_READ, &inner);
   probe->Release();
   if (outer != S_OK || inner != S_OK) {
     entry.input_scope = InputScopeClass::Unknown;
@@ -1317,11 +1331,64 @@ void refresh_input_scope(TextService &service, ContextEntry &entry) {
           static_cast<unsigned long>(outer), static_cast<unsigned long>(inner));
     return;
   }
-  const char *classification = entry.input_scope == InputScopeClass::Sensitive
-                                   ? "sensitive"
-                                   : entry.input_scope == InputScopeClass::Ordinary ? "ordinary"
-                                                                                    : "unknown";
+  const char *classification = entry.input_scope == InputScopeClass::Sensitive  ? "sensitive"
+                               : entry.input_scope == InputScopeClass::Ordinary ? "ordinary"
+                                                                                : "unknown";
   diagf("INPUT_SCOPE", "class=%s", classification);
+}
+
+// U6: the owner decided that a newly opened application window starts with Fusion
+// open. The compartment write at Activate alone does not achieve that: the diagnostic
+// log shows the thread compartment open at activation and closed at the first key of a
+// new context, with no service-side write and no Deactivate in between (2026-10-19,
+// fusion-tsf-2028.log). **Attribution is a hypothesis**: something re-initialises the
+// compartment between activation and that first key (the application's context
+// initialisation or Windows), and nothing in the current evidence separates the two.
+//
+// The minimal correction is to declare it open once per *new document manager* — the
+// lifecycle event that actually corresponds to a new application window — and never
+// from a key path. That is what makes a Ctrl+Space close before the first key
+// effective: after the declaration for a window, this service never writes the
+// compartment again for it.
+bool TextService::declare_keyboard_open(const char *reason) {
+  if (!thread_mgr_)
+    return false;
+  auto compartments = qi<ITfCompartmentMgr>(thread_mgr_.get(), IID_ITfCompartmentMgr);
+  if (!compartments)
+    return false;
+  ComRef<ITfCompartment> compartment;
+  if (FAILED(
+          compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, compartment.out())) ||
+      !compartment) {
+    diagf("KEYBOARD_OPEN", "declared reason=%s unavailable=1", reason);
+    return false;
+  }
+  VARIANT current;
+  VariantInit(&current);
+  bool open = false;
+  if (SUCCEEDED(compartment->GetValue(&current))) {
+    open = (current.vt == VT_I4 && current.lVal != 0) ||
+           (current.vt == VT_UI4 && current.uintVal != 0) ||
+           (current.vt == VT_BOOL && current.boolVal != VARIANT_FALSE);
+  }
+  VariantClear(&current);
+  const bool was_closed = !open;
+  if (was_closed) {
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_I4;
+    value.lVal = 1;
+    const HRESULT hr = compartment->SetValue(client_id_, &value);
+    VariantClear(&value);
+    if (FAILED(hr)) {
+      diagf("KEYBOARD_OPEN", "declared reason=%s set_failed=0x%08lX", reason,
+            static_cast<unsigned long>(hr));
+      return false;
+    }
+    open = true;
+  }
+  diagf("KEYBOARD_OPEN", "declared reason=%s was_closed=%d", reason, was_closed ? 1 : 0);
+  return open;
 }
 
 bool TextService::hard_policy_allows(ContextEntry &entry) {

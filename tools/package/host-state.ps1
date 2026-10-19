@@ -144,6 +144,10 @@ function Get-FusionScheduledTask {
   $task = Get-ScheduledTask -TaskName 'FusionHost' -ErrorAction SilentlyContinue
   if (-not $task) { return $null }
   $info = Get-ScheduledTaskInfo -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  # A task with no trigger yields $null here, and @($null) is a one-element array of
+  # null: filter it out before reading CimClass (StrictMode would throw). The product
+  # task always has triggers; the WP7 restart tool also reads tasks registered by hand.
+  $triggers = @($task.Triggers | Where-Object { $null -ne $_ })
   return [pscustomobject]@{
     TaskName  = $task.TaskName
     State     = [string]$task.State
@@ -155,13 +159,13 @@ function Get-FusionScheduledTask {
     RunLevel  = [string]$task.Principal.RunLevel
     Instances = [string]$task.Settings.MultipleInstances
     TimeLimit = [string]$task.Settings.ExecutionTimeLimit
-    TriggerCount = @($task.Triggers).Count
-    Triggers  = ($task.Triggers | ForEach-Object {
+    TriggerCount = $triggers.Count
+    Triggers  = ($triggers | ForEach-Object {
         $_.CimClass.CimClassName -replace '^MSFT_Task', '' -replace 'Trigger$', ''
       }) -join ';'
     # The R34 event trigger's XPath, so a run can record that it exists and what it
     # selects (empty when the task has no event trigger).
-    EventSubscription = (@($task.Triggers |
+    EventSubscription = (@($triggers |
           Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskEventTrigger' } |
           ForEach-Object { $_.Subscription }) -join ';')
     LastResult = if ($info) { $info.LastTaskResult } else { $null }
@@ -405,11 +409,17 @@ function Invoke-PackageScript {
 # and waits, bounded, for the process to exit. Never terminates anything: if the
 # event cannot be opened (another principal, or no Host), it reports that instead.
 function Stop-FusionHostOrderly {
-  param([int]$TimeoutMs = 20000, [string]$InstallRoot = '')
+  # -Pids restricts the stop to an already verified set (the WP7 restart tool passes
+  # this user's/this session's pids), so a waiter never waits for another session's
+  # Host. The stop event is per user x session either way.
+  param([int]$TimeoutMs = 20000, [string]$InstallRoot = '', [int[]]$Pids = @())
   $eventName = Get-FusionStopEventName
   $hosts = @(Get-FusionHostState)
   if ($InstallRoot) {
     $hosts = @($hosts | Where-Object { $_.Path -and $_.Path.StartsWith($InstallRoot, [StringComparison]::OrdinalIgnoreCase) })
+  }
+  if ($Pids.Count -gt 0) {
+    $hosts = @($hosts | Where-Object { $Pids -contains $_.Id })
   }
   $result = [pscustomobject]@{
     EventName = $eventName

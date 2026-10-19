@@ -19,11 +19,12 @@
 #include "tsf/com_ptr.hpp"
 #include "tsf/display_attribute.hpp"
 #include "tsf/lifecycle.hpp"
+#include "tsf/open_declaration.hpp"
 #include "tsf/orchestration.hpp"
 #include "tsf/semantic.hpp"
 
-#include <msctf.h>
 #include <InputScope.h>
+#include <msctf.h>
 #include <windows.h>
 
 #include <atomic>
@@ -138,6 +139,12 @@ public:
   std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
   ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
   bool hard_policy_allows(ContextEntry &entry);
+  // U6: declares this thread's keyboard open/close compartment open, once per
+  // activation and once per document manager that has not been seen yet (a new
+  // application window). It is never called from a key path, so a Ctrl+Space close
+  // made before or after the first key of that window is preserved. Returns true
+  // when the compartment reads open afterwards.
+  bool declare_keyboard_open(const char *reason);
   // `presentation` (real frontend only) places the caret at the engine cursor
   // and styles the composition; without it the caret goes to the end.
   fusion::EditResult apply_state_text(ContextEntry &entry, TfEditCookie ec,
@@ -201,6 +208,11 @@ private:
   fusion::test::MockBackend backend_;
 #endif
   std::vector<std::shared_ptr<ContextEntry>> entries_;
+  // U6: document managers whose window has already been given the open default. An
+  // entry is released when TSF reports that document manager destroyed, so a reused
+  // identity counts as new; the set is cleared on Deactivate and bounded without
+  // forgetting a known window (see tsf/open_declaration.hpp).
+  OpenDeclarationTracker open_declarations_;
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;
   bool handling_key_ = false; // reentrancy guard (D072 §7.5)

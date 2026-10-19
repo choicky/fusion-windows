@@ -129,6 +129,22 @@ try {
     Write-Host '  no HKLM registration found'
   }
 
+  $currentStep = 'shortcut'
+  Write-Step 'removing the Start Menu shortcut'
+  $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Fusion'
+  $shortcutPath = Join-Path $startMenu 'Restart FusionHost.lnk'
+  if (Test-Path -LiteralPath $shortcutPath) {
+    Remove-Item -LiteralPath $shortcutPath -Force
+    Write-Host "  removed $shortcutPath"
+  } else {
+    Write-Host '  no shortcut to remove'
+  }
+  if ((Test-Path -LiteralPath $startMenu) -and
+      @(Get-ChildItem -LiteralPath $startMenu -Force).Count -eq 0) {
+    Remove-Item -LiteralPath $startMenu -Force
+    Write-Host "  removed the empty folder $startMenu"
+  }
+
   $currentStep = 'task'
   Write-Step "deleting the logon task '$taskName'"
   if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
