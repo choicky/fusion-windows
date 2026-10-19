@@ -758,7 +758,10 @@ public static class FusionWts
 
     // Class 24 is WTSSessionInfo: the buffer is a WTSINFOW, not a FILETIME. Reading its
     // first 8 bytes as a FILETIME gives State + SessionId (the 5700X reported
-    // 1601-01-01 00:07:09 for session 1), so the structure is parsed properly here.
+    // 1601-01-01 00:07:09 for session 1). The structure is parsed properly here, and the
+    // six DWORD counters that follow SessionId are part of it: without them every later
+    // field is shifted by 24 bytes, so the field named LogonTime would read ConnectTime
+    // (equal on a console session, different after a disconnect/reconnect).
     private const int WTSSessionInfo = 24;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -766,6 +769,12 @@ public static class FusionWts
     {
         public int State;
         public int SessionId;
+        public int IncomingBytes;
+        public int OutgoingBytes;
+        public int IncomingFrames;
+        public int OutgoingFrames;
+        public int IncomingCompressedBytes;
+        public int OutgoingCompressedBytes;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string WinStationName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 17)] public string Domain;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)] public string UserName;
@@ -776,32 +785,60 @@ public static class FusionWts
         public long CurrentTime;
     }
 
-    // The session's logon time as a FILETIME value (0 when unavailable or implausible).
-    public static long LogonTimeUtc(int sessionId)
+    // What the query read back, including the numbers that prove the layout: the structure
+    // size the marshaller computed and the byte count WTS returned must agree.
+    public sealed class WtsSessionInfo
+    {
+        public int State;
+        public int SessionId;
+        public long ConnectTime;
+        public long LogonTime;
+        public int StructSize;
+        public int Bytes;
+    }
+
+    public static WtsSessionInfo Query(int sessionId)
     {
         IntPtr buffer;
         int bytes;
         if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, WTSSessionInfo, out buffer, out bytes))
-            return 0;
+            return null;
         try
         {
-            if (buffer == IntPtr.Zero || bytes < Marshal.SizeOf(typeof(WTSINFOW))) { return 0; }
+            int size = Marshal.SizeOf(typeof(WTSINFOW));
+            if (buffer == IntPtr.Zero || bytes < size) { return null; }
             WTSINFOW info = (WTSINFOW)Marshal.PtrToStructure(buffer, typeof(WTSINFOW));
-            long logon = info.LogonTime;
-            if (logon <= 0) { return 0; }
-            DateTime value;
-            try { value = DateTime.FromFileTimeUtc(logon); }
-            catch { return 0; }
-            // Sanity: not before 2000 and not before the last boot (5 s of clock slop).
-            if (value.Year < 2000) { return 0; }
-            DateTime boot = DateTime.UtcNow.AddMilliseconds(-(long)GetTickCount64());
-            if (value < boot.AddSeconds(-5)) { return 0; }
-            return logon;
+            return new WtsSessionInfo
+            {
+                State = info.State,
+                SessionId = info.SessionId,
+                ConnectTime = info.ConnectTime,
+                LogonTime = info.LogonTime,
+                StructSize = size,
+                Bytes = bytes
+            };
         }
         finally
         {
             if (buffer != IntPtr.Zero) { WTSFreeMemory(buffer); }
         }
+    }
+
+    // The session's logon time as a FILETIME value (0 when unavailable or implausible).
+    public static long LogonTimeUtc(int sessionId)
+    {
+        WtsSessionInfo info = Query(sessionId);
+        if (info == null) { return 0; }
+        long logon = info.LogonTime;
+        if (logon <= 0) { return 0; }
+        DateTime value;
+        try { value = DateTime.FromFileTimeUtc(logon); }
+        catch { return 0; }
+        // Sanity: not before 2000 and not before the last boot (5 s of clock slop).
+        if (value.Year < 2000) { return 0; }
+        DateTime boot = DateTime.UtcNow.AddMilliseconds(-(long)GetTickCount64());
+        if (value < boot.AddSeconds(-5)) { return 0; }
+        return logon;
     }
 }
 '@
