@@ -698,6 +698,9 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
 STDMETHODIMP TextService::Deactivate() {
   diagf("DEACTIVATE", "tid=%lu entries=%zu", static_cast<unsigned long>(client_id_),
         entries_.size());
+  // U6: the next activation starts a new tracking set (the previous window pointers
+  // are no longer meaningful).
+  open_declared_document_managers_.clear();
   if (thread_mgr_) {
     if (auto keystroke_mgr = thread_mgr_.as<ITfKeystrokeMgr>(IID_ITfKeystrokeMgr)) {
       keystroke_mgr->UnadviseKeyEventSink(client_id_);
@@ -1023,6 +1026,18 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
         "dim=%p prev=%p entries=%zu in_focus=%zu in_previous=%zu end_context=%d reset_epoch=0",
         static_cast<void *>(pdimFocus), static_cast<void *>(pdimPrevFocus), entries_.size(),
         in_focus, in_previous, obligation.end_context ? 1 : 0);
+  // U6: a document manager this service has not seen is a new application window.
+  // Declaring the open default here (and never from a key path) means a new window
+  // starts open while a Ctrl+Space close made before the first key still holds. A
+  // lazily created semantic entry is not used as the window signal.
+  if (pdimFocus != nullptr && pdimFocus != pdimPrevFocus) {
+    if (open_declared_document_managers_.size() >= kMaxOpenDeclaredDocumentManagers) {
+      open_declared_document_managers_.clear();
+    }
+    if (open_declared_document_managers_.insert(pdimFocus).second) {
+      declare_keyboard_open("new_document");
+    }
+  }
   // Presentation only (D072 §9): a candidate page attached to the document that
   // just lost focus must not stay visible or actionable in the wrong focused
   // context. Hiding is the complete obligation here: no Host unbind, no
@@ -1201,10 +1216,6 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
   entries_.push_back(std::move(entry));
   diagf("ENTRY_CREATE", "cid=%" PRIu64 " ctx=%p dim=%p entries=%zu", raw->semantic.context_id(),
         static_cast<void *>(pic), static_cast<void *>(dim), entries_.size());
-  // U6: a new application context starts with Fusion open (owner decision
-  // 2026-10-19). This runs before the same key's hard_policy_allows, so the first
-  // key of a new window is admitted without Ctrl+Space.
-  declare_keyboard_open("new_context");
   return raw;
 }
 
@@ -1316,15 +1327,17 @@ void refresh_input_scope(TextService &service, ContextEntry &entry) {
 
 // U6: the owner decided that a newly opened application window starts with Fusion
 // open. The compartment write at Activate alone does not achieve that: the diagnostic
-// log shows the thread compartment reading closed again on the first key of a new
-// context, with no service-side write and no Deactivate in between (2026-10-19,
-// fusion-tsf-2028.log: KEYBOARD_OPEN declared at activation, then HARD_POLICY
-// openclose=closed on the new context's first key). Windows/the application therefore
-// re-initialises the compartment when the context appears, after our activation write.
+// log shows the thread compartment open at activation and closed at the first key of a
+// new context, with no service-side write and no Deactivate in between (2026-10-19,
+// fusion-tsf-2028.log). **Attribution is a hypothesis**: something re-initialises the
+// compartment between activation and that first key (the application's context
+// initialisation or Windows), and nothing in the current evidence separates the two.
 //
-// The minimal correction is to declare it open once per *new context* as well. It is
-// deliberately not called on focus changes or per key, so the user's own Ctrl+Space
-// close still holds inside a context; only a new context starts open.
+// The minimal correction is to declare it open once per *new document manager* — the
+// lifecycle event that actually corresponds to a new application window — and never
+// from a key path. That is what makes a Ctrl+Space close before the first key
+// effective: after the declaration for a window, this service never writes the
+// compartment again for it.
 bool TextService::declare_keyboard_open(const char *reason) {
   if (!thread_mgr_)
     return false;

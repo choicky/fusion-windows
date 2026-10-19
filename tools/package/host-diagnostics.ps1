@@ -1,11 +1,15 @@
 # Stage 6 WP7: explicit opt-in / opt-out for the Host technical log (R30).
 #
-# The product default stays OFF. This helper turns the log on for *this user* only,
-# through the same environment variable the Host reads at startup
-# (FUSION_HOST_DIAGNOSTICS = 1), and then restarts the Host so the setting actually
-# reaches the process that writes the log. It verifies that the launch path received
-# it by looking for the new process's log file; a launcher that keeps an old
-# environment block is reported instead of assumed to work.
+# The product default stays OFF. This helper turns the log on or off for *this user*
+# only, through the same environment variable the Host reads at startup
+# (FUSION_HOST_DIAGNOSTICS = 1), restarts the Host, and then **verifies the effect on
+# the process that was actually launched**:
+#   * enable  -> a log file for the new pid whose write time is at or after that
+#                process's start (a historical file, including one left by an earlier
+#                process with the same pid, does not count);
+#   * disable -> no log file for the new pid written at or after its start.
+# A failed verification is reported as failure, not as success. The mere existence of
+# the log directory is never taken as evidence of current logging.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File host-diagnostics.ps1 -Status
@@ -50,10 +54,30 @@ function Send-EnvironmentChanged {
 }
 
 function Get-Setting { [Environment]::GetEnvironmentVariable($variable, 'User') }
-function Get-MyHosts {
+# Same verified scope as the restart tool: session and owner both match.
+function Get-VerifiedHosts {
   @(Get-FusionHostState | Where-Object {
-      $_.SessionId -eq $sessionId -and ($_.User -eq '' -or $_.User -eq $me)
+      $_.SessionId -eq $sessionId -and $_.User -eq $me
     })
+}
+
+# The log file for one process, with whether it was written by *that* launch. A file
+# with the same pid from an earlier process is stale and does not count.
+function Get-LaunchLog($host_) {
+  $file = Join-Path $logDir ("fusion-host-{0}.log" -f $host_.Id)
+  if (-not (Test-Path -LiteralPath $file)) {
+    return [pscustomobject]@{ Path = $file; Exists = $false; FromThisLaunch = $false; Detail = 'no file' }
+  }
+  $item = Get-Item -LiteralPath $file
+  $started = $host_.StartTime
+  if ($null -eq $started) {
+    return [pscustomobject]@{ Path = $file; Exists = $true; FromThisLaunch = $false; Detail = 'process start time unreadable' }
+  }
+  $fresh = $item.LastWriteTime -ge $started.AddSeconds(-1)
+  return [pscustomobject]@{
+    Path = $file; Exists = $true; FromThisLaunch = $fresh
+    Detail = ("written={0:HH:mm:ss} started={1:HH:mm:ss}" -f $item.LastWriteTime, $started)
+  }
 }
 
 function Restart-Host {
@@ -66,26 +90,16 @@ function Restart-Host {
 function Show-Status {
   $value = Get-Setting
   Write-Host ("{0} (user) = {1}" -f $variable, $(if ($value) { "'$value'" } else { '(not set: the product default, off)' }))
-  Write-Host ("log directory: {0}" -f $logDir)
-  if (Test-Path -LiteralPath $logDir) {
-    $newest = Get-ChildItem -LiteralPath $logDir -Filter 'fusion-host-*.log' -File -ErrorAction SilentlyContinue |
-      Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($newest) {
-      Write-Host ("newest log:    {0} ({1:yyyy-MM-dd HH:mm:ss}, {2} bytes)" -f $newest.Name, $newest.LastWriteTime, $newest.Length)
-    } else {
-      Write-Host 'newest log:    (none)'
-    }
-  } else {
-    Write-Host 'newest log:    (no directory: the log has never been enabled for this user)'
-  }
-  $hosts = @(Get-MyHosts)
-  if ($hosts.Count -gt 0) {
-    foreach ($host_ in $hosts) {
-      $file = Join-Path $logDir ("fusion-host-{0}.log" -f $host_.Id)
-      Write-Host ("running Host:  pid={0} log-for-this-pid={1}" -f $host_.Id, (Test-Path -LiteralPath $file))
-    }
-  } else {
+  Write-Host ("log directory: {0}{1}" -f $logDir, $(if (Test-Path -LiteralPath $logDir) { '' } else { ' (does not exist)' }))
+  $hosts = @(Get-VerifiedHosts)
+  if ($hosts.Count -eq 0) {
     Write-Host 'running Host:  (none)'
+    return
+  }
+  foreach ($host_ in $hosts) {
+    $log = Get-LaunchLog $host_
+    Write-Host ("running Host:  pid={0} log={1} ({2})" -f $host_.Id,
+      $(if ($log.Exists) { $log.Path } else { '(none)' }), $log.Detail)
   }
 }
 
@@ -109,34 +123,46 @@ try {
 
   if ($NoRestart) {
     Write-Host 'The running Host keeps its old setting until it is restarted; run restart-host.ps1 or sign out.'
-  } else {
-    Write-Host ''
-    Write-Host '== restarting the Host so the setting reaches it'
-    $before = @(Get-MyHosts | ForEach-Object { $_.Id })
-    Restart-Host
-    $after = @(Get-MyHosts)
-    $new = @($after | Where-Object { $before -notcontains $_.Id })
-    if ($new.Count -eq 0) { $new = $after }
-    Write-Host ''
+    Show-Status
+    exit 0
+  }
+
+  Write-Host ''
+  Write-Host '== restarting the Host so the setting reaches it'
+  $before = @(Get-VerifiedHosts | ForEach-Object { $_.Id })
+  Restart-Host
+  $after = @(Get-VerifiedHosts)
+  $new = @($after | Where-Object { $before -notcontains $_.Id })
+  if ($new.Count -eq 0) { $new = $after }
+  if ($new.Count -eq 0) { throw 'no Host is running after the restart, so the setting could not be verified' }
+
+  # Give a freshly started Host a moment to write its startup lines (or to prove it
+  # does not write any).
+  Start-Sleep -Seconds 2
+  $new = @(Get-VerifiedHosts)
+  Write-Host ''
+  $verified = $true
+  foreach ($host_ in $new) {
+    $log = Get-LaunchLog $host_
+    Write-Host ("  pid={0} log={1} exists={2} from_this_launch={3} ({4})" -f
+      $host_.Id, $log.Path, $log.Exists, $log.FromThisLaunch, $log.Detail)
+    if ($Enable -and -not $log.FromThisLaunch) { $verified = $false }
+    if ($Disable -and $log.FromThisLaunch) { $verified = $false }
+  }
+
+  if (-not $verified) {
     if ($Enable) {
-      $verified = $false
-      foreach ($host_ in $new) {
-        $file = Join-Path $logDir ("fusion-host-{0}.log" -f $host_.Id)
-        $exists = Test-Path -LiteralPath $file
-        Write-Host ("  pid={0} expected log {1}: {2}" -f $host_.Id, $file, $exists)
-        if ($exists) { $verified = $true }
-      }
-      if (-not $verified) {
-        Write-Host 'WARNING: the restarted Host wrote no log. Its launch path did not receive the setting' -ForegroundColor Yellow
-        Write-Host '         (a launcher with a cached environment block). Sign out and sign in, then run -Status.' -ForegroundColor Yellow
-        $exitCode = 1
-      }
+      Write-Host 'FAILED: the restarted Host is not writing a log, so the setting did not take effect.' -ForegroundColor Red
+      Write-Host '  Possible causes: the launcher kept an older environment block, the process could not create' -ForegroundColor Yellow
+      Write-Host '  the file (permissions/disk), or the variable was changed after that process started.' -ForegroundColor Yellow
+      Write-Host '  Sign out and sign in, then run -Status to see whether the next Host writes a log.' -ForegroundColor Yellow
     } else {
-      foreach ($host_ in $new) {
-        $file = Join-Path $logDir ("fusion-host-{0}.log" -f $host_.Id)
-        Write-Host ("  pid={0} log for this pid exists: {1} (it will not grow)" -f $host_.Id, (Test-Path -LiteralPath $file))
-      }
+      Write-Host 'FAILED: the restarted Host still writes a log, so the setting was not applied.' -ForegroundColor Red
+      Write-Host '  Check that no other launch path sets the variable (user, machine or process scope), then retry.' -ForegroundColor Yellow
     }
+    $exitCode = 1
+  } else {
+    Write-Host $(if ($Enable) { 'Confirmed: the restarted Host writes its log.' } else { 'Confirmed: the restarted Host writes no log.' })
   }
   Write-Host ''
   Show-Status

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -139,10 +140,10 @@ public:
   ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
   bool hard_policy_allows(ContextEntry &entry);
   // U6: declares this thread's keyboard open/close compartment open, once per
-  // activation and once per new application context. Writing only when the value is
-  // closed keeps the user's own Ctrl+Space close effective inside a context; a new
-  // context is what the owner decided should start open. Returns true when the
-  // compartment reads open afterwards.
+  // activation and once per document manager that has not been seen yet (a new
+  // application window). It is never called from a key path, so a Ctrl+Space close
+  // made before or after the first key of that window is preserved. Returns true
+  // when the compartment reads open afterwards.
   bool declare_keyboard_open(const char *reason);
   // `presentation` (real frontend only) places the caret at the engine cursor
   // and styles the composition; without it the caret goes to the end.
@@ -207,6 +208,11 @@ private:
   fusion::test::MockBackend backend_;
 #endif
   std::vector<std::shared_ptr<ContextEntry>> entries_;
+  // U6: document managers whose window has already been given the open default. A
+  // pointer that is reused after release can only suppress one re-declaration, never
+  // force a window that the user closed; the set is cleared on Deactivate and capped.
+  std::set<ITfDocumentMgr *> open_declared_document_managers_;
+  static constexpr std::size_t kMaxOpenDeclaredDocumentManagers = 256;
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;
   bool handling_key_ = false; // reentrancy guard (D072 §7.5)

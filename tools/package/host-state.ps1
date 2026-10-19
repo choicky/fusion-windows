@@ -409,11 +409,17 @@ function Invoke-PackageScript {
 # and waits, bounded, for the process to exit. Never terminates anything: if the
 # event cannot be opened (another principal, or no Host), it reports that instead.
 function Stop-FusionHostOrderly {
-  param([int]$TimeoutMs = 20000, [string]$InstallRoot = '')
+  # -Pids restricts the stop to an already verified set (the WP7 restart tool passes
+  # this user's/this session's pids), so a waiter never waits for another session's
+  # Host. The stop event is per user x session either way.
+  param([int]$TimeoutMs = 20000, [string]$InstallRoot = '', [int[]]$Pids = @())
   $eventName = Get-FusionStopEventName
   $hosts = @(Get-FusionHostState)
   if ($InstallRoot) {
     $hosts = @($hosts | Where-Object { $_.Path -and $_.Path.StartsWith($InstallRoot, [StringComparison]::OrdinalIgnoreCase) })
+  }
+  if ($Pids.Count -gt 0) {
+    $hosts = @($hosts | Where-Object { $Pids -contains $_.Id })
   }
   $result = [pscustomobject]@{
     EventName = $eventName
