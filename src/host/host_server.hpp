@@ -158,7 +158,9 @@ bool wait_for_stop_request(void *stop_event, void *exit_complete);
 // trigger (User32 1077 -> start the Host again), not this handler.
 class SessionEndHandler {
 public:
-  using RequestStop = std::function<void()>;
+  // R30: the path is passed so the diagnostic log can name which way the stop came
+  // (session end vs an external window close).
+  using RequestStop = std::function<void(const char *path)>;
 
   SessionEndHandler(RequestStop request_stop, void *exit_complete, unsigned long timeout_ms)
       : request_stop_(std::move(request_stop)), exit_complete_(exit_complete),
@@ -219,15 +221,17 @@ private:
   struct Connection {
     Connection(std::unique_ptr<PipeServer> pipe_server, Backend &backend_ref,
                std::mutex &backend_mutex_ref, std::atomic<std::uint64_t> &next_context,
-               std::uint64_t host_incarnation)
+               std::uint64_t host_incarnation, std::uint64_t connection_id)
         : pipe(std::move(pipe_server)), backend(backend_ref), backend_mutex(backend_mutex_ref),
-          next_host_context(next_context), incarnation(host_incarnation) {}
+          next_host_context(next_context), incarnation(host_incarnation), id(connection_id) {}
 
     std::unique_ptr<PipeServer> pipe;
     Backend &backend;
     std::mutex &backend_mutex;
     std::atomic<std::uint64_t> &next_host_context;
     std::uint64_t incarnation;
+    // R30: this connection's identity in the diagnostic log (no payload, no client data).
+    const std::uint64_t id;
     std::map<std::uint64_t, Binding> context_map; // client_context → host binding
 
     void run();
@@ -262,6 +266,7 @@ private:
   std::atomic<bool> stopping_{false};
   std::mutex backend_mutex_;
   std::atomic<std::uint64_t> next_host_context_{1};
+  std::atomic<std::uint64_t> next_connection_id_{1};
   bool first_instance_ = true;
 
   mutable std::mutex connections_mutex_;
