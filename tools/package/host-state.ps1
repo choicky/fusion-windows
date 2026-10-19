@@ -155,6 +155,15 @@ function Get-FusionScheduledTask {
     RunLevel  = [string]$task.Principal.RunLevel
     Instances = [string]$task.Settings.MultipleInstances
     TimeLimit = [string]$task.Settings.ExecutionTimeLimit
+    TriggerCount = @($task.Triggers).Count
+    Triggers  = ($task.Triggers | ForEach-Object {
+        $_.CimClass.CimClassName -replace '^MSFT_Task', '' -replace 'Trigger$', ''
+      }) -join ';'
+    # The R34 event trigger's XPath, so a run can record that it exists and what it
+    # selects (empty when the task has no event trigger).
+    EventSubscription = (@($task.Triggers |
+          Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskEventTrigger' } |
+          ForEach-Object { $_.Subscription }) -join ';')
     LastResult = if ($info) { $info.LastTaskResult } else { $null }
   }
 }

@@ -23,6 +23,12 @@
 // ordered shutdown (stop -> shutdown_backend -> Fcitx's own save on exit), exactly
 // as the console path does. `--console` keeps the console mode with its control
 // handler for development and tests.
+//
+// Stage 6 R34: none of these paths makes the Host survive a *cancelled* session end.
+// Windows delivers WM_ENDSESSION(TRUE) to applications one after another during a
+// logoff, so an application processed before the blocking one has already ended when the
+// user's Cancel takes effect (measured 2026-10-18). Surviving that is the scheduled
+// task's event trigger (User32 1077 -> start the Host again), not this process.
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
@@ -142,7 +148,14 @@ LRESULT CALLBACK session_end_window_proc(HWND window, UINT message, WPARAM wpara
     return static_cast<LRESULT>(session_end_handler->handle(message, wparam));
   switch (message) {
   case WM_CLOSE:
-    DestroyWindow(window);
+    // An external close (taskkill without /f, a window closer) must not silently remove
+    // the Host's only logoff/shutdown path: before the exit it requests the orderly stop
+    // and the window stays; after the exit this is main()'s own close and the window
+    // goes. With no handler (never in a started Host, but the branch must not hang the
+    // join) the window is destroyed as before.
+    if (session_end_handler == nullptr || !session_end_handler->close_keeps_window()) {
+      DestroyWindow(window);
+    }
     return 0;
   case WM_DESTROY:
     PostQuitMessage(0);

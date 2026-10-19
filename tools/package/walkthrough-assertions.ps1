@@ -580,7 +580,8 @@ public static class FusionShutdownBlocker
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandleW(string name);
 
-    private static WndProcDelegate procDelegate;
+    private static WndProcDelegate procDelegate = new WndProcDelegate(Proc);
+    private static bool classRegistered = false;
     private static IntPtr handle = IntPtr.Zero;
     private static Thread thread;
     private static ManualResetEvent ready = new ManualResetEvent(false);
@@ -588,11 +589,16 @@ public static class FusionShutdownBlocker
     private static bool querySeen = false;
     private static bool queryResult = true;
 
+    private const int ERROR_CLASS_ALREADY_EXISTS = 1410;
+
+    // Restartable: every field is reset here, so a second Start in the same process (the
+    // walkthrough starts one blocker for (c2) and another for (c3)) behaves like the first.
+    // The window class is per process and survives Stop, so Run tolerates its re-registration.
     public static bool Start(string title, string reason, int timeoutMs)
     {
         reasonText = reason;
         handle = IntPtr.Zero;
-        ready.Reset();
+        ready = new ManualResetEvent(false);
         querySeen = false;
         queryResult = true;
         thread = new Thread(delegate() { Run(title); });
@@ -602,17 +608,30 @@ public static class FusionShutdownBlocker
         return ready.WaitOne(timeoutMs) && handle != IntPtr.Zero;
     }
 
-    private static void Run(string title)
+    // Registering a class that this process already registered fails with
+    // ERROR_CLASS_ALREADY_EXISTS. That is the restart case, not an error: the existing
+    // class still points at the same delegate and can be used again.
+    private static bool EnsureClass()
     {
-        procDelegate = new WndProcDelegate(Proc);
+        if (classRegistered) { return true; }
         WNDCLASS wc = new WNDCLASS();
         wc.lpfnWndProc = Marshal.GetFunctionPointerForDelegate(procDelegate);
         wc.hInstance = GetModuleHandleW(null);
         wc.lpszClassName = ClassName;
         wc.hbrBackground = (IntPtr)6;
-        if (RegisterClassW(ref wc) == 0) { ready.Set(); return; }
+        if (RegisterClassW(ref wc) == 0)
+        {
+            if (Marshal.GetLastWin32Error() != ERROR_CLASS_ALREADY_EXISTS) { return false; }
+        }
+        classRegistered = true;
+        return true;
+    }
+
+    private static void Run(string title)
+    {
+        if (!EnsureClass()) { ready.Set(); return; }
         handle = CreateWindowExW(0, ClassName, title, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT, 560, 150, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+            CW_USEDEFAULT, CW_USEDEFAULT, 560, 150, IntPtr.Zero, IntPtr.Zero, GetModuleHandleW(null), IntPtr.Zero);
         if (handle == IntPtr.Zero) { ready.Set(); return; }
         ShowWindow(handle, SW_SHOW);
         ShutdownBlockReasonCreate(handle, reasonText);
@@ -668,9 +687,10 @@ public static class FusionShutdownBlocker
 
     public static void Stop()
     {
-        if (handle != IntPtr.Zero) { PostMessageW(handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero); }
-        if (thread != null) { thread.Join(5000); }
+        IntPtr closing = handle;
         handle = IntPtr.Zero;
+        if (closing != IntPtr.Zero) { PostMessageW(closing, WM_CLOSE, IntPtr.Zero, IntPtr.Zero); }
+        if (thread != null) { thread.Join(5000); thread = null; }
     }
 }
 '@
@@ -712,4 +732,166 @@ function Test-ShutdownBlockerBlocksSessionEnd {
 
 function Stop-ShutdownBlocker {
   [FusionShutdownBlocker]::Stop()
+}
+
+# --- R34: session identity, cancel evidence, save stamp ---------------------
+#
+# Step (c2) used to decide "was the sign-out cancelled?" from the tester's impression,
+# and the WP4 run got that wrong: the terminal closed, the tester believed the session had
+# ended, and the product failure was recorded as a harness failure. These helpers let the
+# walkthrough decide from evidence instead.
+if (-not ('FusionWts' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class FusionWts
+{
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass,
+        out IntPtr buffer, out int bytes);
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr buffer);
+    // Environment.TickCount64 is not in .NET Framework 4.8 (what Windows PowerShell loads).
+    [DllImport("kernel32.dll")]
+    private static extern ulong GetTickCount64();
+
+    // Class 24 is WTSSessionInfo: the buffer is a WTSINFOW, not a FILETIME. Reading its
+    // first 8 bytes as a FILETIME gives State + SessionId (the 5700X reported
+    // 1601-01-01 00:07:09 for session 1). The structure is parsed properly here, and the
+    // six DWORD counters that follow SessionId are part of it: without them every later
+    // field is shifted by 24 bytes, so the field named LogonTime would read ConnectTime
+    // (equal on a console session, different after a disconnect/reconnect).
+    private const int WTSSessionInfo = 24;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WTSINFOW
+    {
+        public int State;
+        public int SessionId;
+        public int IncomingBytes;
+        public int OutgoingBytes;
+        public int IncomingFrames;
+        public int OutgoingFrames;
+        public int IncomingCompressedBytes;
+        public int OutgoingCompressedBytes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string WinStationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 17)] public string Domain;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)] public string UserName;
+        public long ConnectTime;
+        public long DisconnectTime;
+        public long LastInputTime;
+        public long LogonTime;
+        public long CurrentTime;
+    }
+
+    // What the query read back, including the numbers that prove the layout: the structure
+    // size the marshaller computed and the byte count WTS returned must agree.
+    public sealed class WtsSessionInfo
+    {
+        public int State;
+        public int SessionId;
+        public long ConnectTime;
+        public long LogonTime;
+        public int StructSize;
+        public int Bytes;
+    }
+
+    public static WtsSessionInfo Query(int sessionId)
+    {
+        IntPtr buffer;
+        int bytes;
+        if (!WTSQuerySessionInformationW(IntPtr.Zero, sessionId, WTSSessionInfo, out buffer, out bytes))
+            return null;
+        try
+        {
+            int size = Marshal.SizeOf(typeof(WTSINFOW));
+            if (buffer == IntPtr.Zero || bytes < size) { return null; }
+            WTSINFOW info = (WTSINFOW)Marshal.PtrToStructure(buffer, typeof(WTSINFOW));
+            return new WtsSessionInfo
+            {
+                State = info.State,
+                SessionId = info.SessionId,
+                ConnectTime = info.ConnectTime,
+                LogonTime = info.LogonTime,
+                StructSize = size,
+                Bytes = bytes
+            };
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { WTSFreeMemory(buffer); }
+        }
+    }
+
+    // The session's logon time as a FILETIME value (0 when unavailable or implausible).
+    public static long LogonTimeUtc(int sessionId)
+    {
+        WtsSessionInfo info = Query(sessionId);
+        if (info == null) { return 0; }
+        long logon = info.LogonTime;
+        if (logon <= 0) { return 0; }
+        DateTime value;
+        try { value = DateTime.FromFileTimeUtc(logon); }
+        catch { return 0; }
+        // Sanity: not before 2000 and not before the last boot (5 s of clock slop).
+        if (value.Year < 2000) { return 0; }
+        DateTime boot = DateTime.UtcNow.AddMilliseconds(-(long)GetTickCount64());
+        if (value < boot.AddSeconds(-5)) { return 0; }
+        return logon;
+    }
+}
+'@
+}
+
+# The session this script runs in, with its logon time. A sign-out produces a new session
+# id or a later logon time; a cancelled one leaves both unchanged. `LogonText` is local time
+# (what `query user` prints); `LogonTimeUtc` is the same instant in UTC.
+function Get-SessionIdentity {
+  $sessionId = (Get-Process -Id $PID).SessionId
+  $logon = [FusionWts]::LogonTimeUtc($sessionId)
+  $logonUtc = $null
+  $logonTime = $null
+  if ($logon -gt 0) {
+    $logonUtc = [DateTime]::FromFileTimeUtc($logon)
+    $logonTime = $logonUtc.ToLocalTime()
+  }
+  return [pscustomobject]@{
+    SessionId    = $sessionId
+    LogonTimeUtc = $logonUtc
+    LogonText    = if ($logonTime) { $logonTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '(unavailable)' }
+  }
+}
+
+# The newest User32 cancel event in the System log: 1077 for a cancelled logoff, 1073 for a
+# cancelled restart/shutdown. Windows writes neither when the attempt completes (measured
+# 2026-10-18 and 2026-10-19). Reading the System log needs no elevation.
+function Get-LastCancelEvent {
+  param([ValidateSet(1077, 1073)][int]$EventId = 1077)
+  try {
+    $event = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'User32'; Id = $EventId } `
+      -MaxEvents 1 -ErrorAction Stop
+    if ($event) {
+      return [pscustomobject]@{ Time = $event.TimeCreated; RecordId = $event.RecordId; User = $event.UserId; Id = $event.Id }
+    }
+  } catch {
+    # No event, or the log cannot be read: callers treat "no evidence" as "no cancel seen".
+  }
+  return $null
+}
+
+# The newest mtime among the Fcitx user-data files. An orderly stop saves, so this stamp
+# advancing proves the save ran (and did not, when it does not move).
+function Get-FusionSaveStamp {
+  $root = Join-Path $env:APPDATA 'Fcitx5'
+  if (-not (Test-Path -LiteralPath $root)) { return $null }
+  $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue)
+  if ($files.Count -eq 0) { return $null }
+  $newest = $files | Sort-Object -Property LastWriteTimeUtc -Descending | Select-Object -First 1
+  return [pscustomobject]@{
+    NewestUtc = $newest.LastWriteTimeUtc
+    NewestText = $newest.LastWriteTimeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+    File      = $newest.Name
+    FileCount = $files.Count
+  }
 }

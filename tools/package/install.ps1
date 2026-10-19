@@ -140,6 +140,56 @@ try {
   Write-Step "creating or updating the logon task '$taskName'"
   $action = New-ScheduledTaskAction -Execute $hostExe -WorkingDirectory $versionDir
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger cannot help
+  # because the session never ended. Windows writes User32 1077 when a *logoff* is cancelled
+  # and User32 1073 when a *restart or shutdown* is cancelled; neither is written when the
+  # attempt completes (measured 2026-10-18 and 2026-10-19), so an event trigger on both starts
+  # the Host again. Scoped to this user's SID; delayed so the previous Host has released
+  # HostClaim (its bounded orderly shutdown is 4 s) before the new instance starts.
+  # New-ScheduledTaskTrigger has no event form, hence the CIM class.
+  #
+  # The SID is an attribute of System/Security, not of System: `@UserID=` on System matches
+  # nothing (found in review; the query below is proven against records 104140, 104461 and
+  # 104462, and against the completed restart of 2026-10-19 11:24, which it does not match).
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $xpath = "*[System[Provider[@Name='User32'] and (EventID=1077 or EventID=1073) and Security[@UserID='$sid']]]"
+  # The QueryList must be well-formed XML: closing </Query> is required (a missing one is
+  # tolerated by Get-WinEvent but rejected when the task is registered.)
+  $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
+  # Validate the query before it goes into a trigger: a bad XPath would only show up as a
+  # trigger that never fires. EventLogReader takes the XPath and returns $null when nothing
+  # matches (a valid answer); the QueryList form the trigger actually uses is then checked
+  # against the same log whenever at least one event exists.
+  $subscriptionOk = $true
+  $subscriptionError = ''
+  $firstEvent = $null
+  try {
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery('System',
+      [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
+    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    $firstEvent = $reader.ReadEvent()
+    $reader.Dispose()
+  } catch {
+    $subscriptionOk = $false
+    $subscriptionError = $_.Exception.Message
+  }
+  if ($subscriptionOk -and $null -ne $firstEvent) {
+    try {
+      # -FilterXml carries its own <Query Path>, so it cannot be combined with -LogName.
+      $null = Get-WinEvent -FilterXml $subscription -MaxEvents 1 -ErrorAction Stop
+    } catch {
+      $subscriptionOk = $false
+      $subscriptionError = ("the QueryList form was rejected: {0}" -f $_.Exception.Message)
+    }
+  }
+  if (-not $subscriptionOk) {
+    throw ("the event subscription is not a valid query: {0}`n  {1}" -f $subscriptionError, $subscription)
+  }
+  $eventClass = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
+  $eventTrigger = New-CimInstance -CimClass $eventClass -ClientOnly
+  $eventTrigger.Enabled = $true
+  $eventTrigger.Subscription = $subscription
+  $eventTrigger.Delay = 'PT10S'
   # Interactive token + limited run level: the Host always runs as the logged-on
   # user at Medium integrity, never elevated. HostClaim, not the task, remains the
   # authority for "one Host per user x session", so IgnoreNew only avoids a queue of
@@ -147,11 +197,15 @@ try {
   $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable:$false
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
-    -Settings $settings -Force | Out-Null
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger, $eventTrigger) `
+    -Principal $principal -Settings $settings -Force | Out-Null
   $task = Get-FusionScheduledTask
   if (-not $task) { throw "the task '$taskName' was registered but cannot be read back" }
   Write-Host "  execute=$($task.Execute) args='$($task.Arguments)' user=$($task.UserId) logon=$($task.LogonType) runLevel=$($task.RunLevel) instances=$($task.Instances) timeLimit=$($task.TimeLimit)"
+  Write-Host "  triggers=$($task.Triggers) count=$($task.TriggerCount)"
+  if ($task.EventSubscription -notmatch '1077' -or $task.EventSubscription -notmatch '1073') {
+    throw "the task was registered without the User32 1077/1073 event trigger (subscription: '$($task.EventSubscription)')"
+  }
 
   $currentStep = 'start'
   if ($NoStart) {

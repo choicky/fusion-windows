@@ -19,7 +19,9 @@
 //   owning thread still drains before the backend is destroyed (Stage 6 WP4).
 // - wp4sessionend: the session-end decision — a cancelled logoff (query only, or
 //   WM_ENDSESSION(FALSE)) stops nothing, only WM_ENDSESSION(TRUE) requests the stop
-//   and waits, bounded (Stage 6 WP4).
+//   and waits, bounded; an external WM_CLOSE before the exit requests the same stop
+//   and keeps the window (Stage 6 WP4; R34 clarifies that surviving a cancelled end is
+//   the task's event trigger, not this decision).
 // - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
 //   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
 //   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
@@ -1696,6 +1698,12 @@ void test_stop_event() {
 // the Host — a Host that stopped there would stay gone until the next logon. Only
 // WM_ENDSESSION with wParam TRUE means the session is really ending; it requests the
 // stop and waits, bounded, for the ordered shutdown.
+//
+// R34: this decision does not make the Host survive a *cancelled* end — Windows delivers
+// ENDSESSION(TRUE) before the Cancel takes effect, and restarting afterwards is the
+// scheduled task's event trigger. What is tested here is only the decision itself, plus
+// the external WM_CLOSE case: before the exit it must request the stop and keep the
+// window, after the exit it must close it.
 void test_session_end() {
   HANDLE exit_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   require(exit_complete != nullptr, "session-end exit signal created");
@@ -1731,9 +1739,29 @@ void test_session_end() {
           "a finished exit releases the wait immediately");
   require(requests == 2, "each WM_ENDSESSION(TRUE) requests the stop once");
 
+  // R34: a WM_CLOSE from outside (taskkill without /f) must not remove the Host's only
+  // logoff/shutdown path. Before main() has finished it requests the same orderly stop
+  // and the window is kept; after the exit it is main()'s own close and the window goes.
+  {
+    HANDLE close_exit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    require(close_exit != nullptr, "close-test exit signal created");
+    int close_requests = 0;
+    fusion::ipc::SessionEndHandler close_handler([&close_requests] { close_requests++; },
+                                                 close_exit, timeout_ms);
+    require(close_handler.close_keeps_window(),
+            "an external WM_CLOSE keeps the window before the exit");
+    require(close_requests == 1, "an external WM_CLOSE requests the orderly stop");
+    SetEvent(close_exit);
+    require(!close_handler.close_keeps_window(), "after the exit, WM_CLOSE closes the window");
+    require(close_requests == 1, "the close after the exit requests nothing more");
+    CloseHandle(close_exit);
+  }
+
   CloseHandle(exit_complete);
   std::cout << "PASS WP4 session end: a query or a cancelled end stops nothing, only "
-               "WM_ENDSESSION(TRUE) requests the stop and waits, bounded\n";
+               "WM_ENDSESSION(TRUE) requests the stop and waits, bounded; an external "
+               "WM_CLOSE before the exit requests the same stop instead of removing the "
+               "window\n";
 }
 
 } // namespace

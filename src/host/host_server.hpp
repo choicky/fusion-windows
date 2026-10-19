@@ -149,6 +149,13 @@ bool wait_for_stop_request(void *stop_event, void *exit_complete);
 // the session is really ending: then the handler requests the stop and waits,
 // bounded, for main() to finish the ordered shutdown (Fcitx's save included).
 // WM_ENDSESSION with wParam FALSE (the session end was cancelled) does nothing.
+//
+// This handler does NOT make the Host survive a *cancelled* session end. Windows
+// delivers WM_ENDSESSION(TRUE) to applications one after another during a logoff, so an
+// application processed before the blocking one has already ended when the user's Cancel
+// takes effect (measured 2026-10-18: the Host saved at 19:03:13, the cancel was logged at
+// 19:03:20, and the process was gone). Surviving that is the scheduled task's event
+// trigger (User32 1077 -> start the Host again), not this handler.
 class SessionEndHandler {
 public:
   using RequestStop = std::function<void()>;
@@ -161,6 +168,13 @@ public:
   static bool handles(unsigned int message);
   // The value the window procedure must return for a message it owns.
   std::intptr_t handle(unsigned int message, std::uintptr_t wparam);
+
+  // The window procedure's WM_CLOSE decision. Before main() has finished, an external
+  // close (taskkill without /f, a window closer) must not remove the Host's only
+  // logoff/shutdown path: it requests the same orderly stop and the window is kept.
+  // After exit_complete is signalled the close is main()'s own and the window is
+  // destroyed. Returns true when the window must be kept.
+  bool close_keeps_window();
 
 private:
   RequestStop request_stop_;
