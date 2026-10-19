@@ -125,8 +125,8 @@ public:
   // Whether Return is engine work right now: raw input, a displayed candidate/panel
   // page, unsettled frontend work or an unresolved pass barrier. When this is false the
   // engine only answers Return with ForwardKey, so the TSF shell must not claim the key
-  // in OnTestKeyDown: an application that honours only that callback drops it otherwise
-  // (measured in Notepad--, R36).
+  // in OnTestKeyDown: an application that honours only that callback then loses it
+  // (observed in Notepad-- 3.4, R36).
   bool return_has_engine_work() const;
 
   // The unresolved effect to drain synchronously before allowing PASS, if any.
