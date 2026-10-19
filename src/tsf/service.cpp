@@ -814,7 +814,15 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (!entry)
     return S_OK;
   const auto action = physical_key(wparam, lparam);
-  const bool mapped = entry->semantic.routes_key(action);
+  bool mapped = entry->semantic.routes_key(action);
+  // R36: an idle Return is not engine work — the engine answers it with ForwardKey only.
+  // Claiming it here makes the shell own a key it then has to hand back, and an
+  // application that honours only OnTestKeyDown drops it (Notepad--: the batch carried
+  // ForwardKey, the shell answered "not eaten", and no newline appeared). Leaving the key
+  // unclaimed lets the application handle it natively. While composing, with a candidate
+  // page or with unsettled work, Return stays engine-owned as before.
+  if (mapped && wparam == kVkReturn && !entry->semantic.return_has_engine_work())
+    mapped = false;
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
   diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);

@@ -528,6 +528,12 @@ Result SemanticController::settle_state(Key key, EditResult observed) {
 
 Pass SemanticController::pass_probe() const { return host_.pass_barrier(); }
 
+bool SemanticController::return_has_engine_work() const {
+  if (!real_backend_)
+    return true; // the Mock Backend keeps the shell's previous routing
+  return !buffer_.empty() || page_present_ || !pending_.empty() || pass_probe() != Pass::Clear;
+}
+
 std::optional<PendingWork> SemanticController::drain_work() {
   for (const auto &work : pending_) {
     if (real_backend_ || work.kind == Kind::Effect) {

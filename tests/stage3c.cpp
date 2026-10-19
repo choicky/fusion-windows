@@ -172,11 +172,26 @@ int main() {
       require(!d.forward || controller.finish_pass(), "punctuation Forward barrier");
     }
     controller.note_composition_terminated();
+    // Idle Return: no composition, nothing pending. The engine must not consume the
+    // physical key, so it passes to the application (the Notepad-- symptom is that it
+    // does not arrive). This is the one Return case the earlier checks never covered.
+    auto idle_return = controller.begin_key(translate_key(kVkReturn, false, false, false), true);
+    std::cout << "idle Return forward=" << (idle_return.forward ? 1 : 0)
+              << " route=" << static_cast<int>(idle_return.route)
+              << " ops=" << idle_return.frontend.size() << '\n';
+    require(!controller.return_has_engine_work(),
+            "idle Return is not engine work, so the shell must not claim it");
+    require(idle_return.forward && idle_return.route == SemanticDecision::Route::Pass,
+            "idle Return must pass to the application");
+    doc.apply(controller, idle_return);
+    require(controller.finish_pass(), "idle Return Forward barrier");
     type(controller, doc, "nihao");
     auto back = controller.begin_key(translate_key(kVkBack, false, false, false), true);
     require(back.eaten && !back.frontend.empty(), "real Backspace");
     doc.apply(controller, back);
     auto ret = controller.begin_key(translate_key(kVkReturn, false, false, false), true);
+    require(controller.return_has_engine_work(),
+            "composing Return stays engine work, so the shell claims it");
     require(ret.backend_session_id && ret.route != SemanticDecision::Route::CancelledRecovery,
             "real Return composition");
     doc.apply(controller, ret);
