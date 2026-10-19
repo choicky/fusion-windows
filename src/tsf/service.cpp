@@ -797,7 +797,9 @@ STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
 STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lparam,
                                         BOOL *pfEaten) {
   // Eligibility only: no engine consumption prediction or dispatch in T.
-  // Applications which consult T must receive TRUE to subsequently route K.
+  // An application that consults T must receive TRUE to route the key to K, so T
+  // claims what the engine is ready to receive — except a key the engine would only
+  // hand back (the Return rule below), which the application handles itself.
   (void)lparam;
   if (pfEaten == nullptr)
     return E_INVALIDARG;
@@ -814,7 +816,15 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (!entry)
     return S_OK;
   const auto action = physical_key(wparam, lparam);
-  const bool mapped = entry->semantic.routes_key(action);
+  bool mapped = entry->semantic.routes_key(action);
+  // R36: an idle Return is not engine work — the engine answers it with ForwardKey only
+  // (real Fcitx: one operation, no document callback). Claiming it here makes the shell
+  // own a key it has to hand back in K, and Notepad-- 3.4 then inserts no newline: the
+  // batch carried ForwardKey, the shell answered "not eaten" in K, and nothing arrived.
+  // Leaving the key unclaimed lets the application handle it natively. While composing,
+  // with a candidate page or with unsettled work, Return stays engine-owned as before.
+  if (mapped && action.virtual_key == kVkReturn && !entry->semantic.return_has_engine_work())
+    mapped = false;
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
   diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);

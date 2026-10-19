@@ -171,12 +171,42 @@ int main() {
       doc.apply(controller, d);
       require(!d.forward || controller.finish_pass(), "punctuation Forward barrier");
     }
-    controller.note_composition_terminated();
+    // R36: the owner's exact sequence — type, commit the candidate with Space, then
+    // Enter with nothing pending. The commit clears the client preedit projection, so
+    // the engine has no work for Return and would only forward it; the shell must
+    // therefore not claim the key in OnTestKeyDown, because an application that honours
+    // only that callback (Notepad--) drops the key. Earlier checks never covered an idle
+    // Return *after* a commit: they forced an external termination first, which clears
+    // the projection by itself and would hide exactly this precondition.
+    type(controller, doc, "nihao");
+    auto commit = controller.begin_key(translate_key(kVkSpace, false, false, false), true);
+    require(commit.eaten && !commit.forward && !commit.frontend.empty() &&
+                commit.frontend.front().operation.type == BackendOperation::Type::CommitText &&
+                commit.frontend.front().operation.text == "你好",
+            "Space did not commit the candidate");
+    doc.apply(controller, commit);
+    require(controller.finish_pass(), "commit barrier");
+    require(controller.raw_buffer().empty(), "commit clears the client preedit projection");
+    require(!controller.return_has_engine_work(),
+            "idle Return after a commit is not engine work, so the shell must not claim it");
+    require(controller.routes_key(translate_key(kVkReturn, false, false, false)),
+            "Return is still T-routable while the engine is ready");
+    auto idle_return = controller.begin_key(translate_key(kVkReturn, false, false, false), true);
+    std::cout << "idle Return forward=" << (idle_return.forward ? 1 : 0)
+              << " route=" << static_cast<int>(idle_return.route)
+              << " ops=" << idle_return.frontend.size() << '\n';
+    require(idle_return.forward && idle_return.frontend.empty() &&
+                idle_return.route == SemanticDecision::Route::Pass,
+            "idle Return must only be forwarded to the application");
+    doc.apply(controller, idle_return);
+    require(controller.finish_pass(), "idle Return Forward barrier");
     type(controller, doc, "nihao");
     auto back = controller.begin_key(translate_key(kVkBack, false, false, false), true);
     require(back.eaten && !back.frontend.empty(), "real Backspace");
     doc.apply(controller, back);
     auto ret = controller.begin_key(translate_key(kVkReturn, false, false, false), true);
+    require(controller.return_has_engine_work(),
+            "composing Return stays engine work, so the shell claims it");
     require(ret.backend_session_id && ret.route != SemanticDecision::Route::CancelledRecovery,
             "real Return composition");
     doc.apply(controller, ret);
