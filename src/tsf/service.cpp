@@ -536,27 +536,47 @@ public:
     // failing HRESULT, a null view or no active view is a presentation failure
     // only: the anchor stays invalid, the caller hides the page, and no engine
     // semantic event is invented.
+    //
+    // R25: the popup is invisible in Firefox's contenteditable editor while it works
+    // in that browser's address bar and search field, so the anchor query is the
+    // suspect and it used to fail silently. These lines are content-free (stage,
+    // HRESULT, screen geometry) and appear only under FUSION_TSF_DIAGNOSTICS.
     ComRef<ITfContextView> view;
-    if (FAILED(entry->context->GetActiveView(view.out())) || !view)
+    HRESULT hr = entry->context->GetActiveView(view.out());
+    if (FAILED(hr) || !view) {
+      diagf("ANCHOR_PROBE", "stage=no-active-view hr=0x%08lX", static_cast<unsigned long>(hr));
       return S_OK;
+    }
     ComRef<ITfRange> range;
+    bool from_composition = false;
     if (entry->composition != nullptr && SUCCEEDED(entry->composition->GetRange(range.out())) &&
         range) {
       // Composition range is the caret while preedit text is present.
+      from_composition = true;
     } else {
       TF_SELECTION selection{};
       ULONG fetched = 0;
-      if (FAILED(entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) ||
-          fetched == 0 || selection.range == nullptr)
+      hr = entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+      if (FAILED(hr) || fetched == 0 || selection.range == nullptr) {
+        diagf("ANCHOR_PROBE", "stage=no-range source=selection hr=0x%08lX fetched=%lu",
+              static_cast<unsigned long>(hr), static_cast<unsigned long>(fetched));
         return S_OK;
+      }
       range = ComRef<ITfRange>(selection.range); // takes over the GetSelection reference
     }
     RECT rect{};
-    BOOL at_start = FALSE;
-    if (FAILED(view->GetTextExt(ec, range.get(), &rect, &at_start)))
+    BOOL clipped = FALSE;
+    hr = view->GetTextExt(ec, range.get(), &rect, &clipped);
+    if (FAILED(hr)) {
+      diagf("ANCHOR_PROBE", "stage=text-ext source=%s hr=0x%08lX",
+            from_composition ? "composition" : "selection", static_cast<unsigned long>(hr));
       return S_OK;
+    }
     entry->candidate_anchor = POINT{rect.right, rect.bottom};
     entry->candidate_anchor_valid = true;
+    diagf("ANCHOR_PROBE", "stage=ok source=%s rect=%ld,%ld,%ld,%ld clipped=%d",
+          from_composition ? "composition" : "selection", rect.left, rect.top, rect.right,
+          rect.bottom, clipped != FALSE ? 1 : 0);
     return S_OK;
   }
 
@@ -1761,6 +1781,7 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     // No displayed projection: an empty page (hide signal) or a fenced dispatch.
     if (entry.candidates)
       entry.candidates->hide();
+    diagf("CANDIDATE_VIEW", "hidden reason=no-page cid=%" PRIu64, entry.semantic.context_id());
     return;
   }
   if (!entry.candidates)
@@ -1777,8 +1798,12 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
   session->Release();
   if (entry.candidate_anchor_valid)
     entry.candidates->show(*page, entry.candidate_anchor);
-  else
+  else {
+    // R25: the page existed but could not be placed, so it is hidden. The anchor probe
+    // line above names the failing stage; this one records the consequence.
+    diagf("CANDIDATE_VIEW", "hidden reason=no-anchor cid=%" PRIu64, entry.semantic.context_id());
     entry.candidates->hide(); // never show a page we cannot place near its text
+  }
 }
 
 void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,
