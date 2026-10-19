@@ -566,7 +566,33 @@ public:
     }
     RECT rect{};
     BOOL clipped = FALSE;
+    const char *source = from_composition ? "composition" : "selection";
     hr = view->GetTextExt(ec, range.get(), &rect, &clipped);
+    if (FAILED(hr) && from_composition) {
+      // R25 (measured 2026-10-20 in a local fixture): Firefox answers GetTextExt with
+      // TS_E_NOLAYOUT for the composition range on every keystroke, so the popup stayed
+      // hidden for the whole session while composition and commit worked. The same view
+      // answers the selection (caret) range with a valid rectangle from the second
+      // keystroke on, so fall back to the caret instead of hiding the page. A collapsed
+      // clone of the composition range fails the same way and is deliberately not tried.
+      TF_SELECTION caret{};
+      ULONG fetched = 0;
+      const HRESULT selection_hr =
+          entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &caret, &fetched);
+      if (SUCCEEDED(selection_hr) && fetched > 0 && caret.range != nullptr) {
+        ComRef<ITfRange> caret_range(caret.range); // takes over the GetSelection reference
+        RECT caret_rect{};
+        BOOL caret_clipped = FALSE;
+        const HRESULT caret_hr =
+            view->GetTextExt(ec, caret_range.get(), &caret_rect, &caret_clipped);
+        if (SUCCEEDED(caret_hr)) {
+          rect = caret_rect;
+          clipped = caret_clipped;
+          hr = caret_hr;
+          source = "composition-caret";
+        }
+      }
+    }
     if (FAILED(hr)) {
       diagf("ANCHOR_PROBE", "stage=text-ext source=%s hr=0x%08lX",
             from_composition ? "composition" : "selection", static_cast<unsigned long>(hr));
@@ -574,9 +600,8 @@ public:
     }
     entry->candidate_anchor = POINT{rect.right, rect.bottom};
     entry->candidate_anchor_valid = true;
-    diagf("ANCHOR_PROBE", "stage=ok source=%s rect=%ld,%ld,%ld,%ld clipped=%d",
-          from_composition ? "composition" : "selection", rect.left, rect.top, rect.right,
-          rect.bottom, clipped != FALSE ? 1 : 0);
+    diagf("ANCHOR_PROBE", "stage=ok source=%s rect=%ld,%ld,%ld,%ld clipped=%d", source, rect.left,
+          rect.top, rect.right, rect.bottom, clipped != FALSE ? 1 : 0);
     return S_OK;
   }
 
