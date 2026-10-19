@@ -140,17 +140,19 @@ try {
   Write-Step "creating or updating the logon task '$taskName'"
   $action = New-ScheduledTaskAction -Execute $hostExe -WorkingDirectory $versionDir
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-  # R34: a cancelled logoff ends the Host, and the logon trigger cannot help because the
-  # session never ended. Windows writes User32 1077 ("attempted to log off ... and failed")
-  # when a logoff is cancelled and nothing when it completes (measured 2026-10-18), so an
-  # event trigger on it starts the Host again. Scoped to this user's SID; delayed so the
-  # previous Host has released HostClaim (its bounded orderly shutdown is 4 s) before the
-  # new instance starts. New-ScheduledTaskTrigger has no event form, hence the CIM class.
+  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger cannot help
+  # because the session never ended. Windows writes User32 1077 when a *logoff* is cancelled
+  # and User32 1073 when a *restart or shutdown* is cancelled; neither is written when the
+  # attempt completes (measured 2026-10-18 and 2026-10-19), so an event trigger on both starts
+  # the Host again. Scoped to this user's SID; delayed so the previous Host has released
+  # HostClaim (its bounded orderly shutdown is 4 s) before the new instance starts.
+  # New-ScheduledTaskTrigger has no event form, hence the CIM class.
   #
   # The SID is an attribute of System/Security, not of System: `@UserID=` on System matches
-  # nothing (found in review; the query below is proven against record 104140 of 2026-10-18).
+  # nothing (found in review; the query below is proven against records 104140, 104461 and
+  # 104462, and against the completed restart of 2026-10-19 11:24, which it does not match).
   $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $xpath = "*[System[Provider[@Name='User32'] and EventID=1077 and Security[@UserID='$sid']]]"
+  $xpath = "*[System[Provider[@Name='User32'] and (EventID=1077 or EventID=1073) and Security[@UserID='$sid']]]"
   # The QueryList must be well-formed XML: closing </Query> is required (a missing one is
   # tolerated by Get-WinEvent but rejected when the task is registered.)
   $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
@@ -201,8 +203,8 @@ try {
   if (-not $task) { throw "the task '$taskName' was registered but cannot be read back" }
   Write-Host "  execute=$($task.Execute) args='$($task.Arguments)' user=$($task.UserId) logon=$($task.LogonType) runLevel=$($task.RunLevel) instances=$($task.Instances) timeLimit=$($task.TimeLimit)"
   Write-Host "  triggers=$($task.Triggers) count=$($task.TriggerCount)"
-  if ($task.EventSubscription -notmatch 'EventID=1077') {
-    throw "the task was registered without the User32 1077 event trigger (subscription: '$($task.EventSubscription)')"
+  if ($task.EventSubscription -notmatch '1077' -or $task.EventSubscription -notmatch '1073') {
+    throw "the task was registered without the User32 1077/1073 event trigger (subscription: '$($task.EventSubscription)')"
   }
 
   $currentStep = 'start'

@@ -476,6 +476,8 @@ if (-not $Resume) {
     package2Path    = (Join-Path $extractRoot $secondManifest.version)
     devRegistration = $dev
     stage           = 'a'
+    c2              = $null
+    c3              = $null
   }
   $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8
 } else {
@@ -524,14 +526,15 @@ if ($state.stage -eq 'a') {
   Add-Result 'a' '安装后是否清掉了旧版本目录' ("leftover-before={0} still-present={1}" -f
     $(if ($leftovers.Count -gt 0) { $leftovers -join ',' } else { 'none' }),
     $(if ($survivors.Count -gt 0) { $survivors -join ',' } else { 'none' }))
-  # R34: the task must carry the logon trigger and the User32 1077 event trigger; the
-  # walkthrough records both, so a missing event trigger is visible in the evidence.
+  # R34: the task must carry the logon trigger and the User32 1077/1073 event trigger (a
+  # cancelled logoff, and a cancelled restart/shutdown); the walkthrough records both, so a
+  # missing event trigger is visible in the evidence.
   $task = Get-FusionScheduledTask
-  Add-Result 'a' '计划任务（登录触发器 + R34 取消注销事件触发器）' $(if ($task) {
+  Add-Result 'a' '计划任务（登录触发器 + R34 取消注销/重启事件触发器）' $(if ($task) {
       "triggers=$($task.Triggers) count=$($task.TriggerCount) instances=$($task.Instances) runLevel=$($task.RunLevel) subscription=$($task.EventSubscription)"
     } else { 'absent' })
-  if (-not $task -or $task.EventSubscription -notmatch 'EventID=1077') {
-    Stop-Walkthrough -Step 'a' -Command 'require the User32 1077 event trigger on the task' -Code 8 `
+  if (-not $task -or $task.EventSubscription -notmatch '1077' -or $task.EventSubscription -notmatch '1073') {
+    Stop-Walkthrough -Step 'a' -Command 'require the User32 1077/1073 event trigger on the task' -Code 8 `
       -Detail ("triggers={0} subscription='{1}'" -f $(if ($task) { $task.Triggers } else { 'absent' }),
         $(if ($task) { $task.EventSubscription } else { '' }))
   }
@@ -693,7 +696,7 @@ if ($state.stage -eq 'c2') {
   # even though Cancel worked: the session, its logon time and the User32 1077 record are
   # what settle it.
   $session = Get-SessionIdentity
-  $lastCancel = Get-LastCancelledLogoff
+  $lastCancel = Get-LastCancelEvent -EventId 1077
   $saveBefore = Get-FusionSaveStamp
   Add-Result 'c2' '注销前的会话（session id + 登录时间）' ("session={0} logon={1}" -f $session.SessionId, $session.LogonText)
   Add-Result 'c2' '注销前最近一次 User32 1077（取消注销）' $(if ($lastCancel) {
@@ -732,7 +735,7 @@ if ($state.stage -eq 'c2-signout') {
   Write-Head '步骤 c2（续）：从证据判断注销是否被取消'
   $baseline = $state.c2
   $session = Get-SessionIdentity
-  $cancel = Get-LastCancelledLogoff
+  $cancel = Get-LastCancelEvent -EventId 1077
   $sameSession = ($session.SessionId -eq [int]$baseline.SessionId) -and ($session.LogonText -eq [string]$baseline.LogonText)
   $newCancel = $false
   if ($cancel) { $newCancel = ([long]$cancel.RecordId -gt [long]$baseline.LastCancelRecord) }
@@ -779,6 +782,130 @@ if ($state.stage -eq 'c2-signout') {
     }
   }
   New-Snapshot 'after-cancelled-logoff'
+  $state.stage = 'c3'
+  $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
+}
+
+# ---------------------------------------------------------------------------
+# c3. cancel a restart (R34: a cancelled restart/shutdown writes User32 1073)
+# ---------------------------------------------------------------------------
+
+if ($state.stage -eq 'c3') {
+  Write-Head '步骤 c3：取消一次重启，Host 必须仍在运行'
+  Write-Host '注销被取消时 Windows 写 User32 1077；重启/关机被取消时写 User32 1073。'
+  Write-Host '这一步取消一次重启，用同样的证据判断，然后看 Host 是否又回来了。'
+  $before = @(Get-FusionHostState)
+  $beforeIds = ($before | ForEach-Object { $_.Id } | Sort-Object) -join ','
+  Add-Result 'c3' '取消重启前的 Host pid' $beforeIds
+  if ($before.Count -eq 0) {
+    Stop-Walkthrough -Step 'c3' -Command 'require a running Host to cancel a restart' -Code 8 `
+      -Detail 'no FusionHost is running'
+  }
+
+  # A second blocker in the same process: (c2) already started and stopped one, and the
+  # terminal survived (c2), so this is the restart case the blocker had to learn.
+  $blocker = Start-ShutdownBlocker -Title 'WP4 test: cancel the restart' -Reason 'WP4 test: cancel the restart'
+  Add-Result 'c3' '阻断窗口已创建（本进程第二次）' ("started={0} alive={1} handle=0x{2:X}" -f
+    $blocker.Started, $blocker.State.Alive, $blocker.State.Handle.ToInt64())
+  Add-Result 'c3' '阻断窗口已登记阻止原因（ShutdownBlockReasonQuery）' ("reason='{0}' registered={1}" -f
+    $blocker.State.Reason, $blocker.State.BlockRegistered)
+  if (-not $blocker.Started -or -not $blocker.State.Alive -or -not $blocker.State.BlockRegistered) {
+    Stop-Walkthrough -Step 'c3' -Command 'start the shutdown blocker a second time and register its block reason' -Code 8 `
+      -Detail ("started={0} alive={1} reason='{2}'" -f $blocker.Started, $blocker.State.Alive, $blocker.State.Reason)
+  }
+  $query = Test-ShutdownBlockerBlocksSessionEnd
+  Add-Result 'c3' '阻断窗口对 WM_QUERYENDSESSION 的回答' ("returnedTrue={0} blocks={1}" -f $query.ReturnedTrue, $query.Blocks)
+  if (-not $query.Blocks) {
+    Stop-Walkthrough -Step 'c3' -Command 'send WM_QUERYENDSESSION to the blocker' -Code 8 `
+      -Detail 'the blocker answered TRUE, so it would not hold the restart'
+  }
+
+  $session = Get-SessionIdentity
+  $lastCancel = Get-LastCancelEvent -EventId 1073
+  $saveBefore = Get-FusionSaveStamp
+  Add-Result 'c3' '取消重启前的会话（session id + 登录时间）' ("session={0} logon={1}" -f $session.SessionId, $session.LogonText)
+  Add-Result 'c3' '取消重启前最近一次 User32 1073' $(if ($lastCancel) {
+      "time=$($lastCancel.Time.ToString('yyyy-MM-dd HH:mm:ss')) record=$($lastCancel.RecordId)"
+    } else { '(none)' })
+  Add-Result 'c3' '取消重启前的用户数据保存时间' $(if ($saveBefore) { "$($saveBefore.NewestText) $($saveBefore.File)" } else { '(no user data)' })
+
+  # Saved before the request, so -Resume can evaluate the same evidence if the terminal dies
+  # with the attempt (it did in one of the 2026-10-19 measurements).
+  $state.stage = 'c3-restart'
+  $state.c3 = [pscustomobject]@{
+    SessionId        = $session.SessionId
+    LogonText        = $session.LogonText
+    LastCancelRecord = $(if ($lastCancel) { [long]$lastCancel.RecordId } else { [long]0 })
+    HostPids         = $beforeIds
+    SaveStamp        = $(if ($saveBefore) { $saveBefore.NewestText } else { '' })
+  }
+  $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+  Write-Head '现在请发起一次重启，并在 Windows 的阻止界面里点“取消”'
+  Write-Host '1. 打开开始菜单。'
+  Write-Host '2. 点右下角的电源按钮。'
+  Write-Host '3. 选择“重启”。'
+  Write-Host '4. Windows 会显示“这些应用阻止你重启”之类的界面，其中一项是 "WP4 test: cancel the restart"。'
+  Write-Host '5. 在那个界面点“取消”（不要点“仍要重启”/“强制重启”）。'
+  Write-Host ''
+  Write-Host '注意：即使取消成功，本终端窗口也可能被重启流程关掉。那不代表重启成功。' -ForegroundColor Yellow
+  Write-Host '脚本用证据判断：取消会写一条 User32 1073，且会话号和登录时间不变。'
+  Write-Host '如果本窗口被关掉，请重新打开 PowerShell 运行：'
+  Write-Host ("   powershell -ExecutionPolicy Bypass -File `"{0}`" -Resume" -f $PSCommandPath) -ForegroundColor Yellow
+  if (-not (Ask-Enter '取消重启后（或重新打开终端后）按 Enter。')) { Write-Host '已放弃。'; exit 0 }
+  # Fall through to the c3-restart block, which evaluates the evidence for both paths.
+}
+
+# The evidence-based (c3) verdict, reached either directly after the Cancel or through
+# -Resume when the terminal died with the attempt.
+if ($state.stage -eq 'c3-restart') {
+  Write-Head '步骤 c3（续）：从证据判断重启是否被取消'
+  $baseline = $state.c3
+  $session = Get-SessionIdentity
+  $cancel = Get-LastCancelEvent -EventId 1073
+  $sameSession = ($session.SessionId -eq [int]$baseline.SessionId) -and ($session.LogonText -eq [string]$baseline.LogonText)
+  $newCancel = $false
+  if ($cancel) { $newCancel = ([long]$cancel.RecordId -gt [long]$baseline.LastCancelRecord) }
+  Add-Result 'c3' '取消重启后的会话（session id + 登录时间）' ("session={0} logon={1} same={2}" -f
+    $session.SessionId, $session.LogonText, $sameSession)
+  Add-Result 'c3' '取消重启后的 User32 1073' $(if ($cancel) {
+      "time=$($cancel.Time.ToString('yyyy-MM-dd HH:mm:ss')) record=$($cancel.RecordId) newerThanBaseline=$newCancel"
+    } else { '(none)' })
+
+  if (-not $sameSession) {
+    Add-Result 'c3' 'c3 结论' 'restarted — the session really ended, so the cancel was not performed; NOT EXERCISED (neither a pass nor a product failure)'
+  } elseif (-not $newCancel) {
+    Add-Result 'c3' 'c3 结论' 'same session but no new User32 1073 — no cancel was observed; NOT EXERCISED'
+  } else {
+    $deadline = (Get-Date).AddSeconds(60)
+    $hosts = @()
+    while ((Get-Date) -lt $deadline) {
+      $hosts = @(Get-FusionHostState | Where-Object { $_.SessionId -eq $session.SessionId })
+      if ($hosts.Count -gt 0) { break }
+      Start-Sleep -Milliseconds 500
+    }
+    $newIds = ($hosts | ForEach-Object { $_.Id } | Sort-Object) -join ','
+    $saveAfter = Get-FusionSaveStamp
+    Add-Result 'c3' '取消重启后本会话的 Host pid' $newIds
+    Add-Result 'c3' '取消重启后本会话的 Host 路径/完整性' $(if ($hosts.Count -gt 0) {
+        ($hosts | ForEach-Object { "pid=$($_.Id) path=$($_.Path) integrity=$($_.Integrity)" }) -join '; '
+      } else { '(none)' })
+    Add-Result 'c3' 'Host pid 变化（新的 pid 是预期的）' ("before={0} after={1}" -f $baseline.HostPids, $newIds)
+    Add-Result 'c3' '用户数据保存时间（旧 Host 退出时应已保存）' $(if ($saveAfter) {
+        "$($baseline.SaveStamp) → $($saveAfter.NewestText)"
+      } else { '(no user data)' })
+    Stop-ShutdownBlocker
+    $blockerAfter = Get-ShutdownBlockerState
+    Add-Result 'c3' '阻断窗口已关闭' (-not $blockerAfter.Alive)
+    if ($hosts.Count -gt 0) {
+      Add-Result 'c3' 'c3 结论' 'PASS — the restart was cancelled (User32 1073, same session) and a Host is running in this session'
+    } else {
+      Add-Result 'c3' 'c3 结论' 'FAIL — the restart was cancelled (User32 1073) and no Host came back in this session'
+      Stop-Walkthrough -Step 'c3' -Command 'require a Host after a cancelled restart' -Code 8 `
+        -Detail 'the restart was cancelled (User32 1073, same session) and no FusionHost is running in this session'
+    }
+  }
+  New-Snapshot 'after-cancelled-restart'
   $state.stage = 'd'
   $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath -Encoding UTF8
 }
