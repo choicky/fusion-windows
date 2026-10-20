@@ -40,8 +40,23 @@ function Get-PinnedCheckout([string]$Name, [string]$Url, [string]$Pin, [string]$
   } else {
     $status = @(& git -C $path status --porcelain)
     if ($LASTEXITCODE -ne 0) { throw "Cannot inspect working tree: $path" }
-    if ($status.Count -gt 0 -and (-not $AllowedPatch -or -not (Test-PatchApplied $path $AllowedPatch))) {
-      throw "Preserve and inspect modified upstream source before refreshing: $path"
+    if ($status.Count -gt 0) {
+      if (-not $AllowedPatch) {
+        throw "Unexpected modifications in pinned source (fork commit must be clean): $path`n$($status -join "`n")"
+      }
+      if (($status | Where-Object { $_ -match '^\?\?' }).Count -gt 0) {
+        throw "Untracked inputs are not allowed in pinned source checkout: $path`n$($status -join "`n")"
+      }
+      if (-not (Test-PatchApplied $path $AllowedPatch)) {
+        throw "The declared patch is not the exact applied state of $path; unexpected tracked changes were found.`n$($status -join "`n")"
+      }
+      $expectedFiles = @(Get-Content -LiteralPath $AllowedPatch |
+        Where-Object { $_ -match '^\+\+\+ b/(.+)$' } |
+        ForEach-Object { $Matches[1] } | Sort-Object -Unique)
+      $actualFiles = @($status | ForEach-Object { $_.Substring(3).Trim() } | Sort-Object -Unique)
+      if (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles).Count -ne 0) {
+        throw "Tracked changes outside the declared patch were found in $path.`nExpected: $($expectedFiles -join ', ')`nActual: $($actualFiles -join ', ')"
+      }
     }
     $head = (& git -C $path rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or $head -ne $Pin) {

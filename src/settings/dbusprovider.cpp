@@ -270,7 +270,10 @@ void PendingCall::complete(const QDBusMessage &reply, SettingsSelection selectio
     finished_ = true;
     reply_ = reply;
     selection_ = std::move(selection);
-    Q_EMIT finished();
+    if (!completionQueued_) {
+        completionQueued_ = true;
+        QTimer::singleShot(0, this, [this] { Q_EMIT finished(); });
+    }
 }
 
 void PendingCall::fail(const QString &error) {

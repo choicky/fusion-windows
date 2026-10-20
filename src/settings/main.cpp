@@ -14,6 +14,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMainWindow>
@@ -59,10 +60,9 @@ QString inputMethodName(const QString &name) {
 
 class SettingsWindow final : public QMainWindow {
 public:
-  explicit SettingsWindow(QString pipeName, bool selfTest = false,
-                          bool persistenceCheck = false, QString screenshot = {})
+  explicit SettingsWindow(QString pipeName, bool selfTest = false, QString screenshot = {})
       : provider_(this, pipeName), selfTest_(selfTest),
-        persistenceCheck_(persistenceCheck), screenshot_(std::move(screenshot)) {
+        screenshot_(std::move(screenshot)) {
     setWindowTitle(QStringLiteral("Fusion 输入法设置"));
     resize(920, 760);
 
@@ -108,10 +108,6 @@ public:
     setCentralWidget(central);
 
     connect(apply_, &QPushButton::clicked, this, [this, status] {
-      if (!provider_.available()) {
-        showError(status, QStringLiteral("FusionHost is disconnected; the settings were not applied."));
-        return;
-      }
       auto *page = currentPage();
       if (!page) {
         return;
@@ -121,24 +117,16 @@ public:
       page->save();
     });
     connect(cancel_, &QPushButton::clicked, this, [this, status] {
-      if (!provider_.available()) {
-        showError(status, QStringLiteral("FusionHost is disconnected; reconnect before cancelling local edits."));
-        return;
-      }
       status->setText(QStringLiteral("正在放弃未应用更改并重新加载…"));
       reloadAll(status, QStringLiteral("已放弃未应用的更改并重新加载。"));
     });
     connect(reload_, &QPushButton::clicked, this, [this, status] {
-      if (!provider_.available()) {
-        showError(status, QStringLiteral("FusionHost is disconnected; reload is unavailable."));
-        return;
-      }
       status->setText(QStringLiteral("正在从 FusionHost 重新加载…"));
       reloadAll(status, QStringLiteral("已从 FusionHost 重新加载。"));
     });
     connect(applySelection, &QPushButton::clicked, this, [this, status, applySelection] {
-      if (!provider_.available() || !provider_.controller()) {
-        showError(status, QStringLiteral("FusionHost 未连接。请确认托盘显示 Host 正在运行后重试。"));
+      if (!provider_.controller()) {
+        showError(status, QStringLiteral("无法创建 FusionHost 重连请求。"));
         return;
       }
       applySelection->setEnabled(false);
@@ -276,14 +264,22 @@ private:
   }
 
   void runSelfTest() {
+    if (!selfTestTimer_.isValid()) {
+      selfTestTimer_.start();
+    }
+    if (selfTestTimer_.elapsed() > 8000) {
+      status_->setText(QStringLiteral("SELF-TEST FAIL: timed out waiting for the Host/config schema."));
+      QCoreApplication::exit(10);
+      return;
+    }
     if (!pinyinLoaded_) {
-      QTimer::singleShot(250, this, [this] { runSelfTest(); });
+      QTimer::singleShot(100, this, [this] { runSelfTest(); });
       return;
     }
     const QString before = pinyin_->value().toMap().value(QStringLiteral("PageSize")).toString();
     if (before.isEmpty()) {
       status_->setText(QStringLiteral("SELF-TEST FAIL: PageSize was not rendered."));
-      QCoreApplication::exit(1);
+      QCoreApplication::exit(11);
       return;
     }
     QVariantMap values = pinyin_->value().toMap();
@@ -293,14 +289,44 @@ private:
             [this, before](bool ok, const QString &error) {
               if (!ok) {
                 showError(status_, error);
-                QCoreApplication::exit(1);
+                QCoreApplication::exit(12);
                 return;
               }
-              status_->setText(QStringLiteral("SELF-TEST PASS: PageSize %1 -> 9 confirmed by FusionHost.").arg(before));
-              if (!screenshot_.isEmpty()) {
-                windowScreenshot_ = grab().save(screenshot_);
-              }
-              QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0 : 1);
+              pinyinLoaded_ = false;
+              connect(shuangpin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
+                      [this](bool loaded, const QString &loadError) {
+                        if (!loaded) {
+                          showError(status_, loadError);
+                          QCoreApplication::exit(13);
+                          return;
+                        }
+                        QVariantMap sharedCheck = shuangpin_->value().toMap();
+                        const QString sharedPageSize = sharedCheck.value(QStringLiteral("PageSize")).toString();
+                        if (sharedPageSize != QStringLiteral("9")) {
+                          showError(status_, QStringLiteral("SELF-TEST FAIL: Shuangpin restored stale PageSize=%1.").arg(sharedPageSize));
+                          QCoreApplication::exit(14);
+                          return;
+                        }
+                        if (sharedCheck.contains(QStringLiteral("ShuangpinProfile"))) {
+                          sharedCheck.insert(QStringLiteral("ShuangpinProfile"), QStringLiteral("MS"));
+                        }
+                        shuangpin_->setValue(sharedCheck);
+                        connect(shuangpin_, &fcitx::kcm::ConfigWidget::saveFinished, this,
+                                [this, before](bool applied, const QString &applyError) {
+                                  if (!applied) {
+                                    showError(status_, applyError);
+                                    QCoreApplication::exit(15);
+                                    return;
+                                  }
+                                  status_->setText(QStringLiteral("SELF-TEST PASS: PageSize %1 -> 9 and shared-page preservation confirmed.").arg(before));
+                                  if (!screenshot_.isEmpty()) {
+                                    windowScreenshot_ = grab().save(screenshot_);
+                                  }
+                                  QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0 : 16);
+                                }, Qt::SingleShotConnection);
+                        shuangpin_->save();
+                      }, Qt::SingleShotConnection);
+              shuangpin_->load();
             }, Qt::SingleShotConnection);
     pinyin_->save();
   }
@@ -365,9 +391,9 @@ private:
   bool pinyinLoaded_ = false;
   bool shuangpinLoaded_ = false;
   bool selfTest_ = false;
-  bool persistenceCheck_ = false;
   bool windowScreenshot_ = false;
   QString screenshot_;
+  QElapsedTimer selfTestTimer_;
 };
 
 } // namespace
@@ -379,14 +405,11 @@ int main(int argc, char **argv) {
   QApplication::setOrganizationName(QStringLiteral("Fcitx5 Fusion"));
   const QString pipeName = endpointName(argc, argv);
   bool selfTest = false;
-  bool persistenceCheck = false;
   QString screenshot;
   for (int i = 1; i < argc; ++i) {
     const QString arg = QString::fromLocal8Bit(argv[i]);
     if (arg == QLatin1String("--self-test")) {
       selfTest = true;
-    } else if (arg == QLatin1String("--persistence-check")) {
-      persistenceCheck = true;
     } else if (arg == QLatin1String("--screenshot") && i + 1 < argc) {
       screenshot = QString::fromLocal8Bit(argv[++i]);
     }
@@ -396,7 +419,7 @@ int main(int argc, char **argv) {
                           QStringLiteral("无法确定当前用户和会话的 FusionHost 管道。"));
     return 2;
   }
-  SettingsWindow window(pipeName, selfTest, persistenceCheck, screenshot);
+  SettingsWindow window(pipeName, selfTest, screenshot);
   window.show();
   return application.exec();
 }

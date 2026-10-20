@@ -247,7 +247,7 @@ try {
     sourceCommit         = 'covered by package sourceCommit'
     repository           = 'https://github.com/choicky/fcitx5-configtool'
     branch               = 'windows/fusion-settings'
-    commit               = 'd440322d2c8adf75897d19afa411c48e99e9a4d8'
+    commit               = '0234c64b2b66f7dcb0d03e1997310d34a3ae43b0'
     sourceAccess         = 'licenses/settings-ui/SOURCE-ACCESS.txt'
   }
   layout        = 'bin\ (Host + Tray + Settings + TSF DLL + runtime/Qt/plugins), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
