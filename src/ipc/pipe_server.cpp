@@ -233,7 +233,7 @@ std::optional<WireFrame> PipeServer::recv_frame(std::chrono::milliseconds timeou
   }
 
   auto type_byte = header_buf[4];
-  if (type_byte < 0x01 || type_byte > 0x0A) {
+  if (type_byte < 0x01 || type_byte > max_message_type) {
     last_error_ = ERROR_INVALID_DATA;
     return std::nullopt;
   }

@@ -1,0 +1,20 @@
+Fusion Settings dependency notice — scoped to FusionSettings.exe
+
+Owner authorization, recorded 2026-10-20: the upstream-derived settings executable and its derivative code are distributed under GPL-2.0-or-later, with all upstream copyright, license notices and corresponding source preserved. This scope does not apply GPL to FusionHost.exe, FusionTray.exe, FusionTsf.dll, or the fusion-windows repository as a whole. Those components retain their existing component licenses.
+
+1. fcitx5-configtool 5.1.16 — GPL-2.0-or-later
+   Pinned source: commit 9bd6022c6f5f768d32b6dbe2012358e4cdb1116b. The retained schema renderer and the local transport/application derivative are part of the GPL-2.0-or-later settings executable. Upstream SPDX/copyright headers remain in source. The unmodified upstream LICENSES/GPL-2.0-or-later.txt is included here.
+
+2. fcitx5-qt 5.1.16 — per-file licenses
+   Pinned source: commit 0285a5d18367d8f3af80dab7e4819d5555982340. qt6/dbusaddons is BSD-3-Clause; qt6/widgetsaddons is LGPL-2.1-or-later. The Windows path-conversion fix is tracked as a separate one-file patch. Upstream file headers remain intact; both upstream license texts are included here.
+
+3. Qt 6.8.3 — dynamically linked open-source Qt components
+   Linked modules: Qt6Core, Qt6Gui, Qt6Widgets, Qt6Network and Qt6DBus. The package contains their shared DLLs and the Qt Windows platform plugin, so Qt remains out of FusionHost.exe and FusionTsf.dll. The Qt open-source license options and requirements are component-specific; the package provides the upstream LGPL-3.0-only, GPL-2.0-only and GPL-3.0-only texts obtained from qtbase tag v6.8.3. The Qt installation and the upstream source-access route are listed in SOURCE-ACCESS.txt. This inventory does not assert that every Qt module is dual-licensed under all three options; the packaged build uses the LGPL shared-library route for the linked runtime libraries.
+
+4. Existing pinned Fcitx runtime — component licenses retained
+   Pinned fcitx5 core, fcitx5-chinese-addons and LibIME remain LGPL-2.1-or-later according to their file headers/source license texts. Their license texts are included under licenses/runtime/. This settings task does not relicense the runtime, other Host modules, TSF or tray components.
+
+5. ECM, MSVC, Windows SDK, vcpkg and gettext
+   These are build-time tools/dependencies and are not linked into or shipped as part of FusionSettings.exe. Their source, version or package provenance is listed in SOURCE-ACCESS.txt and the package manifest; they retain their respective licenses.
+
+This component-specific notice is not legal advice. The package includes the corresponding product source-access/build procedure and exact upstream pins plus patch files. No repository-wide license was selected or changed.

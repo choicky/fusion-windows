@@ -1,7 +1,8 @@
 param(
   [ValidateSet('Debug','Release')][string]$Configuration='Debug',
   [string]$WorkRoot=(Join-Path $env:USERPROFILE 'worktmp\fusion-windows\stage3-real-backend-poc'),
-  [string]$VsDevCmd='C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat'
+  [string]$VsDevCmd='C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat',
+  [switch]$UseCurrentToolchainEnvironment
 )
 $ErrorActionPreference='Stop'
 $taskRepoRoot=(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -21,13 +22,24 @@ function Invoke-Native([string]$Executable,[string[]]$Arguments) {
   if($LASTEXITCODE -ne 0) {throw "$Executable failed with exit $LASTEXITCODE"}
 }
 # Import only build-tool environment variables; never print a process environment.
-$taskEnvironment=& $env:ComSpec /d /c ('call "'+$VsDevCmd+'" -arch=x64 -host_arch=x64 >nul && set')
-if($LASTEXITCODE -ne 0) {throw 'Visual Studio environment initialization failed'}
-$taskAllowed=@('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion','VSCMD_ARG_HOST_ARCH','VSCMD_ARG_TGT_ARCH','VSCMD_VER','VisualStudioVersion')
-foreach($taskLine in $taskEnvironment) {
-  if($taskLine -match '^([^=]+)=(.*)$' -and $taskAllowed -contains $Matches[1]) {Set-Item -LiteralPath ('Env:'+$Matches[1]) -Value $Matches[2]}
+# An explicit current-process environment is supported for machines where the
+# VS discovery batch cannot run (for example, reg.exe is blocked by local policy).
+# The caller must set INCLUDE/LIB and put the pinned MSVC/SDK/CMake/Ninja/UCRT
+# directories on this process's PATH; nothing is written to the user or machine PATH.
+if($UseCurrentToolchainEnvironment) {
+  if(-not $env:INCLUDE -or -not $env:LIB -or -not (Get-Command cl -ErrorAction SilentlyContinue) -or
+     -not (Get-Command cmake -ErrorAction SilentlyContinue) -or -not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+    throw 'UseCurrentToolchainEnvironment requires process-local INCLUDE, LIB, cl, cmake and ninja'
+  }
+} else {
+  $taskEnvironment=& $env:ComSpec /d /c ('call "'+$VsDevCmd+'" -arch=x64 -host_arch=x64 >nul && set')
+  if($LASTEXITCODE -ne 0) {throw 'Visual Studio environment initialization failed'}
+  $taskAllowed=@('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion','VSCMD_ARG_HOST_ARCH','VSCMD_ARG_TGT_ARCH','VSCMD_VER','VisualStudioVersion')
+  foreach($taskLine in $taskEnvironment) {
+    if($taskLine -match '^([^=]+)=(.*)$' -and $taskAllowed -contains $Matches[1]) {Set-Item -LiteralPath ('Env:'+$Matches[1]) -Value $Matches[2]}
+  }
+  & $env:ComSpec /d /c 'chcp 65001 >nul'
 }
-& $env:ComSpec /d /c 'chcp 65001 >nul'
 function Get-PinnedSource([string]$Name,[string]$Url,[string]$Commit,[string]$Parent) {
   $taskPath=Join-Path $Parent $Name
   if(-not (Test-Path -LiteralPath (Join-Path $taskPath '.git'))) {

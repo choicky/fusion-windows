@@ -1,5 +1,6 @@
 #pragma once
 #include "fusion/core.hpp"
+#include "fusion/settings.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -184,6 +185,31 @@ public:
   virtual bool healthy() const = 0;
   virtual std::uint64_t session_id() const = 0;
   virtual BackendBatch send(const BackendStimulus &stimulus) = 0;
+
+  // Settings control calls are separate from the input stimulus path. Production
+  // FcitxBackend implementations execute them on the Fcitx event loop and keep
+  // settings admission separate from key admission so opening the UI never
+  // blocks or resets a text context. Non-Fcitx test backends default to an
+  // explicit unsupported result.
+  virtual SettingsStatus settings_get_config(const std::string &, SettingsSnapshot &,
+                                             std::string &error) {
+    error = "settings are not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_set_config(const std::string &, const SettingsValue &,
+                                             SettingsSnapshot &, std::string &error) {
+    error = "settings are not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_get_selection(SettingsSelection &, std::string &error) {
+    error = "input-method selection is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_select_input_method(const std::string &, SettingsSelection &,
+                                                       std::string &error) {
+    error = "input-method selection is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
 
   // Link lifecycle. Defaults describe a backend with no transport, so every
   // existing implementation (Mock, in-process Fcitx, test fakes) stays valid and

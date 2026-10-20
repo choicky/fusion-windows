@@ -209,7 +209,7 @@ std::optional<WireFrame> PipeClient::recv_frame(std::chrono::milliseconds timeou
   }
 
   auto type_byte = header_buf[4];
-  if (type_byte < 0x01 || type_byte > 0x0A) {
+  if (type_byte < 0x01 || type_byte > max_message_type) {
     connected_ = false;
     return std::nullopt;
   }

@@ -233,12 +233,19 @@ private:
     // R30: this connection's identity in the diagnostic log (no payload, no client data).
     const std::uint64_t id;
     std::map<std::uint64_t, Binding> context_map; // client_context → host binding
+    bool settings_capable = false;
+    bool close_after_settings_request = false;
 
     void run();
     // Cancels a blocking receive and drops the client so run() can leave its
     // loop. Safe to call from another thread (stop()).
     void disconnect();
     void handle_hello();
+    void handle_settings_hello(const std::vector<std::uint8_t> &payload);
+    void handle_settings_get_config(const std::vector<std::uint8_t> &payload);
+    void handle_settings_set_config(const std::vector<std::uint8_t> &payload);
+    void handle_settings_get_selection(const std::vector<std::uint8_t> &payload);
+    void handle_settings_select_input_method(const std::vector<std::uint8_t> &payload);
     void handle_bind(const std::vector<std::uint8_t> &payload);
     void handle_reset(const std::vector<std::uint8_t> &payload);
     void handle_unbind(const std::vector<std::uint8_t> &payload);

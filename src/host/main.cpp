@@ -58,12 +58,31 @@
 
 namespace {
 
-std::wstring parse_pipe_name(const std::vector<std::wstring> &arguments) {
+std::wstring parse_argument(const std::vector<std::wstring> &arguments, const wchar_t *name) {
   for (size_t i = 1; i + 1 < arguments.size(); ++i) {
-    if (arguments[i] == L"--pipe-name")
+    if (arguments[i] == name)
       return arguments[i + 1];
   }
-  return fusion::ipc::compute_pipe_name();
+  return {};
+}
+
+std::wstring parse_pipe_name(const std::vector<std::wstring> &arguments) {
+  const auto override_name = parse_argument(arguments, L"--pipe-name");
+  return override_name.empty() ? fusion::ipc::compute_pipe_name() : override_name;
+}
+
+std::wstring pipe_object_scope(const std::wstring &pipe_name) {
+  std::wstring scope = pipe_name;
+  const std::wstring prefix = fusion::ipc::default_pipe_name_prefix;
+  if (scope.rfind(prefix, 0) == 0) {
+    scope.erase(0, prefix.size());
+  }
+  for (wchar_t &character : scope) {
+    if (character == L'\\' || character == L'/') {
+      character = L'-';
+    }
+  }
+  return scope;
 }
 
 bool has_switch(const std::vector<std::wstring> &arguments, const wchar_t *name) {
@@ -249,7 +268,14 @@ int run_host(const std::vector<std::wstring> &arguments) {
   // reason as the claim: a Host that cannot be stopped orderly must not start
   // loading or saving user data. It is released only when this process exits.
   fusion::ipc::HostStopEvent stop_event;
-  if (!stop_event.create()) {
+  // Keep test Host scopes separate from the production stop event. The packaged
+  // Host's default pipe derives the existing per-user/session stop-event name;
+  // explicit --pipe-name test instances use their own matching Local namespace.
+  std::wstring stop_scope = parse_argument(arguments, L"--stop-event-scope");
+  if (stop_scope.empty()) {
+    stop_scope = pipe_object_scope(pipe_name);
+  }
+  if (!stop_event.create(stop_scope)) {
     std::fprintf(stderr,
                  "[FusionHost] cannot create the stop event; refusing to run without an orderly "
                  "stop path\n");

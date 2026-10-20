@@ -36,4 +36,5 @@ file(GLOB FUSION_FCITX5_DLLS "${FUSION_FCITX5_ROOT}/bin/*.dll")
 add_custom_command(TARGET FusionFcitxHost POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${FUSION_FCITX5_DLLS} "$<TARGET_FILE_DIR:FusionFcitxHost>"
   COMMAND "${CMAKE_COMMAND}" -E copy_directory "${FUSION_FCITX5_ROOT}/data" "${CMAKE_BINARY_DIR}/data"
+  COMMAND "${CMAKE_COMMAND}" -E copy_directory "${FUSION_FCITX5_ROOT}/share/locale" "${CMAKE_BINARY_DIR}/data/locale"
   COMMAND "${CMAKE_COMMAND}" -E copy_directory "${FUSION_FCITX5_ROOT}/lib/libime" "${CMAKE_BINARY_DIR}/lib/libime")

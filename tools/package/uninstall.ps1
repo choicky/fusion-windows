@@ -153,12 +153,14 @@ try {
   $currentStep = 'shortcut'
   Write-Step 'removing the Start Menu shortcut'
   $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Fusion'
-  $shortcutPath = Join-Path $startMenu 'Restart FusionHost.lnk'
-  if (Test-Path -LiteralPath $shortcutPath) {
-    Remove-Item -LiteralPath $shortcutPath -Force
-    Write-Host "  removed $shortcutPath"
-  } else {
-    Write-Host '  no shortcut to remove'
+  foreach ($shortcutName in @('Restart FusionHost.lnk', 'Fusion Settings.lnk')) {
+    $shortcutPath = Join-Path $startMenu $shortcutName
+    if (Test-Path -LiteralPath $shortcutPath) {
+      Remove-Item -LiteralPath $shortcutPath -Force
+      Write-Host "  removed $shortcutPath"
+    } else {
+      Write-Host "  no shortcut: $shortcutName"
+    }
   }
   if ((Test-Path -LiteralPath $startMenu) -and
       @(Get-ChildItem -LiteralPath $startMenu -Force).Count -eq 0) {

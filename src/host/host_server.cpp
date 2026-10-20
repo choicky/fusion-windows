@@ -1,6 +1,7 @@
 #include "host/host_server.hpp"
 
 #include "host/host_diag.hpp"
+#include "fusion/settings_protocol.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -379,9 +380,12 @@ void HostServer::Connection::run() {
   if (!pipe->client_connected())
     return;
 
-  // Process requests until disconnect.
+  // TIP connections retain their existing idle behavior. A settings connection
+  // performs exactly one bounded operation after its capability handshake and is
+  // then closed, so it never leaves an idle Host worker or partial-frame wait.
   while (pipe->client_connected()) {
-    auto frame = pipe->recv_frame(std::chrono::milliseconds(0)); // block indefinitely
+    const auto timeout = std::chrono::milliseconds(settings_capable ? 5000 : 0);
+    auto frame = pipe->recv_frame(timeout);
     if (!frame) {
       std::fprintf(stderr, "[FusionHost] client read failed, disconnecting\n");
       fusion::host::diag::event("client_read_failed",
@@ -390,16 +394,65 @@ void HostServer::Connection::run() {
     }
     switch (frame->type) {
     case MessageType::BindRequest:
-      handle_bind(frame->payload);
+      if (settings_capable) {
+        pipe->disconnect_client();
+      } else {
+        handle_bind(frame->payload);
+      }
       break;
     case MessageType::ResetRequest:
-      handle_reset(frame->payload);
+      if (settings_capable) {
+        pipe->disconnect_client();
+      } else {
+        handle_reset(frame->payload);
+      }
       break;
     case MessageType::UnbindRequest:
-      handle_unbind(frame->payload);
+      if (settings_capable) {
+        pipe->disconnect_client();
+      } else {
+        handle_unbind(frame->payload);
+      }
       break;
     case MessageType::SendRequest:
-      handle_send(frame->payload);
+      if (settings_capable) {
+        pipe->disconnect_client();
+      } else {
+        handle_send(frame->payload);
+      }
+      break;
+    case MessageType::SettingsHelloRequest:
+      // The settings hello is valid only as the first frame handled by
+      // handle_hello(); a second one is a malformed protocol transition.
+      pipe->disconnect_client();
+      break;
+    case MessageType::SettingsGetConfigRequest:
+      if (settings_capable) {
+        handle_settings_get_config(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsSetConfigRequest:
+      if (settings_capable) {
+        handle_settings_set_config(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsGetSelectionRequest:
+      if (settings_capable) {
+        handle_settings_get_selection(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsSelectInputMethodRequest:
+      if (settings_capable) {
+        handle_settings_select_input_method(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
       break;
     default: {
       const unsigned type = static_cast<unsigned>(static_cast<std::uint8_t>(frame->type));
@@ -411,6 +464,9 @@ void HostServer::Connection::run() {
       pipe->disconnect_client();
       break;
     }
+    }
+    if (close_after_settings_request) {
+      break;
     }
   }
 
@@ -427,6 +483,10 @@ void HostServer::Connection::handle_hello() {
     std::fprintf(stderr, "[FusionHost] expected Hello, got type=0x%02x\n", 0u);
     fusion::host::diag::event("hello", io_failure_detail(id, "recv", pipe->last_error()).c_str());
     pipe->disconnect_client();
+    return;
+  }
+  if (frame->type == MessageType::SettingsHelloRequest) {
+    handle_settings_hello(frame->payload);
     return;
   }
   if (frame->type != MessageType::HelloRequest) {
@@ -462,6 +522,132 @@ void HostServer::Connection::handle_hello() {
     detail::write_u64(response_payload, backend.session_id());
   }
   send_response(MessageType::HelloResponse, response_payload);
+}
+
+void HostServer::Connection::handle_settings_hello(const std::vector<std::uint8_t> &payload) {
+  const auto hello = deserialize_settings_hello(payload.data(), payload.size());
+  if (!hello) {
+    pipe->disconnect_client();
+    return;
+  }
+  const bool protocol_matches = hello->protocol == protocol_version;
+  const bool api_matches = hello->api == settings_api_version;
+  std::uint64_t session = 0;
+  if (protocol_matches) {
+    std::lock_guard lock(backend_mutex);
+    session = backend.session_id();
+  }
+  const SettingsStatus status = !protocol_matches || !api_matches
+                                    ? SettingsStatus::VersionMismatch
+                                    : SettingsStatus::Ok;
+  const std::string error = !protocol_matches
+                                ? "The Host IPC protocol version is not supported."
+                                : (!api_matches ? "The Host settings API version is not supported."
+                                                : std::string());
+  std::vector<std::uint8_t> response_payload;
+  detail::write_u32(response_payload, protocol_matches ? protocol_version : 0);
+  detail::write_u64(response_payload, session);
+  detail::write_u32(response_payload, settings_api_version);
+  const auto status_payload = serialize_settings_status(status, error);
+  response_payload.insert(response_payload.end(), status_payload.begin(), status_payload.end());
+  send_response(MessageType::SettingsHelloResponse, response_payload);
+  settings_capable = status == SettingsStatus::Ok;
+  close_after_settings_request = !settings_capable;
+}
+
+void HostServer::Connection::handle_settings_get_config(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  const auto uri = deserialize_settings_get_request(payload.data(), payload.size());
+  if (!uri) {
+    pipe->disconnect_client();
+    return;
+  }
+  SettingsSnapshot snapshot;
+  std::string error;
+  const auto status = backend.settings_get_config(*uri, snapshot, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_snapshot(response_payload, snapshot)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Error, "The settings schema exceeds the supported response bound.");
+  }
+  send_response(MessageType::SettingsGetConfigResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_set_config(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  std::string uri;
+  SettingsValue values;
+  if (!deserialize_settings_set_request(payload.data(), payload.size(), uri, values)) {
+    pipe->disconnect_client();
+    return;
+  }
+  SettingsSnapshot snapshot;
+  std::string error;
+  const auto status = backend.settings_set_config(uri, values, snapshot, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_snapshot(response_payload, snapshot)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Indeterminate,
+        "Fcitx accepted the apply, but the Host could not return the resulting settings. Reload before retrying.");
+  }
+  send_response(MessageType::SettingsSetConfigResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_get_selection(
+    const std::vector<std::uint8_t> &payload) {
+  if (!payload.empty()) {
+    pipe->disconnect_client();
+    return;
+  }
+  SettingsSelection selection;
+  std::string error;
+  const auto status = backend.settings_get_selection(selection, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_selection(response_payload, selection)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Error, "The input-method list exceeds the supported response bound.");
+  }
+  send_response(MessageType::SettingsGetSelectionResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_select_input_method(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  detail::Reader reader{payload.data(), payload.size()};
+  auto method = reader.read_string();
+  if (!method || !reader.at_end()) {
+    pipe->disconnect_client();
+    return;
+  }
+  SettingsSelection selection;
+  std::string error;
+  const auto status = backend.settings_select_input_method(*method, selection, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_selection(response_payload, selection)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Indeterminate,
+        "The input method may have changed, but the Host could not confirm the selection. Reload before retrying.");
+  }
+  send_response(MessageType::SettingsSelectInputMethodResponse, response_payload);
+  close_after_settings_request = true;
 }
 
 void HostServer::Connection::handle_bind(const std::vector<std::uint8_t> &payload) {
