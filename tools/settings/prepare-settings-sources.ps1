@@ -44,7 +44,7 @@ function Get-PinnedCheckout([string]$Name, [string]$Url, [string]$Pin, [string]$
       if (-not $AllowedPatch) {
         throw "Unexpected modifications in pinned source (fork commit must be clean): $path`n$($status -join "`n")"
       }
-      if (($status | Where-Object { $_ -match '^\?\?' }).Count -gt 0) {
+      if (@($status | Where-Object { $_ -match '^\?\?' }).Count -gt 0) {
         throw "Untracked inputs are not allowed in pinned source checkout: $path`n$($status -join "`n")"
       }
       if (-not (Test-PatchApplied $path $AllowedPatch)) {
@@ -54,7 +54,7 @@ function Get-PinnedCheckout([string]$Name, [string]$Url, [string]$Pin, [string]$
         Where-Object { $_ -match '^\+\+\+ b/(.+)$' } |
         ForEach-Object { $Matches[1] } | Sort-Object -Unique)
       $actualFiles = @($status | ForEach-Object { $_.Substring(3).Trim() } | Sort-Object -Unique)
-      if (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles).Count -ne 0) {
+      if (@(Compare-Object -ReferenceObject @($expectedFiles) -DifferenceObject @($actualFiles)).Count -ne 0) {
         throw "Tracked changes outside the declared patch were found in $path.`nExpected: $($expectedFiles -join ', ')`nActual: $($actualFiles -join ', ')"
       }
     }
