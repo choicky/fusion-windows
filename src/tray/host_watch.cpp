@@ -78,31 +78,66 @@ HostObservation observe_host() {
     CloseHandle(snapshot);
     return result;
   }
+  // A process named FusionHost.exe that this process cannot judge - it cannot be
+  // opened, its session cannot be read, its token user cannot be read, or the
+  // enumeration itself stopped early - makes the whole look inconclusive. "We
+  // could not tell" must never be reported as "it is gone": that would raise a
+  // stopped notification for a Host that may still be running.
+  bool unresolved = false;
+  bool complete = false;
   do {
     if (_wcsicmp(entry.szExeFile, host_image_name) != 0) {
       continue;
     }
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
     if (process == nullptr) {
-      continue; // exited between the snapshot and here, or not ours to inspect
+      // ERROR_INVALID_PARAMETER is what a process that has already exited
+      // reports; anything else (access denied, for example) is a process whose
+      // identity cannot be established.
+      if (GetLastError() != ERROR_INVALID_PARAMETER) {
+        unresolved = true;
+      }
+      continue;
     }
     DWORD process_session = 0;
-    const bool same_session =
-        ProcessIdToSessionId(entry.th32ProcessID, &process_session) && process_session == session;
-    if (same_session) {
-      const std::wstring owner = token_user_sid(process);
-      if (!owner.empty() && _wcsicmp(owner.c_str(), me.c_str()) == 0) {
-        result.running = true;
-        result.pid = entry.th32ProcessID;
-        CloseHandle(process);
-        break;
-      }
+    if (!ProcessIdToSessionId(entry.th32ProcessID, &process_session)) {
+      unresolved = true;
+      CloseHandle(process);
+      continue;
     }
+    if (process_session != session) {
+      CloseHandle(process); // another session: not the Host this tray reports
+      continue;
+    }
+    const std::wstring owner = token_user_sid(process);
     CloseHandle(process);
+    if (owner.empty()) {
+      unresolved = true;
+      continue;
+    }
+    if (_wcsicmp(owner.c_str(), me.c_str()) == 0) {
+      result.running = true;
+      result.pid = entry.th32ProcessID;
+      complete = true;
+      break;
+    }
+    // Readable and someone else's: resolved, and not this tray's Host.
   } while (Process32NextW(snapshot, &entry));
+  if (!complete) {
+    // Normal completion reports ERROR_NO_MORE_FILES; anything else means the walk
+    // stopped before the process list was exhausted.
+    complete = GetLastError() == ERROR_NO_MORE_FILES;
+  }
   CloseHandle(snapshot);
 
-  // The snapshot ran to completion: the answer is a measurement, not a guess.
+  // A matching Host is a positive measurement whatever else could not be read.
+  if (result.running) {
+    result.verified = true;
+    return result;
+  }
+  if (unresolved || !complete) {
+    return result; // inconclusive: keep the caller's previous state
+  }
   result.verified = true;
   return result;
 }

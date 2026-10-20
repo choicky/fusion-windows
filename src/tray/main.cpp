@@ -5,6 +5,9 @@
 //     user's* Host is running in *this* session;
 //   - one balloon per running -> absent transition, never per key, and no
 //     balloon for an intentional manual restart or a session end;
+//   - a cancelled session end (WM_ENDSESSION(FALSE)) resumes normal reporting,
+//     and a tray that already exited for a session end that was then cancelled is
+//     restarted by its own task's cancellation trigger, like the Host;
 //   - explicit Restart FusionHost and Open log folder actions, plus Exit;
 //   - automatic restart and hang detection are NOT here. A running process is
 //     not reported as healthy: the status is "running (pid N)" / "not running".
@@ -227,8 +230,10 @@ void poll() {
     return;
   }
   const bool suppressed = g_session_ending || restart_in_progress();
-  const fusion::tray::Observation step = g_watch.observe(observation.running, suppressed);
-  if (step.changed) {
+  const fusion::tray::Observation step =
+      g_watch.observe(observation.running, observation.pid, suppressed);
+  if (step.changed || step.identity_changed) {
+    // A replacement Host is a new identity to show, not a transition to report.
     update_status(observation.running, observation.pid);
   }
   if (step.notify_absent) {
@@ -308,10 +313,19 @@ LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM wparam, LPAR
     g_session_ending = true;
     return TRUE;
   case WM_ENDSESSION:
-    g_session_ending = true;
     if (wparam != 0) {
+      g_session_ending = true;
       exit_tray(window);
+      return 0;
     }
+    // The session end was cancelled - another application vetoed it, or Windows
+    // aborted it after this process had already been told the session was ending.
+    // Stop suppressing and drop the baseline: an exit that happened during the
+    // attempt is not a fresh failure to report, and the Host's own cancellation
+    // trigger starts it again. A later real exit notifies normally.
+    g_session_ending = false;
+    g_watch.reset();
+    poll();
     return 0;
   case WM_CLOSE:
     exit_tray(window);

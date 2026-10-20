@@ -123,6 +123,10 @@ try {
   } else {
     Write-Host '  no tray running'
   }
+  if (@($tray.Untouched).Count -gt 0) {
+    # Not this user's tray, this session's, or the product's: reported, never signalled.
+    Write-Host ("  left alone (identity not verified): pid(s) {0}" -f ($tray.Untouched -join ',')) -ForegroundColor Yellow
+  }
   if (-not $tray.Exited) { throw 'a running Fusion tray did not exit; use its Exit command and re-run the installer' }
   $restartMarker = Start-FusionRestartMarker
   Write-Host "  restart marker: $restartMarker"
@@ -161,56 +165,11 @@ try {
   Write-Step "creating or updating the logon task '$taskName'"
   $action = New-ScheduledTaskAction -Execute $hostExe -WorkingDirectory $versionDir
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger cannot help
-  # because the session never ended. Windows writes User32 1077 when a *logoff* is cancelled
-  # and User32 1073 when a *restart or shutdown* is cancelled; neither is written when the
-  # attempt completes (measured 2026-10-18 and 2026-10-19), so an event trigger on both starts
-  # the Host again. Scoped to this user's SID; delayed so the previous Host has released
-  # HostClaim (its bounded orderly shutdown is 4 s) before the new instance starts.
-  # New-ScheduledTaskTrigger has no event form, hence the CIM class.
-  #
-  # The SID is an attribute of System/Security, not of System: `@UserID=` on System matches
-  # nothing (found in review; the query below is proven against records 104140, 104461 and
-  # 104462, and against the completed restart of 2026-10-19 11:24, which it does not match).
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $xpath = "*[System[Provider[@Name='User32'] and (EventID=1077 or EventID=1073) and Security[@UserID='$sid']]]"
-  # The QueryList must be well-formed XML: closing </Query> is required (a missing one is
-  # tolerated by Get-WinEvent but rejected when the task is registered.)
-  $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
-  # Validate the query before it goes into a trigger: a bad XPath would only show up as a
-  # trigger that never fires. EventLogReader takes the XPath and returns $null when nothing
-  # matches (a valid answer); the QueryList form the trigger actually uses is then checked
-  # against the same log whenever at least one event exists.
-  $subscriptionOk = $true
-  $subscriptionError = ''
-  $firstEvent = $null
-  try {
-    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery('System',
-      [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
-    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
-    $firstEvent = $reader.ReadEvent()
-    $reader.Dispose()
-  } catch {
-    $subscriptionOk = $false
-    $subscriptionError = $_.Exception.Message
-  }
-  if ($subscriptionOk -and $null -ne $firstEvent) {
-    try {
-      # -FilterXml carries its own <Query Path>, so it cannot be combined with -LogName.
-      $null = Get-WinEvent -FilterXml $subscription -MaxEvents 1 -ErrorAction Stop
-    } catch {
-      $subscriptionOk = $false
-      $subscriptionError = ("the QueryList form was rejected: {0}" -f $_.Exception.Message)
-    }
-  }
-  if (-not $subscriptionOk) {
-    throw ("the event subscription is not a valid query: {0}`n  {1}" -f $subscriptionError, $subscription)
-  }
-  $eventClass = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
-  $eventTrigger = New-CimInstance -CimClass $eventClass -ClientOnly
-  $eventTrigger.Enabled = $true
-  $eventTrigger.Subscription = $subscription
-  $eventTrigger.Delay = 'PT10S'
+  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger
+  # cannot help because the session never ended. The shared helper builds the
+  # User32 1077/1073 event trigger that starts the Host again; the tray task below
+  # uses the same one for the same reason.
+  $eventTrigger = New-FusionSessionEndCancelledTrigger
   # Interactive token + limited run level: the Host always runs as the logged-on
   # user at Medium integrity, never elevated. HostClaim, not the task, remains the
   # authority for "one Host per user x session", so IgnoreNew only avoids a queue of
@@ -241,14 +200,22 @@ try {
   }
   $trayAction = New-ScheduledTaskAction -Execute $trayExe -WorkingDirectory $versionDir
   $trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  # The tray exits when the session really ends, so a cancelled logoff/restart leaves
+  # no tray behind either. Same established mechanism as the Host (R34): the shared
+  # User32 1077/1073 trigger starts it again. The single-instance mutex makes a
+  # redundant start harmless.
+  $trayEventTrigger = New-FusionSessionEndCancelledTrigger
   $trayPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
   $traySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable:$false
-  Register-ScheduledTask -TaskName $trayTaskName -Action $trayAction -Trigger $trayTrigger `
+  Register-ScheduledTask -TaskName $trayTaskName -Action $trayAction -Trigger @($trayTrigger, $trayEventTrigger) `
     -Principal $trayPrincipal -Settings $traySettings -Force | Out-Null
   $trayTask = Get-FusionScheduledTaskByName -TaskName $trayTaskName
   if (-not $trayTask) { throw "the task '$trayTaskName' was registered but cannot be read back" }
   Write-Host "  execute=$($trayTask.Execute) user=$($trayTask.UserId) logon=$($trayTask.LogonType) runLevel=$($trayTask.RunLevel) instances=$($trayTask.Instances) triggers=$($trayTask.Triggers)"
+  if ($trayTask.EventSubscription -notmatch '1077' -or $trayTask.EventSubscription -notmatch '1073') {
+    throw "the tray task was registered without the User32 1077/1073 cancellation trigger (subscription: '$($trayTask.EventSubscription)')"
+  }
 
   $currentStep = 'shortcut'
   Write-Step 'creating the Start Menu shortcut for the manual restart tool'
@@ -307,8 +274,12 @@ try {
     Write-Step 'starting the Fusion tray'
     Start-ScheduledTask -TaskName $trayTaskName
     $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline -and @(Get-FusionTrayState).Count -eq 0) { Start-Sleep -Milliseconds 200 }
-    $trays = @(Get-FusionTrayState)
+    # Only a verified tray counts: this is the same scoped inventory the stop phase
+    # and the wait loop use, so an unrelated same-named process cannot make the
+    # single-instance check pass or fail.
+    while ((Get-Date) -lt $deadline -and
+      @(Get-FusionTrayState | Where-Object { $_.Verified }).Count -eq 0) { Start-Sleep -Milliseconds 200 }
+    $trays = @(Get-FusionTrayState | Where-Object { $_.Verified })
     if ($trays.Count -eq 0) {
       Write-Host '  WARNING: the tray did not start; start the FusionTray task manually' -ForegroundColor Yellow
     } elseif ($trays.Count -gt 1) {

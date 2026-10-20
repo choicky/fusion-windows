@@ -16,9 +16,12 @@
 namespace fusion::tray {
 
 struct HostObservation {
-  // False when the probe itself could not be trusted (no token SID, no process
-  // snapshot). The caller must then keep its previous state instead of reporting
-  // an absence it cannot prove.
+  // False when the probe itself could not be trusted: no token SID, no process
+  // snapshot, or a process named FusionHost.exe that could not be inspected
+  // (access denied, unreadable session, unreadable token user, an enumeration
+  // that stopped early). The caller must then keep its previous state instead of
+  // reporting an absence it cannot prove. A process proven to have exited is not
+  // an unresolved observation - that one is a real absence.
   bool verified = false;
   bool running = false;
   unsigned long pid = 0;

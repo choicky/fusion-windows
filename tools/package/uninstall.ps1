@@ -76,6 +76,10 @@ try {
   } else {
     Write-Host '  no tray running'
   }
+  if (@($tray.Untouched).Count -gt 0) {
+    # Not this user's tray, this session's, or the product's: reported, never signalled.
+    Write-Host ("  left alone (identity not verified): pid(s) {0}" -f ($tray.Untouched -join ',')) -ForegroundColor Yellow
+  }
   if (-not $tray.Exited) { throw 'a running Fusion tray did not exit; use its Exit command and re-run the uninstaller' }
   $restartMarker = Start-FusionRestartMarker
 

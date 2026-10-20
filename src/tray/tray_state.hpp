@@ -36,6 +36,10 @@ struct Observation {
   bool changed = false;
   // A running -> absent transition that should raise a balloon.
   bool notify_absent = false;
+  // Still running, but a different process: the identity the user sees must be
+  // refreshed. A replacement Host is not an observed absence, so this never
+  // raises a balloon and never counts as a transition.
+  bool identity_changed = false;
   HostState state = HostState::Unknown;
 };
 
@@ -43,22 +47,35 @@ class Watch {
  public:
   // `running` is the verified observation; `suppressed` means an intentional
   // lifecycle event is in progress (manual restart, session end).
-  Observation observe(bool running, bool suppressed) {
+  Observation observe(bool running, unsigned long pid, bool suppressed) {
     const HostState next = running ? HostState::Running : HostState::Absent;
     Observation result;
     result.state = next;
     result.changed = next != state_;
+    if (state_ == HostState::Running && next == HostState::Running && pid != 0 && pid != pid_) {
+      result.identity_changed = true;
+    }
     if (state_ == HostState::Running && next == HostState::Absent) {
       result.notify_absent = !suppressed;
     }
     state_ = next;
+    pid_ = running ? pid : 0;
     return result;
+  }
+
+  // Drops the baseline without reporting anything: the next observation only
+  // establishes the state again. Used after a cancelled session end, so an exit
+  // that happened during the attempt is not replayed as a fresh failure.
+  void reset() {
+    state_ = HostState::Unknown;
+    pid_ = 0;
   }
 
   HostState state() const { return state_; }
 
  private:
   HostState state_ = HostState::Unknown;
+  unsigned long pid_ = 0;
 };
 
 } // namespace fusion::tray
