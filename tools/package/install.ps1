@@ -3,15 +3,19 @@
 # What it does, in this order:
 #   1. refuse to run unelevated (persistent TIP registration writes HKLM);
 #   2. verify every file against the package manifest (SHA-256);
-#   3. ask a running Host for an orderly stop (upgrade), so Fcitx saves and no DLL
+#   3. close a running tray and mark the window as an intentional restart (U7),
+#      so an upgrade raises no "Host stopped" balloon and the old tray releases
+#      its version directory;
+#   4. ask a running Host for an orderly stop (upgrade), so Fcitx saves and no DLL
 #      is replaced under a live process;
-#   4. copy the package into C:\Program Files\Fcitx5 Fusion\<version>\ (one
+#   5. copy the package into C:\Program Files\Fcitx5 Fusion\<version>\ (one
 #      directory per version, never a shared directory that an upgrade rewrites);
-#   5. register the TIP from the new directory (reusing tools\register.ps1);
-#   6. create or update the per-user logon task (interactive token, limited run
-#      level, no execution time limit, no second instance);
-#   7. start the Host for the current interactive user and report its identity;
-#   8. remove older version directories that no process holds and that are not the
+#   6. register the TIP from the new directory (reusing tools\register.ps1);
+#   7. create or update the per-user logon tasks (Host and tray; interactive
+#      token, limited run level, no execution time limit, no second instance);
+#   8. start the Host for the current interactive user and report its identity,
+#      then start the tray from the new version directory;
+#   9. remove older version directories that no process holds and that are not the
 #      registered one.
 #
 # Nothing here modifies PATH, and nothing deletes a directory a process holds open.
@@ -37,6 +41,7 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'host-state.ps1')
 
 $taskName = 'FusionHost'
+$trayTaskName = 'FusionTray'
 $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion'
 $currentStep = 'start'
 
@@ -106,6 +111,26 @@ try {
     exit 0
   }
 
+  # U7: close a running tray before the Host stops, and mark the window as an
+  # intentional restart. Without this an upgrade would raise a "Host stopped"
+  # balloon and the old tray would keep its version directory busy.
+  $currentStep = 'tray'
+  Write-Step 'closing a running Fusion tray'
+  $tray = Stop-FusionTray -TimeoutMs 5000
+  if ($tray.Found) {
+    Write-Host ("  pid(s) {0}: asked={1} exited={2} after {3} ms{4}" -f ($tray.Pids -join ','),
+      $tray.Requested, $tray.Exited, $tray.WaitedMs, $(if ($tray.Forced) { ' (forced)' } else { '' }))
+  } else {
+    Write-Host '  no tray running'
+  }
+  if (@($tray.Untouched).Count -gt 0) {
+    # Not this user's tray, this session's, or the product's: reported, never signalled.
+    Write-Host ("  left alone (identity not verified): pid(s) {0}" -f ($tray.Untouched -join ',')) -ForegroundColor Yellow
+  }
+  if (-not $tray.Exited) { throw 'a running Fusion tray did not exit; use its Exit command and re-run the installer' }
+  $restartMarker = Start-FusionRestartMarker
+  Write-Host "  restart marker: $restartMarker"
+
   $currentStep = 'stop'
   Write-Step 'asking a running Host for an orderly stop'
   $stop = Stop-FusionHostOrderly -TimeoutMs 20000
@@ -140,56 +165,11 @@ try {
   Write-Step "creating or updating the logon task '$taskName'"
   $action = New-ScheduledTaskAction -Execute $hostExe -WorkingDirectory $versionDir
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger cannot help
-  # because the session never ended. Windows writes User32 1077 when a *logoff* is cancelled
-  # and User32 1073 when a *restart or shutdown* is cancelled; neither is written when the
-  # attempt completes (measured 2026-10-18 and 2026-10-19), so an event trigger on both starts
-  # the Host again. Scoped to this user's SID; delayed so the previous Host has released
-  # HostClaim (its bounded orderly shutdown is 4 s) before the new instance starts.
-  # New-ScheduledTaskTrigger has no event form, hence the CIM class.
-  #
-  # The SID is an attribute of System/Security, not of System: `@UserID=` on System matches
-  # nothing (found in review; the query below is proven against records 104140, 104461 and
-  # 104462, and against the completed restart of 2026-10-19 11:24, which it does not match).
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $xpath = "*[System[Provider[@Name='User32'] and (EventID=1077 or EventID=1073) and Security[@UserID='$sid']]]"
-  # The QueryList must be well-formed XML: closing </Query> is required (a missing one is
-  # tolerated by Get-WinEvent but rejected when the task is registered.)
-  $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
-  # Validate the query before it goes into a trigger: a bad XPath would only show up as a
-  # trigger that never fires. EventLogReader takes the XPath and returns $null when nothing
-  # matches (a valid answer); the QueryList form the trigger actually uses is then checked
-  # against the same log whenever at least one event exists.
-  $subscriptionOk = $true
-  $subscriptionError = ''
-  $firstEvent = $null
-  try {
-    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery('System',
-      [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
-    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
-    $firstEvent = $reader.ReadEvent()
-    $reader.Dispose()
-  } catch {
-    $subscriptionOk = $false
-    $subscriptionError = $_.Exception.Message
-  }
-  if ($subscriptionOk -and $null -ne $firstEvent) {
-    try {
-      # -FilterXml carries its own <Query Path>, so it cannot be combined with -LogName.
-      $null = Get-WinEvent -FilterXml $subscription -MaxEvents 1 -ErrorAction Stop
-    } catch {
-      $subscriptionOk = $false
-      $subscriptionError = ("the QueryList form was rejected: {0}" -f $_.Exception.Message)
-    }
-  }
-  if (-not $subscriptionOk) {
-    throw ("the event subscription is not a valid query: {0}`n  {1}" -f $subscriptionError, $subscription)
-  }
-  $eventClass = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
-  $eventTrigger = New-CimInstance -CimClass $eventClass -ClientOnly
-  $eventTrigger.Enabled = $true
-  $eventTrigger.Subscription = $subscription
-  $eventTrigger.Delay = 'PT10S'
+  # R34: a cancelled logoff/restart/shutdown ends the Host, and the logon trigger
+  # cannot help because the session never ended. The shared helper builds the
+  # User32 1077/1073 event trigger that starts the Host again; the tray task below
+  # uses the same one for the same reason.
+  $eventTrigger = New-FusionSessionEndCancelledTrigger
   # Interactive token + limited run level: the Host always runs as the logged-on
   # user at Medium integrity, never elevated. HostClaim, not the task, remains the
   # authority for "one Host per user x session", so IgnoreNew only avoids a queue of
@@ -205,6 +185,36 @@ try {
   Write-Host "  triggers=$($task.Triggers) count=$($task.TriggerCount)"
   if ($task.EventSubscription -notmatch '1077' -or $task.EventSubscription -notmatch '1073') {
     throw "the task was registered without the User32 1077/1073 event trigger (subscription: '$($task.EventSubscription)')"
+  }
+
+  # U7: the tray has its own task, deliberately not a second action on the Host
+  # task. A task instance stays alive while any of its actions runs, so a
+  # long-lived tray action would keep 'FusionHost' in the Running state and
+  # Start-ScheduledTask (MultipleInstances=IgnoreNew, used by restart-host.ps1)
+  # would be ignored - a manual restart would silently do nothing.
+  $currentStep = 'traytask'
+  Write-Step "creating or updating the logon task '$trayTaskName'"
+  $trayExe = Join-Path $versionDir 'bin\FusionTray.exe'
+  if (-not (Test-Path -LiteralPath $trayExe)) {
+    throw "the package does not contain bin\FusionTray.exe ($trayExe)"
+  }
+  $trayAction = New-ScheduledTaskAction -Execute $trayExe -WorkingDirectory $versionDir
+  $trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  # The tray exits when the session really ends, so a cancelled logoff/restart leaves
+  # no tray behind either. Same established mechanism as the Host (R34): the shared
+  # User32 1077/1073 trigger starts it again. The single-instance mutex makes a
+  # redundant start harmless.
+  $trayEventTrigger = New-FusionSessionEndCancelledTrigger
+  $trayPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+  $traySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable:$false
+  Register-ScheduledTask -TaskName $trayTaskName -Action $trayAction -Trigger @($trayTrigger, $trayEventTrigger) `
+    -Principal $trayPrincipal -Settings $traySettings -Force | Out-Null
+  $trayTask = Get-FusionScheduledTaskByName -TaskName $trayTaskName
+  if (-not $trayTask) { throw "the task '$trayTaskName' was registered but cannot be read back" }
+  Write-Host "  execute=$($trayTask.Execute) user=$($trayTask.UserId) logon=$($trayTask.LogonType) runLevel=$($trayTask.RunLevel) instances=$($trayTask.Instances) triggers=$($trayTask.Triggers)"
+  if ($trayTask.EventSubscription -notmatch '1077' -or $trayTask.EventSubscription -notmatch '1073') {
+    throw "the tray task was registered without the User32 1077/1073 cancellation trigger (subscription: '$($trayTask.EventSubscription)')"
   }
 
   $currentStep = 'shortcut'
@@ -255,6 +265,30 @@ try {
     }
   }
 
+  # U7: start the tray after the Host, so its first observation is a running
+  # Host and it never reports a baseline absence as an exit.
+  $currentStep = 'traystart'
+  if ($NoStart) {
+    Write-Step 'not starting the Fusion tray (-NoStart)'
+  } else {
+    Write-Step 'starting the Fusion tray'
+    Start-ScheduledTask -TaskName $trayTaskName
+    $deadline = (Get-Date).AddSeconds(10)
+    # Only a verified tray counts: this is the same scoped inventory the stop phase
+    # and the wait loop use, so an unrelated same-named process cannot make the
+    # single-instance check pass or fail.
+    while ((Get-Date) -lt $deadline -and
+      @(Get-FusionTrayState | Where-Object { $_.Verified }).Count -eq 0) { Start-Sleep -Milliseconds 200 }
+    $trays = @(Get-FusionTrayState | Where-Object { $_.Verified })
+    if ($trays.Count -eq 0) {
+      Write-Host '  WARNING: the tray did not start; start the FusionTray task manually' -ForegroundColor Yellow
+    } elseif ($trays.Count -gt 1) {
+      throw ("{0} tray processes are running; the single-instance rule failed" -f $trays.Count)
+    } else {
+      Write-Host "  pid=$($trays[0].Id) path=$($trays[0].Path)"
+    }
+  }
+
   $currentStep = 'cleanup'
   Write-Step 'removing older version directories that are not in use'
   $registered = Get-FusionRegisteredDll
@@ -287,6 +321,9 @@ try {
   if ($failure.InvocationInfo) { Write-Host $failure.InvocationInfo.PositionMessage -ForegroundColor Red }
   exit 1
 } finally {
+  # The restart marker covers this run only; a stale one must never silence a
+  # later real Host exit.
+  try { Clear-FusionRestartMarker } catch { }
   if ($transcriptStarted) {
     try { Stop-Transcript | Out-Null } catch { }
   }

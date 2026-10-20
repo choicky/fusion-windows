@@ -80,6 +80,21 @@ if(WIN32 AND MSVC)
     target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
     target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore shell32)
+
+    # U7: the minimal per-user tray surface. Deliberately outside the Host (a
+    # crashed Host cannot report itself) and outside the TSF DLL (one status
+    # authority per user, not one per application). It observes processes only;
+    # it never drives the Host, so it does not link the IPC or backend layers.
+    add_executable(FusionTrayExe
+      src/tray/main.cpp
+      src/tray/host_watch.cpp)
+    target_include_directories(FusionTrayExe PRIVATE include src)
+    target_compile_features(FusionTrayExe PRIVATE cxx_std_20)
+    set_target_properties(FusionTrayExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionTray
+      WIN32_EXECUTABLE TRUE)
+    target_compile_definitions(FusionTrayExe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_compile_options(FusionTrayExe PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(FusionTrayExe PRIVATE shell32 advapi32 user32)
   endif()
 endif()
 
@@ -99,6 +114,13 @@ if(BUILD_TESTING)
     target_compile_options(stage3c PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
+
+    # U7: the tray's transition rules (no window, no desktop session needed).
+    add_executable(tray_state tests/tray_state.cpp)
+    target_include_directories(tray_state PRIVATE src)
+    target_compile_features(tray_state PRIVATE cxx_std_20)
+    target_compile_options(tray_state PRIVATE /W4 /WX /utf-8)
+    add_test(NAME tray_state COMMAND tray_state)
 
     # Stage 5 closure: preedit contract / aux producers / hide signal against the
     # real pinned pinyin engine (in-process FusionFcitxHost, no TSF).

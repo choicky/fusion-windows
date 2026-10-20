@@ -1,8 +1,10 @@
 # Stage 6 WP4 shared helpers for install.ps1 / uninstall.ps1 / verify-wp4.ps1.
 #
-# Everything here is read-only except Stop-FusionHostOrderly, which asks a running
-# Host for an *orderly* stop through the product's own named stop event. Nothing in
-# this file terminates a process, and nothing writes user data.
+# Everything here is read-only except two lifecycle helpers: Stop-FusionHostOrderly
+# asks a running Host for an *orderly* stop through the product's own named stop
+# event, and Stop-FusionTray asks the tray to exit through its window, force-stopping
+# only a verified tray that does not answer. Both act only on processes whose user,
+# session and product path this file has verified. Nothing here writes user data.
 
 Set-StrictMode -Version 2.0
 
@@ -20,10 +22,39 @@ public static extern bool OpenProcessToken(System.IntPtr process, uint access, o
 public static extern bool GetTokenInformation(System.IntPtr token, int infoClass, System.IntPtr info, int length, out int returned);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
 public static extern System.IntPtr OpenProcess(uint access, bool inherit, int processId);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool PostMessageW(System.IntPtr window, uint message, System.IntPtr wparam, System.IntPtr lparam);
 [System.Runtime.InteropServices.DllImport("advapi32.dll")]
 public static extern System.IntPtr GetSidSubAuthority(System.IntPtr sid, uint index);
 [System.Runtime.InteropServices.DllImport("advapi32.dll")]
 public static extern System.IntPtr GetSidSubAuthorityCount(System.IntPtr sid);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern uint GetWindowThreadProcessId(System.IntPtr window, out uint processId);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int GetClassNameW(System.IntPtr window, System.Text.StringBuilder name, int size);
+public delegate bool EnumWindowsProc(System.IntPtr window, System.IntPtr lparam);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool EnumWindows(EnumWindowsProc callback, System.IntPtr lparam);
+
+// The tray window that belongs to one of `pids`, or IntPtr.Zero. FindWindow alone
+// is not enough: it returns the first window of that class, which may belong to a
+// process this script must not signal. Ownership is read per window instead.
+public static System.IntPtr FindTrayWindow(int[] pids) {
+  System.IntPtr found = System.IntPtr.Zero;
+  EnumWindows(delegate(System.IntPtr window, System.IntPtr lparam) {
+    uint pid;
+    GetWindowThreadProcessId(window, out pid);
+    if (System.Array.IndexOf(pids, (int)pid) < 0) { return true; }
+    var name = new System.Text.StringBuilder(64);
+    GetClassNameW(window, name, 64);
+    if (string.Equals(name.ToString(), "FusionTrayWindow", System.StringComparison.Ordinal)) {
+      found = window;
+      return false;
+    }
+    return true;
+  }, System.IntPtr.Zero);
+  return found;
+}
 
 public static string IntegrityLevel(int processId) {
   System.IntPtr process = OpenProcess(0x1000, false, processId); // PROCESS_QUERY_LIMITED_INFORMATION
@@ -141,9 +172,17 @@ function Get-FusionRegistrationState {
 }
 
 function Get-FusionScheduledTask {
-  $task = Get-ScheduledTask -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  return Get-FusionScheduledTaskByName -TaskName 'FusionHost'
+}
+
+# The same inventory for any task name. U7 adds a second per-user task
+# ('FusionTray'); keeping one reader means the two tasks are reported with the
+# same fields.
+function Get-FusionScheduledTaskByName {
+  param([string]$TaskName = 'FusionHost')
+  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if (-not $task) { return $null }
-  $info = Get-ScheduledTaskInfo -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
   # A task with no trigger yields $null here, and @($null) is a one-element array of
   # null: filter it out before reading CimClass (StrictMode would throw). The product
   # task always has triggers; the WP7 restart tool also reads tasks registered by hand.
@@ -172,8 +211,57 @@ function Get-FusionScheduledTask {
   }
 }
 
-# The DLL the machine-wide (HKLM) COM registration points at, or $null.
+# The session-end cancellation trigger both per-user tasks share (R34). Windows
+# writes User32 1077 when a *logoff* is cancelled and 1073 when a *restart or
+# shutdown* is cancelled; neither is written when the attempt completes (measured
+# 2026-10-18 and 2026-10-19), so an event trigger on both starts the process again
+# when the session does not actually end. Scoped to this user's SID; delayed so the
+# previous instance has released its claim (the Host's bounded orderly shutdown is
+# 4 s) before a new one starts.
 #
+# The SID is an attribute of System/Security, not of System: `@UserID=` on System
+# matches nothing (found in review; the query below is proven against records
+# 104140, 104461 and 104462, and against the completed restart of 2026-10-19
+# 11:24, which it does not match).
+function New-FusionSessionEndCancelledTrigger {
+  param([int]$DelaySeconds = 10)
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $xpath = "*[System[Provider[@Name='User32'] and (EventID=1077 or EventID=1073) and Security[@UserID='$sid']]]"
+  # The QueryList must be well-formed XML: closing </Query> is required (a missing
+  # one is tolerated by Get-WinEvent but rejected when the task is registered.)
+  $subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
+  # Validate the query before it goes into a trigger: a bad XPath would only show
+  # up as a trigger that never fires. EventLogReader takes the XPath and returns
+  # $null when nothing matches (a valid answer); the QueryList form the trigger
+  # actually uses is then checked against the same log whenever at least one event
+  # exists.
+  $firstEvent = $null
+  try {
+    $query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery('System',
+      [System.Diagnostics.Eventing.Reader.PathType]::LogName, $xpath)
+    $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
+    $firstEvent = $reader.ReadEvent()
+    $reader.Dispose()
+  } catch {
+    throw ("the session-end cancellation query is not valid: {0}`n  {1}" -f $_.Exception.Message, $subscription)
+  }
+  if ($null -ne $firstEvent) {
+    try {
+      $null = Get-WinEvent -FilterXml $subscription -MaxEvents 1 -ErrorAction Stop
+    } catch {
+      throw ("the session-end cancellation query was rejected in its QueryList form: {0}`n  {1}" -f
+        $_.Exception.Message, $subscription)
+    }
+  }
+  $eventClass = Get-CimClass -Namespace ROOT/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskEventTrigger
+  $eventTrigger = New-CimInstance -CimClass $eventClass -ClientOnly
+  $eventTrigger.Enabled = $true
+  $eventTrigger.Subscription = $subscription
+  $eventTrigger.Delay = "PT${DelaySeconds}S"
+  return $eventTrigger
+}
+
+# The DLL the machine-wide (HKLM) COM registration points at, or $null.
 # `(Get-FusionRegistrationState | Where-Object {...}).Dll` is a trap under
 # Set-StrictMode -Version 2.0: when the filter matches nothing the pipeline yields
 # $null and the property read throws "cannot be found on this object". Every caller
@@ -453,4 +541,158 @@ function Stop-FusionHostOrderly {
   $result.WaitedMs = [int]$watch.ElapsedMilliseconds
   $result.Exited = (@($result.Pids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -eq 0)
   return $result
+}
+
+# --- U7: the tray surface ---------------------------------------------------
+#
+# The tray is a separate per-user process with its own logon task. Nothing here
+# starts or stops the Host; these helpers only (a) ask a running tray to exit
+# through its own window so the icon is removed and the version directory is
+# released, and (b) write the short-lived "a restart is in progress" marker that
+# keeps an intentional stop from being reported as a Host failure.
+
+# The tray's product identity is its location, not its name: an installed tray is
+# always <install root>\<version>\bin\FusionTray.exe. Any version directory is
+# legitimate - an upgrade must be able to stop the previous version's tray - while
+# a same-named executable anywhere else is not the product and is never touched.
+function Test-FusionTrayPath {
+  param([string]$Path, [string]$InstallRoot)
+  if (-not $Path) { return $false }
+  $suffix = '\bin\FusionTray.exe'
+  if (-not $Path.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+  $versionDir = $Path.Substring(0, $Path.Length - $suffix.Length)
+  $leaf = [System.IO.Path]::GetFileName($versionDir)
+  if (-not $leaf -or $leaf -eq '.' -or $leaf -eq '..') { return $false }
+  $parent = [System.IO.Path]::GetDirectoryName($versionDir)
+  if (-not $parent) { return $false }
+  $expected = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+  return [string]::Equals($parent.TrimEnd('\'), $expected, [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Running tray processes, each with the identity the caller needs to decide whether
+# it may act: path, owner, session and whether all three match this user, this
+# session and the product path. An owner that cannot be read is "unverified",
+# never "mine". One inventory feeds the wait loop, the installer's single-instance
+# count and the fallback, so none of them can disagree about which processes count.
+function Get-FusionTrayState {
+  param([string]$InstallRoot = (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion'))
+  $sessionId = (Get-Process -Id $PID).SessionId
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $result = @()
+  foreach ($process in @(Get-Process -Name FusionTray -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $process.Path } catch { }
+    $owner = ''
+    try {
+      $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+      if ($cim) {
+        $who = Invoke-CimMethod -InputObject $cim -MethodName GetOwner -ErrorAction Stop
+        if ($who -and $who.User) { $owner = "$($who.Domain)\$($who.User)" }
+      }
+    } catch { }
+    $started = $null
+    try { $started = $process.StartTime } catch { }
+    $productPath = Test-FusionTrayPath -Path $path -InstallRoot $InstallRoot
+    $result += [pscustomobject]@{
+      Id          = $process.Id
+      Path        = $path
+      User        = $owner
+      SessionId   = $process.SessionId
+      StartTime   = $started
+      ProductPath = $productPath
+      Verified    = ($process.SessionId -eq $sessionId -and $owner -eq $me -and $productPath)
+    }
+  }
+  return $result
+}
+
+# Asks the tray to exit the way its own Exit command does: WM_CLOSE to the window
+# class it registers, sent only to a window whose owning process is in the verified
+# set. Falls back to a bounded Stop-Process - re-reading identity first, never
+# reusing the earlier list - and says so: an upgrade must not leave an old tray
+# holding a version directory, and must not silently kill a responsive one either.
+function Stop-FusionTray {
+  param(
+    [int]$TimeoutMs = 5000,
+    [string]$InstallRoot = (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion')
+  )
+  $result = [pscustomobject]@{
+    Found     = $false
+    Requested = $false
+    Exited    = $true
+    Forced    = $false
+    Pids      = @()
+    Untouched = @()
+    WaitedMs  = 0
+  }
+  $trays = @(Get-FusionTrayState -InstallRoot $InstallRoot)
+  # Anything that is not verifiably this user's tray in this session, running from
+  # the product's install root, is reported and left alone.
+  $result.Untouched = @($trays | Where-Object { -not $_.Verified } | ForEach-Object { $_.Id })
+  $mine = @($trays | Where-Object { $_.Verified })
+  if ($mine.Count -eq 0) { return $result }
+  $result.Found = $true
+  $result.Pids = @($mine | ForEach-Object { $_.Id })
+
+  $window = [FusionNative]::FindTrayWindow([int[]]$result.Pids)
+  if ($window -ne [IntPtr]::Zero) {
+    # WM_CLOSE (0x0010): the tray removes its icon and exits on its own path.
+    $result.Requested = [FusionNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+  }
+
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
+    if (@(Get-FusionTrayState -InstallRoot $InstallRoot | Where-Object { $_.Verified }).Count -eq 0) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  $result.WaitedMs = [int]$watch.ElapsedMilliseconds
+  $left = @(Get-FusionTrayState -InstallRoot $InstallRoot | Where-Object { $_.Verified })
+  if ($left.Count -gt 0) {
+    # Identity is read again immediately before terminating: a pid that was ours a
+    # moment ago is not proof that the process still is.
+    foreach ($tray in $left) {
+      $still = @(Get-FusionTrayState -InstallRoot $InstallRoot |
+          Where-Object { $_.Verified -and $_.Id -eq $tray.Id })
+      if ($still.Count -eq 1) { Stop-Process -Id $tray.Id -Force -ErrorAction SilentlyContinue }
+    }
+    $result.Forced = $true
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline -and
+      @(Get-FusionTrayState -InstallRoot $InstallRoot | Where-Object { $_.Verified }).Count -gt 0) {
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  $result.Exited = (@(Get-FusionTrayState -InstallRoot $InstallRoot | Where-Object { $_.Verified }).Count -eq 0)
+  return $result
+}
+
+# %LOCALAPPDATA%\fusion-tray\restart-in-progress - read by the tray, written by
+# restart-host.ps1 (and by install/uninstall around their Host stop). A marker
+# older than the tray's freshness bound is ignored by the tray, so a crash that
+# left one behind cannot silence a later real exit.
+function Get-FusionTrayMarkerPath {
+  return (Join-Path (Join-Path $env:LOCALAPPDATA 'fusion-tray') 'restart-in-progress')
+}
+
+function Start-FusionRestartMarker {
+  $path = Get-FusionTrayMarkerPath
+  try {
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force $parent | Out-Null }
+    Set-Content -LiteralPath $path -Value ([DateTime]::UtcNow.ToString('o')) -Encoding Ascii
+  } catch {
+    # Best effort: an unwritable marker only costs a possible "Host stopped"
+    # balloon while this operation runs, so it must not fail an install.
+  }
+  return $path
+}
+
+function Clear-FusionRestartMarker {
+  $path = Get-FusionTrayMarkerPath
+  try {
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+  } catch {
+    # Best effort: the tray ignores a marker older than its freshness bound, so a
+    # leftover cannot silence a later real exit - and this runs in a finally block.
+  }
 }

@@ -3,7 +3,7 @@
 # The package is a zip whose root maps directly onto the installed version
 # directory (C:\Program Files\Fcitx5 Fusion\<version>\):
 #
-#   bin\        FusionHost.exe, FusionTsf.dll, FusionFcitxHost.dll and every
+#   bin\        FusionHost.exe, FusionTray.exe, FusionTsf.dll, FusionFcitxHost.dll and every
 #               runtime DLL the Host loads (all beside the executable, so no PATH
 #               change is needed and Fcitx resolves its data from ..\data)
 #   data\       fcitx5\ (addon/input-method definitions, pinyin data) + libime\
@@ -46,6 +46,7 @@ $dataDir = Join-Path $BuildDir 'data'
 $libDir = Join-Path $BuildDir 'lib'
 foreach ($required in @(
     (Join-Path $binDir 'FusionHost.exe'),
+    (Join-Path $binDir 'FusionTray.exe'),
     (Join-Path $binDir 'FusionTsf.dll'),
     (Join-Path $binDir 'FusionFcitxHost.dll'),
     (Join-Path $binDir 'Fcitx5Core.dll'),
@@ -74,8 +75,10 @@ try {
   foreach ($file in Get-ChildItem -LiteralPath $binDir -File -Filter '*.dll') {
     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage 'bin') -Force
   }
-  Copy-Item -LiteralPath (Join-Path $binDir 'FusionHost.exe') -Destination (Join-Path $stage 'bin') -Force
-  foreach ($name in @('FusionHost.exe', 'FusionTsf.dll', 'FusionFcitxHost.dll')) {
+  foreach ($name in @('FusionHost.exe', 'FusionTray.exe')) {
+    Copy-Item -LiteralPath (Join-Path $binDir $name) -Destination (Join-Path $stage 'bin') -Force
+  }
+  foreach ($name in @('FusionHost.exe', 'FusionTray.exe', 'FusionTsf.dll', 'FusionFcitxHost.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $stage "bin\$name"))) {
       throw "Release build did not produce bin\$name"
     }
