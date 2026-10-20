@@ -1120,15 +1120,21 @@ public:
   FcitxLikeBackend() {
     settings_snapshot.values = SettingsValue::object();
     settings_snapshot.values.entries.emplace("PageSize", SettingsValue::string("7"));
+    settings_snapshot.values.entries.emplace("ShuangpinProfile", SettingsValue::string("Ziranma"));
+    settings_snapshot.values.entries.emplace("SpellEnabled", SettingsValue::string("true"));
     settings_snapshot.values.entries.emplace("FutureOption", SettingsValue::string("keep-me"));
     SettingsConfigType type;
     type.name = "PinyinEngineConfig";
-    SettingsOptionDescription option;
-    option.name = "PageSize";
-    option.type = "Integer";
-    option.description = "Candidates per page";
-    option.default_value = SettingsValue::string("5");
-    type.options.push_back(std::move(option));
+    for (const auto &[name, defaultValue] :
+         {std::pair{"PageSize", "5"}, std::pair{"ShuangpinProfile", "Ziranma"},
+          std::pair{"SpellEnabled", "true"}}) {
+      SettingsOptionDescription option;
+      option.name = name;
+      option.type = name == std::string("PageSize") ? "Integer" : "Enum";
+      option.description = name;
+      option.default_value = SettingsValue::string(defaultValue);
+      type.options.push_back(std::move(option));
+    }
     settings_snapshot.types.push_back(std::move(type));
   }
 
@@ -1741,7 +1747,7 @@ void test_settings_host() {
               settings_detail::read_snapshot(get_reader, snapshot) && get_reader.at_end() &&
               snapshot.values.entries.at("PageSize").scalar == "7" &&
               snapshot.values.entries.at("FutureOption").scalar == "keep-me" &&
-              snapshot.types.size() == 1 && snapshot.types[0].options.size() == 1,
+              snapshot.types.size() == 1 && snapshot.types[0].options.size() == 3,
           "GetConfig delivers dynamic values and official-schema-shaped metadata");
 
   SettingsValue requested = SettingsValue::object();
@@ -1760,6 +1766,43 @@ void test_settings_host() {
               applied.values.entries.at("FutureOption").scalar == "keep-me" &&
               fake->settings_set_count == 1,
           "SetConfig is acknowledged only after the backend returns the resulting state");
+
+  // The two settings pages share options but are applied independently. A page that
+  // submits only what it changed must not restore a shared value the other page has
+  // just written, in either direction.
+  const auto apply_delta = [&](const char *uri, const char *key, const char *value) {
+    SettingsValue delta = SettingsValue::object();
+    delta.entries.emplace(key, SettingsValue::string(value));
+    std::vector<std::uint8_t> payload;
+    require(serialize_settings_set_request(payload, uri, delta),
+            "partial SetConfig request serialization");
+    auto reply = send_one(MessageType::SettingsSetConfigRequest, payload);
+    detail::Reader reader{reply.payload.data(), reply.payload.size()};
+    auto status = deserialize_settings_status(reader);
+    SettingsSnapshot snapshot_after;
+    require(status && status->status == SettingsStatus::Ok &&
+                settings_detail::read_snapshot(reader, snapshot_after) && reader.at_end(),
+            "partial SetConfig is acknowledged");
+    return snapshot_after;
+  };
+  const auto shuangpin_delta =
+      apply_delta("fcitx://config/inputmethod/shuangpin", "ShuangpinProfile", "MS");
+  require(shuangpin_delta.values.entries.at("PageSize").scalar == "9" &&
+              shuangpin_delta.values.entries.at("ShuangpinProfile").scalar == "MS" &&
+              shuangpin_delta.values.entries.at("FutureOption").scalar == "keep-me" &&
+              fake->settings_set_count == 2,
+          "a partial apply from the other page preserves the shared value it did not submit");
+  require(apply_delta("fcitx://config/inputmethod/shuangpin", "PageSize", "8")
+                  .values.entries.at("PageSize")
+                  .scalar == "8",
+          "the other page can change the shared value");
+  const auto pinyin_delta =
+      apply_delta("fcitx://config/inputmethod/pinyin", "SpellEnabled", "false");
+  require(pinyin_delta.values.entries.at("PageSize").scalar == "8" &&
+              pinyin_delta.values.entries.at("SpellEnabled").scalar == "false" &&
+              pinyin_delta.values.entries.at("ShuangpinProfile").scalar == "MS" &&
+              fake->settings_set_count == 4,
+          "the reverse page direction preserves the shared value it did not submit");
 
   auto selection_reply = send_one(MessageType::SettingsGetSelectionRequest, {});
   detail::Reader selection_reader{selection_reply.payload.data(), selection_reply.payload.size()};
@@ -1814,7 +1857,7 @@ void test_settings_host() {
             "malformed request reached the Host parser");
     require(!client.recv_response(std::chrono::seconds(2)),
             "malformed settings request is disconnected without an apply");
-    require(fake->settings_set_count == 1, "malformed request never reached backend apply");
+    require(fake->settings_set_count == 4, "malformed request never reached backend apply");
   }
   old_tip.reset();
 }

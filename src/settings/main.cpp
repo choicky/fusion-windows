@@ -14,8 +14,11 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDBusMessage>
+#include <QDBusVariant>
 #include <QElapsedTimer>
 #include <QHBoxLayout>
+#include <QHash>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMessageBox>
@@ -25,6 +28,7 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVariantMap>
 #include <QWidget>
 
 #include <clocale>
@@ -84,10 +88,10 @@ public:
     outer->addLayout(selectionRow);
 
     tabs_ = new QTabWidget(central);
-    tabs_->addTab(makePage(QStringLiteral("fcitx://config/inputmethod/pinyin"), pinyin_),
-                  QStringLiteral("拼音设置"));
-    tabs_->addTab(makePage(QStringLiteral("fcitx://config/inputmethod/shuangpin"), shuangpin_),
-                  QStringLiteral("双拼设置"));
+    pinyinUri_ = QStringLiteral("fcitx://config/inputmethod/pinyin");
+    shuangpinUri_ = QStringLiteral("fcitx://config/inputmethod/shuangpin");
+    tabs_->addTab(makePage(pinyinUri_, pinyin_), QStringLiteral("拼音设置"));
+    tabs_->addTab(makePage(shuangpinUri_, shuangpin_), QStringLiteral("双拼设置"));
     outer->addWidget(tabs_, 1);
 
     auto *buttons = new QHBoxLayout;
@@ -107,15 +111,7 @@ public:
     outer->addWidget(limitations);
     setCentralWidget(central);
 
-    connect(apply_, &QPushButton::clicked, this, [this, status] {
-      auto *page = currentPage();
-      if (!page) {
-        return;
-      }
-      apply_->setEnabled(false);
-      status->setText(QStringLiteral("正在应用；不会重启 FusionHost…"));
-      page->save();
-    });
+    connect(apply_, &QPushButton::clicked, this, [this] { applyCurrentPage(); });
     connect(cancel_, &QPushButton::clicked, this, [this, status] {
       status->setText(QStringLiteral("正在放弃未应用更改并重新加载…"));
       reloadAll(status, QStringLiteral("已放弃未应用的更改并重新加载。"));
@@ -163,6 +159,8 @@ public:
             [this, status](bool ok, const QString &error) {
               pinyinLoaded_ = ok;
               if (ok) {
+                pinyinLoads_++;
+                baseline_[pinyin_] = pinyin_->value().toMap();
                 status->setText(QStringLiteral("已从 FusionHost 加载拼音设置。"));
               } else {
                 showError(status, error);
@@ -172,21 +170,13 @@ public:
             [this, status](bool ok, const QString &error) {
               shuangpinLoaded_ = ok;
               if (ok) {
+                shuangpinLoads_++;
+                baseline_[shuangpin_] = shuangpin_->value().toMap();
                 status->setText(QStringLiteral("已从 FusionHost 加载双拼设置。"));
               } else {
                 showError(status, error);
               }
             });
-    const auto applied = [this, status](bool ok, const QString &error) {
-      apply_->setEnabled(true);
-      if (ok) {
-        status->setText(QStringLiteral("FusionHost 已确认应用设置。"));
-      } else {
-        showError(status, error);
-      }
-    };
-    connect(pinyin_, &fcitx::kcm::ConfigWidget::saveFinished, this, applied);
-    connect(shuangpin_, &fcitx::kcm::ConfigWidget::saveFinished, this, applied);
     connect(pinyin_, &fcitx::kcm::ConfigWidget::changed, this, [this, status] {
       status->setText(QStringLiteral("拼音设置有未应用的更改。"));
     });
@@ -194,13 +184,21 @@ public:
       status->setText(QStringLiteral("双拼设置有未应用的更改。"));
     });
 
-    // Probe the selection first, then load the active page. The Host admits one
+    // Probe the selection first, then load the page(s). The Host admits one
     // settings request at a time; serializing startup avoids a false Busy result.
     reloadSelection([this] {
-      loadCurrentPage(true);
       if (selfTest_) {
-        QTimer::singleShot(0, this, [this] { runSelfTest(); });
+        loadBothPages([this](bool ok, const QString &error) {
+          if (!ok) {
+            showError(status_, error);
+            QCoreApplication::exit(13);
+            return;
+          }
+          QTimer::singleShot(0, this, [this] { runSelfTest(); });
+        });
+        return;
       }
+      loadCurrentPage(true);
     });
   }
 
@@ -237,29 +235,130 @@ private:
 
   void reloadAll(QLabel *status, const QString &successMessage) {
     reloadSelection([this, status, successMessage] {
-      pinyinLoaded_ = false;
-      shuangpinLoaded_ = false;
-      auto secondPage = std::make_shared<std::function<void()>>();
-      *secondPage = [this, status, successMessage] {
-        connect(shuangpin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
-                [this, status, successMessage](bool ok, const QString &error) {
-                  if (ok) {
-                    status->setText(successMessage);
-                  } else {
-                    showError(status, error);
-                  }
-                }, Qt::SingleShotConnection);
-        shuangpin_->load();
-      };
-      connect(pinyin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
-              [this, status, secondPage](bool ok, const QString &error) {
-                if (ok) {
-                  (*secondPage)();
-                } else {
-                  showError(status, error);
+      loadBothPages([this, status, successMessage](bool ok, const QString &error) {
+        if (ok) {
+          status->setText(successMessage);
+        } else {
+          showError(status, error);
+        }
+      });
+    });
+  }
+
+  // The Host admits one settings request per connection, so the two pages are
+  // loaded sequentially: Pinyin first, then Shuangpin.
+  void loadBothPages(std::function<void(bool, const QString &)> onDone) {
+    pinyinLoaded_ = false;
+    shuangpinLoaded_ = false;
+    auto secondPage = std::make_shared<std::function<void()>>();
+    *secondPage = [this, onDone] {
+      connect(shuangpin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
+              [onDone](bool ok, const QString &error) { onDone(ok, error); },
+              Qt::SingleShotConnection);
+      shuangpin_->load();
+    };
+    connect(pinyin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
+            [secondPage, onDone](bool ok, const QString &error) {
+              if (ok) {
+                (*secondPage)();
+              } else {
+                onDone(false, error);
+              }
+            }, Qt::SingleShotConnection);
+    pinyin_->load();
+  }
+
+  QString uriFor(const fcitx::kcm::ConfigWidget *page) const {
+    return page == pinyin_ ? pinyinUri_ : shuangpinUri_;
+  }
+
+  // Both pages stay loaded so switching tabs keeps unsaved edits. Submitting the
+  // whole page would therefore write back values the other page read before its
+  // last apply, so only the options this page actually changed are submitted; the
+  // Host merges submitted options onto its live configuration and leaves the rest
+  // untouched. An empty delta means there is nothing to apply.
+  void applyCurrentPage(std::function<void(bool, const QString &)> onDone = {}) {
+    auto *page = currentPage();
+    if (!page) {
+      return;
+    }
+    if (!provider_.controller()) {
+      const QString error = QStringLiteral("无法创建 FusionHost 连接请求。");
+      showError(status_, error);
+      if (onDone) {
+        onDone(false, error);
+      }
+      return;
+    }
+    const QVariantMap current = page->value().toMap();
+    const QVariantMap baseline = baseline_.value(page);
+    QVariantMap delta;
+    for (auto it = current.cbegin(); it != current.cend(); ++it) {
+      if (baseline.value(it.key()) != it.value()) {
+        delta.insert(it.key(), it.value());
+      }
+    }
+    if (delta.isEmpty()) {
+      status_->setText(QStringLiteral("没有需要应用的更改。"));
+      if (onDone) {
+        onDone(true, QString());
+      }
+      return;
+    }
+    apply_->setEnabled(false);
+    status_->setText(QStringLiteral("正在应用；不会重启 FusionHost…"));
+    auto *call = provider_.controller()->SetConfig(uriFor(page), QDBusVariant(delta));
+    connect(call, &fcitx::kcm::PendingCall::finished, this,
+            [this, call, page, onDone] {
+              const QDBusMessage reply = call->reply();
+              call->deleteLater();
+              apply_->setEnabled(true);
+              QString error;
+              if (reply.type() != QDBusMessage::ReplyMessage) {
+                error = reply.errorMessage();
+                if (error.isEmpty()) {
+                  error = QStringLiteral("FusionHost 未确认应用结果；请重新加载后再试。");
                 }
-              }, Qt::SingleShotConnection);
-      pinyin_->load();
+              } else if (reply.arguments().size() < 2) {
+                error = QStringLiteral("FusionHost 未返回应用后的设置。");
+              }
+              if (!error.isEmpty()) {
+                showError(status_, error);
+                if (onDone) {
+                  onDone(false, error);
+                }
+                return;
+              }
+              // Adopt the Host's authoritative result for the page that was just
+              // applied; the other page keeps its own unsaved edits untouched.
+              page->setValue(reply.arguments().at(0).value<QDBusVariant>().variant());
+              baseline_[page] = page->value().toMap();
+              status_->setText(QStringLiteral("FusionHost 已确认应用设置。"));
+              if (onDone) {
+                onDone(true, QString());
+              }
+            });
+  }
+
+  // Reads authoritative Host state without touching either page's widgets, so the
+  // self-test can assert what the Host persisted rather than what the UI shows.
+  void readHostValue(const QString &uri, const QString &key,
+                     std::function<void(bool, const QString &)> onDone) {
+    if (!provider_.controller()) {
+      onDone(false, QString());
+      return;
+    }
+    auto *call = provider_.controller()->GetConfig(uri);
+    connect(call, &fcitx::kcm::PendingCall::finished, this, [call, key, onDone] {
+      const QDBusMessage reply = call->reply();
+      call->deleteLater();
+      if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() < 2) {
+        onDone(false, QString());
+        return;
+      }
+      const QVariantMap values =
+          reply.arguments().at(0).value<QDBusVariant>().variant().toMap();
+      onDone(true, values.value(key).toString());
     });
   }
 
@@ -267,68 +366,142 @@ private:
     if (!selfTestTimer_.isValid()) {
       selfTestTimer_.start();
     }
-    if (selfTestTimer_.elapsed() > 8000) {
+    if (selfTestTimer_.elapsed() > 20000) {
       status_->setText(QStringLiteral("SELF-TEST FAIL: timed out waiting for the Host/config schema."));
       QCoreApplication::exit(10);
       return;
     }
-    if (!pinyinLoaded_) {
+    if (!pinyinLoaded_ || !shuangpinLoaded_) {
       QTimer::singleShot(100, this, [this] { runSelfTest(); });
       return;
     }
-    const QString before = pinyin_->value().toMap().value(QStringLiteral("PageSize")).toString();
-    if (before.isEmpty()) {
+    if (pinyinLoads_ != 1 || shuangpinLoads_ != 1) {
+      status_->setText(
+          QStringLiteral("SELF-TEST FAIL: a page was loaded more than once before the scenario."));
+      QCoreApplication::exit(22);
+      return;
+    }
+    const QString initial = pinyin_->value().toMap().value(QStringLiteral("PageSize")).toString();
+    if (initial.isEmpty()) {
       status_->setText(QStringLiteral("SELF-TEST FAIL: PageSize was not rendered."));
       QCoreApplication::exit(11);
       return;
     }
-    QVariantMap values = pinyin_->value().toMap();
-    values.insert(QStringLiteral("PageSize"), 9);
-    pinyin_->setValue(values);
-    connect(pinyin_, &fcitx::kcm::ConfigWidget::saveFinished, this,
-            [this, before](bool ok, const QString &error) {
-              if (!ok) {
-                showError(status_, error);
-                QCoreApplication::exit(12);
-                return;
-              }
-              pinyinLoaded_ = false;
-              connect(shuangpin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
-                      [this](bool loaded, const QString &loadError) {
-                        if (!loaded) {
-                          showError(status_, loadError);
-                          QCoreApplication::exit(13);
+    // Step 1: change the shared value on the page that is already current.
+    QVariantMap pinyinValues = pinyin_->value().toMap();
+    pinyinValues.insert(QStringLiteral("PageSize"), 9);
+    pinyin_->setValue(pinyinValues);
+    applyCurrentPage([this](bool applied, const QString &error) {
+      if (!applied) {
+        showError(status_, error);
+        QCoreApplication::exit(12);
+        return;
+      }
+      // Step 2: return to the already-loaded Shuangpin page. Switching tabs must
+      // not reload it, otherwise the stale-page scenario would be bypassed.
+      const int loadsBeforeSwitch = shuangpinLoads_;
+      tabs_->setCurrentIndex(1);
+      if (shuangpinLoads_ != loadsBeforeSwitch) {
+        status_->setText(
+            QStringLiteral("SELF-TEST FAIL: switching tabs reloaded the already-loaded page."));
+        QCoreApplication::exit(17);
+        return;
+      }
+      // Step 3: change a different, Shuangpin-specific setting and apply.
+      QVariantMap shuangpinValues = shuangpin_->value().toMap();
+      if (!shuangpinValues.contains(QStringLiteral("ShuangpinProfile"))) {
+        status_->setText(QStringLiteral("SELF-TEST FAIL: ShuangpinProfile was not rendered."));
+        QCoreApplication::exit(18);
+        return;
+      }
+      const QString profile = shuangpinValues.value(QStringLiteral("ShuangpinProfile")).toString();
+      shuangpinValues.insert(QStringLiteral("ShuangpinProfile"),
+                             profile == QLatin1String("MS") ? QStringLiteral("Ziranma")
+                                                            : QStringLiteral("MS"));
+      shuangpin_->setValue(shuangpinValues);
+      applyCurrentPage([this](bool appliedSecond, const QString &secondError) {
+        if (!appliedSecond) {
+          showError(status_, secondError);
+          QCoreApplication::exit(15);
+          return;
+        }
+        // Step 4: read authoritative Host state, not the widget value.
+        readHostValue(shuangpinUri_, QStringLiteral("PageSize"),
+                      [this](bool read, const QString &pageSize) {
+                        if (!read) {
+                          status_->setText(
+                              QStringLiteral("SELF-TEST FAIL: could not read the applied settings."));
+                          QCoreApplication::exit(19);
                           return;
                         }
-                        QVariantMap sharedCheck = shuangpin_->value().toMap();
-                        const QString sharedPageSize = sharedCheck.value(QStringLiteral("PageSize")).toString();
-                        if (sharedPageSize != QStringLiteral("9")) {
-                          showError(status_, QStringLiteral("SELF-TEST FAIL: Shuangpin restored stale PageSize=%1.").arg(sharedPageSize));
+                        if (pageSize != QLatin1String("9")) {
+                          showError(status_,
+                                    QStringLiteral(
+                                        "SELF-TEST FAIL: the Shuangpin apply restored stale PageSize=%1.")
+                                        .arg(pageSize));
                           QCoreApplication::exit(14);
                           return;
                         }
-                        if (sharedCheck.contains(QStringLiteral("ShuangpinProfile"))) {
-                          sharedCheck.insert(QStringLiteral("ShuangpinProfile"), QStringLiteral("MS"));
+                        runReverseSelfTest();
+                      });
+      });
+    });
+  }
+
+  // Reverse direction: Shuangpin changes the shared value, then the already-loaded
+  // (now stale) Pinyin page applies an unrelated change.
+  void runReverseSelfTest() {
+    QVariantMap shuangpinValues = shuangpin_->value().toMap();
+    shuangpinValues.insert(QStringLiteral("PageSize"), 8);
+    shuangpin_->setValue(shuangpinValues);
+    applyCurrentPage([this](bool applied, const QString &error) {
+      if (!applied) {
+        showError(status_, error);
+        QCoreApplication::exit(20);
+        return;
+      }
+      tabs_->setCurrentIndex(0);
+      QVariantMap pinyinValues = pinyin_->value().toMap();
+      if (!pinyinValues.contains(QStringLiteral("SpellEnabled"))) {
+        status_->setText(QStringLiteral("SELF-TEST FAIL: SpellEnabled was not rendered."));
+        QCoreApplication::exit(18);
+        return;
+      }
+      pinyinValues.insert(QStringLiteral("SpellEnabled"),
+                          !pinyinValues.value(QStringLiteral("SpellEnabled")).toBool());
+      pinyin_->setValue(pinyinValues);
+      applyCurrentPage([this](bool appliedSecond, const QString &secondError) {
+        if (!appliedSecond) {
+          showError(status_, secondError);
+          QCoreApplication::exit(20);
+          return;
+        }
+        readHostValue(pinyinUri_, QStringLiteral("PageSize"),
+                      [this](bool read, const QString &pageSize) {
+                        if (!read) {
+                          status_->setText(QStringLiteral(
+                              "SELF-TEST FAIL: could not read the reverse applied settings."));
+                          QCoreApplication::exit(19);
+                          return;
                         }
-                        shuangpin_->setValue(sharedCheck);
-                        connect(shuangpin_, &fcitx::kcm::ConfigWidget::saveFinished, this,
-                                [this](bool applied, const QString &applyError) {
-                                  if (!applied) {
-                                    showError(status_, applyError);
-                                    QCoreApplication::exit(15);
-                                    return;
-                                  }
-                                  status_->setText(QStringLiteral("SELF-TEST PASS: PageSize 7 -> 9 and shared-page preservation confirmed."));
-                                  if (!screenshot_.isEmpty()) {
-                                    windowScreenshot_ = grab().save(screenshot_);
-                                  }
-                                  QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0 : 16);
-                                }, Qt::SingleShotConnection);
-                        shuangpin_->save();
-                      }, Qt::SingleShotConnection);
-              shuangpin_->load();
-            }, Qt::SingleShotConnection);
-    pinyin_->save();
+                        if (pageSize != QLatin1String("8")) {
+                          showError(status_,
+                                    QStringLiteral(
+                                        "SELF-TEST FAIL: the Pinyin apply restored stale PageSize=%1.")
+                                        .arg(pageSize));
+                          QCoreApplication::exit(21);
+                          return;
+                        }
+                        status_->setText(QStringLiteral(
+                            "SELF-TEST PASS: a shared value survived an unrelated apply on the other page in both directions."));
+                        if (!screenshot_.isEmpty()) {
+                          windowScreenshot_ = grab().save(screenshot_);
+                        }
+                        QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0
+                                                                                         : 16);
+                      });
+      });
+    });
   }
 
   void showError(QLabel *status, const QString &error) {
@@ -388,6 +561,12 @@ private:
   QPushButton *reload_ = nullptr;
   fcitx::kcm::ConfigWidget *pinyin_ = nullptr;
   fcitx::kcm::ConfigWidget *shuangpin_ = nullptr;
+  QString pinyinUri_;
+  QString shuangpinUri_;
+  // Last authoritative values per page, used to submit only what this page changed.
+  QHash<fcitx::kcm::ConfigWidget *, QVariantMap> baseline_;
+  int pinyinLoads_ = 0;
+  int shuangpinLoads_ = 0;
   bool pinyinLoaded_ = false;
   bool shuangpinLoaded_ = false;
   bool selfTest_ = false;
