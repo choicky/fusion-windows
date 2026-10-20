@@ -106,6 +106,7 @@ try {
   New-Item -ItemType Directory -Force (Join-Path $stage 'lib') | Out-Null
   Copy-Item -LiteralPath (Join-Path $libDir 'libime') -Destination (Join-Path $stage 'lib\libime') -Recurse -Force
   if ($UpstreamRoot) {
+    New-Item -ItemType Directory -Force (Join-Path $stage 'licenses\runtime') | Out-Null
     $sourceAccess = Join-Path $RepoRoot 'third_party\settings-ui\SOURCE-ACCESS.txt'
     foreach ($pair in @(@('fcitx5','fcitx5'),@('fcitx5-chinese-addons','fcitx5-chinese-addons'),@('libime','libime'))) {
       $source = Join-Path $UpstreamRoot "$($pair[0])"
