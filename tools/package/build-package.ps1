@@ -212,9 +212,11 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $path '.git'))) { throw "Pinned upstream source checkout missing: $path" }
     $head = (& git -C $path rev-parse HEAD)
     if ($LASTEXITCODE -ne 0) { throw "Unable to identify upstream source HEAD: $path" }
-    if (([string]$head).Trim() -ne $runtime[$pair[1]]) {
-      throw "Upstream checkout head does not match pinned source $($pair[1]): $path"
+    $expectedRuntimePin = if ($pair[1] -eq 'chineseAddons') { $runtime['fcitx5-chinese-addons'] } else { $runtime[$pair[1]] }
+    if (([string]$head).Trim() -ne $expectedRuntimePin) {
+      throw "Upstream checkout head does not match pinned source $($pair[1]): $path (expected $expectedRuntimePin, got $(([string]$head).Trim()))"
     }
+    $runtime[$pair[1]] = ([string]$head).Trim()
   }
 
   $files = @()
