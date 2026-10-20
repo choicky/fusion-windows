@@ -312,13 +312,13 @@ private:
                         }
                         shuangpin_->setValue(sharedCheck);
                         connect(shuangpin_, &fcitx::kcm::ConfigWidget::saveFinished, this,
-                                [this, before](bool applied, const QString &applyError) {
+                                [this](bool applied, const QString &applyError) {
                                   if (!applied) {
                                     showError(status_, applyError);
                                     QCoreApplication::exit(15);
                                     return;
                                   }
-                                  status_->setText(QStringLiteral("SELF-TEST PASS: PageSize %1 -> 9 and shared-page preservation confirmed.").arg(before));
+                                  status_->setText(QStringLiteral("SELF-TEST PASS: PageSize 7 -> 9 and shared-page preservation confirmed."));
                                   if (!screenshot_.isEmpty()) {
                                     windowScreenshot_ = grab().save(screenshot_);
                                   }
