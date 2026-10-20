@@ -20,6 +20,7 @@
 #include <QHash>
 #include <QLabel>
 #include <QListWidget>
+#include <QListWidgetItem>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPushButton>
@@ -31,6 +32,7 @@
 #include <QWidget>
 
 #include <clocale>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -60,6 +62,11 @@ QString endpointName(int argc, char **argv) {
   return QString::fromStdWString(fusion::ipc::logical_pipe_name(fusion::ipc::compute_pipe_name()));
 }
 
+// The Global-page probe value used by the self-test/verify pair. It is written to
+// the disposable test profile only; a real user's global configuration is never
+// touched by the harness.
+constexpr int kGlobalPageSizeProbe = 7;
+
 QString inputMethodName(const QString &name) {
   if (name == QLatin1String("shuangpin")) {
     return QStringLiteral("双拼");
@@ -72,8 +79,9 @@ QString inputMethodName(const QString &name) {
 
 class SettingsWindow final : public QMainWindow {
 public:
-  explicit SettingsWindow(QString pipeName, bool selfTest = false, QString screenshot = {})
-      : provider_(this, pipeName), selfTest_(selfTest),
+  explicit SettingsWindow(QString pipeName, bool selfTest = false, bool verifyOnly = false,
+                          QString screenshot = {})
+      : provider_(this, pipeName), selfTest_(selfTest), verifyOnly_(verifyOnly),
         screenshot_(std::move(screenshot)) {
     setWindowTitle(QStringLiteral("Fusion 输入法设置"));
     resize(920, 760);
@@ -129,7 +137,11 @@ public:
     globalUri_ = QStringLiteral("fcitx://config/global");
     tabs_->addTab(makePage(pinyinUri_, pinyin_), QStringLiteral("拼音设置"));
     tabs_->addTab(makePage(shuangpinUri_, shuangpin_), QStringLiteral("双拼设置"));
-    tabs_->addTab(makePage(globalUri_, global_), QStringLiteral("全局设置"));
+    // The Global page renders the official fcitx://config/global schema, which
+    // contains options this Windows path cannot honour. They stay visible — the
+    // schema is Fcitx's — so the page says which categories do not apply instead
+    // of implying that every option shown here changes input behaviour.
+    tabs_->addTab(makePage(globalUri_, global_, globalPageNote()), QStringLiteral("全局设置"));
     outer->addWidget(tabs_, 1);
 
     auto *buttons = new QHBoxLayout;
@@ -165,7 +177,7 @@ public:
       }
       const QString name = item->data(Qt::UserRole).toString();
       availableList_->takeItem(availableList_->row(item));
-      auto *moved = enabledList_->addItem(inputMethodName(name));
+      auto *moved = new QListWidgetItem(inputMethodName(name), enabledList_);
       moved->setData(Qt::UserRole, name);
       status_->setText(QStringLiteral("输入方式列表有未应用的更改。"));
     });
@@ -180,7 +192,7 @@ public:
       }
       const QString name = item->data(Qt::UserRole).toString();
       enabledList_->takeItem(enabledList_->row(item));
-      auto *moved = availableList_->addItem(inputMethodName(name));
+      auto *moved = new QListWidgetItem(inputMethodName(name), availableList_);
       moved->setData(Qt::UserRole, name);
       status_->setText(QStringLiteral("输入方式列表有未应用的更改。"));
     });
@@ -244,14 +256,20 @@ public:
     // one settings request at a time; serializing startup avoids a false Busy
     // result.
     reloadImList([this] {
-      if (selfTest_) {
-        loadBothPages([this](bool ok, const QString &error) {
+      if (selfTest_ || verifyOnly_) {
+        loadAllPages([this](bool ok, const QString &error) {
           if (!ok) {
             showError(status_, error);
             QCoreApplication::exit(13);
             return;
           }
-          QTimer::singleShot(0, this, [this] { runSelfTest(); });
+          QTimer::singleShot(0, this, [this] {
+            if (verifyOnly_) {
+              runVerify();
+            } else {
+              runSelfTest();
+            }
+          });
         });
         return;
       }
@@ -259,11 +277,33 @@ public:
     });
   }
 
+  // Only used by --self-test-verify: the order the harness read from the persisted
+  // profile before the restart.
+  void setExpectedImList(const QStringList &list) { expectedImList_ = list; }
+
 private:
-  QWidget *makePage(const QString &uri, fcitx::kcm::ConfigWidget *&page) {
+  // One precise sentence per unsupported category. The official schema is reused
+  // as-is, so these options are neither hidden nor disabled; the note states what
+  // does not reach the engine on this Windows path.
+  static QString globalPageNote() {
+    return QStringLiteral(
+        "说明：本页由 Fcitx 官方全局配置架构生成。以下类别在 Windows 上不生效或不完全生效——"
+        "全局快捷键（触发/激活/停用/翻页/候选移动/ModifierOnlyKeyTimeout）：Fusion 不把单独的修饰键或 "
+        "Ctrl/Alt/Win 组合键交给引擎，Ctrl+Space 由 Windows 输入法切换负责；"
+        "输入法状态提示与面板相关选项：本产品不提供 Fcitx 面板，候选窗是产品自己的投影；"
+        "密码框相关选项：Windows 输入范围策略先于引擎生效，这里的设置不会覆盖它。"
+        "ActiveByDefault 与 resetStateWhenFocusIn 仅部分生效。其余选项按 Fcitx 语义生效。");
+  }
+
+  QWidget *makePage(const QString &uri, fcitx::kcm::ConfigWidget *&page, const QString &note = {}) {
     auto *wrapper = new QWidget(tabs_);
     auto *layout = new QVBoxLayout(wrapper);
     layout->setContentsMargins(0, 0, 0, 0);
+    if (!note.isEmpty()) {
+      auto *noteLabel = new QLabel(note, wrapper);
+      noteLabel->setWordWrap(true);
+      layout->addWidget(noteLabel);
+    }
     auto *scroll = new QScrollArea(wrapper);
     scroll->setWidgetResizable(true);
     page = new fcitx::kcm::ConfigWidget(uri, &provider_);
@@ -313,7 +353,7 @@ private:
 
   void reloadAll(QLabel *status, const QString &successMessage) {
     reloadImList([this, status, successMessage] {
-      loadBothPages([this, status, successMessage](bool ok, const QString &error) {
+      loadAllPages([this, status, successMessage](bool ok, const QString &error) {
         if (ok) {
           status->setText(successMessage);
         } else {
@@ -323,27 +363,43 @@ private:
     });
   }
 
-  // The Host admits one settings request per connection, so the two pages are
-  // loaded sequentially: Pinyin first, then Shuangpin.
-  void loadBothPages(std::function<void(bool, const QString &)> onDone) {
+  // The Host admits one settings request per connection, so a full reload walks
+  // the pages sequentially: the next request starts only after the previous reply.
+  // Every page the Cancel/Reload buttons claim to reload is included — leaving the
+  // Global page out left its edits and baseline untouched while reporting success.
+  struct ReloadChain {
+    std::vector<fcitx::kcm::ConfigWidget *> pages;
+    std::function<void(bool, const QString &)> onDone;
+    std::size_t index = 0;
+  };
+
+  void stepReload(const std::shared_ptr<ReloadChain> &chain) {
+    if (chain->index >= chain->pages.size()) {
+      chain->onDone(true, QString());
+      return;
+    }
+    auto *page = chain->pages[chain->index];
+    connect(page, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
+            [this, chain](bool ok, const QString &error) {
+              if (!ok) {
+                chain->onDone(false, error);
+                return;
+              }
+              chain->index++;
+              stepReload(chain);
+            },
+            Qt::SingleShotConnection);
+    page->load();
+  }
+
+  void loadAllPages(std::function<void(bool, const QString &)> onDone) {
     pinyinLoaded_ = false;
     shuangpinLoaded_ = false;
-    auto secondPage = std::make_shared<std::function<void()>>();
-    *secondPage = [this, onDone] {
-      connect(shuangpin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
-              [onDone](bool ok, const QString &error) { onDone(ok, error); },
-              Qt::SingleShotConnection);
-      shuangpin_->load();
-    };
-    connect(pinyin_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
-            [secondPage, onDone](bool ok, const QString &error) {
-              if (ok) {
-                (*secondPage)();
-              } else {
-                onDone(false, error);
-              }
-            }, Qt::SingleShotConnection);
-    pinyin_->load();
+    globalLoaded_ = false;
+    auto chain = std::make_shared<ReloadChain>();
+    chain->pages = {pinyin_, shuangpin_, global_};
+    chain->onDone = std::move(onDone);
+    stepReload(chain);
   }
 
   QString uriFor(const fcitx::kcm::ConfigWidget *page) const {
@@ -429,23 +485,28 @@ private:
 
   // Reads authoritative Host state without touching either page's widgets, so the
   // self-test can assert what the Host persisted rather than what the UI shows.
-  void readHostValue(const QString &uri, const QString &key,
-                     std::function<void(bool, const QString &)> onDone) {
+  void readHostValues(const QString &uri,
+                      std::function<void(bool, const QVariantMap &)> onDone) {
     if (!provider_.controller()) {
-      onDone(false, QString());
+      onDone(false, {});
       return;
     }
     auto *call = provider_.controller()->GetConfig(uri);
-    connect(call, &fcitx::kcm::PendingCall::finished, this, [call, key, onDone] {
+    connect(call, &fcitx::kcm::PendingCall::finished, this, [call, onDone] {
       const QDBusMessage reply = call->reply();
       call->deleteLater();
       if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().size() < 2) {
-        onDone(false, QString());
+        onDone(false, {});
         return;
       }
-      const QVariantMap values =
-          reply.arguments().at(0).value<QDBusVariant>().variant().toMap();
-      onDone(true, values.value(key).toString());
+      onDone(true, reply.arguments().at(0).value<QDBusVariant>().variant().toMap());
+    });
+  }
+
+  void readHostValue(const QString &uri, const QString &key,
+                     std::function<void(bool, const QString &)> onDone) {
+    readHostValues(uri, [key, onDone = std::move(onDone)](bool ok, const QVariantMap &values) {
+      onDone(ok, ok ? values.value(key).toString() : QString());
     });
   }
 
@@ -579,15 +640,314 @@ private:
                           QCoreApplication::exit(21);
                           return;
                         }
-                        status_->setText(QStringLiteral(
-                            "SELF-TEST PASS: a shared value survived an unrelated apply on the other page in both directions."));
-                        if (!screenshot_.isEmpty()) {
-                          windowScreenshot_ = grab().save(screenshot_);
-                        }
-                        QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0
-                                                                                         : 16);
+                        runGlobalSelfTest();
                       });
       });
+    });
+  }
+
+  void finishSelfTest() {
+    status_->setText(QStringLiteral(
+        "SELF-TEST PASS: cross-page shared value, global configuration and the input-method list "
+        "round-tripped through the Host."));
+    if (!screenshot_.isEmpty()) {
+      windowScreenshot_ = grab().save(screenshot_);
+    }
+    QCoreApplication::exit(windowScreenshot_ || screenshot_.isEmpty() ? 0 : 16);
+  }
+
+  // Stage A: the Global page must render the official schema, accept a supported
+  // change through the real Host apply path, and read back the value the Host
+  // persisted. The option chosen here is read by engines that have no page size of
+  // their own, so the write is a real configuration change, not a no-op.
+  void runGlobalSelfTest() {
+    if (!globalLoaded_) {
+      status_->setText(QStringLiteral("SELF-TEST FAIL: the Global page did not load."));
+      QCoreApplication::exit(23);
+      return;
+    }
+    QVariantMap values = global_->value().toMap();
+    QVariantMap behavior = values.value(QStringLiteral("Behavior")).toMap();
+    if (behavior.isEmpty() || !behavior.contains(QStringLiteral("DefaultPageSize"))) {
+      status_->setText(
+          QStringLiteral("SELF-TEST FAIL: the global schema did not expose Behavior/DefaultPageSize."));
+      QCoreApplication::exit(23);
+      return;
+    }
+    behavior.insert(QStringLiteral("DefaultPageSize"), kGlobalPageSizeProbe);
+    values.insert(QStringLiteral("Behavior"), behavior);
+    global_->setValue(values);
+    tabs_->setCurrentIndex(2);
+    applyCurrentPage([this](bool applied, const QString &error) {
+      if (!applied) {
+        showError(status_, error);
+        QCoreApplication::exit(24);
+        return;
+      }
+      readHostValues(globalUri_, [this](bool read, const QVariantMap &hostValues) {
+        if (!read) {
+          status_->setText(
+              QStringLiteral("SELF-TEST FAIL: could not read the applied global settings."));
+          QCoreApplication::exit(25);
+          return;
+        }
+        const QString applied = hostValues.value(QStringLiteral("Behavior"))
+                                    .toMap()
+                                    .value(QStringLiteral("DefaultPageSize"))
+                                    .toString();
+        if (applied != QString::number(kGlobalPageSizeProbe)) {
+          showError(status_, QStringLiteral("SELF-TEST FAIL: the Host kept DefaultPageSize=%1.")
+                                 .arg(applied));
+          QCoreApplication::exit(25);
+          return;
+        }
+        runImListSelfTest();
+      });
+    });
+  }
+
+  // Stage A: the list surface must drive the Host's official setGroup/save and
+  // adopt its authoritative result. The steps run in the disposable test profile
+  // only: reorder, then remove the first entry, then add it back. Removing an entry
+  // is a group-membership edit and never deletes a method's definition or learning
+  // data — that is asserted at file level by the validation script, not here.
+  // Two requests the Host must refuse before touching the group: an empty list and a
+  // name this runtime does not define. They go through the same controller call the
+  // panes use, but not through the panes, so a refusal cannot disturb the list the
+  // following steps assert.
+  void runImListRejectProbe(std::function<void()> onDone) {
+    if (!provider_.controller()) {
+      QCoreApplication::exit(31);
+      return;
+    }
+    auto *emptyCall = provider_.controller()->SetImList({});
+    connect(emptyCall, &fcitx::kcm::PendingCall::finished, this,
+            [this, emptyCall, onDone] {
+              const auto emptyReply = emptyCall->reply();
+              emptyCall->deleteLater();
+              if (emptyReply.type() == QDBusMessage::ReplyMessage) {
+                showError(status_, QStringLiteral("SELF-TEST FAIL: the Host accepted an empty "
+                                                  "input-method list."));
+                QCoreApplication::exit(31);
+                return;
+              }
+              auto *unknownCall = provider_.controller()->SetImList(
+                  {QStringLiteral("fusion-unavailable-probe")});
+              connect(unknownCall, &fcitx::kcm::PendingCall::finished, this,
+                      [this, unknownCall, onDone, emptyReply] {
+                        const auto unknownReply = unknownCall->reply();
+                        unknownCall->deleteLater();
+                        if (unknownReply.type() == QDBusMessage::ReplyMessage) {
+                          showError(status_,
+                                    QStringLiteral("SELF-TEST FAIL: the Host accepted an input "
+                                                   "method this runtime does not define."));
+                          QCoreApplication::exit(31);
+                          return;
+                        }
+                        std::fprintf(stderr,
+                                     "[self-test] im-list reject ok empty=%s unknown=%s\n",
+                                     qPrintable(emptyReply.errorMessage()),
+                                     qPrintable(unknownReply.errorMessage()));
+                        onDone();
+                      });
+            });
+  }
+
+  void runImListSelfTest() {
+    runImListRejectProbe([this] { runImListSteps(); });
+  }
+
+  void runImListSteps() {
+    const QStringList initial = enabledOrder();
+    if (initial.size() < 2) {
+      status_->setText(
+          QStringLiteral("SELF-TEST FAIL: the disposable profile did not enable two methods."));
+      QCoreApplication::exit(26);
+      return;
+    }
+    QStringList reordered = initial;
+    reordered.move(0, 1);
+    // Each step asserts the panes show the Host's authoritative reply, not the
+    // request: populateImList() rebuilds both panes from what setGroup/save
+    // confirmed. The unattended run prints the three lists so a failure is
+    // diagnosable from the harness output instead of only from an exit code.
+    applyImList(reordered, status_, [this, initial, reordered](bool applied, const QString &error) {
+      if (!applied) {
+        showError(status_, error);
+        QCoreApplication::exit(26);
+        return;
+      }
+      const QStringList observed = enabledOrder();
+      std::fprintf(stderr, "[self-test] im-list initial=%s reordered=%s observed=%s\n",
+                   qPrintable(initial.join(QLatin1Char(','))),
+                   qPrintable(reordered.join(QLatin1Char(','))),
+                   qPrintable(observed.join(QLatin1Char(','))));
+      if (observed != reordered) {
+        showError(status_,
+                  QStringLiteral("SELF-TEST FAIL: the Host did not confirm the reordered list."));
+        QCoreApplication::exit(27);
+        return;
+      }
+      QStringList withoutFirst = reordered;
+      const QString first = withoutFirst.takeFirst();
+      applyImList(withoutFirst, status_, [this, reordered, withoutFirst,
+                                          first](bool removed, const QString &removeError) {        if (!removed) {
+          showError(status_, removeError);
+          QCoreApplication::exit(26);
+          return;
+        }
+        if (enabledOrder() != withoutFirst) {
+          std::fprintf(stderr, "[self-test] im-list remove expected=%s observed=%s\n",
+                       qPrintable(withoutFirst.join(QLatin1Char(','))),
+                       qPrintable(enabledOrder().join(QLatin1Char(','))));
+          showError(status_, QStringLiteral("SELF-TEST FAIL: removing a method did not reach the "
+                                            "Host's list."));
+          QCoreApplication::exit(27);
+          return;
+        }
+        QStringList restored = withoutFirst;
+        restored.append(first);
+        applyImList(restored, status_,
+                    [this, restored, reordered](bool added, const QString &addError) {
+                      if (!added) {
+                        showError(status_, addError);
+                        QCoreApplication::exit(26);
+                        return;
+                      }
+                      if (enabledOrder() != restored) {
+                        std::fprintf(stderr, "[self-test] im-list add-back expected=%s observed=%s\n",
+                                     qPrintable(restored.join(QLatin1Char(','))),
+                                     qPrintable(enabledOrder().join(QLatin1Char(','))));
+                        showError(status_, QStringLiteral("SELF-TEST FAIL: adding a method back did "
+                                                          "not reach the Host's list."));
+                        QCoreApplication::exit(27);
+                        return;
+                      }
+                      // End on the reordered list, not the original: the restart check
+                      // then proves a *changed* membership order was written to the
+                      // profile and reloaded, rather than that nothing moved.
+                      applyImList(reordered, status_, [this](bool finalOk,
+                                                             const QString &finalError) {
+                        if (!finalOk) {
+                          showError(status_, finalError);
+                          QCoreApplication::exit(26);
+                          return;
+                        }
+                        finishSelfTest();
+                      });
+                    });
+      });
+    });
+  }
+
+  // Read-only restart check. It asserts exactly the state the apply scenario
+  // leaves, so the two invocations together form one restart test: the first
+  // applies, the Host is stopped in an orderly way, and this one proves the values
+  // came back from the profile rather than from a live process.
+  void runVerify() {
+    if (!pinyinLoaded_ || !shuangpinLoaded_ || !globalLoaded_) {
+      status_->setText(
+          QStringLiteral("VERIFY FAIL: not every settings page loaded after the restart."));
+      QCoreApplication::exit(23);
+      return;
+    }
+    // The enabled order is asserted against what the profile held before the
+    // restart, passed in by the harness from the persisted file. That proves the
+    // Host reloaded exactly the membership and order that were saved, without
+    // hard-coding this profile's contents.
+    const QStringList liveList = enabledOrder();
+    if (liveList.isEmpty() || (!expectedImList_.isEmpty() && liveList != expectedImList_)) {
+      std::fprintf(stderr, "[verify] im-list expected=%s observed=%s\n",
+                   qPrintable(expectedImList_.join(QLatin1Char(','))),
+                   qPrintable(liveList.join(QLatin1Char(','))));
+      showError(status_, QStringLiteral("VERIFY FAIL: the input-method list after the restart does "
+                                        "not match the one that was saved."));
+      QCoreApplication::exit(30);
+      return;
+    }
+    readHostValue(pinyinUri_, QStringLiteral("PageSize"),
+                  [this](bool read, const QString &pageSize) {
+                    if (!read) {
+                      status_->setText(
+                          QStringLiteral("VERIFY FAIL: could not read PageSize after the restart."));
+                      QCoreApplication::exit(28);
+                      return;
+                    }
+                    if (pageSize != QLatin1String("8")) {
+                      showError(status_,
+                                QStringLiteral("VERIFY FAIL: PageSize=%1 after the restart, "
+                                               "expected the applied 8.")
+                                    .arg(pageSize));
+                      QCoreApplication::exit(28);
+                      return;
+                    }
+                    readHostValues(globalUri_, [this](bool globalRead,
+                                                      const QVariantMap &hostValues) {
+                      if (!globalRead) {
+                        status_->setText(QStringLiteral(
+                            "VERIFY FAIL: could not read the global configuration after the restart."));
+                        QCoreApplication::exit(29);
+                        return;
+                      }
+                      const QString applied = hostValues.value(QStringLiteral("Behavior"))
+                                                  .toMap()
+                                                  .value(QStringLiteral("DefaultPageSize"))
+                                                  .toString();
+                      if (applied != QString::number(kGlobalPageSizeProbe)) {
+                        showError(status_,
+                                  QStringLiteral("VERIFY FAIL: DefaultPageSize=%1 after the "
+                                                 "restart, expected the applied %2.")
+                                      .arg(applied)
+                                      .arg(kGlobalPageSizeProbe));
+                        QCoreApplication::exit(29);
+                        return;
+                      }
+                      status_->setText(QStringLiteral(
+                          "VERIFY PASS: the applied per-input-method and global values survived an "
+                          "orderly Host restart."));
+                      runNoChangeChecks();
+                    });
+                  });
+  }
+
+  // A no-change Apply must not reach the Host at all: the page computes an empty
+  // delta and returns without a request, so no setter runs and no file is written.
+  // The list apply is sent, but the Host recognises an unchanged list and returns
+  // the current group without calling save(). The harness hashes the profile tree
+  // around this pass, so "no file written" is asserted, not assumed.
+  void runNoChangeChecks() { noChangeStep(0, tabs_->currentIndex()); }
+
+  void noChangeStep(int tab, int originalTab) {
+    if (tab >= 3) {
+      const QStringList current = enabledOrder();
+      applyImList(current, status_, [this, originalTab](bool ok, const QString &error) {
+        if (!ok) {
+          showError(status_, error);
+          QCoreApplication::exit(32);
+          return;
+        }
+        tabs_->setCurrentIndex(originalTab);
+        status_->setText(QStringLiteral(
+            "VERIFY PASS: no-change Apply issued no settings write and the unchanged list was not "
+            "re-saved."));
+        QCoreApplication::exit(0);
+      });
+      return;
+    }
+    tabs_->setCurrentIndex(tab);
+    applyCurrentPage([this, tab, originalTab](bool ok, const QString &error) {
+      if (!ok) {
+        showError(status_, error);
+        QCoreApplication::exit(32);
+        return;
+      }
+      if (!status_->text().contains(QStringLiteral("没有需要应用的更改"))) {
+        showError(status_, QStringLiteral("VERIFY FAIL: a no-change Apply sent a settings request "
+                                          "instead of short-circuiting."));
+        QCoreApplication::exit(32);
+        return;
+      }
+      noChangeStep(tab + 1, originalTab);
     });
   }
 
@@ -596,6 +956,11 @@ private:
                                 ? QStringLiteral("FusionHost 未确认操作结果。请重新加载；不要重复提交不确定的更改。")
                                 : error;
     status->setText(QStringLiteral("操作未完成：%1").arg(message));
+    // An unattended self-test/verify run has nobody to dismiss a modal dialog, so it
+    // reports through the status line and the exit code instead of blocking here.
+    if (selfTest_ || verifyOnly_) {
+      return;
+    }
     QMessageBox::warning(this, QStringLiteral("Fusion 输入法设置"), message);
   }
 
@@ -630,14 +995,14 @@ private:
     availableList_->clear();
     enabledList_->clear();
     for (const auto &name : list.enabled) {
-      auto *item = enabledList_->addItem(inputMethodName(name));
+      auto *item = new QListWidgetItem(inputMethodName(name), enabledList_);
       item->setData(Qt::UserRole, name);
     }
     for (const auto &name : list.available) {
       if (list.enabled.contains(name)) {
         continue;
       }
-      auto *item = availableList_->addItem(inputMethodName(name));
+      auto *item = new QListWidgetItem(inputMethodName(name), availableList_);
       item->setData(Qt::UserRole, name);
     }
   }
@@ -664,20 +1029,29 @@ private:
   // Writes the enabled order through the Host's official setGroup/save. The Host
   // refuses an empty list and any method it does not define; a failure reloads the
   // authoritative list so the panes never drift from what the Host persisted.
-  void applyImList(const QStringList &enabled, QLabel *status) {
+  void applyImList(const QStringList &enabled, QLabel *status,
+                   std::function<void(bool, const QString &)> onDone = {}) {
     if (enabled.isEmpty()) {
-      status->setText(QStringLiteral("至少需保留一种已启用的输入方式。"));
+      const QString message = QStringLiteral("至少需保留一种已启用的输入方式。");
+      status->setText(message);
+      if (onDone) {
+        onDone(false, message);
+      }
       return;
     }
     if (!provider_.controller()) {
-      showError(status, QStringLiteral("无法创建 FusionHost 重连请求。"));
+      const QString message = QStringLiteral("无法创建 FusionHost 重连请求。");
+      showError(status, message);
+      if (onDone) {
+        onDone(false, message);
+      }
       return;
     }
     imApply_->setEnabled(false);
     status->setText(QStringLiteral("正在更新输入方式列表…"));
     auto *call = provider_.controller()->SetImList(enabled);
     connect(call, &fcitx::kcm::PendingCall::finished, this,
-            [this, call, status] {
+            [this, call, status, onDone] {
               const auto reply = call->reply();
               const auto list = call->imList();
               call->deleteLater();
@@ -685,10 +1059,16 @@ private:
               if (reply.type() != QDBusMessage::ReplyMessage) {
                 showError(status, reply.errorMessage());
                 reloadImList();
+                if (onDone) {
+                  onDone(false, reply.errorMessage());
+                }
                 return;
               }
               populateImList(list);
               status->setText(QStringLiteral("FusionHost 已确认输入方式列表。"));
+              if (onDone) {
+                onDone(true, QString());
+              }
             });
   }
 
@@ -715,6 +1095,8 @@ private:
   bool shuangpinLoaded_ = false;
   bool globalLoaded_ = false;
   bool selfTest_ = false;
+  bool verifyOnly_ = false;
+  QStringList expectedImList_;
   bool windowScreenshot_ = false;
   QString screenshot_;
   QElapsedTimer selfTestTimer_;
@@ -729,11 +1111,22 @@ int main(int argc, char **argv) {
   QApplication::setOrganizationName(QStringLiteral("Fcitx5 Fusion"));
   const QString pipeName = endpointName(argc, argv);
   bool selfTest = false;
+  bool verifyOnly = false;
+  QStringList expectedImList;
   QString screenshot;
   for (int i = 1; i < argc; ++i) {
     const QString arg = QString::fromLocal8Bit(argv[i]);
     if (arg == QLatin1String("--self-test")) {
       selfTest = true;
+    } else if (arg == QLatin1String("--self-test-verify")) {
+      // Read-only: asserts the state the apply scenario leaves, so the pair proves
+      // the values came back from the profile after an orderly Host restart.
+      verifyOnly = true;
+    } else if (arg == QLatin1String("--expect-im-list") && i + 1 < argc) {
+      const QString csv = QString::fromLocal8Bit(argv[++i]);
+      if (!csv.isEmpty()) {
+        expectedImList = csv.split(QLatin1Char(','));
+      }
     } else if (arg == QLatin1String("--screenshot") && i + 1 < argc) {
       screenshot = QString::fromLocal8Bit(argv[++i]);
     }
@@ -743,7 +1136,8 @@ int main(int argc, char **argv) {
                           QStringLiteral("无法确定当前用户和会话的 FusionHost 管道。"));
     return 2;
   }
-  SettingsWindow window(pipeName, selfTest, screenshot);
+  SettingsWindow window(pipeName, selfTest, verifyOnly, screenshot);
+  window.setExpectedImList(expectedImList);
   window.show();
   return application.exec();
 }

@@ -1,0 +1,4 @@
+# Patch files are applied with `git apply`, which compares context lines
+# byte-for-byte. A CRLF checkout (core.autocrlf=true on Windows) would rewrite
+# every line and make the patch unapplicable, so they are never EOL-converted.
+*.patch -text

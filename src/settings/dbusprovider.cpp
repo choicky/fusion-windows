@@ -518,7 +518,12 @@ private:
             return;
         }
         (void)session;
-        if (protocol != fusion::ipc::protocol_version || api != fusion::ipc::settings_api_version ||
+        // The wire surface is additive, so this client needs a Host that speaks at
+        // least its own API version; a newer Host keeps the older messages and is
+        // accepted. An older Host is refused here rather than failing later on a
+        // message it does not know.
+        if (protocol != fusion::ipc::protocol_version ||
+            api < fusion::ipc::settings_api_version ||
             status != static_cast<quint8>(fusion::SettingsStatus::Ok)) {
             controller_->provider_->setAvailable(false);
             fail(error.isEmpty()

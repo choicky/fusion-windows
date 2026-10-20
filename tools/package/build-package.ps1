@@ -199,7 +199,9 @@ try {
   if ($dirty) { throw 'Owner-test package must be built from a clean committed fusion-windows worktree' }
 
   $settingsPins = Get-Content -LiteralPath (Join-Path $RepoRoot 'cmake\settings-ui\versions.cmake') -Raw
-  $vcpkgMatch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_VCPKG_COMMIT "([0-9a-f]{40})"\)$')
+  # `[ \t\r]*$` keeps the anchors working on a CRLF checkout, which is what a normal
+  # fresh Windows clone produces with `core.autocrlf=true`.
+  $vcpkgMatch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_VCPKG_COMMIT "([0-9a-f]{40})"\)[ \t\r]*$')
   if (-not $vcpkgMatch.Success) { throw 'Missing exact vcpkg commit pin' }
   $runtime.vcpkg = $vcpkgMatch.Groups[1].Value
   $runtime.msvc = '14.51.36231'
@@ -209,7 +211,7 @@ try {
       @('fcitx5','FUSION_SETTINGS_FCITX5_COMMIT'),
       @('fcitx5-chinese-addons','FUSION_SETTINGS_CHINESE_ADDONS_COMMIT'),
       @('libime','FUSION_SETTINGS_LIBIME_COMMIT'))) {
-    $match = [Regex]::Match($settingsPins, '(?m)^set\(' + [Regex]::Escape($pair[1]) + ' "([0-9a-f]{40})"\)$')
+    $match = [Regex]::Match($settingsPins, '(?m)^set\(' + [Regex]::Escape($pair[1]) + ' "([0-9a-f]{40})"\)[ \t\r]*$')
     if (-not $match.Success) { throw "Missing settings source pin $($pair[1])" }
     $runtime[$pair[0]] = $match.Groups[1].Value
   }

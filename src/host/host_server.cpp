@@ -545,7 +545,10 @@ void HostServer::Connection::handle_settings_hello(const std::vector<std::uint8_
     return;
   }
   const bool protocol_matches = hello->protocol == protocol_version;
-  const bool api_matches = hello->api == settings_api_version;
+  // Additive API: an older client is served (it never sends the newer types) and a
+  // newer client is refused, because this Host cannot know what it would need.
+  const bool api_matches = hello->api >= settings_api_min_version &&
+                           hello->api <= settings_api_version;
   std::uint64_t session = 0;
   if (protocol_matches) {
     std::lock_guard lock(backend_mutex);

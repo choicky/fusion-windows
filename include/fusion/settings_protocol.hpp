@@ -11,7 +11,13 @@
 
 namespace fusion::ipc {
 
+// Every settings message is additive: a later version keeps the shape of the
+// messages that already existed and only adds types. A Host therefore serves any
+// client in [min, current] — a v1 client simply never sends the newer types — and
+// a client requires a Host at least as new as itself, while a newer Host stays
+// usable because it must keep the older messages intact.
 inline constexpr std::uint32_t settings_api_version = 2;
+inline constexpr std::uint32_t settings_api_min_version = 1;
 inline constexpr std::size_t max_settings_payload = 60 * 1024;
 inline constexpr std::size_t max_settings_nodes = 4096;
 inline constexpr std::size_t max_settings_map_entries = 512;
