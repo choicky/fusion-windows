@@ -238,6 +238,23 @@ try {
   Write-Host "  $shortcutPath"
   Write-Host "  -> $powershellExe $($shortcut.Arguments)"
 
+  $currentStep = 'settings-shortcut'
+  Write-Step 'creating the Start Menu shortcut for Fusion Settings'
+  $settingsExe = Join-Path $versionDir 'bin\FusionSettings.exe'
+  if (-not (Test-Path -LiteralPath $settingsExe)) {
+    throw "the package does not contain bin\FusionSettings.exe ($settingsExe)"
+  }
+  $settingsShortcutPath = Join-Path $startMenu 'Fusion Settings.lnk'
+  $settingsShortcut = $shell.CreateShortcut($settingsShortcutPath)
+  $settingsShortcut.TargetPath = $settingsExe
+  $settingsShortcut.Arguments = ''
+  $settingsShortcut.WorkingDirectory = $versionDir
+  $settingsShortcut.IconLocation = "$settingsExe,0"
+  $settingsShortcut.Description = 'Configure Pinyin and Shuangpin through FusionHost'
+  $settingsShortcut.Save()
+  Write-Host "  $settingsShortcutPath"
+  Write-Host "  -> $settingsExe"
+
   $currentStep = 'start'
   if ($NoStart) {
     Write-Step 'not starting the Host (-NoStart)'

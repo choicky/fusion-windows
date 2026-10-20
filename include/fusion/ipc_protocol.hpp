@@ -70,7 +70,25 @@ enum class MessageType : std::uint8_t {
   UnbindResponse = 0x08,
   SendRequest = 0x09,
   SendResponse = 0x0A,
+  // Additive control messages for FusionSettings.exe. The settings client starts
+  // with SettingsHelloRequest rather than HelloRequest and performs one settings
+  // request per connection. Existing v4 TIP clients send only 0x01-0x0A, so this
+  // extension intentionally leaves protocol_version at 4 and never changes their
+  // handshake or message shapes.
+  SettingsHelloRequest = 0x0B,
+  SettingsHelloResponse = 0x0C,
+  SettingsGetConfigRequest = 0x0D,
+  SettingsGetConfigResponse = 0x0E,
+  SettingsSetConfigRequest = 0x0F,
+  SettingsSetConfigResponse = 0x10,
+  SettingsGetSelectionRequest = 0x11,
+  SettingsGetSelectionResponse = 0x12,
+  SettingsSelectInputMethodRequest = 0x13,
+  SettingsSelectInputMethodResponse = 0x14,
 };
+
+inline constexpr std::uint8_t max_message_type =
+    static_cast<std::uint8_t>(MessageType::SettingsSelectInputMethodResponse);
 
 struct WireFrame {
   MessageType type{};
@@ -485,7 +503,7 @@ inline std::optional<WireFrame> parse_header(const std::uint8_t *data, std::size
   if (size < header_size + payload_len)
     return std::nullopt;
   auto type_byte = data[4];
-  if (type_byte < 0x01 || type_byte > 0x0A)
+  if (type_byte < 0x01 || type_byte > max_message_type)
     return std::nullopt;
   WireFrame frame;
   frame.type = static_cast<MessageType>(type_byte);

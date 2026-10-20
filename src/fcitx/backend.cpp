@@ -1,5 +1,8 @@
 #include "fusion/backend.hpp"
+#include "fusion/settings_protocol.hpp"
 #include "candidate_projection.hpp"
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/rawconfig.h>
 #include "startup_group.hpp"
 #include <atomic>
 #include <chrono>
@@ -13,11 +16,13 @@
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx/inputcontext.h>
+#include <fcitx/inputmethodengine.h>
 #include <fcitx/inputmethodgroup.h>
 #include <fcitx/inputmethodmanager.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
 #include <future>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -53,6 +58,246 @@ constexpr std::size_t candidate_page_bytes = 4096;
 constexpr std::size_t preedit_segment_bound = 16;
 // Engineering bounds for this PoC only; D072 numerical policy remains OPEN.
 constexpr auto request_wait = std::chrono::seconds(2);
+constexpr char input_method_config_prefix[] = "fcitx://config/inputmethod/";
+
+bool parse_supported_input_method_uri(const std::string &uri, std::string &name) {
+  const std::string prefix = input_method_config_prefix;
+  if (!uri.starts_with(prefix)) {
+    return false;
+  }
+  name = uri.substr(prefix.size());
+  return name == "pinyin" || name == "shuangpin";
+}
+
+// Convert the public RawConfig tree to the same string/map shape used by Fcitx's
+// Controller1.GetConfig. An empty map key carries a node's own scalar value.
+SettingsValue raw_config_to_settings_value(const fcitx::RawConfig &config) {
+  if (!config.hasSubItems()) {
+    return SettingsValue::string(config.value());
+  }
+  SettingsValue result = SettingsValue::object();
+  if (!config.value().empty()) {
+    result.entries.emplace("", SettingsValue::string(config.value()));
+  }
+  for (const auto &name : config.subItems()) {
+    if (auto child = config.get(name)) {
+      result.entries.emplace(name, raw_config_to_settings_value(*child));
+    }
+  }
+  return result;
+}
+
+bool settings_value_fill_raw_config(const SettingsValue &value, fcitx::RawConfig &config) {
+  if (!value.is_map) {
+    config.setValue(value.scalar);
+    return true;
+  }
+  for (const auto &[name, childValue] : value.entries) {
+    if (name.empty()) {
+      if (childValue.is_map) {
+        return false;
+      }
+      config.setValue(childValue.scalar);
+      continue;
+    }
+    auto child = config.get(name, true);
+    if (!child || !settings_value_fill_raw_config(childValue, *child)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+SettingsValue merge_opaque_map(const SettingsValue &current, const SettingsValue &submitted) {
+  if (!current.is_map || !submitted.is_map) {
+    return submitted;
+  }
+  SettingsValue merged = current;
+  for (const auto &[key, child] : submitted.entries) {
+    const auto found = merged.entries.find(key);
+    if (found != merged.entries.end() && found->second.is_map && child.is_map) {
+      found->second = merge_opaque_map(found->second, child);
+    } else {
+      merged.entries[key] = child;
+    }
+  }
+  return merged;
+}
+
+const SettingsConfigType *find_config_type(const std::vector<SettingsConfigType> &types,
+                                           const std::string &name) {
+  const auto found = std::find_if(types.begin(), types.end(), [&name](const auto &type) {
+    return type.name == name;
+  });
+  return found == types.end() ? nullptr : &*found;
+}
+
+// ConfigWidget serializes only options it knows. Merge at schema-defined paths
+// onto the live RawConfig so unexposed/future fields survive. List/Optional nodes
+// replace their whole value tree, which is necessary for list deletions and an
+// unchecked Optional value; ordinary nested config types merge recursively.
+bool merge_schema_values(const std::vector<SettingsConfigType> &types,
+                         const std::string &typeName, const SettingsValue &submitted,
+                         SettingsValue &merged, std::string &error, std::size_t depth = 0) {
+  if (depth > fusion::ipc::max_settings_depth || !submitted.is_map || !merged.is_map) {
+    error = "The submitted configuration does not match the Fcitx schema.";
+    return false;
+  }
+  const auto *type = find_config_type(types, typeName);
+  if (!type) {
+    error = "Fcitx returned a nested configuration type the settings client could not resolve.";
+    return false;
+  }
+  for (const auto &[name, submittedValue] : submitted.entries) {
+    const auto option = std::find_if(type->options.begin(), type->options.end(),
+                                     [&name](const auto &candidate) {
+                                       return candidate.name == name;
+                                     });
+    if (option == type->options.end() || option->type == "External") {
+      error = "The settings client submitted an option not represented by the current Fcitx schema.";
+      return false;
+    }
+    auto currentValue = merged.entries.find(name);
+    if (option->type.starts_with("Optional|")) {
+      if (!submittedValue.is_map) {
+        error = "An optional Fcitx option was submitted as a scalar.";
+        return false;
+      }
+      if (submittedValue.entries.empty()) {
+        merged.entries[name] = submittedValue; // the UI disabled this Optional option
+        continue;
+      }
+      const std::string nestedType = option->type.substr(std::string("Optional|").size());
+      if (find_config_type(types, nestedType)) {
+        if (currentValue == merged.entries.end()) {
+          currentValue = merged.entries.emplace(name, SettingsValue::object()).first;
+        }
+        SettingsValue nestedSubmitted = submittedValue;
+        auto submittedChild = nestedSubmitted.entries.find("Value");
+        SettingsValue nestedCurrent = SettingsValue::object();
+        if (currentValue->second.is_map) {
+          const auto currentChild = currentValue->second.entries.find("Value");
+          if (currentChild != currentValue->second.entries.end()) {
+            nestedCurrent = currentChild->second;
+          }
+        }
+        if (submittedChild == nestedSubmitted.entries.end() || !nestedSubmitted.is_map ||
+            !merge_schema_values(types, nestedType, submittedChild->second, nestedCurrent,
+                                 error, depth + 1)) {
+          return false;
+        }
+        nestedSubmitted.entries["Value"] = std::move(nestedCurrent);
+        merged.entries[name] = std::move(nestedSubmitted);
+      } else {
+        merged.entries[name] = merge_opaque_map(
+            currentValue == merged.entries.end() ? SettingsValue::object() : currentValue->second,
+            submittedValue);
+      }
+      continue;
+    }
+    if (option->type.starts_with("List|")) {
+      if (!submittedValue.is_map || submittedValue.entries.size() > fusion::ipc::max_settings_map_entries) {
+        error = "A list-valued Fcitx option has an invalid value.";
+        return false;
+      }
+      const std::string elementType = option->type.substr(std::string("List|").size());
+      SettingsValue mergedList = SettingsValue::object();
+      const auto &currentList = currentValue != merged.entries.end() && currentValue->second.is_map
+                                    ? currentValue->second
+                                    : SettingsValue::object();
+      for (std::size_t index = 0; index < submittedValue.entries.size(); ++index) {
+        const std::string indexKey = std::to_string(index);
+        const auto submittedItem = submittedValue.entries.find(indexKey);
+        if (submittedItem == submittedValue.entries.end()) {
+          error = "A list-valued Fcitx option has a non-contiguous index.";
+          return false;
+        }
+        const auto currentItem = currentList.entries.find(indexKey);
+        SettingsValue item = currentItem == currentList.entries.end()
+                                 ? (submittedItem->second.is_map ? SettingsValue::object()
+                                                                 : submittedItem->second)
+                                 : currentItem->second;
+        if (find_config_type(types, elementType) && submittedItem->second.is_map) {
+          if (!merge_schema_values(types, elementType, submittedItem->second, item, error,
+                                   depth + 1)) {
+            return false;
+          }
+        } else if (submittedItem->second.is_map) {
+          item = merge_opaque_map(item, submittedItem->second);
+        } else {
+          item = submittedItem->second;
+        }
+        mergedList.entries.emplace(indexKey, std::move(item));
+      }
+      merged.entries[name] = std::move(mergedList); // preserve edits/deletions/order from UI
+      continue;
+    }
+    if (find_config_type(types, option->type)) {
+      if (!submittedValue.is_map) {
+        error = "A nested Fcitx configuration option had a scalar value.";
+        return false;
+      }
+      if (currentValue == merged.entries.end()) {
+        currentValue = merged.entries.emplace(name, SettingsValue::object()).first;
+      }
+      if (!merge_schema_values(types, option->type, submittedValue, currentValue->second,
+                               error, depth + 1)) {
+        return false;
+      }
+      continue;
+    }
+    if (submittedValue.is_map) {
+      error = "A scalar Fcitx option was submitted as a map.";
+      return false;
+    }
+    merged.entries[name] = submittedValue;
+  }
+  return true;
+}
+
+std::vector<SettingsConfigType> dump_settings_description(const fcitx::Configuration &config) {
+  fcitx::RawConfig rawDescription;
+  config.dumpDescription(rawDescription);
+  std::vector<SettingsConfigType> result;
+  for (const auto &typeName : rawDescription.subItems()) {
+    auto typeConfig = rawDescription.get(typeName);
+    if (!typeConfig) {
+      continue;
+    }
+    SettingsConfigType type;
+    type.name = typeName;
+    for (const auto &optionName : typeConfig->subItems()) {
+      auto optionConfig = typeConfig->get(optionName);
+      if (!optionConfig) {
+        continue;
+      }
+      auto typeField = optionConfig->get("Type");
+      auto descriptionField = optionConfig->get("Description");
+      if (!typeField || !descriptionField) {
+        continue;
+      }
+      SettingsOptionDescription option;
+      option.name = optionName;
+      option.type = typeField->value();
+      option.description = descriptionField->value();
+      if (auto defaultField = optionConfig->get("DefaultValue")) {
+        option.default_value = raw_config_to_settings_value(*defaultField);
+      }
+      option.properties = SettingsValue::object();
+      optionConfig->visitSubItems([&option](const fcitx::RawConfig &value,
+                                            const std::string &path) {
+        if (path == "Type" || path == "Description" || path == "DefaultValue") {
+          return true;
+        }
+        option.properties.entries.emplace(path, raw_config_to_settings_value(value));
+        return true;
+      });
+      type.options.push_back(std::move(option));
+    }
+    result.push_back(std::move(type));
+  }
+  return result;
+}
 
 inline bool is_candidate_action(BackendStimulus::Type type) {
   return type == BackendStimulus::Type::SelectCandidate ||
@@ -275,7 +520,281 @@ public:
     return *output;
   }
 
+  SettingsStatus settings_get_config(const std::string &uri, SettingsSnapshot &snapshot,
+                                     std::string &error) override {
+    std::string method;
+    if (!parse_supported_input_method_uri(uri, method)) {
+      error = "Only the Pinyin and Shuangpin input-method settings are available.";
+      return SettingsStatus::Invalid;
+    }
+    auto result = std::make_shared<SettingsSnapshot>();
+    const auto status = invoke_settings(
+        [this, method, result](std::string &taskError) {
+          return read_settings_on_loop(method, *result, taskError);
+        },
+        error, SettingsStatus::Timeout);
+    if (status == SettingsStatus::Ok) {
+      snapshot = std::move(*result);
+    }
+    return status;
+  }
+
+  SettingsStatus settings_set_config(const std::string &uri, const SettingsValue &submitted,
+                                     SettingsSnapshot &snapshot, std::string &error) override {
+    std::string method;
+    if (!parse_supported_input_method_uri(uri, method) || !submitted.is_map) {
+      error = "The settings request is invalid.";
+      return SettingsStatus::Invalid;
+    }
+    auto result = std::make_shared<SettingsSnapshot>();
+    const auto status = invoke_settings(
+        [this, method, submitted, result](std::string &taskError) {
+          return apply_settings_on_loop(method, submitted, *result, taskError);
+        },
+        error, SettingsStatus::Indeterminate);
+    if (status == SettingsStatus::Ok) {
+      snapshot = std::move(*result);
+    }
+    return status;
+  }
+
+  SettingsStatus settings_get_selection(SettingsSelection &selection,
+                                        std::string &error) override {
+    auto result = std::make_shared<SettingsSelection>();
+    const auto status = invoke_settings(
+        [this, result](std::string &taskError) { return selection_on_loop(*result, taskError); },
+        error, SettingsStatus::Timeout);
+    if (status == SettingsStatus::Ok) {
+      selection = std::move(*result);
+    }
+    return status;
+  }
+
+  SettingsStatus settings_select_input_method(const std::string &method,
+                                              SettingsSelection &selection,
+                                              std::string &error) override {
+    if (method != "pinyin" && method != "shuangpin") {
+      error = "Only Pinyin and Shuangpin can be selected.";
+      return SettingsStatus::Invalid;
+    }
+    auto result = std::make_shared<SettingsSelection>();
+    const auto status = invoke_settings(
+        [this, method, result](std::string &taskError) {
+          auto &manager = instance_->inputMethodManager();
+          if (!manager.entry(method)) {
+            taskError = "The requested input method is not available in this Host.";
+            return SettingsStatus::Unsupported;
+          }
+          const auto &liveGroup = manager.currentGroup();
+          const std::string liveCurrent = liveGroup.inputMethodList().empty()
+                                              ? std::string()
+                                              : liveGroup.inputMethodList().front().name();
+          if (liveCurrent == method) {
+            return selection_on_loop(*result, taskError);
+          }
+          if (has_active_composition_on_loop()) {
+            taskError = "Finish the current composition, then retry the input-method switch.";
+            return SettingsStatus::Busy;
+          }
+          auto group = liveGroup;
+          auto &items = group.inputMethodList();
+          const auto oldCurrent = items.empty() ? std::string() : items.front().name();
+          auto target = std::find_if(items.begin(), items.end(), [&method](const auto &item) {
+            return item.name() == method;
+          });
+          if (target == items.end()) {
+            items.emplace_back(method);
+            target = std::prev(items.end());
+          }
+          if (target != items.begin()) {
+            std::rotate(items.begin(), target, std::next(target));
+          }
+          // Preserve every existing group entry, its layout, and the old current
+          // input method as the fallback. Items/0 remains the selected method.
+          const std::string fallback = oldCurrent.empty() || oldCurrent == method
+                                           ? (items.size() > 1 ? items[1].name() : method)
+                                           : oldCurrent;
+          group.setDefaultInputMethod(fallback);
+          manager.setGroup(std::move(group));
+          manager.save();
+          return selection_on_loop(*result, taskError);
+        },
+        error, SettingsStatus::Indeterminate);
+    if (status == SettingsStatus::Ok) {
+      selection = std::move(*result);
+    }
+    return status;
+  }
+
 private:
+  enum class SettingsTaskPhase : int { Queued, Running, Cancelled, Done };
+  struct SettingsTaskState {
+    std::atomic<SettingsTaskPhase> phase{SettingsTaskPhase::Queued};
+    std::promise<void> completed;
+    SettingsStatus status = SettingsStatus::Error;
+    std::string error;
+  };
+
+  SettingsStatus invoke_settings(const std::function<SettingsStatus(std::string &)> &function,
+                                 std::string &error, SettingsStatus running_timeout_status) {
+    bool expected = false;
+    if (!settings_pending_.compare_exchange_strong(expected, true)) {
+      error = "Another settings request is already in progress.";
+      return SettingsStatus::Busy;
+    }
+    if (!healthy()) {
+      settings_pending_ = false;
+      error = "The Fusion Host backend is unavailable.";
+      return SettingsStatus::Error;
+    }
+
+    auto task = std::make_shared<SettingsTaskState>();
+    auto ready = task->completed.get_future();
+    {
+      std::lock_guard dispatch(dispatch_);
+      if (!instance_ || !healthy()) {
+        settings_pending_ = false;
+        error = "The Fusion Host backend is shutting down.";
+        return SettingsStatus::Error;
+      }
+      instance_->eventDispatcher().schedule([this, task, function] {
+        auto phase = SettingsTaskPhase::Queued;
+        if (!task->phase.compare_exchange_strong(phase, SettingsTaskPhase::Running)) {
+          // The requester cancelled before this callback reached the loop; no
+          // Fcitx touch or late settings mutation is permitted.
+          settings_pending_ = false;
+          return;
+        }
+        try {
+          task->status = function(task->error);
+        } catch (const std::exception &exception) {
+          task->status = SettingsStatus::Error;
+          task->error = exception.what();
+        } catch (...) {
+          task->status = SettingsStatus::Error;
+          task->error = "The Fcitx settings operation failed.";
+        }
+        task->phase = SettingsTaskPhase::Done;
+        try {
+          task->completed.set_value();
+        } catch (...) {
+        }
+        settings_pending_ = false;
+      });
+    }
+
+    if (ready.wait_for(request_wait) != std::future_status::ready) {
+      auto phase = SettingsTaskPhase::Queued;
+      if (task->phase.compare_exchange_strong(phase, SettingsTaskPhase::Cancelled)) {
+        error = "The settings request timed out before it reached the Fcitx event loop.";
+        return SettingsStatus::Timeout;
+      }
+      if (task->phase == SettingsTaskPhase::Running) {
+        error = "The Host did not confirm whether the settings request completed. Reload before retrying.";
+        // Keep settings_pending_ set until the event-loop task completes, fencing
+        // retries while a prior mutation may still be running.
+        return running_timeout_status;
+      }
+      if (task->phase == SettingsTaskPhase::Done) {
+        ready.wait(); // the loop published Done immediately before fulfilling the promise
+      }
+    }
+    error = task->error;
+    return task->status;
+  }
+
+  bool has_active_composition_on_loop() const {
+    for (const auto &[id, context] : contexts_) {
+      (void)id;
+      if (!context->inputPanel().clientPreedit().empty() || !context->inputPanel().empty() ||
+          context->hasPendingEventsStrictOrder()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  SettingsStatus read_settings_on_loop(const std::string &method, SettingsSnapshot &snapshot,
+                                       std::string &error) {
+    const auto *entry = instance_->inputMethodManager().entry(method);
+    auto *engine = instance_->inputMethodEngine(method);
+    if (!entry || !entry->isConfigurable() || !engine) {
+      error = "The requested input-method configuration is unavailable.";
+      return SettingsStatus::Unsupported;
+    }
+    const auto *configuration = engine->getConfigForInputMethod(*entry);
+    if (!configuration) {
+      error = "Fcitx did not provide this input method's configuration.";
+      return SettingsStatus::Error;
+    }
+    fcitx::RawConfig values;
+    configuration->save(values);
+    snapshot.values = raw_config_to_settings_value(values);
+    snapshot.types = dump_settings_description(*configuration);
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus apply_settings_on_loop(const std::string &method,
+                                        const SettingsValue &submitted,
+                                        SettingsSnapshot &snapshot, std::string &error) {
+    SettingsSnapshot current;
+    auto status = read_settings_on_loop(method, current, error);
+    if (status != SettingsStatus::Ok) {
+      return status;
+    }
+    if (current.types.empty()) {
+      error = "Fcitx returned no schema for this input method.";
+      return SettingsStatus::Error;
+    }
+    SettingsValue merged = current.values;
+    if (!merge_schema_values(current.types, current.types.front().name, submitted, merged, error)) {
+      return SettingsStatus::Invalid;
+    }
+    if (merged == current.values) {
+      // A no-change Apply must not call an engine setter or touch learning files.
+      snapshot = std::move(current);
+      return SettingsStatus::Ok;
+    }
+    if (has_active_composition_on_loop()) {
+      error = "Finish the current composition, then retry applying settings.";
+      return SettingsStatus::Busy;
+    }
+    const auto *entry = instance_->inputMethodManager().entry(method);
+    auto *engine = instance_->inputMethodEngine(method);
+    if (!entry || !engine) {
+      error = "The input method stopped being available before the settings were applied.";
+      return SettingsStatus::Unsupported;
+    }
+    fcitx::RawConfig raw;
+    if (!settings_value_fill_raw_config(merged, raw)) {
+      error = "The settings value tree is malformed.";
+      return SettingsStatus::Invalid;
+    }
+    engine->setConfigForInputMethod(*entry, raw);
+    return read_settings_on_loop(method, snapshot, error);
+  }
+
+  SettingsStatus selection_on_loop(SettingsSelection &selection, std::string &error) {
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    selection = {};
+    for (const char *name : {"pinyin", "shuangpin"}) {
+      if (instance_->inputMethodManager().entry(name)) {
+        selection.available.emplace_back(name);
+      }
+    }
+    if (!group.inputMethodList().empty()) {
+      const auto &first = group.inputMethodList().front().name();
+      if (first == "pinyin" || first == "shuangpin") {
+        selection.selected = first; // Items/0 is the selected method; DefaultIM is fallback.
+      }
+    }
+    if (selection.available.empty()) {
+      error = "This Host has no Pinyin or Shuangpin input method available.";
+      return SettingsStatus::Unsupported;
+    }
+    return SettingsStatus::Ok;
+  }
+
   static std::vector<std::string> method_names(const fcitx::InputMethodGroup &group) {
     std::vector<std::string> names;
     names.reserve(group.inputMethodList().size());
@@ -505,6 +1024,7 @@ private:
   const FcitxBackendOptions options_;
   std::atomic<bool> healthy_{false};
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> settings_pending_{false};
   std::mutex admission_, dispatch_;
   std::promise<bool> startup_;
   std::thread thread_;

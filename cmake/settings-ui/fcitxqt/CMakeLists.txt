@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.21)
+project(fcitx5-qt-settings-subset VERSION 5.1.16 LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(GenerateExportHeader)
+include(ECMSetupVersion)
+include(CMakePackageConfigHelpers)
+set(FCITX5_QT_VERSION ${PROJECT_VERSION})
+set(Fcitx5Qt6_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/Fcitx5Qt6)
+set(LIBRARY_TYPE SHARED)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Fcitx5Utils 5.0.16 CONFIG REQUIRED)
+find_package(Qt6 6.4 CONFIG REQUIRED COMPONENTS Core Gui Widgets DBus)
+
+# fcitx-utils/misc.h includes <unistd.h> unconditionally in this pinned revision.
+include_directories(BEFORE "${CMAKE_CURRENT_LIST_DIR}/../../fcitx-native/compat")
+set(UPSTREAM_FCITXQT "${FUSION_SETTINGS_SOURCE_ROOT}/fcitx5-qt")
+add_subdirectory("${UPSTREAM_FCITXQT}/qt6/dbusaddons" dbusaddons)
+add_subdirectory("${UPSTREAM_FCITXQT}/qt6/widgetsaddons" widgetsaddons)

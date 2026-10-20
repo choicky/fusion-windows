@@ -41,6 +41,7 @@
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
+#include "fusion/settings_protocol.hpp"
 #include "host/host_diag.hpp"
 #include "host/host_server.hpp"
 #include "ipc/ipc_backend.hpp"
@@ -124,6 +125,55 @@ std::unique_ptr<IpcBackend> connect_client(const std::wstring &pipe_name) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   return nullptr;
+}
+
+bool connect_settings_client(PipeClient &client, std::uint32_t protocol,
+                             std::uint32_t api, std::uint64_t &incarnation,
+                             SettingsStatus &status) {
+  if (!client.connect(std::chrono::milliseconds(500))) {
+    return false;
+  }
+  if (client.send_request(MessageType::SettingsHelloRequest,
+                          serialize_settings_hello(protocol, api)) != WriteOutcome::Written) {
+    return false;
+  }
+  auto response = client.recv_response(std::chrono::seconds(5));
+  if (!response || response->type != MessageType::SettingsHelloResponse) {
+    return false;
+  }
+  detail::Reader reader{response->payload.data(), response->payload.size()};
+  auto host = reader.read_u64();
+  auto hostProtocol = reader.read_u32();
+  auto session = reader.read_u64();
+  auto hostApi = reader.read_u32();
+  auto prefix = deserialize_settings_status(reader);
+  (void)session;
+  (void)hostApi;
+  if (!host || !hostProtocol || !prefix) {
+    return false;
+  }
+  incarnation = *host;
+  status = prefix->status;
+  return reader.at_end();
+}
+
+std::optional<WireFrame> settings_request(PipeClient &client, MessageType type,
+                                          const std::vector<std::uint8_t> &payload,
+                                          std::uint64_t incarnation) {
+  if (client.send_request(type, payload) != WriteOutcome::Written) {
+    return std::nullopt;
+  }
+  auto response = client.recv_response(std::chrono::seconds(5));
+  if (!response) {
+    return std::nullopt;
+  }
+  detail::Reader reader{response->payload.data(), response->payload.size()};
+  auto host = reader.read_u64();
+  if (!host || *host != incarnation) {
+    return std::nullopt;
+  }
+  response->payload.erase(response->payload.begin(), response->payload.begin() + 8);
+  return response;
 }
 
 // Raw PipeServer plus its serving thread.
@@ -647,10 +697,63 @@ void test_protocol() {
     require(!decoded, "invalid stimulus type rejected");
   }
 
-  // Protocol version constant
+  // Settings schema/value trees are opaque transport data derived at runtime
+  // from Fcitx; nested values and property maps round-trip without a second schema.
   {
+    SettingsSnapshot snapshot;
+    snapshot.values.entries.emplace("PageSize", SettingsValue::string("7"));
+    auto nested = SettingsValue::object();
+    nested.entries.emplace("Fuzzy", SettingsValue::string("True"));
+    snapshot.values.entries.emplace("Nested", std::move(nested));
+    SettingsConfigType type;
+    type.name = "PinyinEngineConfig";
+    SettingsOptionDescription option;
+    option.name = "PageSize";
+    option.type = "Integer";
+    option.description = "Candidates per page";
+    option.default_value = SettingsValue::string("5");
+    option.properties.entries.emplace("Min", SettingsValue::string("3"));
+    type.options.push_back(std::move(option));
+    snapshot.types.push_back(std::move(type));
+    std::vector<std::uint8_t> payload;
+    require(settings_detail::write_snapshot(payload, snapshot), "settings snapshot serializes");
+    detail::Reader reader{payload.data(), payload.size()};
+    SettingsSnapshot decoded;
+    require(settings_detail::read_snapshot(reader, decoded) && reader.at_end() &&
+                decoded.values == snapshot.values && decoded.types.size() == 1 &&
+                decoded.types[0].name == "PinyinEngineConfig" &&
+                decoded.types[0].options.size() == 1 &&
+                decoded.types[0].options[0].properties.entries.at("Min").scalar == "3",
+            "settings snapshot values/schema/properties round-trip");
+  }
+
+  // Duplicate map keys are malformed, not last-writer-wins.
+  {
+    std::vector<std::uint8_t> payload;
+    detail::write_u8(payload, 1); // map
+    detail::write_u32(payload, 2);
+    detail::write_string(payload, "PageSize");
+    detail::write_u8(payload, 0);
+    detail::write_string(payload, "7");
+    detail::write_string(payload, "PageSize");
+    detail::write_u8(payload, 0);
+    detail::write_string(payload, "9");
+    detail::Reader reader{payload.data(), payload.size()};
+    std::size_t nodes = 0;
+    require(!settings_detail::read_value(reader, 0, nodes),
+            "duplicate settings keys fail-closed");
+  }
+
+  // Additive settings message types are framed under v4 without changing the TIP handshake.
+  {
+    const auto frame = frame_message(MessageType::SettingsHelloRequest,
+                                     serialize_settings_hello(protocol_version,
+                                                              settings_api_version));
+    auto parsed = parse_header(frame.data(), frame.size());
+    require(parsed && parsed->type == MessageType::SettingsHelloRequest,
+            "settings capability frame is accepted by the v4 parser");
     require(protocol_version == 4,
-            "protocol_version is 4 (Stage 5 closure preedit/panel payload shape)");
+            "settings messages do not bump the existing TIP protocol version");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";
@@ -1009,6 +1112,31 @@ public:
   std::uint64_t sid = 555;
   std::atomic<int> call_count{0};
   std::atomic<int> contention_count{0};
+  std::atomic<bool> composition_active{false};
+  std::atomic<int> settings_set_count{0};
+  SettingsSnapshot settings_snapshot;
+  SettingsSelection selection_state{"pinyin", {"pinyin", "shuangpin"}};
+
+  FcitxLikeBackend() {
+    settings_snapshot.values = SettingsValue::object();
+    settings_snapshot.values.entries.emplace("PageSize", SettingsValue::string("7"));
+    settings_snapshot.values.entries.emplace("ShuangpinProfile", SettingsValue::string("Ziranma"));
+    settings_snapshot.values.entries.emplace("SpellEnabled", SettingsValue::string("true"));
+    settings_snapshot.values.entries.emplace("FutureOption", SettingsValue::string("keep-me"));
+    SettingsConfigType type;
+    type.name = "PinyinEngineConfig";
+    for (const auto &[name, defaultValue] :
+         {std::pair{"PageSize", "5"}, std::pair{"ShuangpinProfile", "Ziranma"},
+          std::pair{"SpellEnabled", "true"}}) {
+      SettingsOptionDescription option;
+      option.name = name;
+      option.type = name == std::string("PageSize") ? "Integer" : "Enum";
+      option.description = name;
+      option.default_value = SettingsValue::string(defaultValue);
+      type.options.push_back(std::move(option));
+    }
+    settings_snapshot.types.push_back(std::move(type));
+  }
 
   bool bind(Binding binding) override {
     call_count++;
@@ -1075,6 +1203,63 @@ public:
     return batch;
   }
 
+  SettingsStatus settings_get_config(const std::string &uri, SettingsSnapshot &snapshot,
+                                    std::string &error) override {
+    if (uri != "fcitx://config/inputmethod/pinyin" &&
+        uri != "fcitx://config/inputmethod/shuangpin") {
+      error = "unsupported URI";
+      return SettingsStatus::Invalid;
+    }
+    std::lock_guard lock(settings_mutex_);
+    snapshot = settings_snapshot;
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus settings_set_config(const std::string &uri, const SettingsValue &values,
+                                     SettingsSnapshot &snapshot, std::string &error) override {
+    if (uri != "fcitx://config/inputmethod/pinyin" &&
+        uri != "fcitx://config/inputmethod/shuangpin") {
+      error = "unsupported URI";
+      return SettingsStatus::Invalid;
+    }
+    if (composition_active.load()) {
+      error = "finish composition first";
+      return SettingsStatus::Busy;
+    }
+    std::lock_guard lock(settings_mutex_);
+    for (const auto &[key, value] : values.entries) {
+      settings_snapshot.values.entries[key] = value;
+    }
+    snapshot = settings_snapshot;
+    settings_set_count++;
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus settings_get_selection(SettingsSelection &selection,
+                                        std::string &) override {
+    std::lock_guard lock(settings_mutex_);
+    selection = selection_state;
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus settings_select_input_method(const std::string &method,
+                                              SettingsSelection &selection,
+                                              std::string &error) override {
+    if (composition_active.load()) {
+      error = "finish composition first";
+      return SettingsStatus::Busy;
+    }
+    std::lock_guard lock(settings_mutex_);
+    if (std::find(selection_state.available.begin(), selection_state.available.end(), method) ==
+        selection_state.available.end()) {
+      error = "method unavailable";
+      return SettingsStatus::Invalid;
+    }
+    selection_state.selected = method;
+    selection = selection_state;
+    return SettingsStatus::Ok;
+  }
+
   std::size_t bound_count() {
     std::lock_guard lock(state_);
     return contexts_.size();
@@ -1088,6 +1273,7 @@ public:
 private:
   std::mutex admission_; // FcitxBackend admission lock: try_lock, never wait
   std::mutex state_;
+  std::mutex settings_mutex_;
   std::set<std::uint64_t> contexts_;
   std::vector<std::uint64_t> unbound_;
 };
@@ -1494,7 +1680,190 @@ void test_hostserver_connection_reaping() {
   }
 }
 
+void test_settings_host() {
+  const auto pipe_name = test_pipe_name(L"settings-control");
+  auto backend = std::make_unique<FcitxLikeBackend>();
+  FcitxLikeBackend *fake = backend.get();
+  RunningHost host(std::move(backend), pipe_name);
+  require(host.start(), "settings Host start");
+
+  auto send_one = [&](MessageType type, const std::vector<std::uint8_t> &payload) {
+    PipeClient client(pipe_name);
+    std::uint64_t incarnation = 0;
+    SettingsStatus hello_status = SettingsStatus::Error;
+    const auto deadline = std::chrono::steady_clock::now() + kWait;
+    bool connected = false;
+    while (!connected && std::chrono::steady_clock::now() < deadline) {
+      connected = connect_settings_client(client, protocol_version, settings_api_version,
+                                          incarnation, hello_status);
+      if (!connected)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    require(connected && hello_status == SettingsStatus::Ok && incarnation != 0,
+            "settings API capability handshake succeeds");
+    auto reply = settings_request(client, type, payload, incarnation);
+    require(reply.has_value(), "settings request receives an incarnation-fenced reply");
+    return std::move(*reply);
+  };
+
+  // The settings extension remains protocol v4-compatible with a TIP client that
+  // sends only the original Hello/Bind/Send messages.
+  auto old_tip = connect_client(pipe_name);
+  require(old_tip != nullptr, "existing v4 TIP client connects alongside settings");
+  const Binding binding{73, 1, 1};
+  require(old_tip->bind(binding), "existing v4 TIP Bind still succeeds");
+  auto batch = old_tip->send(character_stimulus(binding, 1, 'a'));
+  require(batch.disposition == BackendBatch::Disposition::Consumed,
+          "existing v4 TIP Send still succeeds after the settings extension");
+
+  // The settings handshake reports protocol/API incompatibility distinctly.
+  {
+    PipeClient client(pipe_name);
+    std::uint64_t incarnation = 0;
+    SettingsStatus status = SettingsStatus::Ok;
+    require(connect_settings_client(client, protocol_version + 1, settings_api_version,
+                                    incarnation, status),
+            "settings protocol mismatch receives a bounded response");
+    require(status == SettingsStatus::VersionMismatch,
+            "settings protocol mismatch is explicit");
+  }
+  {
+    PipeClient client(pipe_name);
+    std::uint64_t incarnation = 0;
+    SettingsStatus status = SettingsStatus::Ok;
+    require(connect_settings_client(client, protocol_version, settings_api_version + 1,
+                                    incarnation, status),
+            "settings API mismatch receives a bounded response");
+    require(status == SettingsStatus::VersionMismatch,
+            "settings API mismatch is explicit");
+  }
+
+  auto get_payload = serialize_settings_get_request("fcitx://config/inputmethod/pinyin");
+  auto get_reply = send_one(MessageType::SettingsGetConfigRequest, get_payload);
+  detail::Reader get_reader{get_reply.payload.data(), get_reply.payload.size()};
+  auto get_status = deserialize_settings_status(get_reader);
+  SettingsSnapshot snapshot;
+  require(get_status && get_status->status == SettingsStatus::Ok &&
+              settings_detail::read_snapshot(get_reader, snapshot) && get_reader.at_end() &&
+              snapshot.values.entries.at("PageSize").scalar == "7" &&
+              snapshot.values.entries.at("FutureOption").scalar == "keep-me" &&
+              snapshot.types.size() == 1 && snapshot.types[0].options.size() == 3,
+          "GetConfig delivers dynamic values and official-schema-shaped metadata");
+
+  SettingsValue requested = SettingsValue::object();
+  requested.entries.emplace("PageSize", SettingsValue::string("9"));
+  std::vector<std::uint8_t> set_payload;
+  require(serialize_settings_set_request(set_payload,
+                                         "fcitx://config/inputmethod/pinyin", requested),
+          "SetConfig request serialization");
+  auto set_reply = send_one(MessageType::SettingsSetConfigRequest, set_payload);
+  detail::Reader set_reader{set_reply.payload.data(), set_reply.payload.size()};
+  auto set_status = deserialize_settings_status(set_reader);
+  SettingsSnapshot applied;
+  require(set_status && set_status->status == SettingsStatus::Ok &&
+              settings_detail::read_snapshot(set_reader, applied) && set_reader.at_end() &&
+              applied.values.entries.at("PageSize").scalar == "9" &&
+              applied.values.entries.at("FutureOption").scalar == "keep-me" &&
+              fake->settings_set_count == 1,
+          "SetConfig is acknowledged only after the backend returns the resulting state");
+
+  // The two settings pages share options but are applied independently. A page that
+  // submits only what it changed must not restore a shared value the other page has
+  // just written, in either direction.
+  const auto apply_delta = [&](const char *uri, const char *key, const char *value) {
+    SettingsValue delta = SettingsValue::object();
+    delta.entries.emplace(key, SettingsValue::string(value));
+    std::vector<std::uint8_t> payload;
+    require(serialize_settings_set_request(payload, uri, delta),
+            "partial SetConfig request serialization");
+    auto reply = send_one(MessageType::SettingsSetConfigRequest, payload);
+    detail::Reader reader{reply.payload.data(), reply.payload.size()};
+    auto status = deserialize_settings_status(reader);
+    SettingsSnapshot snapshot_after;
+    require(status && status->status == SettingsStatus::Ok &&
+                settings_detail::read_snapshot(reader, snapshot_after) && reader.at_end(),
+            "partial SetConfig is acknowledged");
+    return snapshot_after;
+  };
+  const auto shuangpin_delta =
+      apply_delta("fcitx://config/inputmethod/shuangpin", "ShuangpinProfile", "MS");
+  require(shuangpin_delta.values.entries.at("PageSize").scalar == "9" &&
+              shuangpin_delta.values.entries.at("ShuangpinProfile").scalar == "MS" &&
+              shuangpin_delta.values.entries.at("FutureOption").scalar == "keep-me" &&
+              fake->settings_set_count == 2,
+          "a partial apply from the other page preserves the shared value it did not submit");
+  require(apply_delta("fcitx://config/inputmethod/shuangpin", "PageSize", "8")
+                  .values.entries.at("PageSize")
+                  .scalar == "8",
+          "the other page can change the shared value");
+  const auto pinyin_delta =
+      apply_delta("fcitx://config/inputmethod/pinyin", "SpellEnabled", "false");
+  require(pinyin_delta.values.entries.at("PageSize").scalar == "8" &&
+              pinyin_delta.values.entries.at("SpellEnabled").scalar == "false" &&
+              pinyin_delta.values.entries.at("ShuangpinProfile").scalar == "MS" &&
+              fake->settings_set_count == 4,
+          "the reverse page direction preserves the shared value it did not submit");
+
+  auto selection_reply = send_one(MessageType::SettingsGetSelectionRequest, {});
+  detail::Reader selection_reader{selection_reply.payload.data(), selection_reply.payload.size()};
+  auto selection_status = deserialize_settings_status(selection_reader);
+  SettingsSelection selection;
+  require(selection_status && selection_status->status == SettingsStatus::Ok &&
+              settings_detail::read_selection(selection_reader, selection) &&
+              selection_reader.at_end() && selection.selected == "pinyin" &&
+              selection.available.size() == 2,
+          "selection reads the Fcitx group state");
+
+  std::vector<std::uint8_t> select_payload;
+  detail::write_string(select_payload, "shuangpin");
+  auto select_reply = send_one(MessageType::SettingsSelectInputMethodRequest, select_payload);
+  detail::Reader select_reader{select_reply.payload.data(), select_reply.payload.size()};
+  auto select_status = deserialize_settings_status(select_reader);
+  SettingsSelection selected;
+  require(select_status && select_status->status == SettingsStatus::Ok &&
+              settings_detail::read_selection(select_reader, selected) && select_reader.at_end() &&
+              selected.selected == "shuangpin",
+          "selection apply returns the Host-accepted current method");
+
+  fake->composition_active = true;
+  std::vector<std::uint8_t> busy_select_payload;
+  detail::write_string(busy_select_payload, "pinyin");
+  auto busy_reply = send_one(MessageType::SettingsSelectInputMethodRequest, busy_select_payload);
+  detail::Reader busy_reader{busy_reply.payload.data(), busy_reply.payload.size()};
+  auto busy_status = deserialize_settings_status(busy_reader);
+  require(busy_status && busy_status->status == SettingsStatus::Busy && busy_reader.at_end(),
+          "active composition returns a visible retry condition without switching");
+  auto unchanged_reply = send_one(MessageType::SettingsGetSelectionRequest, {});
+  detail::Reader unchanged_reader{unchanged_reply.payload.data(), unchanged_reply.payload.size()};
+  auto unchanged_status = deserialize_settings_status(unchanged_reader);
+  SettingsSelection unchanged;
+  require(unchanged_status && unchanged_status->status == SettingsStatus::Ok &&
+              settings_detail::read_selection(unchanged_reader, unchanged) &&
+              unchanged.selected == "shuangpin",
+          "active-composition refusal preserves the selected method");
+  fake->composition_active = false;
+
+  // Malformed settings payloads fail closed and never reach the backend.
+  {
+    PipeClient client(pipe_name);
+    std::uint64_t incarnation = 0;
+    SettingsStatus status = SettingsStatus::Error;
+    require(connect_settings_client(client, protocol_version, settings_api_version,
+                                    incarnation, status) && status == SettingsStatus::Ok,
+            "malformed-request test handshake");
+    const std::vector<std::uint8_t> malformed{0xFF};
+    require(client.send_request(MessageType::SettingsSetConfigRequest, malformed) ==
+                WriteOutcome::Written,
+            "malformed request reached the Host parser");
+    require(!client.recv_response(std::chrono::seconds(2)),
+            "malformed settings request is disconnected without an apply");
+    require(fake->settings_set_count == 4, "malformed request never reached backend apply");
+  }
+  old_tip.reset();
+}
+
 void test_hostserver() {
+  test_settings_host();
   test_hostserver_multi_client();
   test_hostserver_transport_failure();
   test_hostserver_healthy_no_ipc();

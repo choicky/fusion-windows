@@ -50,6 +50,7 @@ constexpr UINT poll_interval_ms = 2000;
 constexpr UINT command_restart = 1;
 constexpr UINT command_open_logs = 2;
 constexpr UINT command_exit = 3;
+constexpr UINT command_settings = 4;
 constexpr wchar_t restart_marker_name[] = L"restart-in-progress";
 
 fusion::tray::Watch g_watch;
@@ -214,6 +215,24 @@ void restart_host() {
                 SW_SHOWNORMAL);
 }
 
+void open_settings() {
+  if (g_version_dir.empty()) {
+    MessageBoxW(nullptr, L"无法确定 Fusion 安装版本目录。", L"Fusion 设置",
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    return;
+  }
+  const std::wstring executable = g_version_dir + L"\\bin\\FusionSettings.exe";
+  const auto result = reinterpret_cast<INT_PTR>(
+      ShellExecuteW(nullptr, L"open", executable.c_str(), nullptr, g_version_dir.c_str(),
+                    SW_SHOWNORMAL));
+  if (result <= 32) {
+    MessageBoxW(nullptr,
+                L"无法启动 Fusion 设置。请确认当前安装包包含 bin\\FusionSettings.exe，"
+                L"且 FusionHost 正在运行。",
+                L"Fusion 设置", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+  }
+}
+
 void exit_tray(HWND window) {
   if (g_icon_added) {
     Shell_NotifyIconW(NIM_DELETE, &g_icon);
@@ -256,6 +275,7 @@ void show_menu(HWND window, POINT point) {
   }
   AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status);
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, command_settings, L"Settings");
   AppendMenuW(menu, MF_STRING, command_restart, L"Restart FusionHost");
   AppendMenuW(menu, MF_STRING, command_open_logs, L"Open log folder");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -295,6 +315,9 @@ LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM wparam, LPAR
     }
   case WM_COMMAND:
     switch (LOWORD(wparam)) {
+    case command_settings:
+      open_settings();
+      return 0;
     case command_restart:
       restart_host();
       return 0;

@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 project(FusionWindowsStage1 LANGUAGES CXX)
 
 option(FUSION_WITH_FCITX5 "Enable the Stage 4A out-of-process Fcitx Host (FusionHost.exe + IPC)" OFF)
+option(FUSION_WITH_SETTINGS_UI "Build the upstream-derived FusionSettings.exe process" OFF)
+if(FUSION_WITH_SETTINGS_UI AND NOT FUSION_WITH_FCITX5)
+  message(FATAL_ERROR "FusionSettings.exe requires FUSION_WITH_FCITX5=ON")
+endif()
 if(FUSION_WITH_FCITX5)
   include(cmake/FcitxBackend.cmake)
 endif()
@@ -95,6 +99,39 @@ if(WIN32 AND MSVC)
     target_compile_definitions(FusionTrayExe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     target_compile_options(FusionTrayExe PRIVATE /W4 /WX /utf-8)
     target_link_libraries(FusionTrayExe PRIVATE shell32 advapi32 user32)
+
+    if(FUSION_WITH_SETTINGS_UI)
+      include(cmake/settings-ui/CMakeLists.txt)
+      if(NOT FUSION_SETTINGS_NATIVE_SOURCE_ROOT)
+        message(FATAL_ERROR "Set FUSION_SETTINGS_NATIVE_SOURCE_ROOT to the pinned Fcitx/chinese-addons/libime source root")
+      endif()
+      # The Host loads Fcitx locales under bin/data/locale (WP4 sets the built-in
+      # data root relative to Fcitx5Utils.dll). Build the upstream zh_CN catalogs
+      # into that same tree when msgfmt is present.
+      find_program(FUSION_MSGFMT_EXECUTABLE NAMES msgfmt
+        HINTS "${FUSION_GETTEXT_BIN}" "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/gettext/bin")
+      if(FUSION_MSGFMT_EXECUTABLE)
+        set(_fcitx_locale_dir "${CMAKE_BINARY_DIR}/bin/data/locale/zh_CN/LC_MESSAGES")
+        file(MAKE_DIRECTORY "${_fcitx_locale_dir}")
+        set(_translation_pairs
+          "${FUSION_SETTINGS_SOURCE_ROOT}/fcitx5-configtool/po/fcitx5-configtool/zh_CN.po|fcitx5-configtool"
+          "${FUSION_SETTINGS_NATIVE_SOURCE_ROOT}/fcitx5-chinese-addons/po/zh_CN.po|fcitx5-chinese-addons")
+        foreach(_pair IN LISTS _translation_pairs)
+          string(REPLACE "|" ";" _fields "${_pair}")
+          list(GET _fields 0 _translation)
+          list(GET _fields 1 _domain)
+          if(NOT EXISTS "${_translation}")
+            message(FATAL_ERROR "Required pinned Chinese catalog is missing: ${_translation}")
+          endif()
+          add_custom_command(TARGET FusionSettingsExe POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_fcitx_locale_dir}"
+            COMMAND "${FUSION_MSGFMT_EXECUTABLE}" -o "${_fcitx_locale_dir}/${_domain}.mo" "${_translation}"
+            VERBATIM)
+        endforeach()
+      else()
+        message(FATAL_ERROR "gettext msgfmt is required to include the pinned Simplified Chinese catalogs")
+      endif()
+    endif()
   endif()
 endif()
 
