@@ -12,7 +12,6 @@
 #include "ipc/pipe_security.hpp"
 
 #include <QApplication>
-#include <QComboBox>
 #include <QCoreApplication>
 #include <QDBusMessage>
 #include <QDBusVariant>
@@ -20,11 +19,11 @@
 #include <QHBoxLayout>
 #include <QHash>
 #include <QLabel>
+#include <QListWidget>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
-#include <QStandardItemModel>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -62,8 +61,13 @@ QString endpointName(int argc, char **argv) {
 }
 
 QString inputMethodName(const QString &name) {
-  return name == QLatin1String("shuangpin") ? QStringLiteral("双拼")
-                                             : QStringLiteral("拼音");
+  if (name == QLatin1String("shuangpin")) {
+    return QStringLiteral("双拼");
+  }
+  if (name == QLatin1String("pinyin")) {
+    return QStringLiteral("拼音");
+  }
+  return name;
 }
 
 class SettingsWindow final : public QMainWindow {
@@ -81,21 +85,51 @@ public:
     status->setWordWrap(true);
     outer->addWidget(status);
 
-    auto *selectionRow = new QHBoxLayout;
-    selectionRow->addWidget(new QLabel(QStringLiteral("当前输入方式："), central));
-    selection_ = new QComboBox(central);
-    selection_->addItem(QStringLiteral("拼音"), QStringLiteral("pinyin"));
-    selection_->addItem(QStringLiteral("双拼"), QStringLiteral("shuangpin"));
-    selectionRow->addWidget(selection_, 1);
-    auto *applySelection = new QPushButton(QStringLiteral("应用输入方式"), central);
-    selectionRow->addWidget(applySelection);
-    outer->addLayout(selectionRow);
+    // Stage A input-method management: the packaged runtime's defined methods,
+    // the ordered enabled list (top to bottom, first row = the active method a
+    // bound context follows), and add / remove / reorder controls. Writing the
+    // list goes through the Host's official setGroup/save; it never deletes a
+    // method's definition or learning data. This replaces the old two-method
+    // dropdown, which could only switch the active method, not manage membership.
+    auto *manageRow = new QHBoxLayout;
+    auto *leftCol = new QVBoxLayout;
+    leftCol->addWidget(new QLabel(QStringLiteral("可用输入方式："), central));
+    availableList_ = new QListWidget(central);
+    leftCol->addWidget(availableList_);
+    auto *moveCol = new QVBoxLayout;
+    auto *addButton = new QPushButton(QStringLiteral("添加 >"), central);
+    auto *removeButton = new QPushButton(QStringLiteral("< 移除"), central);
+    moveCol->addStretch(1);
+    moveCol->addWidget(addButton);
+    moveCol->addWidget(removeButton);
+    moveCol->addStretch(1);
+    auto *rightCol = new QVBoxLayout;
+    rightCol->addWidget(
+        new QLabel(QStringLiteral("已启用（从上到下；第一项为当前输入方式）："), central));
+    enabledList_ = new QListWidget(central);
+    rightCol->addWidget(enabledList_);
+    auto *orderCol = new QVBoxLayout;
+    auto *upButton = new QPushButton(QStringLiteral("上移"), central);
+    auto *downButton = new QPushButton(QStringLiteral("下移"), central);
+    imApply_ = new QPushButton(QStringLiteral("应用输入方式列表"), central);
+    orderCol->addStretch(1);
+    orderCol->addWidget(upButton);
+    orderCol->addWidget(downButton);
+    orderCol->addWidget(imApply_);
+    orderCol->addStretch(1);
+    manageRow->addLayout(leftCol, 1);
+    manageRow->addLayout(moveCol);
+    manageRow->addLayout(rightCol, 1);
+    manageRow->addLayout(orderCol);
+    outer->addLayout(manageRow);
 
     tabs_ = new QTabWidget(central);
     pinyinUri_ = QStringLiteral("fcitx://config/inputmethod/pinyin");
     shuangpinUri_ = QStringLiteral("fcitx://config/inputmethod/shuangpin");
+    globalUri_ = QStringLiteral("fcitx://config/global");
     tabs_->addTab(makePage(pinyinUri_, pinyin_), QStringLiteral("拼音设置"));
     tabs_->addTab(makePage(shuangpinUri_, shuangpin_), QStringLiteral("双拼设置"));
+    tabs_->addTab(makePage(globalUri_, global_), QStringLiteral("全局设置"));
     outer->addWidget(tabs_, 1);
 
     auto *buttons = new QHBoxLayout;
@@ -124,33 +158,38 @@ public:
       status->setText(QStringLiteral("正在从 FusionHost 重新加载…"));
       reloadAll(status, QStringLiteral("已从 FusionHost 重新加载。"));
     });
-    connect(applySelection, &QPushButton::clicked, this, [this, status, applySelection] {
-      if (!provider_.controller()) {
-        showError(status, QStringLiteral("无法创建 FusionHost 重连请求。"));
+    connect(addButton, &QPushButton::clicked, this, [this] {
+      auto *item = availableList_->currentItem();
+      if (!item) {
         return;
       }
-      applySelection->setEnabled(false);
-      status->setText(QStringLiteral("正在切换输入方式…"));
-      auto *call = provider_.controller()->SelectInputMethod(selection_->currentData().toString());
-      connect(call, &fcitx::kcm::PendingCall::finished, this,
-              [this, call, applySelection, status] {
-                const auto reply = call->reply();
-                const auto selection = call->selection();
-                call->deleteLater();
-                applySelection->setEnabled(true);
-                if (reply.type() != QDBusMessage::ReplyMessage) {
-                  const QString error = reply.errorMessage();
-                  showError(status, error.isEmpty()
-                                        ? QStringLiteral("FusionHost 未确认输入方式切换；请重新加载状态。")
-                                        : error);
-                  reloadSelection();
-                  return;
-                }
-                setSelection(selection);
-                loadCurrentPage();
-                status->setText(QStringLiteral("输入方式已由 FusionHost 确认：%1。")
-                                    .arg(inputMethodName(selection.selected)));
-              });
+      const QString name = item->data(Qt::UserRole).toString();
+      availableList_->takeItem(availableList_->row(item));
+      auto *moved = enabledList_->addItem(inputMethodName(name));
+      moved->setData(Qt::UserRole, name);
+      status_->setText(QStringLiteral("输入方式列表有未应用的更改。"));
+    });
+    connect(removeButton, &QPushButton::clicked, this, [this] {
+      auto *item = enabledList_->currentItem();
+      if (!item) {
+        return;
+      }
+      if (enabledList_->count() <= 1) {
+        status_->setText(QStringLiteral("至少需保留一种已启用的输入方式。"));
+        return;
+      }
+      const QString name = item->data(Qt::UserRole).toString();
+      enabledList_->takeItem(enabledList_->row(item));
+      auto *moved = availableList_->addItem(inputMethodName(name));
+      moved->setData(Qt::UserRole, name);
+      status_->setText(QStringLiteral("输入方式列表有未应用的更改。"));
+    });
+    connect(upButton, &QPushButton::clicked, this,
+            [this] { moveEnabledRow(enabledList_->currentRow(), -1); });
+    connect(downButton, &QPushButton::clicked, this,
+            [this] { moveEnabledRow(enabledList_->currentRow(), 1); });
+    connect(imApply_, &QPushButton::clicked, this, [this, status] {
+      applyImList(enabledOrder(), status);
     });
     connect(&provider_, &fcitx::kcm::DBusProvider::availabilityChanged, this,
             [status](bool available) {
@@ -187,10 +226,24 @@ public:
     connect(shuangpin_, &fcitx::kcm::ConfigWidget::changed, this, [this, status] {
       status->setText(QStringLiteral("双拼设置有未应用的更改。"));
     });
+    connect(global_, &fcitx::kcm::ConfigWidget::configurationLoaded, this,
+            [this, status](bool ok, const QString &error) {
+              globalLoaded_ = ok;
+              if (ok) {
+                baseline_[global_] = global_->value().toMap();
+                status->setText(QStringLiteral("已从 FusionHost 加载全局设置。"));
+              } else {
+                showError(status, error);
+              }
+            });
+    connect(global_, &fcitx::kcm::ConfigWidget::changed, this, [this, status] {
+      status->setText(QStringLiteral("全局设置有未应用的更改。"));
+    });
 
-    // Probe the selection first, then load the page(s). The Host admits one
-    // settings request at a time; serializing startup avoids a false Busy result.
-    reloadSelection([this] {
+    // Probe the input-method list first, then load the page(s). The Host admits
+    // one settings request at a time; serializing startup avoids a false Busy
+    // result.
+    reloadImList([this] {
       if (selfTest_) {
         loadBothPages([this](bool ok, const QString &error) {
           if (!ok) {
@@ -220,7 +273,29 @@ private:
   }
 
   fcitx::kcm::ConfigWidget *currentPage() const {
-    return tabs_->currentIndex() == 0 ? pinyin_ : shuangpin_;
+    switch (tabs_->currentIndex()) {
+    case 0:
+      return pinyin_;
+    case 1:
+      return shuangpin_;
+    case 2:
+      return global_;
+    default:
+      return nullptr;
+    }
+  }
+
+  bool loadedFor(const fcitx::kcm::ConfigWidget *page) const {
+    if (page == pinyin_) {
+      return pinyinLoaded_;
+    }
+    if (page == shuangpin_) {
+      return shuangpinLoaded_;
+    }
+    if (page == global_) {
+      return globalLoaded_;
+    }
+    return false;
   }
 
   void loadCurrentPage(bool force = false) {
@@ -231,14 +306,13 @@ private:
     if (!page) {
       return;
     }
-    const bool loaded = page == pinyin_ ? pinyinLoaded_ : shuangpinLoaded_;
-    if (force || !loaded) {
+    if (force || !loadedFor(page)) {
       page->load();
     }
   }
 
   void reloadAll(QLabel *status, const QString &successMessage) {
-    reloadSelection([this, status, successMessage] {
+    reloadImList([this, status, successMessage] {
       loadBothPages([this, status, successMessage](bool ok, const QString &error) {
         if (ok) {
           status->setText(successMessage);
@@ -273,7 +347,16 @@ private:
   }
 
   QString uriFor(const fcitx::kcm::ConfigWidget *page) const {
-    return page == pinyin_ ? pinyinUri_ : shuangpinUri_;
+    if (page == pinyin_) {
+      return pinyinUri_;
+    }
+    if (page == shuangpin_) {
+      return shuangpinUri_;
+    }
+    if (page == global_) {
+      return globalUri_;
+    }
+    return {};
   }
 
   // Both pages stay loaded so switching tabs keeps unsaved edits. Submitting the
@@ -516,21 +599,21 @@ private:
     QMessageBox::warning(this, QStringLiteral("Fusion 输入法设置"), message);
   }
 
-  void reloadSelection(std::function<void()> continuation = {}) {
+  void reloadImList(std::function<void()> continuation = {}) {
     if (!provider_.controller()) {
       if (continuation) {
         continuation();
       }
       return;
     }
-    auto *call = provider_.controller()->GetSelection();
+    auto *call = provider_.controller()->GetImList();
     connect(call, &fcitx::kcm::PendingCall::finished, this,
             [this, call, continuation = std::move(continuation)]() mutable {
               const auto reply = call->reply();
-              const auto selection = call->selection();
+              const auto list = call->imList();
               call->deleteLater();
               if (reply.type() == QDBusMessage::ReplyMessage) {
-                setSelection(selection);
+                populateImList(list);
                 if (continuation) {
                   continuation();
                 }
@@ -540,39 +623,97 @@ private:
             });
   }
 
-  void setSelection(const fcitx::kcm::SettingsSelection &selection) {
-    const int index = selection_->findData(selection.selected);
-    if (index >= 0) {
-      selection_->setCurrentIndex(index);
-      const bool wasBlocked = tabs_->blockSignals(true);
-      tabs_->setCurrentIndex(index);
-      tabs_->blockSignals(wasBlocked);
+  // Splits the Host's authoritative list into the two panes: the enabled methods
+  // keep their order (top row = Items/0 = the active method), and every defined
+  // method not in the enabled list appears as available to add.
+  void populateImList(const fcitx::kcm::SettingsImList &list) {
+    availableList_->clear();
+    enabledList_->clear();
+    for (const auto &name : list.enabled) {
+      auto *item = enabledList_->addItem(inputMethodName(name));
+      item->setData(Qt::UserRole, name);
     }
-    auto *model = qobject_cast<QStandardItemModel *>(selection_->model());
-    for (int i = 0; model && i < selection_->count(); ++i) {
-      if (auto *item = model->item(i)) {
-        item->setEnabled(selection.available.contains(selection_->itemData(i).toString()));
+    for (const auto &name : list.available) {
+      if (list.enabled.contains(name)) {
+        continue;
       }
+      auto *item = availableList_->addItem(inputMethodName(name));
+      item->setData(Qt::UserRole, name);
     }
+  }
+
+  QStringList enabledOrder() const {
+    QStringList order;
+    for (int i = 0; i < enabledList_->count(); ++i) {
+      order.append(enabledList_->item(i)->data(Qt::UserRole).toString());
+    }
+    return order;
+  }
+
+  void moveEnabledRow(int row, int delta) {
+    const int target = row + delta;
+    if (row < 0 || target < 0 || target >= enabledList_->count()) {
+      return;
+    }
+    auto *item = enabledList_->takeItem(row);
+    enabledList_->insertItem(target, item);
+    enabledList_->setCurrentRow(target);
+    status_->setText(QStringLiteral("输入方式列表有未应用的更改。"));
+  }
+
+  // Writes the enabled order through the Host's official setGroup/save. The Host
+  // refuses an empty list and any method it does not define; a failure reloads the
+  // authoritative list so the panes never drift from what the Host persisted.
+  void applyImList(const QStringList &enabled, QLabel *status) {
+    if (enabled.isEmpty()) {
+      status->setText(QStringLiteral("至少需保留一种已启用的输入方式。"));
+      return;
+    }
+    if (!provider_.controller()) {
+      showError(status, QStringLiteral("无法创建 FusionHost 重连请求。"));
+      return;
+    }
+    imApply_->setEnabled(false);
+    status->setText(QStringLiteral("正在更新输入方式列表…"));
+    auto *call = provider_.controller()->SetImList(enabled);
+    connect(call, &fcitx::kcm::PendingCall::finished, this,
+            [this, call, status] {
+              const auto reply = call->reply();
+              const auto list = call->imList();
+              call->deleteLater();
+              imApply_->setEnabled(true);
+              if (reply.type() != QDBusMessage::ReplyMessage) {
+                showError(status, reply.errorMessage());
+                reloadImList();
+                return;
+              }
+              populateImList(list);
+              status->setText(QStringLiteral("FusionHost 已确认输入方式列表。"));
+            });
   }
 
   fcitx::kcm::DBusProvider provider_;
   QLabel *status_ = nullptr;
   QTabWidget *tabs_ = nullptr;
-  QComboBox *selection_ = nullptr;
+  QListWidget *availableList_ = nullptr;
+  QListWidget *enabledList_ = nullptr;
+  QPushButton *imApply_ = nullptr;
   QPushButton *apply_ = nullptr;
   QPushButton *cancel_ = nullptr;
   QPushButton *reload_ = nullptr;
   fcitx::kcm::ConfigWidget *pinyin_ = nullptr;
   fcitx::kcm::ConfigWidget *shuangpin_ = nullptr;
+  fcitx::kcm::ConfigWidget *global_ = nullptr;
   QString pinyinUri_;
   QString shuangpinUri_;
+  QString globalUri_;
   // Last authoritative values per page, used to submit only what this page changed.
   QHash<fcitx::kcm::ConfigWidget *, QVariantMap> baseline_;
   int pinyinLoads_ = 0;
   int shuangpinLoads_ = 0;
   bool pinyinLoaded_ = false;
   bool shuangpinLoaded_ = false;
+  bool globalLoaded_ = false;
   bool selfTest_ = false;
   bool windowScreenshot_ = false;
   QString screenshot_;

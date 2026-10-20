@@ -454,6 +454,20 @@ void HostServer::Connection::run() {
         pipe->disconnect_client();
       }
       break;
+    case MessageType::SettingsGetImListRequest:
+      if (settings_capable) {
+        handle_settings_get_im_list(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsSetImListRequest:
+      if (settings_capable) {
+        handle_settings_set_im_list(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
     default: {
       const unsigned type = static_cast<unsigned>(static_cast<std::uint8_t>(frame->type));
       std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, disconnecting\n", type);
@@ -647,6 +661,49 @@ void HostServer::Connection::handle_settings_select_input_method(
         "The input method may have changed, but the Host could not confirm the selection. Reload before retrying.");
   }
   send_response(MessageType::SettingsSelectInputMethodResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_get_im_list(
+    const std::vector<std::uint8_t> &payload) {
+  if (!payload.empty()) {
+    pipe->disconnect_client();
+    return;
+  }
+  ImList list;
+  std::string error;
+  const auto status = backend.settings_get_im_list(list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok && !settings_detail::write_im_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Error, "The input-method list exceeds the supported response bound.");
+  }
+  send_response(MessageType::SettingsGetImListResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_set_im_list(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  std::vector<std::string> enabled;
+  if (!deserialize_settings_set_im_list_request(payload.data(), payload.size(), enabled)) {
+    pipe->disconnect_client();
+    return;
+  }
+  ImList list;
+  std::string error;
+  const auto status = backend.settings_set_im_list(enabled, list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok && !settings_detail::write_im_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Indeterminate,
+        "The input-method list may have changed, but the Host could not confirm the result. Reload "
+        "before retrying.");
+  }
+  send_response(MessageType::SettingsSetImListResponse, response_payload);
   close_after_settings_request = true;
 }
 

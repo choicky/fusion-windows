@@ -100,6 +100,35 @@ bool readString(const QByteArray &bytes, qsizetype &offset, QString &value) {
     return true;
 }
 
+bool appendStringList(QByteArray &bytes, const QStringList &items) {
+    if (static_cast<quint32>(items.size()) > fusion::ipc::max_vector_length) {
+        return false;
+    }
+    appendU32(bytes, static_cast<quint32>(items.size()));
+    for (const auto &item : items) {
+        if (!appendString(bytes, item)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool readStringList(const QByteArray &bytes, qsizetype &offset, QStringList &items) {
+    quint32 count = 0;
+    if (!readU32(bytes, offset, count) || count > fusion::ipc::max_vector_length) {
+        return false;
+    }
+    items.clear();
+    for (quint32 i = 0; i < count; ++i) {
+        QString item;
+        if (!readString(bytes, offset, item)) {
+            return false;
+        }
+        items.append(item);
+    }
+    return true;
+}
+
 bool readValue(const QByteArray &bytes, qsizetype &offset, fusion::SettingsValue &value,
                std::size_t depth, std::size_t &nodes) {
     if (depth > fusion::ipc::max_settings_depth || ++nodes > fusion::ipc::max_settings_nodes) {
@@ -263,13 +292,15 @@ QByteArray makeFrame(fusion::ipc::MessageType type, const QByteArray &payload) {
 
 } // namespace
 
-void PendingCall::complete(const QDBusMessage &reply, SettingsSelection selection) {
+void PendingCall::complete(const QDBusMessage &reply, SettingsSelection selection,
+                           SettingsImList imList) {
     if (finished_) {
         return;
     }
     finished_ = true;
     reply_ = reply;
     selection_ = std::move(selection);
+    imList_ = std::move(imList);
     if (!completionQueued_) {
         completionQueued_ = true;
         QTimer::singleShot(0, this, [this] { Q_EMIT finished(); });
@@ -373,6 +404,13 @@ private:
                 return {};
             }
             break;
+        case ControllerProxy::Operation::GetImList:
+            break;
+        case ControllerProxy::Operation::SetImList:
+            if (!appendStringList(payload, value_.toStringList())) {
+                return {};
+            }
+            break;
         }
         return payload;
     }
@@ -387,6 +425,10 @@ private:
             return fusion::ipc::MessageType::SettingsGetSelectionRequest;
         case ControllerProxy::Operation::SelectInputMethod:
             return fusion::ipc::MessageType::SettingsSelectInputMethodRequest;
+        case ControllerProxy::Operation::GetImList:
+            return fusion::ipc::MessageType::SettingsGetImListRequest;
+        case ControllerProxy::Operation::SetImList:
+            return fusion::ipc::MessageType::SettingsSetImListRequest;
         }
         return fusion::ipc::MessageType::SettingsGetConfigRequest;
     }
@@ -401,6 +443,10 @@ private:
             return fusion::ipc::MessageType::SettingsGetSelectionResponse;
         case ControllerProxy::Operation::SelectInputMethod:
             return fusion::ipc::MessageType::SettingsSelectInputMethodResponse;
+        case ControllerProxy::Operation::GetImList:
+            return fusion::ipc::MessageType::SettingsGetImListResponse;
+        case ControllerProxy::Operation::SetImList:
+            return fusion::ipc::MessageType::SettingsSetImListResponse;
         }
         return fusion::ipc::MessageType::SettingsGetConfigResponse;
     }
@@ -520,6 +566,20 @@ private:
                 return;
             }
             call_->complete(configReply(values, types));
+        } else if (operation_ == ControllerProxy::Operation::GetImList ||
+                   operation_ == ControllerProxy::Operation::SetImList) {
+            SettingsImList list;
+            QStringList enabled, available;
+            if (!readString(payload, offset, list.active) ||
+                !readString(payload, offset, list.fallback) ||
+                !readStringList(payload, offset, enabled) ||
+                !readStringList(payload, offset, available) || offset != payload.size()) {
+                fail(QStringLiteral("FusionHost returned a malformed input-method list."));
+                return;
+            }
+            list.enabled = enabled;
+            list.available = available;
+            call_->complete(emptyReply(), SettingsSelection{}, std::move(list));
         } else {
             QString selected;
             quint32 count = 0;
@@ -615,6 +675,18 @@ PendingCall *ControllerProxy::GetSelection() {
 PendingCall *ControllerProxy::SelectInputMethod(const QString &method) {
     auto *call = new PendingCall(this);
     startRequest(Operation::SelectInputMethod, {}, method, call);
+    return call;
+}
+
+PendingCall *ControllerProxy::GetImList() {
+    auto *call = new PendingCall(this);
+    startRequest(Operation::GetImList, {}, {}, call);
+    return call;
+}
+
+PendingCall *ControllerProxy::SetImList(const QStringList &enabled) {
+    auto *call = new PendingCall(this);
+    startRequest(Operation::SetImList, {}, QVariant(enabled), call);
     return call;
 }
 

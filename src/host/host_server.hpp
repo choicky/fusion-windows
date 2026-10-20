@@ -246,6 +246,8 @@ private:
     void handle_settings_set_config(const std::vector<std::uint8_t> &payload);
     void handle_settings_get_selection(const std::vector<std::uint8_t> &payload);
     void handle_settings_select_input_method(const std::vector<std::uint8_t> &payload);
+    void handle_settings_get_im_list(const std::vector<std::uint8_t> &payload);
+    void handle_settings_set_im_list(const std::vector<std::uint8_t> &payload);
     void handle_bind(const std::vector<std::uint8_t> &payload);
     void handle_reset(const std::vector<std::uint8_t> &payload);
     void handle_unbind(const std::vector<std::uint8_t> &payload);

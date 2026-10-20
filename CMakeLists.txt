@@ -339,6 +339,19 @@ if(BUILD_TESTING)
     target_compile_options(wp3_input_methods PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
   add_test(NAME wp3_input_methods COMMAND wp3_input_methods)
+  # Stage A settings/list protocol and the product-side list validation are pure
+  # header logic (no Fcitx instance), so they build and run on every platform.
+  add_executable(stage_a_settings tests/stage_a_settings.cpp)
+  target_include_directories(stage_a_settings PRIVATE src include)
+  target_compile_features(stage_a_settings PRIVATE cxx_std_20)
+  if(MSVC)
+    target_compile_options(stage_a_settings PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(stage_a_settings PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  foreach(test protocol bounds validator)
+    add_test(NAME stage_a_settings_${test} COMMAND stage_a_settings ${test})
+  endforeach()
   # Stage 5 candidate projection/action decisions are platform-free controller
   # logic (the Win32 surface is smoke-tested on the real product path), so they
   # build with the same portable sources as tsf_lifecycle.

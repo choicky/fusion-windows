@@ -211,6 +211,21 @@ public:
     return SettingsStatus::Unsupported;
   }
 
+  // Stage A input-method list management. Get reads the current group's ordered
+  // enabled list plus the full available set; Set writes an ordered enabled list
+  // back through the manager's official setGroup/save. These are separate from the
+  // single-select path above: selection changes which method a context follows,
+  // list management changes which methods belong to the group and their order.
+  virtual SettingsStatus settings_get_im_list(ImList &, std::string &error) {
+    error = "input-method list management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_set_im_list(const std::vector<std::string> &, ImList &,
+                                              std::string &error) {
+    error = "input-method list management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+
   // Link lifecycle. Defaults describe a backend with no transport, so every
   // existing implementation (Mock, in-process Fcitx, test fakes) stays valid and
   // keeps exactly the Stage 4A lifecycle: established, no incarnation, one bind.

@@ -85,10 +85,19 @@ enum class MessageType : std::uint8_t {
   SettingsGetSelectionResponse = 0x12,
   SettingsSelectInputMethodRequest = 0x13,
   SettingsSelectInputMethodResponse = 0x14,
+  // Stage A input-method list management (settings_api_version 2). GetImList
+  // returns the ordered enabled list plus the full available set; SetImList
+  // writes an ordered enabled list back through the manager's setGroup/save.
+  // Additive on v4, one request per connection, so existing v4 TIP and v1
+  // settings clients are unaffected.
+  SettingsGetImListRequest = 0x15,
+  SettingsGetImListResponse = 0x16,
+  SettingsSetImListRequest = 0x17,
+  SettingsSetImListResponse = 0x18,
 };
 
 inline constexpr std::uint8_t max_message_type =
-    static_cast<std::uint8_t>(MessageType::SettingsSelectInputMethodResponse);
+    static_cast<std::uint8_t>(MessageType::SettingsSetImListResponse);
 
 struct WireFrame {
   MessageType type{};

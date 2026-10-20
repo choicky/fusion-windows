@@ -4,6 +4,7 @@
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/rawconfig.h>
 #include "startup_group.hpp"
+#include "im_list.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <fcitx/inputmethodgroup.h>
 #include <fcitx/inputmethodmanager.h>
 #include <fcitx/inputpanel.h>
+#include <fcitx/globalconfig.h>
 #include <fcitx/instance.h>
 #include <future>
 #include <iterator>
@@ -59,6 +61,11 @@ constexpr std::size_t preedit_segment_bound = 16;
 // Engineering bounds for this PoC only; D072 numerical policy remains OPEN.
 constexpr auto request_wait = std::chrono::seconds(2);
 constexpr char input_method_config_prefix[] = "fcitx://config/inputmethod/";
+// The official Fcitx global-configuration URI (fcitx5 modules/dbus/dbusmodule.cpp
+// globalConfigPath). It is served here with the same GetConfig/SetConfig messages
+// and the same dumpDescription/save/load+safeSave+reloadConfig semantics as the
+// D-Bus controller uses; no Fusion-specific schema is introduced.
+constexpr char global_config_uri[] = "fcitx://config/global";
 
 bool parse_supported_input_method_uri(const std::string &uri, std::string &name) {
   const std::string prefix = input_method_config_prefix;
@@ -68,6 +75,8 @@ bool parse_supported_input_method_uri(const std::string &uri, std::string &name)
   name = uri.substr(prefix.size());
   return name == "pinyin" || name == "shuangpin";
 }
+
+bool is_global_config_uri(const std::string &uri) { return uri == global_config_uri; }
 
 // Convert the public RawConfig tree to the same string/map shape used by Fcitx's
 // Controller1.GetConfig. An empty map key carries a node's own scalar value.
@@ -522,9 +531,22 @@ public:
 
   SettingsStatus settings_get_config(const std::string &uri, SettingsSnapshot &snapshot,
                                      std::string &error) override {
+    if (is_global_config_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, result](std::string &taskError) {
+                          return read_global_settings_on_loop(*result, taskError);
+                        },
+                        error, SettingsStatus::Timeout);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
     std::string method;
     if (!parse_supported_input_method_uri(uri, method)) {
-      error = "Only the Pinyin and Shuangpin input-method settings are available.";
+      error = "Only the Global configuration and the Pinyin and Shuangpin input-method settings "
+              "are available.";
       return SettingsStatus::Invalid;
     }
     auto result = std::make_shared<SettingsSnapshot>();
@@ -541,8 +563,24 @@ public:
 
   SettingsStatus settings_set_config(const std::string &uri, const SettingsValue &submitted,
                                      SettingsSnapshot &snapshot, std::string &error) override {
+    if (!submitted.is_map) {
+      error = "The settings request is invalid.";
+      return SettingsStatus::Invalid;
+    }
+    if (is_global_config_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, submitted, result](std::string &taskError) {
+                            return apply_global_settings_on_loop(submitted, *result, taskError);
+                          },
+                          error, SettingsStatus::Indeterminate);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
     std::string method;
-    if (!parse_supported_input_method_uri(uri, method) || !submitted.is_map) {
+    if (!parse_supported_input_method_uri(uri, method)) {
       error = "The settings request is invalid.";
       return SettingsStatus::Invalid;
     }
@@ -622,6 +660,31 @@ public:
         error, SettingsStatus::Indeterminate);
     if (status == SettingsStatus::Ok) {
       selection = std::move(*result);
+    }
+    return status;
+  }
+
+  SettingsStatus settings_get_im_list(ImList &list, std::string &error) override {
+    auto result = std::make_shared<ImList>();
+    const auto status = invoke_settings(
+        [this, result](std::string &taskError) { return im_list_on_loop(*result, taskError); },
+        error, SettingsStatus::Timeout);
+    if (status == SettingsStatus::Ok) {
+      list = std::move(*result);
+    }
+    return status;
+  }
+
+  SettingsStatus settings_set_im_list(const std::vector<std::string> &enabled, ImList &list,
+                                      std::string &error) override {
+    auto result = std::make_shared<ImList>();
+    const auto status = invoke_settings(
+        [this, enabled, result](std::string &taskError) {
+          return apply_im_list_on_loop(enabled, *result, taskError);
+        },
+        error, SettingsStatus::Indeterminate);
+    if (status == SettingsStatus::Ok) {
+      list = std::move(*result);
     }
     return status;
   }
@@ -714,6 +777,60 @@ private:
     return false;
   }
 
+  SettingsStatus read_global_settings_on_loop(SettingsSnapshot &snapshot, std::string &error) {
+    const auto &global = instance_->globalConfig();
+    fcitx::RawConfig values;
+    global.save(values);
+    snapshot.values = raw_config_to_settings_value(values);
+    snapshot.types = dump_settings_description(global.config());
+    (void)error;
+    return SettingsStatus::Ok;
+  }
+
+  // The official D-Bus controller apply sequence for fcitx://config/global
+  // (dbusmodule.cpp:425-432): partial load onto the live GlobalConfig, safeSave, and
+  // reloadConfig only if the save succeeded. The submitted tree is merged onto the
+  // current values first (same delta/no-change path as an input-method page), so a
+  // partial load never resets an unexposed option to its default, and a no-change
+  // Apply calls neither load nor safeSave nor reloadConfig and touches no file.
+  SettingsStatus apply_global_settings_on_loop(const SettingsValue &submitted,
+                                               SettingsSnapshot &snapshot, std::string &error) {
+    SettingsSnapshot current;
+    if (const auto status = read_global_settings_on_loop(current, error);
+        status != SettingsStatus::Ok) {
+      return status;
+    }
+    if (current.types.empty()) {
+      error = "Fcitx returned no schema for the global configuration.";
+      return SettingsStatus::Error;
+    }
+    SettingsValue merged = current.values;
+    if (!merge_schema_values(current.types, current.types.front().name, submitted, merged,
+                             error)) {
+      return SettingsStatus::Invalid;
+    }
+    if (merged == current.values) {
+      snapshot = std::move(current);
+      return SettingsStatus::Ok;
+    }
+    if (has_active_composition_on_loop()) {
+      error = "Finish the current composition, then retry applying the global settings.";
+      return SettingsStatus::Busy;
+    }
+    fcitx::RawConfig raw;
+    if (!settings_value_fill_raw_config(merged, raw)) {
+      error = "The global settings value tree is malformed.";
+      return SettingsStatus::Invalid;
+    }
+    instance_->globalConfig().load(raw, /*partial=*/true);
+    if (!instance_->globalConfig().safeSave()) {
+      error = "Fcitx could not save the global configuration; reload before retrying.";
+      return SettingsStatus::Error;
+    }
+    instance_->reloadConfig();
+    return read_global_settings_on_loop(snapshot, error);
+  }
+
   SettingsStatus read_settings_on_loop(const std::string &method, SettingsSnapshot &snapshot,
                                        std::string &error) {
     const auto *entry = instance_->inputMethodManager().entry(method);
@@ -793,6 +910,105 @@ private:
       return SettingsStatus::Unsupported;
     }
     return SettingsStatus::Ok;
+  }
+
+  // The input methods this packaged runtime defines. The Host registers only the
+  // Pinyin and Shuangpin engines, so the manageable set is those names where an
+  // entry actually exists; a name outside it is not exposed and is refused on
+  // write (see im_list.hpp), rather than silently dropped by setGroup.
+  std::vector<std::string> available_method_names_on_loop() const {
+    auto &manager = instance_->inputMethodManager();
+    std::vector<std::string> names;
+    for (const char *name : {"pinyin", "shuangpin"}) {
+      if (manager.entry(name)) {
+        names.emplace_back(name);
+      }
+    }
+    return names;
+  }
+
+  // Reads the current group's ordered membership using official semantics:
+  // enabled = the group's defined Items, active = Items/0, fallback = DefaultIM,
+  // available = the methods this runtime defines.
+  SettingsStatus im_list_on_loop(ImList &list, std::string &error) {
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    list = {};
+    list.available = available_method_names_on_loop();
+    if (list.available.empty()) {
+      error = "This Host has no Pinyin or Shuangpin input method available.";
+      return SettingsStatus::Unsupported;
+    }
+    for (const auto &item : group.inputMethodList()) {
+      const auto &name = item.name();
+      if (std::find(list.available.begin(), list.available.end(), name) !=
+          list.available.end()) {
+        list.enabled.push_back(name);
+      }
+    }
+    if (!list.enabled.empty()) {
+      list.active = list.enabled.front();
+    }
+    list.fallback = group.defaultInputMethod();
+    return SettingsStatus::Ok;
+  }
+
+  // Writes an ordered enabled list back through the official setGroup/save path.
+  // The pure validator refuses an empty list and any unavailable name; a no-change
+  // Apply neither touches the composition guard nor calls save (no file writes);
+  // each retained entry keeps its keyboard layout and the group's existing
+  // DefaultIM is carried to setDefaultInputMethod so Fcitx preserves the fallback.
+  SettingsStatus apply_im_list_on_loop(const std::vector<std::string> &requested, ImList &out,
+                                       std::string &error) {
+    auto &manager = instance_->inputMethodManager();
+    const auto available = available_method_names_on_loop();
+    if (available.empty()) {
+      error = "This Host has no Pinyin or Shuangpin input method available.";
+      return SettingsStatus::Unsupported;
+    }
+    const auto &current_group = manager.currentGroup();
+    const auto plan =
+        selection::plan_im_list_update(requested, available, current_group.defaultInputMethod());
+    if (!plan) {
+      error = "The input-method list must contain at least one method this Host defines, and every "
+              "entry must be available.";
+      return SettingsStatus::Invalid;
+    }
+    // No-change short-circuit: same defined membership and order and the same
+    // requested fallback leaves the group identical, so persist nothing.
+    const auto current_enabled = [&] {
+      std::vector<std::string> names;
+      for (const auto &item : current_group.inputMethodList()) {
+        const auto &name = item.name();
+        if (std::find(available.begin(), available.end(), name) != available.end()) {
+          names.push_back(name);
+        }
+      }
+      return names;
+    }();
+    if (current_enabled == plan->methods &&
+        current_group.defaultInputMethod() == plan->requested_fallback) {
+      return im_list_on_loop(out, error);
+    }
+    if (has_active_composition_on_loop()) {
+      error = "Finish the current composition, then retry the input-method list change.";
+      return SettingsStatus::Busy;
+    }
+    auto group = current_group;
+    std::vector<fcitx::InputMethodGroupItem> rebuilt;
+    rebuilt.reserve(plan->methods.size());
+    for (const auto &name : plan->methods) {
+      fcitx::InputMethodGroupItem item(name);
+      const auto &layout = current_group.layoutFor(name);
+      if (!layout.empty()) {
+        item.setLayout(layout);
+      }
+      rebuilt.push_back(std::move(item));
+    }
+    group.inputMethodList() = std::move(rebuilt);
+    group.setDefaultInputMethod(plan->requested_fallback);
+    manager.setGroup(std::move(group));
+    manager.save();
+    return im_list_on_loop(out, error);
   }
 
   static std::vector<std::string> method_names(const fcitx::InputMethodGroup &group) {

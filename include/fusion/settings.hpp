@@ -54,6 +54,23 @@ struct SettingsSelection {
   std::vector<std::string> available;
 };
 
+// Stage A input-method list management (settings_api_version 2). This models one
+// Fcitx input-method group's membership using official semantics, not a Fusion
+// concept. `active` is the group's Items/0 (the method a bound context follows);
+// `fallback` is Fcitx's DefaultIM (NOT the active method). `enabled` is the
+// ordered Items list (Items/0..N, so enabled.front() == active when non-empty);
+// `available` is every input method the packaged runtime actually defines. An
+// add/remove/reorder writes `enabled` + `active` back through the manager's
+// setGroup/save; it never deletes a method definition file or learning data.
+struct ImList {
+  std::string active;
+  std::string fallback;
+  std::vector<std::string> enabled;
+  std::vector<std::string> available;
+
+  bool operator==(const ImList &) const = default;
+};
+
 enum class SettingsStatus : std::uint8_t {
   Ok = 0,
   Error = 1,

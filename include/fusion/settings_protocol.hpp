@@ -11,7 +11,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t settings_api_version = 1;
+inline constexpr std::uint32_t settings_api_version = 2;
 inline constexpr std::size_t max_settings_payload = 60 * 1024;
 inline constexpr std::size_t max_settings_nodes = 4096;
 inline constexpr std::size_t max_settings_map_entries = 512;
@@ -209,6 +209,58 @@ inline bool read_selection(detail::Reader &reader, SettingsSelection &selection)
   return true;
 }
 
+inline bool write_string_list(std::vector<std::uint8_t> &out,
+                              const std::vector<std::string> &items) {
+  if (items.size() > max_vector_length) {
+    return false;
+  }
+  detail::write_u32(out, static_cast<std::uint32_t>(items.size()));
+  for (const auto &item : items) {
+    if (!write_string(out, item)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool read_string_list(detail::Reader &reader, std::vector<std::string> &items) {
+  auto count = reader.read_u32();
+  if (!count || *count > max_vector_length) {
+    return false;
+  }
+  items.clear();
+  items.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto item = reader.read_string();
+    if (!item) {
+      return false;
+    }
+    items.push_back(std::move(*item));
+  }
+  return true;
+}
+
+// ImList: active, fallback, ordered enabled list, available list. Every string is
+// capped by max_string_length and every list by max_vector_length, so a bound
+// peer cannot drive unbounded allocation; readers fail closed on a short buffer
+// or trailing bytes.
+inline bool write_im_list(std::vector<std::uint8_t> &out, const ImList &list) {
+  return write_string(out, list.active) && write_string(out, list.fallback) &&
+         write_string_list(out, list.enabled) && write_string_list(out, list.available) &&
+         out.size() <= max_settings_payload;
+}
+
+inline bool read_im_list(detail::Reader &reader, ImList &list) {
+  auto active = reader.read_string();
+  auto fallback = reader.read_string();
+  if (!active || !fallback) {
+    return false;
+  }
+  list.active = std::move(*active);
+  list.fallback = std::move(*fallback);
+  return read_string_list(reader, list.enabled) && read_string_list(reader, list.available);
+}
+
 } // namespace settings_detail
 
 inline std::vector<std::uint8_t> serialize_settings_hello(std::uint32_t protocol,
@@ -279,6 +331,31 @@ inline bool deserialize_settings_set_request(const std::uint8_t *data, std::size
   }
   uri = std::move(*parsed_uri);
   values = std::move(*parsed_values);
+  return true;
+}
+
+// Stage A: the input-method list-set request carries the desired ordered enabled
+// list (Items/0..N). The active method is enabled.front(); the fallback and each
+// entry's keyboard layout are preserved server-side, so they are not sent here.
+inline std::vector<std::uint8_t> serialize_settings_set_im_list_request(
+    const std::vector<std::string> &enabled) {
+  std::vector<std::uint8_t> payload;
+  if (!settings_detail::write_string_list(payload, enabled) ||
+      payload.size() > max_settings_payload) {
+    payload.clear();
+  }
+  return payload;
+}
+
+inline bool deserialize_settings_set_im_list_request(const std::uint8_t *data, std::size_t size,
+                                                     std::vector<std::string> &enabled) {
+  if (size > max_settings_payload) {
+    return false;
+  }
+  detail::Reader reader{data, size};
+  if (!settings_detail::read_string_list(reader, enabled) || !reader.at_end()) {
+    return false;
+  }
   return true;
 }
 
