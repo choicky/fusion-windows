@@ -101,7 +101,7 @@ try {
   $builtLocale = Join-Path $binDir 'data\locale'
   if (Test-Path -LiteralPath $builtLocale) {
     New-Item -ItemType Directory -Force (Join-Path $stage 'data\locale') | Out-Null
-    Copy-Item -LiteralPath $builtLocale -Destination (Join-Path $stage 'data\locale') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $builtLocale '*') -Destination (Join-Path $stage 'data\locale') -Recurse -Force
   }
   New-Item -ItemType Directory -Force (Join-Path $stage 'lib') | Out-Null
   Copy-Item -LiteralPath (Join-Path $libDir 'libime') -Destination (Join-Path $stage 'lib\libime') -Recurse -Force
