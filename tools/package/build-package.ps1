@@ -145,7 +145,7 @@ try {
   if (-not $UpstreamRoot) { throw 'Pass the pinned Fcitx upstream source root as -UpstreamRoot for the translation catalog' }
   $msgfmt = Join-Path $VcpkgRoot 'installed\x64-windows\tools\gettext\bin\msgfmt.exe'
   if (-not (Test-Path -LiteralPath $msgfmt)) { throw "Pinned gettext msgfmt.exe not found: $msgfmt" }
-  $localeDir = Join-Path $stage 'bin\data\locale\zh_CN\LC_MESSAGES'
+  $localeDir = Join-Path $stage 'data\locale\zh_CN\LC_MESSAGES'
   New-Item -ItemType Directory -Force $localeDir | Out-Null
   foreach ($translation in @(
       @((Join-Path $SettingsSourceRoot 'fcitx5-configtool\po\fcitx5-configtool\zh_CN.po'), 'fcitx5-configtool.mo'),
