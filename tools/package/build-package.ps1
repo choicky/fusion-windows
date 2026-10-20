@@ -105,6 +105,12 @@ try {
   }
   New-Item -ItemType Directory -Force (Join-Path $stage 'lib') | Out-Null
   Copy-Item -LiteralPath (Join-Path $libDir 'libime') -Destination (Join-Path $stage 'lib\libime') -Recurse -Force
+  $runtime = [ordered]@{
+    identity = $RuntimeIdentity
+    machine = $env:COMPUTERNAME
+    rebuilt = 'rebuilt from the pinned sources by tools/fcitx/build-native.ps1 for this owner-test package'
+    patches = @('fcitx5-msvc.patch', 'chinese-addons-msvc.patch')
+  }
   if ($UpstreamRoot) {
     New-Item -ItemType Directory -Force (Join-Path $stage 'licenses\runtime') | Out-Null
     $sourceAccess = Join-Path $RepoRoot 'third_party\settings-ui\SOURCE-ACCESS.txt'
@@ -183,13 +189,6 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
   if ($dirty) { throw 'Owner-test package must be built from a clean committed fusion-windows worktree' }
 
-  $runtime = [ordered]@{
-    identity = $RuntimeIdentity
-      # Runtime artifacts are hashed in the manifest; this label is not their identity.
-    machine  = $env:COMPUTERNAME
-    rebuilt  = 'rebuilt from the pinned sources by tools/fcitx/build-native.ps1 for this owner-test package'
-    patches  = @('fcitx5-msvc.patch', 'chinese-addons-msvc.patch')
-  }
   $settingsPins = Get-Content -LiteralPath (Join-Path $RepoRoot 'cmake\settings-ui\versions.cmake') -Raw
   $vcpkgMatch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_VCPKG_COMMIT "([0-9a-f]{40})"\)$')
   if (-not $vcpkgMatch.Success) { throw 'Missing exact vcpkg commit pin' }
