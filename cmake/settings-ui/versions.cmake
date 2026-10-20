@@ -1,5 +1,6 @@
 # Upstream/runtime compatibility pins used by the owner-test settings executable.
 set(FUSION_SETTINGS_CONFIGTOOL_REPOSITORY "https://github.com/choicky/fcitx5-configtool.git")
+set(FUSION_SETTINGS_CONFIGTOOL_BRANCH "windows/fusion-settings")
 set(FUSION_SETTINGS_CONFIGTOOL_BASE_COMMIT "9bd6022c6f5f768d32b6dbe2012358e4cdb1116b")
 set(FUSION_SETTINGS_CONFIGTOOL_COMMIT "abc2c6644b030d761d3d5e7c27c888af019e63f0")
 set(FUSION_SETTINGS_FCITXQT_COMMIT "0285a5d18367d8f3af80dab7e4819d5555982340")
