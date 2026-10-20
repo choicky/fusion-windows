@@ -1,10 +1,14 @@
 // Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
 // end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <mode>, one of: protocol | loopback | hostserver | wp3singleton |
-// wp3shutdown | wp4stopevent | wp4sessionend | integration
+// Usage: stage4a <mode>, one of: protocol | pipeendpoint | loopback | hostserver |
+// wp3singleton | wp3shutdown | wp4stopevent | wp4sessionend | integration
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
+// - pipeendpoint: the settings client's endpoint name — the default startup path
+//   keeps the product identity and round-trips to compute_pipe_name(), an explicit
+//   isolated endpoint keeps its complete name, and empty/malformed endpoints are
+//   rejected instead of being rewritten into another endpoint.
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
 // - hostserver: real HostServer with a fake Backend that mimics FcitxBackend
 //   admission (duplicate bind rejected, every call fails on admission contention):
@@ -861,6 +865,68 @@ void run_loopback_server(PipeServer &server, CallbackBackend &backend, std::atom
 
 KeyAction physical(char character) {
   return translate_key(static_cast<unsigned char>(character), false, false, false, character);
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1b: the settings endpoint name
+// ---------------------------------------------------------------------------
+//
+// FusionSettings hands QLocalSocket::connectToServer() a *logical* pipe name; Qt
+// prepends `\\.\pipe\` itself (qtbase v6.8.3 qlocalsocket_win.cpp:173-177, and
+// qlocalserver_win.cpp:209-213 on the server end). This exercises the same
+// fusion::ipc::logical_pipe_name() the product calls, so a regression in the
+// conversion fails here rather than in an installed window.
+void test_pipe_endpoint() {
+  const std::wstring device(fusion::ipc::pipe_device_path_prefix);
+  require(device == L"\\\\.\\pipe\\", "device path prefix is the Win32 pipe path");
+
+  // 1. Default startup keeps the product identity and round-trips exactly to the
+  //    endpoint compute_pipe_name() creates for the Host.
+  {
+    const std::wstring production = fusion::ipc::compute_pipe_name();
+    require(!production.empty(), "compute_pipe_name() yields an endpoint");
+    require(production.rfind(device, 0) == 0, "compute_pipe_name() returns a device path");
+    const std::wstring logical = fusion::ipc::logical_pipe_name(production);
+    require(!logical.empty(), "the production endpoint converts to a logical name");
+    require(logical == production.substr(device.size()),
+            "the default conversion removes the device path only");
+    require(logical.rfind(L"FusionHost-v1-", 0) == 0,
+            "the default conversion retains the product pipe identity");
+    require(device + logical == production,
+            "Qt re-adding the device path reaches the Host endpoint exactly");
+  }
+
+  // 2. An explicit endpoint keeps its complete name, whichever accepted form the
+  //    caller used (the isolated runner passes the device path).
+  {
+    const std::wstring isolated = L"fusion-selftest-8f2c";
+    require(fusion::ipc::logical_pipe_name(device + isolated) == isolated,
+            "an explicit device-path endpoint keeps its complete name");
+    require(fusion::ipc::logical_pipe_name(isolated) == isolated,
+            "an explicit logical endpoint keeps its complete name");
+    const std::wstring production_shaped = L"FusionHost-v1-S-1-5-21-1-1";
+    require(fusion::ipc::logical_pipe_name(device + production_shaped) == production_shaped,
+            "an explicit production-shaped endpoint keeps the product identity");
+  }
+
+  // 3. Empty and malformed endpoints are rejected, never rewritten into another
+  //    endpoint. The caller fails closed on the empty result.
+  {
+    require(fusion::ipc::logical_pipe_name(L"").empty(), "an empty endpoint is rejected");
+    require(fusion::ipc::logical_pipe_name(device).empty(),
+            "a bare device path with no name is rejected");
+    require(fusion::ipc::logical_pipe_name(L"   ").empty(), "a whitespace endpoint is rejected");
+    require(fusion::ipc::logical_pipe_name(device + L"   ").empty(),
+            "a whitespace-only name after the device path is rejected");
+    require(fusion::ipc::logical_pipe_name(L"fusion\\nested").empty(),
+            "a nested path is rejected");
+    require(fusion::ipc::logical_pipe_name(L"fusion:bad").empty(),
+            "a name Win32 rejects is rejected");
+    require(fusion::ipc::logical_pipe_name(L"fusion\nbad").empty(),
+            "a control character is rejected");
+    require(fusion::ipc::logical_pipe_name(L"\\\\?\\pipe\\fusion").empty(),
+            "an unsupported device path form is rejected");
+  }
 }
 
 void test_loopback() {
@@ -2450,12 +2516,12 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
-                      "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
-                      "wp4sessionend|hostdiag|integration>\n";
+                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
+                      "wp4stopevent|wp4sessionend|hostdiag|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
-                      "<protocol|loopback|hostserver|wp3singleton|wp3shutdown|wp4stopevent|"
-                      "wp4sessionend|hostdiag>\n";
+                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
+                      "wp4stopevent|wp4sessionend|hostdiag>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -2465,6 +2531,8 @@ int main(int argc, char *argv[]) {
   try {
     if (mode == "protocol")
       test_protocol();
+    else if (mode == "pipeendpoint")
+      test_pipe_endpoint();
     else if (mode == "loopback")
       test_loopback();
     else if (mode == "hostserver")

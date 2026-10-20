@@ -38,23 +38,27 @@
 
 namespace {
 
+// The endpoint handed to QLocalSocket::connectToServer(): the *logical* pipe name
+// only. Qt prepends `\\.\pipe\` itself (qtbase v6.8.3, qlocalsocket_win.cpp), so
+// the client must neither pass the device path nor strip the product identity:
+// removing `FusionHost-v1-` as well made the window open on
+// `\\.\pipe\<sid>-<session>` while the Host listens on
+// `\\.\pipe\FusionHost-v1-<sid>-<session>`, which is the "FusionHost is
+// unavailable or does not support settings" report on 0.0.0-settings+1f4b749.
 QString endpointName(int argc, char **argv) {
-  for (int i = 1; i + 1 < argc; ++i) {
-    if (QString::fromLocal8Bit(argv[i]) == QLatin1String("--pipe-name")) {
-      const QString supplied = QString::fromLocal8Bit(argv[i + 1]);
-      const QString prefix = QString::fromStdWString(fusion::ipc::default_pipe_name_prefix);
-      if (!supplied.startsWith(prefix) || supplied.size() == prefix.size()) {
-        return {};
-      }
-      return supplied.mid(prefix.size());
+  for (int i = 1; i < argc; ++i) {
+    if (QString::fromLocal8Bit(argv[i]) != QLatin1String("--pipe-name")) {
+      continue;
     }
+    // An explicit endpoint must stand on its own: falling back to the production
+    // pipe here would silently connect to a different Host than the one asked for.
+    if (i + 1 >= argc) {
+      return {};
+    }
+    const std::wstring supplied = QString::fromLocal8Bit(argv[i + 1]).toStdWString();
+    return QString::fromStdWString(fusion::ipc::logical_pipe_name(supplied));
   }
-  const std::wstring pipe = fusion::ipc::compute_pipe_name();
-  const std::wstring prefix = fusion::ipc::default_pipe_name_prefix;
-  if (pipe.empty() || pipe.rfind(prefix, 0) != 0) {
-    return {};
-  }
-  return QString::fromStdWString(pipe.substr(prefix.size()));
+  return QString::fromStdWString(fusion::ipc::logical_pipe_name(fusion::ipc::compute_pipe_name()));
 }
 
 QString inputMethodName(const QString &name) {
