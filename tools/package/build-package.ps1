@@ -98,10 +98,19 @@ try {
 
   # data/ and lib/libime: the Fcitx data root the runtime resolves from ..\data.
   Copy-Item -LiteralPath $dataDir -Destination (Join-Path $stage 'data') -Recurse -Force
+  # The build stages the Host's catalogs under bin\data\locale, while the package
+  # keeps Fcitx data at data\locale. Copy file by file so the existing language
+  # directories are merged: copying the directory itself would nest
+  # data\locale\locale, and a wildcard under -LiteralPath would copy nothing.
   $builtLocale = Join-Path $binDir 'data\locale'
   if (Test-Path -LiteralPath $builtLocale) {
-    New-Item -ItemType Directory -Force (Join-Path $stage 'data\locale') | Out-Null
-    Copy-Item -LiteralPath (Join-Path $builtLocale '*') -Destination (Join-Path $stage 'data\locale') -Recurse -Force
+    $packagedLocale = Join-Path $stage 'data\locale'
+    foreach ($file in Get-ChildItem -LiteralPath $builtLocale -Recurse -File) {
+      $relative = $file.FullName.Substring($builtLocale.Length).TrimStart('\')
+      $target = Join-Path $packagedLocale $relative
+      New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
+      Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+    }
   }
   New-Item -ItemType Directory -Force (Join-Path $stage 'lib') | Out-Null
   Copy-Item -LiteralPath (Join-Path $libDir 'libime') -Destination (Join-Path $stage 'lib\libime') -Recurse -Force
