@@ -11,6 +11,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 
+#include <cwchar>
 #include <vector>
 
 namespace fusion::ipc {
@@ -42,6 +43,29 @@ std::wstring compute_pipe_name() {
   name += L'-';
   name += std::to_wstring(session_id);
   LocalFree(sid_str);
+  return name;
+}
+
+std::wstring logical_pipe_name(const std::wstring &endpoint) {
+  std::wstring name = endpoint;
+  const std::wstring device(pipe_device_path_prefix);
+  // Win32 object paths are case-insensitive, so accept the device path in any
+  // case rather than reject a name that names the right pipe.
+  if (name.size() > device.size() && _wcsnicmp(name.c_str(), device.c_str(), device.size()) == 0) {
+    name.erase(0, device.size());
+  }
+  // A logical name is a single pipe name component. Anything that is empty,
+  // whitespace only, a path separator, a character Win32 rejects in a pipe name
+  // or a control character cannot name an endpoint: report it as invalid rather
+  // than let a caller connect somewhere unintended.
+  if (name.find_first_not_of(L' ') == std::wstring::npos) {
+    return {};
+  }
+  for (const wchar_t character : name) {
+    if (character < 0x20 || std::wcschr(L"\\/:*?\"<>|", character) != nullptr) {
+      return {};
+    }
+  }
   return name;
 }
 
