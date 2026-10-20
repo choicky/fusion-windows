@@ -2,14 +2,15 @@
 #
 # What it does, in this order:
 #   1. refuse to run unelevated;
-#   2. ask the running Host for an orderly stop through the product's own stop
+#   2. close a running tray (U7) and mark the window as an intentional stop;
+#   3. ask the running Host for an orderly stop through the product's own stop
 #      event and wait, bounded - never terminate it;
-#   3. unregister the TIP with the same script the install used, and remove the
+#   4. unregister the TIP with the same script the install used, and remove the
 #      CTF\TIP / COM keys that the COM unregister leaves behind;
-#   4. delete the logon task;
-#   5. remove the version directories, leaving any directory a process still holds
+#   5. delete the logon tasks (Host and tray);
+#   6. remove the version directories, leaving any directory a process still holds
 #      open in place and reporting it (never force-deleted, never partially deleted);
-#   6. keep %APPDATA%\Fcitx5 unless -RemoveUserData is given, and then remove only
+#   7. keep %APPDATA%\Fcitx5 unless -RemoveUserData is given, and then remove only
 #      the current user's %APPDATA%\Fcitx5 and %LOCALAPPDATA%\Fcitx5.
 #
 # Failures are self-describing: every phase sets $currentStep, and the catch prints
@@ -30,6 +31,7 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'host-state.ps1')
 
 $taskName = 'FusionHost'
+$trayTaskName = 'FusionTray'
 $clsid = '{8B7C4A90-5E2D-4B1F-9A31-6C0F42D1E7A4}'
 $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion'
 $currentStep = 'start'
@@ -61,6 +63,21 @@ try {
   } else {
     Write-Host "Install root: $installRoot"
   }
+
+  # U7: close the tray first and mark the window as intentional. The tray would
+  # otherwise report the Host stop below as a failure, and its executable would
+  # keep the version directory in use.
+  $currentStep = 'tray'
+  Write-Step 'closing a running Fusion tray'
+  $tray = Stop-FusionTray -TimeoutMs 5000
+  if ($tray.Found) {
+    Write-Host ("  pid(s) {0}: asked={1} exited={2} after {3} ms{4}" -f ($tray.Pids -join ','),
+      $tray.Requested, $tray.Exited, $tray.WaitedMs, $(if ($tray.Forced) { ' (forced)' } else { '' }))
+  } else {
+    Write-Host '  no tray running'
+  }
+  if (-not $tray.Exited) { throw 'a running Fusion tray did not exit; use its Exit command and re-run the uninstaller' }
+  $restartMarker = Start-FusionRestartMarker
 
   $currentStep = 'stop'
   Write-Step 'asking the running Host for an orderly stop'
@@ -146,12 +163,14 @@ try {
   }
 
   $currentStep = 'task'
-  Write-Step "deleting the logon task '$taskName'"
-  if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host '  task removed'
-  } else {
-    Write-Host '  no task'
+  Write-Step "deleting the logon tasks"
+  foreach ($name in @($taskName, $trayTaskName)) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false
+      Write-Host "  task removed: $name"
+    } else {
+      Write-Host "  no task: $name"
+    }
   }
 
   $currentStep = 'remove'
@@ -213,6 +232,9 @@ try {
   if ($failure.InvocationInfo) { Write-Host $failure.InvocationInfo.PositionMessage -ForegroundColor Red }
   exit 1
 } finally {
+  # Only this run's marker; nothing may be left behind that could silence a
+  # later real Host exit.
+  try { Clear-FusionRestartMarker } catch { }
   if ($transcriptStarted) {
     try { Stop-Transcript | Out-Null } catch { }
   }

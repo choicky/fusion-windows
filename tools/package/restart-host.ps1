@@ -67,6 +67,15 @@ function Test-ExpectedPath($host_) {
 }
 
 $exitCode = 0
+# U7: a manual restart is an intentional stop. The marker tells the tray not to
+# report the Host's absence as a failure, and is removed when this run ends - also
+# when it is started from the Start Menu shortcut rather than the tray.
+$restartMarker = ''
+try {
+  $restartMarker = Start-FusionRestartMarker
+} catch {
+  Write-Host "WARNING: no restart marker was written: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 try {
   if (-not (Get-FusionScheduledTask)) {
     throw "the logon task '$taskName' does not exist; install the package first (install.ps1)"
@@ -154,6 +163,9 @@ try {
   Write-Host ''
   Write-Host ("RESTART FAILED: {0}" -f $_.Exception.Message) -ForegroundColor Red
 } finally {
+  # Before the optional pause: the restart is over, so the tray must stop
+  # treating an absence as intentional.
+  try { Clear-FusionRestartMarker } catch { }
   if ($Pause) {
     Write-Host ''
     Read-Host 'Press Enter to close this window' | Out-Null

@@ -20,6 +20,10 @@ public static extern bool OpenProcessToken(System.IntPtr process, uint access, o
 public static extern bool GetTokenInformation(System.IntPtr token, int infoClass, System.IntPtr info, int length, out int returned);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
 public static extern System.IntPtr OpenProcess(uint access, bool inherit, int processId);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr FindWindowW(string className, System.IntPtr windowName);
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool PostMessageW(System.IntPtr window, uint message, System.IntPtr wparam, System.IntPtr lparam);
 [System.Runtime.InteropServices.DllImport("advapi32.dll")]
 public static extern System.IntPtr GetSidSubAuthority(System.IntPtr sid, uint index);
 [System.Runtime.InteropServices.DllImport("advapi32.dll")]
@@ -141,9 +145,17 @@ function Get-FusionRegistrationState {
 }
 
 function Get-FusionScheduledTask {
-  $task = Get-ScheduledTask -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  return Get-FusionScheduledTaskByName -TaskName 'FusionHost'
+}
+
+# The same inventory for any task name. U7 adds a second per-user task
+# ('FusionTray'); keeping one reader means the two tasks are reported with the
+# same fields.
+function Get-FusionScheduledTaskByName {
+  param([string]$TaskName = 'FusionHost')
+  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if (-not $task) { return $null }
-  $info = Get-ScheduledTaskInfo -TaskName 'FusionHost' -ErrorAction SilentlyContinue
+  $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
   # A task with no trigger yields $null here, and @($null) is a one-element array of
   # null: filter it out before reading CimClass (StrictMode would throw). The product
   # task always has triggers; the WP7 restart tool also reads tasks registered by hand.
@@ -453,4 +465,107 @@ function Stop-FusionHostOrderly {
   $result.WaitedMs = [int]$watch.ElapsedMilliseconds
   $result.Exited = (@($result.Pids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -eq 0)
   return $result
+}
+
+# --- U7: the tray surface ---------------------------------------------------
+#
+# The tray is a separate per-user process with its own logon task. Nothing here
+# starts or stops the Host; these helpers only (a) ask a running tray to exit
+# through its own window so the icon is removed and the version directory is
+# released, and (b) write the short-lived "a restart is in progress" marker that
+# keeps an intentional stop from being reported as a Host failure.
+
+# Running tray processes. One per user x session is enforced by the tray itself;
+# this inventory is what the installer reports and, if needed, falls back to.
+function Get-FusionTrayState {
+  $result = @()
+  foreach ($process in @(Get-Process -Name FusionTray -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $process.Path } catch { }
+    $started = $null
+    try { $started = $process.StartTime } catch { }
+    $result += [pscustomobject]@{
+      Id        = $process.Id
+      Path      = $path
+      SessionId = $process.SessionId
+      StartTime = $started
+    }
+  }
+  return $result
+}
+
+# Asks the tray to exit the way its own Exit command does: WM_CLOSE to the window
+# class it registers. Falls back to a bounded Stop-Process only when the window
+# does not answer, and says so - an upgrade must not leave an old tray holding a
+# version directory, and must not silently kill a responsive one either.
+function Stop-FusionTray {
+  param([int]$TimeoutMs = 5000)
+  $result = [pscustomobject]@{
+    Found    = $false
+    Requested = $false
+    Exited   = $true
+    Forced   = $false
+    Pids     = @()
+    WaitedMs = 0
+  }
+  $trays = @(Get-FusionTrayState)
+  if ($trays.Count -eq 0) { return $result }
+  $result.Found = $true
+  $result.Pids = @($trays | ForEach-Object { $_.Id })
+  # The window name must be a real NULL: PowerShell marshals $null for a [string]
+  # parameter as an empty string, and FindWindowW then looks for a window whose
+  # title is empty - which never matches, silently degrading every stop to a kill.
+  $window = [FusionNative]::FindWindowW('FusionTrayWindow', [IntPtr]::Zero)
+  if ($window -ne [IntPtr]::Zero) {
+    # WM_CLOSE (0x0010): the tray removes its icon and exits on its own path.
+    $result.Requested = [FusionNative]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+  }
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  while ($watch.ElapsedMilliseconds -lt $TimeoutMs) {
+    if (@(Get-FusionTrayState).Count -eq 0) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  $result.WaitedMs = [int]$watch.ElapsedMilliseconds
+  $left = @(Get-FusionTrayState)
+  if ($left.Count -gt 0) {
+    foreach ($tray in $left) { Stop-Process -Id $tray.Id -Force -ErrorAction SilentlyContinue }
+    $result.Forced = $true
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline -and @(Get-FusionTrayState).Count -gt 0) {
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  $result.Exited = (@(Get-FusionTrayState).Count -eq 0)
+  return $result
+}
+
+# %LOCALAPPDATA%\fusion-tray\restart-in-progress - read by the tray, written by
+# restart-host.ps1 (and by install/uninstall around their Host stop). A marker
+# older than the tray's freshness bound is ignored by the tray, so a crash that
+# left one behind cannot silence a later real exit.
+function Get-FusionTrayMarkerPath {
+  return (Join-Path (Join-Path $env:LOCALAPPDATA 'fusion-tray') 'restart-in-progress')
+}
+
+function Start-FusionRestartMarker {
+  $path = Get-FusionTrayMarkerPath
+  try {
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force $parent | Out-Null }
+    Set-Content -LiteralPath $path -Value ([DateTime]::UtcNow.ToString('o')) -Encoding Ascii
+  } catch {
+    # Best effort: an unwritable marker only costs a possible "Host stopped"
+    # balloon while this operation runs, so it must not fail an install.
+  }
+  return $path
+}
+
+function Clear-FusionRestartMarker {
+  $path = Get-FusionTrayMarkerPath
+  try {
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+  } catch {
+    # Best effort: the tray ignores a marker older than its freshness bound, so a
+    # leftover cannot silence a later real exit - and this runs in a finally block.
+  }
 }

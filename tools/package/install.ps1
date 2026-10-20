@@ -3,15 +3,19 @@
 # What it does, in this order:
 #   1. refuse to run unelevated (persistent TIP registration writes HKLM);
 #   2. verify every file against the package manifest (SHA-256);
-#   3. ask a running Host for an orderly stop (upgrade), so Fcitx saves and no DLL
+#   3. close a running tray and mark the window as an intentional restart (U7),
+#      so an upgrade raises no "Host stopped" balloon and the old tray releases
+#      its version directory;
+#   4. ask a running Host for an orderly stop (upgrade), so Fcitx saves and no DLL
 #      is replaced under a live process;
-#   4. copy the package into C:\Program Files\Fcitx5 Fusion\<version>\ (one
+#   5. copy the package into C:\Program Files\Fcitx5 Fusion\<version>\ (one
 #      directory per version, never a shared directory that an upgrade rewrites);
-#   5. register the TIP from the new directory (reusing tools\register.ps1);
-#   6. create or update the per-user logon task (interactive token, limited run
-#      level, no execution time limit, no second instance);
-#   7. start the Host for the current interactive user and report its identity;
-#   8. remove older version directories that no process holds and that are not the
+#   6. register the TIP from the new directory (reusing tools\register.ps1);
+#   7. create or update the per-user logon tasks (Host and tray; interactive
+#      token, limited run level, no execution time limit, no second instance);
+#   8. start the Host for the current interactive user and report its identity,
+#      then start the tray from the new version directory;
+#   9. remove older version directories that no process holds and that are not the
 #      registered one.
 #
 # Nothing here modifies PATH, and nothing deletes a directory a process holds open.
@@ -37,6 +41,7 @@ Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot 'host-state.ps1')
 
 $taskName = 'FusionHost'
+$trayTaskName = 'FusionTray'
 $installRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Fcitx5 Fusion'
 $currentStep = 'start'
 
@@ -105,6 +110,22 @@ try {
     Write-Host "Package verified: $($entries.Count) files match the manifest. Nothing was installed."
     exit 0
   }
+
+  # U7: close a running tray before the Host stops, and mark the window as an
+  # intentional restart. Without this an upgrade would raise a "Host stopped"
+  # balloon and the old tray would keep its version directory busy.
+  $currentStep = 'tray'
+  Write-Step 'closing a running Fusion tray'
+  $tray = Stop-FusionTray -TimeoutMs 5000
+  if ($tray.Found) {
+    Write-Host ("  pid(s) {0}: asked={1} exited={2} after {3} ms{4}" -f ($tray.Pids -join ','),
+      $tray.Requested, $tray.Exited, $tray.WaitedMs, $(if ($tray.Forced) { ' (forced)' } else { '' }))
+  } else {
+    Write-Host '  no tray running'
+  }
+  if (-not $tray.Exited) { throw 'a running Fusion tray did not exit; use its Exit command and re-run the installer' }
+  $restartMarker = Start-FusionRestartMarker
+  Write-Host "  restart marker: $restartMarker"
 
   $currentStep = 'stop'
   Write-Step 'asking a running Host for an orderly stop'
@@ -207,6 +228,28 @@ try {
     throw "the task was registered without the User32 1077/1073 event trigger (subscription: '$($task.EventSubscription)')"
   }
 
+  # U7: the tray has its own task, deliberately not a second action on the Host
+  # task. A task instance stays alive while any of its actions runs, so a
+  # long-lived tray action would keep 'FusionHost' in the Running state and
+  # Start-ScheduledTask (MultipleInstances=IgnoreNew, used by restart-host.ps1)
+  # would be ignored - a manual restart would silently do nothing.
+  $currentStep = 'traytask'
+  Write-Step "creating or updating the logon task '$trayTaskName'"
+  $trayExe = Join-Path $versionDir 'bin\FusionTray.exe'
+  if (-not (Test-Path -LiteralPath $trayExe)) {
+    throw "the package does not contain bin\FusionTray.exe ($trayExe)"
+  }
+  $trayAction = New-ScheduledTaskAction -Execute $trayExe -WorkingDirectory $versionDir
+  $trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $trayPrincipal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+  $traySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable:$false
+  Register-ScheduledTask -TaskName $trayTaskName -Action $trayAction -Trigger $trayTrigger `
+    -Principal $trayPrincipal -Settings $traySettings -Force | Out-Null
+  $trayTask = Get-FusionScheduledTaskByName -TaskName $trayTaskName
+  if (-not $trayTask) { throw "the task '$trayTaskName' was registered but cannot be read back" }
+  Write-Host "  execute=$($trayTask.Execute) user=$($trayTask.UserId) logon=$($trayTask.LogonType) runLevel=$($trayTask.RunLevel) instances=$($trayTask.Instances) triggers=$($trayTask.Triggers)"
+
   $currentStep = 'shortcut'
   Write-Step 'creating the Start Menu shortcut for the manual restart tool'
   $restartScript = Join-Path $versionDir 'restart-host.ps1'
@@ -255,6 +298,26 @@ try {
     }
   }
 
+  # U7: start the tray after the Host, so its first observation is a running
+  # Host and it never reports a baseline absence as an exit.
+  $currentStep = 'traystart'
+  if ($NoStart) {
+    Write-Step 'not starting the Fusion tray (-NoStart)'
+  } else {
+    Write-Step 'starting the Fusion tray'
+    Start-ScheduledTask -TaskName $trayTaskName
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and @(Get-FusionTrayState).Count -eq 0) { Start-Sleep -Milliseconds 200 }
+    $trays = @(Get-FusionTrayState)
+    if ($trays.Count -eq 0) {
+      Write-Host '  WARNING: the tray did not start; start the FusionTray task manually' -ForegroundColor Yellow
+    } elseif ($trays.Count -gt 1) {
+      throw ("{0} tray processes are running; the single-instance rule failed" -f $trays.Count)
+    } else {
+      Write-Host "  pid=$($trays[0].Id) path=$($trays[0].Path)"
+    }
+  }
+
   $currentStep = 'cleanup'
   Write-Step 'removing older version directories that are not in use'
   $registered = Get-FusionRegisteredDll
@@ -287,6 +350,9 @@ try {
   if ($failure.InvocationInfo) { Write-Host $failure.InvocationInfo.PositionMessage -ForegroundColor Red }
   exit 1
 } finally {
+  # The restart marker covers this run only; a stale one must never silence a
+  # later real Host exit.
+  try { Clear-FusionRestartMarker } catch { }
   if ($transcriptStarted) {
     try { Stop-Transcript | Out-Null } catch { }
   }
