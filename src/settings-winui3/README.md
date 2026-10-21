@@ -7,11 +7,14 @@ new configuration path.
 
 ## Layout
 
-| Path | What it is | Builds here? |
-|---|---|---|
-| `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models | **yes** |
-| `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe | **yes** |
-| the WinUI views | The settings window itself | **not yet written** — see *Prerequisites* |
+| Path | What it is |
+|---|---|
+| `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models |
+| `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe |
+| `FusionSettings.App/` | The WinUI 3 window: four pages, the key editor, the schema-driven option rows |
+
+`FusionSettings.Core` targets `net10.0` and `net8.0`: the checks run on net10, the app on
+net8, which is the runtime it is published against.
 
 `FusionSettings.Core` has **no `PackageReference`** on purpose. That is what lets it build
 and test with nothing but a .NET SDK, and it keeps the client's correctness-critical logic
@@ -41,20 +44,30 @@ These are the properties the presentation may rely on, each covered by a check:
 - **.NET SDK 10.0.402** (current LTS at the time of writing; SDK 10 is supported until
   2028-11-14). Any SDK that supports `net10.0` works; the version is pinned here because
   that is what was used and verified.
-- For the WinUI views only: **`Microsoft.WindowsAppSDK`** and
-  **`Microsoft.Windows.SDK.BuildTools`** from a reachable NuGet feed. Neither is restorable
-  in the environment this core was developed in, which is why the views do not exist yet.
+- **`Microsoft.WindowsAppSDK` 2.5.1** and **`Microsoft.Windows.SDK.BuildTools` 10.0.28000.2705**
+  from a NuGet feed. On a machine with normal nuget.org access the project files restore from
+  there; in the environment this was built in a mirror was used as transport only, and every
+  package was verified against the SHA-512 nuget.org publishes (`fusion-controller` →
+  `evidence/settings-winui3-2026-10-21/blocker.md`).
 
-No other dependency is required, and none is distributed with the core.
+The published app is **self-contained for both .NET and the Windows App SDK**, so it needs
+nothing installed on the target machine. That is also why the package is large.
 
 ## Build and test
 
 ```powershell
 # from the repository root
-dotnet build src/settings-winui3/FusionSettings.Core/FusionSettings.Core.csproj
 dotnet build src/settings-winui3/FusionSettings.Core.Tests/FusionSettings.Core.Tests.csproj
-dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
+dotnet run   --project src/settings-winui3/FusionSettings.Core.Tests
+
+# the app, and the folder the package ships
+dotnet build   src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj -c Release
+dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj -c Release -o <publish-dir>
 ```
+
+`publish` does not carry the compiled XAML resource index, and the published app then fails
+with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
+`FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
 Exit code 0 means every check passed: **371 checks** as of this revision — 336 focused (including a controlled pipe
 peer for mutation outcomes and handshake versions) and 35 against a real Host when one is supplied. `--no-integration`
