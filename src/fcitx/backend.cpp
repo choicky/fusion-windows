@@ -933,14 +933,30 @@ private:
       error = "The candidate-presentation settings value tree is malformed.";
       return SettingsStatus::Invalid;
     }
-    presentation_config_.load(raw, /*partial=*/true);
-    if (!fcitx::safeSaveAsIni(presentation_config_, candidate_presentation_config_path)) {
-      error = "Fcitx could not save the candidate-presentation configuration; reload before "
-              "retrying.";
+    // The write happens against a throwaway configuration, and the value is published to the
+    // live object only after the file is safely on disk. Loading the live object first and
+    // saving afterwards would let a failed write leave the Host reporting a value it never
+    // persisted: GetConfig would return the new layout, the projection would still use the
+    // old one, and — worse — resubmitting the same change would then match the "nothing
+    // changed" branch and report success without writing anything. Ordering the publish
+    // after the write removes that state instead of trying to roll it back.
+    //
+    // A fresh object is used rather than copying the live one: the generated copy semantics
+    // exist, but copying an object whose options carry an owner pointer is a question this
+    // change has no reason to ask. `load` into a default-constructed instance is the same
+    // path startup already uses, and it validates the raw tree exactly once, before any I/O.
+    CandidatePresentationConfig candidate;
+    candidate.load(raw, /*partial=*/true);
+    if (!fcitx::safeSaveAsIni(candidate, candidate_presentation_config_path)) {
+      error = "Fcitx could not save the candidate-presentation configuration; nothing was "
+              "changed, so the same change can be retried.";
       return SettingsStatus::Error;
     }
-    // The in-memory configuration is the authority from here on; the file is the record
-    // that survives a restart. A save therefore takes effect on the next projected page.
+    // Persisted. Publish the same raw tree to the object the Host reads from, then derive the
+    // effective layout from it, so the stored value, what GetConfig reports and what the next
+    // projected page uses cannot disagree — including when the write failed, where none of
+    // the three moves.
+    presentation_config_.load(raw, /*partial=*/true);
     candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
     return read_presentation_settings_on_loop(snapshot, error);
   }

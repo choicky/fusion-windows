@@ -21,7 +21,9 @@ namespace Fusion.Settings.Tests;
 /// setting with its own configuration, holding no engine or global value. The checks below
 /// are about the <b>stored</b> value and the file, not about pixels: whether the candidate
 /// window actually changes geometry is a separate, product-path check, because a saved enum
-/// alone proves nothing about the renderer.
+/// alone proves nothing about the renderer. They also cover what a <b>refused</b> write leaves
+/// behind, because a save that reports success without persisting is the failure mode this
+/// configuration has to rule out.
 /// </para>
 /// <para>
 /// It needs <c>FUSION_SETTINGS_GLOBAL_PROFILE</c> (the same profile root the global save
@@ -163,16 +165,66 @@ internal static class PresentationSaveTests
                 .ConfigureAwait(false),
             "the Host stores the vertical layout");
 
-        // 7. Leave a non-default value behind, so the post-restart run proves persistence of a
-        //    choice rather than of a default that would read the same either way.
+        // 7. A write that the operating system genuinely refuses must not publish anything.
+        //
+        //    The failure is produced by the real write path, not by a stub: Fcitx saves by
+        //    writing a temporary file and renaming it over the target, so holding the target
+        //    open without delete sharing makes the rename fail with access denied. The Host
+        //    then takes its error branch, and the temporary file it created is removed by
+        //    Fcitx itself.
+        //
+        //    This is the regression for a real defect: the Host used to load the live
+        //    configuration before writing it, so a failed write left it reporting a layout it
+        //    had never persisted, the projection still using the old one, and a resubmission
+        //    matching the "nothing changed" branch — a false success with no file write. Each
+        //    assertion below fails against that ordering.
+        var lockedFile = FindConfigFile(profileRoot);
+        Harness.Check(lockedFile is not null, "the stored file is known before the failure is induced");
+        if (lockedFile is null)
+        {
+            return;
+        }
+
+        var beforeFailure = File.ReadAllText(lockedFile);
+        Harness.Check(beforeFailure.Contains("CandidateLayout=Vertical", StringComparison.Ordinal),
+            "the file holds the known vertical value before the failure");
+
         Harness.Check(workspace.TrySet(SettingsTarget.Presentation, Option,
                 SettingsValue.Text("Horizontal")),
-            "the layout is set back to horizontal for the restart check");
+            "a change to the other layout is made while the file cannot be replaced");
+        using (new FileStream(lockedFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"   refused save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+            Harness.Check(workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+                "a save the filesystem refuses is reported as not saved");
+            Harness.Check(workspace.PresentationDraft!.HasChanges,
+                "and the edit is kept, so the user can retry it");
+            Harness.CheckEqual("Vertical", await ReadStoredAsync(endpoint, cancellationToken)
+                    .ConfigureAwait(false),
+                "the Host still reports the old layout, not the value it failed to persist");
+            Harness.CheckEqual(beforeFailure, File.ReadAllText(lockedFile),
+                "and the stored file is byte-for-byte unchanged");
+        }
+
+        // 8. The same request, once the file can be replaced, must really be written. Against
+        //    the old ordering this returned success while writing nothing, which the file
+        //    assertion below would catch.
         await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Console.WriteLine($"   retried save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+        Harness.Check(!workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+            "the identical request succeeds once writing is possible again");
+        Harness.Check(!workspace.PresentationDraft!.HasChanges, "and nothing is pending");
         Harness.CheckEqual("Horizontal", await ReadStoredAsync(endpoint, cancellationToken)
                 .ConfigureAwait(false),
-            "the horizontal layout is stored again");
+            "the Host reports the layout it now holds");
+        Harness.Check(File.ReadAllText(lockedFile).Contains("CandidateLayout=Horizontal",
+                StringComparison.Ordinal),
+            "and the file really contains the retried value, so the success was not a no-op");
 
+        // 9. The value left behind is horizontal, a non-default one, so the post-restart run
+        //    proves persistence of a choice rather than of a default that would read the same
+        //    either way.
         Console.WriteLine($"   PRESENTATION_EXPECT={Option}=Horizontal");
     }
 
