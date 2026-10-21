@@ -201,16 +201,17 @@ int main() {
     doc.apply(controller, idle_return);
     require(controller.finish_pass(), "idle Return Forward barrier");
     // R37: the same shape for the editing keys. After a commit the engine has no work
-    // for Backspace, Delete or the arrows — pinyin handles them only inside its
-    // non-empty input branch — so it answers them with ForwardKey only. The oracle here
-    // is that engine answer, not the fixed expression: the key must come back as the
-    // application's own key, and only then must T stop claiming it. WeChat lost exactly
-    // these keys after a commit while they worked with the TIP unloaded (owner report,
-    // 2026-10-22), which is what an overstated T claim looks like in an application that
-    // honours only that callback.
+    // for them — pinyin handles them only inside its non-empty input branch — so it
+    // answers them with ForwardKey only. The oracle here is that engine answer, not the
+    // fixed expression: the key must come back as the application's own key, and only
+    // then must T stop claiming it. WeChat reported exactly these keys after a commit
+    // while they worked with the TIP unloaded (owner report, 2026-10-22), which is what
+    // an overstated T claim looks like in an application that honours only that callback.
+    // Up/Down are measured here rather than assumed: the owner reported "the arrows", and
+    // the same engine branch decides them.
     for (const auto &[vk, name] : {std::pair{0x08u, "Backspace"}, {0x2eu, "Delete"},
-                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x24u, "Home"},
-                                   {0x23u, "End"}}) {
+                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x26u, "Up"},
+                                   {0x28u, "Down"}, {0x24u, "Home"}, {0x23u, "End"}}) {
       const auto idle_key = translate_key(vk, false, false, false);
       require(controller.routes_key(idle_key), "editing key is no longer an engine key class");
       const auto idle = controller.begin_key(idle_key, true);
@@ -236,8 +237,8 @@ int main() {
     // While composing, the same keys stay engine work: the engine deletes, moves and
     // navigates the composition with them.
     for (const auto &[vk, name] : {std::pair{0x08u, "Backspace"}, {0x2eu, "Delete"},
-                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x24u, "Home"},
-                                   {0x23u, "End"}}) {
+                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x26u, "Up"},
+                                   {0x28u, "Down"}, {0x24u, "Home"}, {0x23u, "End"}}) {
       (void)name;
       require(controller.engine_has_work_for(translate_key(vk, false, false, false)),
               "composing editing key left the engine, so the shell would stop claiming it");
@@ -267,6 +268,41 @@ int main() {
     require(!denied.backend_session_id && !denied.eaten, "hard policy dispatched");
     controller.destroy();
     std::cout << "PASS real Backspace/Return and hard-policy gate\n";
+    // R37 control, the other half of the same rule: a configured Fcitx global hotkey is
+    // engine work with **nothing** composing, so the shell must keep claiming it. F6 is
+    // installed as this isolated instance's own "toggle input method" hotkey
+    // (Hotkey/TriggerKeys) — a global action this runtime has two methods for, so the
+    // engine really acts on it. The composition is committed first, so no composition, no
+    // candidate page and a clear pass barrier are in place when F6 arrives. Asserting
+    // only routes_key would prove nothing about the path — the point is that the engine
+    // acts on the key and that T lets it through.
+    {
+      auto hotkey_backend = make_fcitx_backend(FcitxBackendOptions{false, "F6"});
+      require(hotkey_backend != nullptr, "global hotkey fixture backend");
+      SemanticController hotkey(952, 64, *hotkey_backend);
+      Document hotkey_doc;
+      type(hotkey, hotkey_doc, "nihao");
+      auto hotkey_commit = hotkey.begin_key(translate_key(kVkSpace, false, false, false), true);
+      require(hotkey_commit.eaten && !hotkey_commit.frontend.empty(), "fixture commit");
+      hotkey_doc.apply(hotkey, hotkey_commit);
+      require(hotkey.finish_pass(), "fixture commit barrier");
+      require(hotkey.raw_buffer().empty(), "fixture commit left a projection");
+      const auto f6 = translate_key(0x75, false, false, false); // VK_F6
+      require(f6.keysym == 0xffc3 && !f6.modified, "F6 translation");
+      require(hotkey.routes_key(f6), "a configured global hotkey is still an engine key class");
+      require(hotkey.engine_has_work_for(f6),
+              "T must keep claiming a configured global hotkey with nothing composing");
+      const auto global = hotkey.begin_key(f6, true);
+      std::cout << "idle F6 eaten=" << (global.eaten ? 1 : 0)
+                << " forward=" << (global.forward ? 1 : 0)
+                << " route=" << static_cast<int>(global.route)
+                << " ops=" << global.frontend.size() << '\n';
+      require(global.eaten && !global.forward && global.frontend.empty(),
+              "the engine did not handle the configured global hotkey");
+      require(hotkey.finish_pass(), "global hotkey barrier");
+      hotkey.destroy();
+      std::cout << "PASS configured global hotkey reached the engine with nothing composing\n";
+    }
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "FAIL " << e.what() << '\n';

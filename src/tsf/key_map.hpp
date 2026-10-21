@@ -20,6 +20,19 @@ inline constexpr std::uint32_t kVkSpace = 0x20;
 inline constexpr std::uint32_t kVkNumpad0 = 0x60;
 inline constexpr std::uint32_t kVkNumpad9 = 0x69;
 
+// X11 keysyms of the keys whose Fcitx handling needs a live composition: the engine's
+// branches for them sit inside its non-empty-input branch. Named here so the shell's
+// admission rule and the translation table cannot drift apart.
+inline constexpr std::uint32_t kKeysymBackSpace = 0xff08;
+inline constexpr std::uint32_t kKeysymReturn = 0xff0d;
+inline constexpr std::uint32_t kKeysymHome = 0xff50;
+inline constexpr std::uint32_t kKeysymLeft = 0xff51;
+inline constexpr std::uint32_t kKeysymUp = 0xff52;
+inline constexpr std::uint32_t kKeysymRight = 0xff53;
+inline constexpr std::uint32_t kKeysymDown = 0xff54;
+inline constexpr std::uint32_t kKeysymEnd = 0xff57;
+inline constexpr std::uint32_t kKeysymDelete = 0xffff;
+
 struct KeyAction {
   enum class Type {
     AppendChar, // append one raw character to the composition buffer (STATE input)

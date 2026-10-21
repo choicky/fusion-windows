@@ -43,13 +43,13 @@ KeyAction translate_key(std::uint32_t vk, bool ctrl, bool alt, bool win, char32_
   // Virtual-key to keysym translation only. No IME semantic key classes.
   switch (vk) {
   case kVkBack:
-    action.keysym = 0xff08;
+    action.keysym = kKeysymBackSpace;
     break;
   case 0x09:
     action.keysym = 0xff09;
     break;
   case kVkReturn:
-    action.keysym = 0xff0d;
+    action.keysym = kKeysymReturn;
     break;
   case kVkEscape:
     action.keysym = 0xff1b;
@@ -64,28 +64,28 @@ KeyAction translate_key(std::uint32_t vk, bool ctrl, bool alt, bool win, char32_
     action.keysym = 0xff56;
     break;
   case 0x23:
-    action.keysym = 0xff57;
+    action.keysym = kKeysymEnd;
     break;
   case 0x24:
-    action.keysym = 0xff50;
+    action.keysym = kKeysymHome;
     break;
   case 0x25:
-    action.keysym = 0xff51;
+    action.keysym = kKeysymLeft;
     break;
   case 0x26:
-    action.keysym = 0xff52;
+    action.keysym = kKeysymUp;
     break;
   case 0x27:
-    action.keysym = 0xff53;
+    action.keysym = kKeysymRight;
     break;
   case 0x28:
-    action.keysym = 0xff54;
+    action.keysym = kKeysymDown;
     break;
   case 0x2d:
     action.keysym = 0xff63;
     break;
   case 0x2e:
-    action.keysym = 0xffff;
+    action.keysym = kKeysymDelete;
     break;
   default:
     if (vk >= 0x70 && vk <= 0x87)

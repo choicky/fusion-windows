@@ -847,7 +847,9 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   // hand back, which the application handles itself. A claim made here cannot be
   // retracted in K: the application routes the key to the TIP and does not deliver it
   // natively when K answers "not eaten", so an overstated claim loses the key (R36
-  // Return in Notepad-- 3.4; R37 Backspace/Delete/arrows after a commit in WeChat).
+  // Return in Notepad-- 3.4; R37 the editing keys in WeChat). The gate is deliberately
+  // narrow — the measured editing/navigation keys and Return — because a configured
+  // Fcitx global hotkey is handled with no composition and must still arrive.
   (void)lparam;
   if (pfEaten == nullptr)
     return E_INVALIDARG;

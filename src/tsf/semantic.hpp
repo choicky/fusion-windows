@@ -122,20 +122,17 @@ public:
   // requires the caller to drain (drain_work) or explicitly cancel.
   Pass pass_probe() const;
 
-  // Whether routing this key through the engine can achieve anything right now.
+  // Whether the TSF shell may claim this key in OnTestKeyDown right now.
   //
-  // A key that carries a character always can: it starts, extends or commits a
-  // composition, and the engine may translate it (punctuation, quickphrase). A key that
-  // carries none — Backspace, Delete, the arrows, Home/End, PageUp/PageDown, Tab,
-  // Return — is engine work only while a composition, a projected page, queued work or
-  // a pass barrier exists; with none of those the engine can only answer it with
-  // ForwardKey.
-  //
-  // The TSF shell must not claim such a key in OnTestKeyDown, because a claim made in T
-  // cannot be retracted in K: an application that honours only T routes the key to the
-  // TIP and does not deliver it natively when K answers "not eaten". That is how Notepad--
-  // 3.4 lost Return (R36) and how WeChat lost Backspace/Delete/arrows after a commit
-  // (R37).
+  // Only the editing/navigation keys whose engine handling needs a live composition are
+  // gated (Backspace, Delete, the four arrows, Home/End, and Return — see
+  // editing_key_needs_composition); every other key keeps exactly the admission this
+  // shell had before R37. That narrowness matters in both directions: with nothing
+  // composing the engine can only forward a gated key, so a claim made in T cannot be
+  // retracted in K and an application that honours only T loses it (Notepad-- 3.4 lost
+  // Return, R36; WeChat lost the editing keys, R37); but a configured Fcitx global
+  // hotkey (for example its own toggle-input-method action on F6) is handled with no
+  // composition at all, so filtering every character-less key would swallow it.
   bool engine_has_work_for(const KeyAction &action) const;
 
   // The unresolved effect to drain synchronously before allowing PASS, if any.
@@ -210,10 +207,14 @@ private:
   std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
-  // The composition-state work that makes a character-less key engine work: raw input,
-  // a projected page, queued frontend work, an unresolved pass barrier. The Mock Backend
-  // answers true so the development fixture keeps its previous routing.
+  // The composition-state work that makes a gated key engine work: raw input, a projected
+  // page, queued frontend work, an unresolved pass barrier. The Mock Backend answers true
+  // so the development fixture keeps its previous routing.
   bool engine_has_composition_work() const;
+  // Whether this key is engine work only while a composition has something for it: the
+  // editing/navigation keys Fcitx handles inside its non-empty-input branch, plus Return
+  // (R36). Measured against the pinned engine in stage3c, not inferred from the key class.
+  static bool editing_key_needs_composition(const KeyAction &action);
   // Shared real-frontend tail: dispatch one stimulus, validate the returned
   // batch, own the ordered Core records, and project any candidate snapshot.
   // Used by both the key and the candidate-action paths.

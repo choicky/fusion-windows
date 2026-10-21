@@ -535,13 +535,32 @@ bool SemanticController::engine_has_composition_work() const {
 }
 
 bool SemanticController::engine_has_work_for(const KeyAction &action) const {
-  if (action.type == KeyAction::Type::AppendChar || action.type == KeyAction::Type::Commit)
-    return true; // raw input: starts, extends or commits a composition
-  if (action.keysym != 0 && action.keysym < 0x0100u)
-    return true; // a printable ASCII character, which the engine may translate
-  if (action.keysym >= 0x01000000u)
-    return true; // a non-ASCII character, in the same X11 keysym convention
+  // Every key this shell admitted before R37 keeps its admission; only the keys whose
+  // Fcitx handling needs a live composition are gated on the composition state.
+  if (!editing_key_needs_composition(action))
+    return true;
   return engine_has_composition_work();
+}
+
+bool SemanticController::editing_key_needs_composition(const KeyAction &action) {
+  // The keys the pinned pinyin engine handles only inside its non-empty-input branch
+  // (stage3c measures the idle and composing behaviour of each one): with nothing
+  // composing it can only forward them. Return belongs here through R36, whose idle case
+  // is the same claim-then-hand-back shape.
+  switch (action.keysym) {
+  case kKeysymBackSpace:
+  case kKeysymDelete:
+  case kKeysymUp:
+  case kKeysymDown:
+  case kKeysymLeft:
+  case kKeysymRight:
+  case kKeysymHome:
+  case kKeysymEnd:
+  case kKeysymReturn:
+    return true;
+  default:
+    return false;
+  }
 }
 
 std::optional<PendingWork> SemanticController::drain_work() {
