@@ -9,6 +9,9 @@
 //     and a tray that already exited for a session end that was then cancelled is
 //     restarted by its own task's cancellation trigger, like the Host;
 //   - explicit Restart FusionHost and Open log folder actions, plus Exit;
+//   - left click on the icon opens the settings window, or brings the window that is
+//     already open to the foreground instead of stacking a duplicate; the right-click
+//     menu keeps every action above and stays keyboard reachable;
 //   - automatic restart and hang detection are NOT here. A running process is
 //     not reported as healthy: the status is "running (pid N)" / "not running".
 //
@@ -24,6 +27,7 @@
 //                             exit 0 host=running, 1 host=absent, 2 unverified
 
 #include "tray/host_watch.hpp"
+#include "tray/settings_window.hpp"
 #include "tray/tray_state.hpp"
 
 #ifndef NOMINMAX
@@ -215,22 +219,63 @@ void restart_host() {
                 SW_SHOWNORMAL);
 }
 
+std::wstring settings_executable() { return g_version_dir + L"\\bin\\FusionSettings.exe"; }
+
+// One in-flight launch at a time: a second click while the process is still starting must
+// not stack another window, and a launch that failed or exited must not lock the action.
+fusion::tray::LaunchGuard g_settings_launch;
+
 void open_settings() {
   if (g_version_dir.empty()) {
     MessageBoxW(nullptr, L"无法确定 Fusion 安装版本目录。", L"Fusion 设置",
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     return;
   }
-  const std::wstring executable = g_version_dir + L"\\bin\\FusionSettings.exe";
-  const auto result = reinterpret_cast<INT_PTR>(
-      ShellExecuteW(nullptr, L"open", executable.c_str(), nullptr, g_version_dir.c_str(),
-                    SW_SHOWNORMAL));
-  if (result <= 32) {
+  const ULONGLONG now = GetTickCount64();
+  const std::wstring executable = settings_executable();
+  DWORD session = 0;
+  if (ProcessIdToSessionId(GetCurrentProcessId(), &session) != 0) {
+    // The intended instance is this exact executable, in this session, on the production
+    // endpoint. An older version directory, a development copy or a test instance started
+    // with --pipe-name is not it, and is never raised as if it were.
+    const fusion::tray::SettingsInstance instance =
+        fusion::tray::find_settings_instance(executable, session);
+    const bool found = instance.window != nullptr;
+    const bool activated = found && fusion::tray::activate_window(instance.window);
+    switch (fusion::tray::decide_settings_action(found, activated)) {
+    case fusion::tray::SettingsAction::Activate:
+      g_settings_launch.clear();
+      return;
+    case fusion::tray::SettingsAction::NotifyOnly:
+      // The window exists but Windows refused the foreground change. Launching again would
+      // only add a second window, so ask for attention instead.
+      g_settings_launch.clear();
+      fusion::tray::request_attention(instance.window);
+      return;
+    case fusion::tray::SettingsAction::Launch:
+      break;
+    }
+  }
+  // Only the launch path is guarded: a click while the previous process is still starting
+  // must not stack another window.
+  if (g_settings_launch.pending(now)) {
+    return;
+  }
+  SHELLEXECUTEINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.lpVerb = L"open";
+  info.lpFile = executable.c_str();
+  info.lpDirectory = g_version_dir.c_str();
+  info.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&info)) {
     MessageBoxW(nullptr,
                 L"无法启动 Fusion 设置。请确认当前安装包包含 bin\\FusionSettings.exe，"
                 L"且 FusionHost 正在运行。",
                 L"Fusion 设置", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    return;
   }
+  g_settings_launch.started(info.hProcess, now);
 }
 
 void exit_tray(HWND window) {
@@ -302,6 +347,12 @@ LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM wparam, LPAR
     return 0;
   case tray_callback_message:
     switch (LOWORD(lparam)) {
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+      // Left click is the settings entry point; the context menu stays on the right
+      // button so every existing action keeps its place.
+      open_settings();
+      return 0;
     case WM_RBUTTONUP:
     case WM_CONTEXTMENU: {
       POINT point{};

@@ -96,7 +96,8 @@ if(WIN32 AND MSVC)
     # it never drives the Host, so it does not link the IPC or backend layers.
     add_executable(FusionTrayExe
       src/tray/main.cpp
-      src/tray/host_watch.cpp)
+      src/tray/host_watch.cpp
+      src/tray/settings_window.cpp)
     target_include_directories(FusionTrayExe PRIVATE include src)
     target_compile_features(FusionTrayExe PRIVATE cxx_std_20)
     set_target_properties(FusionTrayExe PROPERTIES CXX_EXTENSIONS OFF OUTPUT_NAME FusionTray
@@ -220,6 +221,14 @@ if(BUILD_TESTING)
     target_compile_definitions(stage4a PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage4a PRIVATE MockBackend)
+    add_executable(tray_settings_window tests/tray_settings_window.cpp src/tray/settings_window.cpp)
+    target_include_directories(tray_settings_window PRIVATE include src)
+    target_compile_features(tray_settings_window PRIVATE cxx_std_20)
+    target_compile_definitions(tray_settings_window PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_compile_options(tray_settings_window PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(tray_settings_window PRIVATE user32)
+    add_test(NAME tray_settings_window COMMAND tray_settings_window)
+
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_pipeendpoint COMMAND stage4a pipeendpoint)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
