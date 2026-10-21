@@ -351,13 +351,19 @@ private:
     }
   }
 
-  void reloadAll(QLabel *status, const QString &successMessage) {
-    reloadImList([this, status, successMessage] {
-      loadAllPages([this, status, successMessage](bool ok, const QString &error) {
+  // onDone is for the unattended self-test, which has to know when the reload
+  // chain finished; the buttons pass nothing and rely on the status label.
+  void reloadAll(QLabel *status, const QString &successMessage,
+                 std::function<void(bool, const QString &)> onDone = {}) {
+    reloadImList([this, status, successMessage, onDone] {
+      loadAllPages([this, status, successMessage, onDone](bool ok, const QString &error) {
         if (ok) {
           status->setText(successMessage);
         } else {
           showError(status, error);
+        }
+        if (onDone) {
+          onDone(ok, error);
         }
       });
     });
@@ -510,6 +516,78 @@ private:
     });
   }
 
+  // Writes through the Host's apply path without adopting the result into a page,
+  // which is what a *second* settings client does: the page keeps the values it
+  // loaded, so a Reload that does not actually fetch cannot pass this check by
+  // replaying its own baseline.
+  void applyHostValues(const QString &uri, const QVariantMap &values,
+                       std::function<void(bool, const QString &)> onDone) {
+    if (!provider_.controller()) {
+      onDone(false, QStringLiteral("无法创建 FusionHost 连接请求。"));
+      return;
+    }
+    auto *call = provider_.controller()->SetConfig(uri, QDBusVariant(values));
+    connect(call, &fcitx::kcm::PendingCall::finished, this, [call, onDone] {
+      const QDBusMessage reply = call->reply();
+      call->deleteLater();
+      if (reply.type() != QDBusMessage::ReplyMessage) {
+        onDone(false, reply.errorMessage());
+        return;
+      }
+      onDone(true, QString());
+    });
+  }
+
+  // The Cancel/Reload buttons start an asynchronous chain with no completion
+  // signal of its own. The self-test waits for the state it expects instead of
+  // assuming a fixed delay, and fails when the state never arrives.
+  void waitFor(std::function<bool()> ready, std::function<void(bool)> settled,
+               int timeoutMs = 15000) {
+    auto elapsed = std::make_shared<int>(0);
+    auto tick = std::make_shared<std::function<void()>>();
+    *tick = [this, ready, settled, elapsed, tick, timeoutMs] {
+      if (ready()) {
+        settled(true);
+        return;
+      }
+      if (*elapsed >= timeoutMs) {
+        settled(false);
+        return;
+      }
+      *elapsed += 50;
+      QTimer::singleShot(50, this, [tick] { (*tick)(); });
+    };
+    QTimer::singleShot(0, this, [tick] { (*tick)(); });
+  }
+
+  int globalPageSize() const {
+    return global_->value()
+        .toMap()
+        .value(QStringLiteral("Behavior"))
+        .toMap()
+        .value(QStringLiteral("DefaultPageSize"))
+        .toInt();
+  }
+
+  void setGlobalPageSize(int size) {
+    QVariantMap values = global_->value().toMap();
+    QVariantMap behavior = values.value(QStringLiteral("Behavior")).toMap();
+    behavior.insert(QStringLiteral("DefaultPageSize"), size);
+    values.insert(QStringLiteral("Behavior"), behavior);
+    global_->setValue(values);
+  }
+
+  // A page size that differs from both arguments, kept inside the schema's range
+  // so the write is a real value rather than a rejected one.
+  static int otherPageSize(int avoid1, int avoid2) {
+    for (int candidate : {8, 9, 10, 6, 5}) {
+      if (candidate != avoid1 && candidate != avoid2) {
+        return candidate;
+      }
+    }
+    return avoid1;
+  }
+
   void runSelfTest() {
     if (!selfTestTimer_.isValid()) {
       selfTestTimer_.start();
@@ -648,8 +726,8 @@ private:
 
   void finishSelfTest() {
     status_->setText(QStringLiteral(
-        "SELF-TEST PASS: cross-page shared value, global configuration and the input-method list "
-        "round-tripped through the Host."));
+        "SELF-TEST PASS: cross-page shared value, global configuration, Cancel/Reload on the "
+        "Global page and the input-method list round-tripped through the Host."));
     if (!screenshot_.isEmpty()) {
       windowScreenshot_ = grab().save(screenshot_);
     }
@@ -701,9 +779,193 @@ private:
           QCoreApplication::exit(25);
           return;
         }
-        runImListSelfTest();
+        runGlobalCancelReloadChecks();
       });
     });
+  }
+
+  // Cancel and Reload must act on the Global page, not only on the pages they used
+  // to walk: leaving it out kept its edits and baseline untouched while the status
+  // line reported success. Each step drives the same button a user clicks, and the
+  // Host is changed behind the page so that a Reload which does not fetch cannot
+  // pass by replaying the page's own baseline.
+  struct GlobalReloadCheck {
+    int host = 0;
+    int dirty = 0;
+    int foreign = 0;
+    int step = 0;
+  };
+
+  void runGlobalCancelReloadChecks() {
+    if (!globalLoaded_) {
+      status_->setText(QStringLiteral("SELF-TEST FAIL: the Global page did not load."));
+      QCoreApplication::exit(33);
+      return;
+    }
+    globalReloadStep(std::make_shared<GlobalReloadCheck>());
+  }
+
+  void failGlobalReload(const QString &message) {
+    showError(status_, QStringLiteral("SELF-TEST FAIL: %1").arg(message));
+    QCoreApplication::exit(33);
+  }
+
+  void globalReloadStep(const std::shared_ptr<GlobalReloadCheck> &check) {
+    switch (check->step++) {
+    case 0: {
+      // Read the authoritative value, make an unsaved edit, then Cancel.
+      readHostValues(globalUri_, [this, check](bool ok, const QVariantMap &values) {
+        if (!ok) {
+          failGlobalReload(QStringLiteral("could not read the global configuration."));
+          return;
+        }
+        check->host = values.value(QStringLiteral("Behavior"))
+                          .toMap()
+                          .value(QStringLiteral("DefaultPageSize"))
+                          .toInt();
+        if (check->host <= 0) {
+          failGlobalReload(QStringLiteral("the Host did not report a DefaultPageSize."));
+          return;
+        }
+        check->dirty = otherPageSize(check->host, -1);
+        check->foreign = otherPageSize(check->host, check->dirty);
+        setGlobalPageSize(check->dirty);
+        if (globalPageSize() != check->dirty) {
+          failGlobalReload(QStringLiteral("the Global page did not take an unsaved edit."));
+          return;
+        }
+        cancel_->click();
+        waitFor([this, check] { return globalPageSize() == check->host; },
+                [this, check](bool settled) {
+                  if (!settled) {
+                    failGlobalReload(QStringLiteral("Cancel did not restore the Host's value."));
+                    return;
+                  }
+                  if (baselinePageSize() != check->host) {
+                    failGlobalReload(QStringLiteral("Cancel did not refresh the Global baseline."));
+                    return;
+                  }
+                  if (!globalLoaded_) {
+                    failGlobalReload(QStringLiteral("Cancel left the Global page unloaded."));
+                    return;
+                  }
+                  std::fprintf(stderr, "[self-test] global cancel restored=%d\n", check->host);
+                  globalReloadStep(check);
+                });
+      });
+      return;
+    }
+    case 1: {
+      // A second client changes the Host through the same official apply path. The
+      // page must still show the value it loaded, then Reload must fetch the new one.
+      QVariantMap values = global_->value().toMap();
+      QVariantMap behavior = values.value(QStringLiteral("Behavior")).toMap();
+      behavior.insert(QStringLiteral("DefaultPageSize"), check->foreign);
+      values.insert(QStringLiteral("Behavior"), behavior);
+      applyHostValues(globalUri_, values, [this, check](bool ok, const QString &error) {
+        if (!ok) {
+          failGlobalReload(
+              QStringLiteral("a second client could not change the global value: %1").arg(error));
+          return;
+        }
+        if (globalPageSize() != check->host) {
+          failGlobalReload(QStringLiteral("the page adopted a change it did not load."));
+          return;
+        }
+        readHostValues(globalUri_, [this, check](bool hostRead, const QVariantMap &hostValues) {
+          if (!hostRead) {
+            failGlobalReload(QStringLiteral("could not read the changed global value."));
+            return;
+          }
+          const int applied = hostValues.value(QStringLiteral("Behavior"))
+                                  .toMap()
+                                  .value(QStringLiteral("DefaultPageSize"))
+                                  .toInt();
+          if (applied != check->foreign) {
+            failGlobalReload(QStringLiteral("the Host did not keep the second client's value."));
+            return;
+          }
+          setGlobalPageSize(check->dirty);
+          reload_->click();
+          waitFor([this, check] { return globalPageSize() == check->foreign; },
+                  [this, check](bool settled) {
+                    if (!settled) {
+                      failGlobalReload(
+                          QStringLiteral("Reload did not fetch the Host's changed value."));
+                      return;
+                    }
+                    if (baselinePageSize() != check->foreign) {
+                      failGlobalReload(QStringLiteral("Reload did not refresh the Global baseline."));
+                      return;
+                    }
+                    std::fprintf(stderr, "[self-test] global reload fetched=%d\n", check->foreign);
+                    globalReloadStep(check);
+                  });
+        });
+      });
+      return;
+    }
+    case 2: {
+      // Switching tabs must keep an ordinary unsaved edit, and the baseline a
+      // reload left behind must still support a normal apply.
+      const int pending = otherPageSize(check->foreign, check->host);
+      setGlobalPageSize(pending);
+      tabs_->setCurrentIndex(0);
+      tabs_->setCurrentIndex(2);
+      if (globalPageSize() != pending) {
+        failGlobalReload(QStringLiteral("switching tabs discarded an unsaved edit."));
+        return;
+      }
+      std::fprintf(stderr, "[self-test] global tab-switch kept=%d\n", pending);
+      cancel_->click();
+      waitFor([this, check] { return globalPageSize() == check->foreign; },
+              [this, check](bool settled) {
+                if (!settled) {
+                  failGlobalReload(QStringLiteral("Cancel did not discard the tab-switch edit."));
+                  return;
+                }
+                // Leave the value the restart check expects.
+                setGlobalPageSize(kGlobalPageSizeProbe);
+                applyCurrentPage([this](bool applied, const QString &error) {
+                  if (!applied) {
+                    failGlobalReload(
+                        QStringLiteral("apply after Reload failed: %1").arg(error));
+                    return;
+                  }
+                  readHostValues(globalUri_, [this](bool ok, const QVariantMap &values) {
+                    if (!ok) {
+                      failGlobalReload(
+                          QStringLiteral("could not read the value after the final apply."));
+                      return;
+                    }
+                    const int applied = values.value(QStringLiteral("Behavior"))
+                                            .toMap()
+                                            .value(QStringLiteral("DefaultPageSize"))
+                                            .toInt();
+                    if (applied != kGlobalPageSizeProbe) {
+                      failGlobalReload(
+                          QStringLiteral("the apply after Reload did not reach the Host."));
+                      return;
+                    }
+                    std::fprintf(stderr, "[self-test] global apply-after-reload=%d\n",
+                                 kGlobalPageSizeProbe);
+                    runImListSelfTest();
+                  });
+                });
+              });
+      return;
+    }
+    default:
+      return;
+    }
+  }
+
+  int baselinePageSize() const {
+    return baseline_.value(global_)
+        .value(QStringLiteral("Behavior"))
+        .toMap()
+        .value(QStringLiteral("DefaultPageSize"))
+        .toInt();
   }
 
   // Stage A: the list surface must drive the Host's official setGroup/save and
