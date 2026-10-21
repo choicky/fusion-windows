@@ -9,7 +9,7 @@ new configuration path.
 
 | Path | What it is |
 |---|---|
-| `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models |
+| `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models, and the workspace that routes edits, splits saves and reconciles uncertain writes |
 | `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe |
 | `FusionSettings.App/` | The WinUI 3 window: four pages, the key editor, the schema-driven option rows |
 
@@ -69,8 +69,10 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **371 checks** as of this revision — 336 focused (including a controlled pipe
-peer for mutation outcomes and handshake versions) and 35 against a real Host when one is supplied. `--no-integration`
+Exit code 0 means every check passed: **422 checks** as of this revision — 347 without a Host, and 75 more against one
+(the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, and the
+workspace path: Global routing, a Shuangpin-only save, clearing the last binding, the method list, a
+failed start and its retry). `--no-integration`
 skips the real-Host section.
 
 ### Running the real-Host checks
