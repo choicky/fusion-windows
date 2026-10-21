@@ -29,8 +29,11 @@
 // - hostdiag: the R30 opt-in Host diagnostic log — off by default, file and line
 //   format when enabled, privacy-marker redaction, the size cap and retention.
 // - integration: full FusionHost.exe + Fcitx backend over IPC (only in the
-//   FUSION_WITH_FCITX5 build; requires a running FusionHost.exe and the Fcitx
-//   runtime). Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip instead of fail.
+//   FUSION_WITH_FCITX5 build). It types into the Host it connects to, so it
+//   requires an explicit isolated endpoint in FUSION_STAGE4A_INTEGRATION_PIPE;
+//   with none set it prints SKIP and connects to nothing, and an endpoint equal to
+//   this user's production pipe is refused before the first request.
+//   Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip explicitly.
 //
 // protocol/loopback/hostserver build and run in the Mock-only build too: the
 // transport, the IpcBackend client and the HostServer do not depend on Fcitx.
@@ -59,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -94,6 +98,33 @@ constexpr std::uint64_t kTestIncarnation = 0x4B00000000000001ull;
 
 std::wstring test_pipe_name(const wchar_t *suffix) {
   return std::wstring(L"\\\\.\\pipe\\FusionHost-ipc-test-") + suffix;
+}
+
+// The isolated endpoint arrives as an environment variable, so it is UTF-8 text
+// on the way in. An endpoint that is not valid UTF-8 cannot name the pipe the
+// caller meant, so it is rejected rather than converted into a similar name.
+std::wstring wide_from_utf8(const char *text) {
+  if (text == nullptr || *text == '\0')
+    return {};
+  const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
+  if (count <= 0)
+    return {};
+  std::wstring wide(static_cast<std::size_t>(count - 1), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide.data(), count) <= 0)
+    return {};
+  return wide;
+}
+
+// True when the endpoint names the pipe the installed product Host listens on for
+// this user and session. Both spellings have to be recognised — the full Win32
+// path and the bare logical name — because both reach the same pipe, and the
+// integration assertions type into whichever Host they connect to.
+bool is_production_endpoint(const std::wstring &endpoint) {
+  const std::wstring logical = logical_pipe_name(endpoint);
+  if (logical.empty())
+    return false;
+  const std::wstring production = logical_pipe_name(compute_pipe_name());
+  return !production.empty() && _wcsicmp(logical.c_str(), production.c_str()) == 0;
 }
 
 template <typename Predicate>
@@ -926,6 +957,29 @@ void test_pipe_endpoint() {
             "a control character is rejected");
     require(fusion::ipc::logical_pipe_name(L"\\\\?\\pipe\\fusion").empty(),
             "an unsupported device path form is rejected");
+  }
+
+  // 4. The integration mode's production-endpoint guard, checked here without a
+  //    Host so the guard itself can never be the thing that reaches the live pipe.
+  //    Both spellings of the live endpoint are recognised; a production-*shaped*
+  //    name that is not this user's endpoint is not mistaken for it.
+  {
+    const std::wstring production = fusion::ipc::compute_pipe_name();
+    const std::wstring logical = fusion::ipc::logical_pipe_name(production);
+    require(!logical.empty(), "the production endpoint has a logical name");
+    require(is_production_endpoint(production),
+            "the full-path production endpoint is recognised");
+    require(is_production_endpoint(logical), "the logical production endpoint is recognised");
+    require(is_production_endpoint(L"\\\\.\\pipe\\" + logical),
+            "the full path of the logical production name is recognised");
+    require(!is_production_endpoint(L"fusion-selftest-8f2c"),
+            "an isolated endpoint is not the production endpoint");
+    require(!is_production_endpoint(L"FusionHost-v1-S-1-5-21-1-1"),
+            "a production-shaped name for another user is not this endpoint");
+    require(!is_production_endpoint(L""), "an empty endpoint is not the production endpoint");
+    require(wide_from_utf8("fusion-selftest-8f2c") == L"fusion-selftest-8f2c",
+            "a UTF-8 endpoint converts to the same logical name");
+    require(wide_from_utf8("\xff\xfe").empty(), "invalid UTF-8 is rejected");
   }
 }
 
@@ -2398,12 +2452,43 @@ void test_integration() {
     return;
   }
 
-  // This test requires FusionHost.exe to be running.
-  auto backend = make_ipc_backend(std::chrono::milliseconds(2000));
+  // These assertions type into whichever Host owns the endpoint they connect to,
+  // so this mode must never fall back to the default endpoint: that one belongs to
+  // the installed product Host and to the user's live configuration and learning
+  // data. A CTest process cannot isolate a Host it did not start — an environment
+  // variable set here would not reach one — so an explicit isolated endpoint is
+  // required, and its absence skips instead of connecting.
+  const char *configured = std::getenv("FUSION_STAGE4A_INTEGRATION_PIPE");
+  if (configured == nullptr || *configured == '\0') {
+    std::cout << "SKIP integration (FUSION_STAGE4A_INTEGRATION_PIPE not set; the production "
+                 "endpoint is never used)\n";
+    return;
+  }
+  const std::wstring endpoint = wide_from_utf8(configured);
+  const std::wstring isolated = logical_pipe_name(endpoint);
+  if (isolated.empty()) {
+    throw std::runtime_error(
+        "integration: FUSION_STAGE4A_INTEGRATION_PIPE is not a single pipe name");
+  }
+  // Refused before the first request: the caller asked for an isolated run and got
+  // the live endpoint, which is the one case where connecting would corrupt state
+  // outside this test.
+  if (is_production_endpoint(endpoint)) {
+    throw std::runtime_error(
+        "integration: refusing the production endpoint; set FUSION_STAGE4A_INTEGRATION_PIPE "
+        "to the isolated Host's pipe");
+  }
+
+  // IpcBackend hands the name straight to CreateFileW, so it needs the Win32 device
+  // path; only Qt's QLocalSocket completes a logical name by itself.
+  const std::wstring device_path = std::wstring(pipe_device_path_prefix) + isolated;
+  auto backend = make_ipc_backend(device_path, std::chrono::milliseconds(2000));
   if (!backend) {
-    std::fprintf(stderr, "FAIL integration: FusionHost not reachable\n");
-    std::fprintf(stderr, "  Set FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip.\n");
-    throw std::runtime_error("integration: FusionHost not reachable");
+    std::fprintf(stderr, "FAIL integration: no FusionHost is listening on the isolated endpoint\n");
+    std::fprintf(stderr, "  Start an isolated Host on %ls, or set "
+                         "FUSION_STAGE4A_SKIP_INTEGRATION=1 to skip.\n",
+                 isolated.c_str());
+    throw std::runtime_error("integration: isolated FusionHost not reachable");
   }
   require(backend->healthy(), "integration healthy");
 

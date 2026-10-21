@@ -3,6 +3,11 @@ project(FusionWindowsStage1 LANGUAGES CXX)
 
 option(FUSION_WITH_FCITX5 "Enable the Stage 4A out-of-process Fcitx Host (FusionHost.exe + IPC)" OFF)
 option(FUSION_WITH_SETTINGS_UI "Build the upstream-derived FusionSettings.exe process" OFF)
+# The real-engine integration test types into the Host it connects to, so it runs
+# only against an endpoint named here. Leave it unset and the test skips: the
+# default endpoint is the installed product Host and the user's live data.
+set(FUSION_STAGE4A_INTEGRATION_PIPE "" CACHE STRING
+    "Isolated FusionHost pipe for stage4a_ipc_integration (empty = skip)")
 if(FUSION_WITH_SETTINGS_UI AND NOT FUSION_WITH_FCITX5)
   message(FATAL_ERROR "FusionSettings.exe requires FUSION_WITH_FCITX5=ON")
 endif()
@@ -228,10 +233,16 @@ if(BUILD_TESTING)
       target_compile_definitions(stage4a PRIVATE FUSION_WITH_FCITX5)
       target_link_libraries(stage4a PRIVATE FusionFcitxHost)
       add_test(NAME stage4a_ipc_integration COMMAND stage4a integration)
-      # The spawned product Host must not read or write the real per-user Fcitx
-      # data (Stage 6 WP3 A2): the Host's own switch keeps it on the skipped path.
+      # Without an explicit isolated endpoint the mode prints SKIP and connects to
+      # nothing, so CTest has to report it as skipped rather than as a successful
+      # integration run. Setting a variable on this process would not isolate the
+      # Host anyway: it is already running, with its own environment and profile.
       set_tests_properties(stage4a_ipc_integration PROPERTIES
-        ENVIRONMENT "FUSION_FCITX_SKIP_USER_PATH=1")
+        SKIP_REGULAR_EXPRESSION "SKIP integration")
+      if(FUSION_STAGE4A_INTEGRATION_PIPE)
+        set_tests_properties(stage4a_ipc_integration PROPERTIES
+          ENVIRONMENT "FUSION_STAGE4A_INTEGRATION_PIPE=${FUSION_STAGE4A_INTEGRATION_PIPE}")
+      endif()
     endif()
 
     # Stage 4B reconnect / semantic-readiness / incarnation-fencing tests. They
@@ -339,6 +350,19 @@ if(BUILD_TESTING)
     target_compile_options(wp3_input_methods PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
   add_test(NAME wp3_input_methods COMMAND wp3_input_methods)
+  # Stage A settings/list protocol and the product-side list validation are pure
+  # header logic (no Fcitx instance), so they build and run on every platform.
+  add_executable(stage_a_settings tests/stage_a_settings.cpp)
+  target_include_directories(stage_a_settings PRIVATE src include)
+  target_compile_features(stage_a_settings PRIVATE cxx_std_20)
+  if(MSVC)
+    target_compile_options(stage_a_settings PRIVATE /W4 /WX /utf-8)
+  else()
+    target_compile_options(stage_a_settings PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  foreach(test protocol bounds validator)
+    add_test(NAME stage_a_settings_${test} COMMAND stage_a_settings ${test})
+  endforeach()
   # Stage 5 candidate projection/action decisions are platform-free controller
   # logic (the Win32 surface is smoke-tested on the real product path), so they
   # build with the same portable sources as tsf_lifecycle.

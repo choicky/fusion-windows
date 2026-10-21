@@ -12,7 +12,10 @@ New-Item -ItemType Directory -Force $sourceRoot | Out-Null
 $pinsPath = Join-Path $RepoRoot 'cmake\settings-ui\versions.cmake'
 $pinText = Get-Content -LiteralPath $pinsPath -Raw
 function Get-Pin([string]$Name) {
-  $pattern = '(?m)^set\(' + [Regex]::Escape($Name) + ' "([0-9a-f]{40})"\)$'
+  # Tolerate a CRLF checkout: with `core.autocrlf=true` the line ends in `\r\n`, and
+  # an anchor placed directly after `)` would then never match, which made a normal
+  # fresh Windows clone unable to prepare sources.
+  $pattern = '(?m)^set\(' + [Regex]::Escape($Name) + ' "([0-9a-f]{40})"\)[ \t\r]*$'
   $match = [Regex]::Match($pinText, $pattern)
   if (-not $match.Success) { throw "Missing exact 40-hex pin: $Name" }
   return $match.Groups[1].Value
@@ -84,7 +87,7 @@ function Apply-Patch([string]$Path, [string]$Patch) {
   if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $Patch" }
   Invoke-Git @('-C',$Path,'apply',$Patch)
 }
-$configtoolRepository = [Regex]::Match($pinText, '(?m)^set\(FUSION_SETTINGS_CONFIGTOOL_REPOSITORY "([^"]+)"\)$')
+$configtoolRepository = [Regex]::Match($pinText, '(?m)^set\(FUSION_SETTINGS_CONFIGTOOL_REPOSITORY "([^"]+)"\)[ \t\r]*$')
 if (-not $configtoolRepository.Success) { throw 'Missing owner-fork repository URL pin' }
 $configtool = Get-PinnedCheckout 'fcitx5-configtool' $configtoolRepository.Groups[1].Value `
   (Get-Pin 'FUSION_SETTINGS_CONFIGTOOL_COMMIT')

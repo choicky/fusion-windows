@@ -199,7 +199,9 @@ try {
   if ($dirty) { throw 'Owner-test package must be built from a clean committed fusion-windows worktree' }
 
   $settingsPins = Get-Content -LiteralPath (Join-Path $RepoRoot 'cmake\settings-ui\versions.cmake') -Raw
-  $vcpkgMatch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_VCPKG_COMMIT "([0-9a-f]{40})"\)$')
+  # `[ \t\r]*$` keeps the anchors working on a CRLF checkout, which is what a normal
+  # fresh Windows clone produces with `core.autocrlf=true`.
+  $vcpkgMatch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_VCPKG_COMMIT "([0-9a-f]{40})"\)[ \t\r]*$')
   if (-not $vcpkgMatch.Success) { throw 'Missing exact vcpkg commit pin' }
   $runtime.vcpkg = $vcpkgMatch.Groups[1].Value
   $runtime.msvc = '14.51.36231'
@@ -209,12 +211,19 @@ try {
       @('fcitx5','FUSION_SETTINGS_FCITX5_COMMIT'),
       @('fcitx5-chinese-addons','FUSION_SETTINGS_CHINESE_ADDONS_COMMIT'),
       @('libime','FUSION_SETTINGS_LIBIME_COMMIT'))) {
-    $match = [Regex]::Match($settingsPins, '(?m)^set\(' + [Regex]::Escape($pair[1]) + ' "([0-9a-f]{40})"\)$')
+    $match = [Regex]::Match($settingsPins, '(?m)^set\(' + [Regex]::Escape($pair[1]) + ' "([0-9a-f]{40})"\)[ \t\r]*$')
     if (-not $match.Success) { throw "Missing settings source pin $($pair[1])" }
     $runtime[$pair[0]] = $match.Groups[1].Value
   }
   $runtime.qt = '6.8.3 win64_msvc2022_64'
   $runtime.ecm = '6.30.0 build-time only'
+  # The settings manifest below records the fork revision the settings executable was
+  # actually built from. Read it from the same pin file the build reads, so the manifest
+  # cannot drift from versions.cmake the way a literal did.
+  $configtoolRepository = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_CONFIGTOOL_REPOSITORY "([^"]+)"\)[ \t\r]*$')
+  if (-not $configtoolRepository.Success) { throw 'Missing maintained configtool fork repository pin' }
+  $configtoolBranch = [Regex]::Match($settingsPins, '(?m)^set\(FUSION_SETTINGS_CONFIGTOOL_BRANCH "([^"]+)"\)[ \t\r]*$')
+  $configtoolBranchName = if ($configtoolBranch.Success) { $configtoolBranch.Groups[1].Value } else { 'windows/fusion-settings' }
   if (-not $UpstreamRoot) { throw 'The pinned native source root is required to provide corresponding runtime source' }
   foreach ($pair in @(@('fcitx5', 'fcitx5'), @('fcitx5-chinese-addons', 'chineseAddons'), @('libime', 'libime'))) {
     $path = Join-Path $UpstreamRoot $pair[0]
@@ -247,20 +256,20 @@ try {
     builtAt       = (Get-Date).ToString('o')
     builtOn       = $env:COMPUTERNAME
     configuration = 'Release'
-  runtime       = $runtime
-  settings      = [ordered]@{
-    implementationStatus = 'implemented; isolated-product-validated when recorded by the delivery report'
-    experimentalResult   = 'not owner-installed or owner-accepted; owner-test package only'
-    selectionUi          = 'official InputMethodManager group APIs; Items/0 selected, DefaultIM preserved as fallback'
-    applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; changed apply checks contexts and preserves unexposed values'
-    sourceCommit         = 'covered by package sourceCommit'
-    repository           = 'https://github.com/choicky/fcitx5-configtool'
-    branch               = 'windows/fusion-settings'
-    commit               = '0234c64e93f1d61badc1fd3eaad2ba786ca63850'
-    sourceAccess         = 'licenses/settings-ui/SOURCE-ACCESS.txt'
-  }
-  layout        = 'bin\ (Host + Tray + Settings + TSF DLL + runtime/Qt/plugins), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
-  files         = $files
+    runtime       = $runtime
+    settings      = [ordered]@{
+      implementationStatus = 'implemented; built and validated against an isolated Host + GUI from this source commit'
+      experimentalResult   = 'not owner-installed, not owner-accepted, not registered; owner-test package only'
+      selectionUi          = 'official InputMethodManager group APIs; Items/0 selected, DefaultIM preserved as fallback'
+      applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; changed apply checks contexts and preserves unexposed values'
+      sourceCommit         = 'covered by package sourceCommit'
+      repository           = $configtoolRepository.Groups[1].Value
+      branch               = $configtoolBranchName
+      commit               = $runtime['fcitx5-configtool']
+      sourceAccess         = 'licenses/settings-ui/SOURCE-ACCESS.txt'
+    }
+    layout        = 'bin\ (Host + Tray + Settings + TSF DLL + runtime/Qt/plugins), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    files         = $files
   }
   $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'package.json') -Encoding UTF8
 
