@@ -52,4 +52,16 @@
     <ProjectReference Include="..\FusionSettings.Core\FusionSettings.Core.csproj" />
   </ItemGroup>
 
+  <!--
+    dotnet publish does not carry the app's compiled XAML resource index, so the published
+    copy starts and then fails with "Cannot locate resource from ms-appx:///MainWindow.xaml".
+    The build output has it; copy it across so the published folder is complete.
+  -->
+  <Target Name="CopyResourceIndexToPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <ResourceIndexFiles Include="$(TargetDir)*.pri" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ResourceIndexFiles)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>
