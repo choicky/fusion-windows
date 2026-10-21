@@ -40,9 +40,13 @@ These are the properties the presentation may rely on, each covered by a check:
 - **An uncertain method-list write keeps the request.** The reread becomes the baseline and the
   requested order stays pending unless the reread shows it applied, so "not applied" is never
   reported as saved.
-- **A reconnect preserves pending edits**, and a retry after a first load that never succeeded
-  creates the drafts it does not have. Losing the connection is tracked separately from having
-  loaded, so the window offers the retry in both cases.
+- **A reconnect keeps pending edits, and only pending edits.** A configuration draft keeps its
+  pending values. An input-method list the user actually reordered keeps the requested order while
+  the baseline moves to the Host's. A list nobody edited adopts the Host's order instead: a cached
+  list is not user intent, and keeping it would report a stale order as a local edit and let a
+  later save submit a reversal. A retry after a first load that never succeeded creates the drafts
+  it does not have, and losing the connection is tracked separately from having loaded, so the
+  window offers the retry in both cases.
 - **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
   replaced with an empty one, and empty entries keep their positions through a copy or a
   replacement.
@@ -79,12 +83,12 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **515 checks** as of this revision — 423 without a Host, and 92 more against one
+Exit code 0 means every check passed: **546 checks** as of this revision — 454 without a Host, and 92 more against one
 (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the workspace path — Global
 routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list, a failed start and its
-retry — a scripted peer for an uncertain method-list write and for a reconnect, a successful global save with its
-persistence check, and read/apply/read-back with incarnation stability). `--no-integration`
-skips the real-Host section.
+retry — a scripted peer for an uncertain method-list write and for the three reconnect cases of the list, a successful
+global save with its persistence check, and read/apply/read-back with incarnation stability). `--no-integration` skips the
+real-Host section.
 
 ### Running the real-Host checks
 

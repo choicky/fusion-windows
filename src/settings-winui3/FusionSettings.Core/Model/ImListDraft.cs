@@ -101,20 +101,45 @@ public sealed class ImListDraft
     }
 
     /// <summary>
-    /// Moves the baseline to a fresh read and leaves the requested order alone.
+    /// Moves the baseline to a fresh read, and adopts the read's enabled list too when there was
+    /// nothing pending to preserve.
     /// </summary>
     /// <remarks>
-    /// This is the reconciliation for an uncertain write and for a reconnect, and it is
-    /// deliberately the same operation for both. The reread is authoritative, so it becomes the
-    /// baseline; the user's order stays pending, so nothing they asked for is thrown away. Which
-    /// of the two happened is then read off <see cref="HasChanges"/>: false means the reread
-    /// shows the request applied (and there is nothing left to save), true means it does not (and
-    /// the request is still pending). Neither outcome replays the mutation.
+    /// <para>
+    /// The reread is authoritative either way, so it always becomes the baseline — including its
+    /// availability, which is what the UI shows as unavailable or fallback.
+    /// </para>
+    /// <para>
+    /// The requested order is a different question, and it is decided from the state <b>before</b>
+    /// the baseline moves. A list with pending edits is user intent: it stays, and
+    /// <see cref="HasChanges"/> then says whether the reread agrees (false: the request is applied
+    /// and there is nothing left to save; true: it is still pending). A list with no pending edits
+    /// is not user intent at all — it is just what the Host said last time — so adopting the fresh
+    /// order is the only correct outcome. Keeping it instead would present a stale cached order as
+    /// a local edit, and the next save would submit a reversal nobody asked for.
+    /// </para>
+    /// <para>
+    /// Neither path replays the mutation. This is the reconciliation for an uncertain write and for
+    /// a reconnect; the difference between them is only that an uncertain write always arrives
+    /// here with a pending request.
+    /// </para>
     /// </remarks>
     public void RefreshBaseline(ImList fresh)
     {
         ArgumentNullException.ThrowIfNull(fresh);
+
+        // Ask the question against the old baseline. After the assignment below, the two lists
+        // would be compared with each other and the answer would always be "clean".
+        var hadPendingEdits = HasChanges;
         Baseline = fresh;
+
+        if (hadPendingEdits)
+        {
+            return;
+        }
+
+        _enabled.Clear();
+        _enabled.AddRange(fresh.Enabled);
     }
 
     /// <summary>The ordered list a save submits.</summary>

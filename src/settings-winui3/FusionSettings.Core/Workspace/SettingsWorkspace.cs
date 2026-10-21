@@ -304,8 +304,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             }
             else
             {
-                // A refresh moves the baseline and leaves pending edits alone, so a reconnect
-                // can never overwrite unsaved work.
+                // A refresh moves the baseline. Configuration drafts keep their pending edits; the
+                // method list decides per draft, because a list nobody edited must follow the Host
+                // rather than be reported as a local edit.
                 PinyinDraft?.RefreshBaseline(pinyin.Value!);
                 GlobalDraft?.RefreshBaseline(global.Value!);
                 MergeMethods(methods.Value!);
@@ -664,9 +665,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Keeps a refresh from discarding list edits: the baseline moves to the fresh read and a
-    /// pending order stays pending, so a reconnect can neither drop the user's work nor claim it
-    /// was saved.
+    /// Keeps a refresh from discarding list edits without inventing one. The baseline moves to the
+    /// fresh read; a pending order stays pending, and a list with nothing pending adopts the Host's
+    /// order instead of turning the cached one into a local edit.
     /// </summary>
     private void MergeMethods(ImList fresh)
     {

@@ -28,6 +28,9 @@ internal static class RecoveryTests
     {
         await UncertainMethodWriteAsync().ConfigureAwait(false);
         await ReconnectAsync().ConfigureAwait(false);
+        await CleanListReconnectAsync().ConfigureAwait(false);
+        await PendingListReconnectAsync().ConfigureAwait(false);
+        await PendingListAlreadyOnHostAsync().ConfigureAwait(false);
         await RetryAfterFailedStartAsync().ConfigureAwait(false);
     }
 
@@ -194,6 +197,171 @@ internal static class RecoveryTests
     }
 
     /// <summary>
+    /// A list nobody edited is not user intent. When the Host's order has changed, the reconnect
+    /// must adopt it; keeping the cached order would present it as a local edit and let a later
+    /// save submit a reversal nobody asked for.
+    /// </summary>
+    private static async Task CleanListReconnectAsync()
+    {
+        Harness.Section("reconnect: a clean list adopts the Host's order instead of becoming an edit");
+
+        var name = FakeHost.UniqueName();
+        var hostOrder = OldOrder;
+        var listWrites = 0;
+        var configWrites = 0;
+
+        await using var peer = FakeHost.StartScripted(name, (type, _) =>
+        {
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return ConfigurableSnapshotBody();
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(hostOrder, hostOrder);
+                case MessageType.SettingsSetImListRequest:
+                    listWrites++;
+                    return ImListBody(hostOrder, hostOrder);
+                case MessageType.SettingsSetConfigRequest:
+                    configWrites++;
+                    return ConfigurableSnapshotBody();
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.CheckEqual("pinyin,shuangpin", string.Join(",", workspace.Methods!.Enabled),
+            "with the list the Host holds");
+        Harness.Check(!workspace.HasChanges, "and nothing pending: the list was never edited");
+
+        // The Host's authoritative list changes while this window is away.
+        hostOrder = RequestedOrder;
+
+        Harness.Check(await workspace.RetryAsync(cancellation.Token).ConfigureAwait(false),
+            "the retry reconnects");
+        Harness.CheckEqual("shuangpin,pinyin", string.Join(",", workspace.Methods!.Enabled),
+            "the displayed list adopts the Host's new order");
+        Harness.CheckEqual("shuangpin,pinyin", string.Join(",", workspace.Methods.Baseline.Enabled),
+            "and the baseline moves with it");
+        Harness.Check(!workspace.Methods.HasChanges,
+            "the cached list is not turned into a local edit");
+        Harness.Check(!workspace.HasChanges, "so the workspace has nothing to save");
+
+        await workspace.SaveAsync(cancellation.Token).ConfigureAwait(false);
+        Harness.CheckEqual(0, listWrites, "a save with nothing pending sends no SetImList");
+        Harness.Check(workspace.SaveSummary.Contains("没有需要保存", StringComparison.Ordinal),
+            "and says there is nothing to save");
+
+        // A configuration-only edit after the clean reconnect must not drag the list along.
+        Harness.Check(workspace.TrySet(SettingsTarget.Global, "PageSize", SettingsValue.Text("6")),
+            "a Global edit is accepted");
+        await workspace.SaveAsync(cancellation.Token).ConfigureAwait(false);
+        Harness.CheckEqual(1, configWrites, "the configuration edit is saved");
+        Harness.CheckEqual(0, listWrites, "and it sends no SetImList");
+        Harness.Check(!workspace.HasChanges, "with nothing left pending");
+    }
+
+    /// <summary>
+    /// A list the user really did edit is intent. The reconnect moves the baseline to the Host and
+    /// leaves the request pending, and the reconnect itself sends nothing.
+    /// </summary>
+    private static async Task PendingListReconnectAsync()
+    {
+        Harness.Section("reconnect: a pending list keeps the request while the baseline moves");
+
+        var name = FakeHost.UniqueName();
+        var listWrites = 0;
+
+        await using var peer = FakeHost.StartScripted(name, (type, _) =>
+        {
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return SnapshotBody();
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(OldOrder, OldOrder);
+                case MessageType.SettingsSetImListRequest:
+                    listWrites++;
+                    return ImListBody(OldOrder, OldOrder);
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.Check(workspace.MoveMethod(0, 1), "the user reorders the list");
+        Harness.Check(workspace.Methods!.HasChanges, "so the list has a pending request");
+
+        Harness.Check(await workspace.RetryAsync(cancellation.Token).ConfigureAwait(false),
+            "the retry reconnects");
+        Harness.CheckEqual("shuangpin,pinyin", string.Join(",", workspace.Methods!.Enabled),
+            "the requested order is still what the window shows");
+        Harness.CheckEqual("pinyin,shuangpin", string.Join(",", workspace.Methods.Baseline.Enabled),
+            "while the baseline reflects what the Host actually holds");
+        Harness.Check(workspace.Methods.HasChanges, "so the request is still pending");
+        Harness.Check(workspace.HasChanges, "and the workspace still has work to save");
+        Harness.CheckEqual(0, listWrites, "the retry itself sends no mutation");
+    }
+
+    /// <summary>
+    /// The pending request and the Host's list agree, so the request is no longer a change — and
+    /// nothing is replayed to get there.
+    /// </summary>
+    private static async Task PendingListAlreadyOnHostAsync()
+    {
+        Harness.Section("reconnect: a pending request the Host already reflects becomes clean");
+
+        var name = FakeHost.UniqueName();
+        var hostOrder = OldOrder;
+        var listWrites = 0;
+
+        await using var peer = FakeHost.StartScripted(name, (type, _) =>
+        {
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return SnapshotBody();
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(hostOrder, hostOrder);
+                case MessageType.SettingsSetImListRequest:
+                    listWrites++;
+                    return ImListBody(hostOrder, hostOrder);
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.Check(workspace.MoveMethod(0, 1), "the user reorders the list");
+
+        // The write landed through another path, or the Host applied it before the reply was lost.
+        hostOrder = RequestedOrder;
+
+        Harness.Check(await workspace.RetryAsync(cancellation.Token).ConfigureAwait(false),
+            "the retry reconnects");
+        Harness.CheckEqual("shuangpin,pinyin", string.Join(",", workspace.Methods!.Enabled),
+            "the list still shows the requested order");
+        Harness.CheckEqual("shuangpin,pinyin", string.Join(",", workspace.Methods.Baseline.Enabled),
+            "which is now also the baseline");
+        Harness.Check(!workspace.Methods.HasChanges,
+            "so the request is no longer a change");
+        Harness.Check(!workspace.HasChanges, "and the workspace has nothing left to save");
+        Harness.CheckEqual(0, listWrites, "nothing was replayed to reach that state");
+    }
+
+    /// <summary>
     /// The first load never succeeded, so there are no drafts for a retry to preserve.
     /// </summary>
     private static async Task RetryAfterFailedStartAsync()
@@ -226,6 +394,19 @@ internal static class RecoveryTests
 
     private static byte[] SnapshotBody() =>
         Bytes.SnapshotPayload(Bytes.Map(("PageSize", Bytes.Scalar("5"))));
+
+    /// <summary>
+    /// The same values with a schema, so a check can make an ordinary configuration edit. The
+    /// reconnect checks for the list itself need no schema; the configuration-only save does,
+    /// because the draft refuses a field the view does not describe.
+    /// </summary>
+    private static byte[] ConfigurableSnapshotBody() =>
+        Bytes.SnapshotPayload(
+            Bytes.Map(("PageSize", Bytes.Scalar("5"))),
+            ("GlobalConfig", new[]
+            {
+                Bytes.Option("PageSize", "Integer", Bytes.Scalar("5"), Bytes.EmptyProperties()),
+            }));
 
     private static byte[] StatusBody(SettingsStatus status, string error) =>
         Bytes.Concat(Bytes.U8((byte)status), Bytes.Str(error));
