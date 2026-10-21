@@ -219,32 +219,59 @@ void restart_host() {
                 SW_SHOWNORMAL);
 }
 
+std::wstring settings_executable() { return g_version_dir + L"\\bin\\FusionSettings.exe"; }
+
+// One in-flight launch at a time: a second click while the process is still starting must
+// not stack another window, and a launch that failed or exited must not lock the action.
+fusion::tray::LaunchGuard g_settings_launch;
+
 void open_settings() {
   if (g_version_dir.empty()) {
     MessageBoxW(nullptr, L"无法确定 Fusion 安装版本目录。", L"Fusion 设置",
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     return;
   }
-  // A settings window that is already open is activated, not duplicated. The match is
-  // on the executable name, so a future client keeps working as long as it ships as
-  // FusionSettings.exe in the same version directory.
+  const ULONGLONG now = GetTickCount64();
+  if (g_settings_launch.pending(now)) {
+    return; // the previous launch is still starting
+  }
+  const std::wstring executable = settings_executable();
   DWORD session = 0;
   if (ProcessIdToSessionId(GetCurrentProcessId(), &session) != 0) {
-    HWND existing = fusion::tray::find_window_of_process_image(L"FusionSettings.exe", session, 0);
-    if (existing != nullptr && fusion::tray::activate_window(existing)) {
+    // The intended instance is this exact executable, in this session, on the production
+    // endpoint. An older version directory, a development copy or a test instance started
+    // with --pipe-name is not it, and is never raised as if it were.
+    const fusion::tray::SettingsInstance instance =
+        fusion::tray::find_settings_instance(executable, session);
+    const bool found = instance.window != nullptr;
+    const bool activated = found && fusion::tray::activate_window(instance.window);
+    switch (fusion::tray::decide_settings_action(found, activated)) {
+    case fusion::tray::SettingsAction::Activate:
       return;
+    case fusion::tray::SettingsAction::NotifyOnly:
+      // The window exists but Windows refused the foreground change. Launching again would
+      // only add a second window, so ask for attention instead.
+      fusion::tray::request_attention(instance.window);
+      return;
+    case fusion::tray::SettingsAction::Launch:
+      break;
     }
   }
-  const std::wstring executable = g_version_dir + L"\\bin\\FusionSettings.exe";
-  const auto result = reinterpret_cast<INT_PTR>(
-      ShellExecuteW(nullptr, L"open", executable.c_str(), nullptr, g_version_dir.c_str(),
-                    SW_SHOWNORMAL));
-  if (result <= 32) {
+  SHELLEXECUTEINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS;
+  info.lpVerb = L"open";
+  info.lpFile = executable.c_str();
+  info.lpDirectory = g_version_dir.c_str();
+  info.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&info)) {
     MessageBoxW(nullptr,
                 L"无法启动 Fusion 设置。请确认当前安装包包含 bin\\FusionSettings.exe，"
                 L"且 FusionHost 正在运行。",
                 L"Fusion 设置", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    return;
   }
+  g_settings_launch.started(info.hProcess, now);
 }
 
 void exit_tray(HWND window) {
