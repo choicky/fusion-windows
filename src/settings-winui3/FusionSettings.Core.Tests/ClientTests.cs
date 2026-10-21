@@ -39,7 +39,11 @@ internal static class ClientTests
             Harness.Check(!result.IsUncertain, "so the outcome is not uncertain");
         }
 
-        Harness.Section("mutation: the connection closes while the request is being written");
+        // The peer answers the handshake and then disconnects without reading the request.
+        // That is not a deterministic mid-write failure: it covers "the connection went away
+        // after the handshake", where the client cannot tell whether the request was read, so
+        // the only honest answer is that the outcome is unknown.
+        Harness.Section("mutation: the peer disconnects after the handshake");
         await using (var host = FakeHost.Start(FakeHost.UniqueName(), FakeBehaviour.CloseAfterHello))
         {
             var client = new SettingsClient(host.Name, TimeSpan.FromSeconds(5));
@@ -47,9 +51,9 @@ internal static class ClientTests
             var result = await client.SetConfigAsync("fcitx://config/inputmethod/pinyin",
                 ChangeSet(), cts.Token).ConfigureAwait(false);
             Harness.CheckEqual(SettingsStatus.Indeterminate, result.Status,
-                "a write that fails part-way leaves the outcome unknown");
+                "a disconnect after the handshake leaves the outcome unknown");
             Harness.Check(result.MutationMayHaveBeenApplied,
-                "because the frame may already have reached the Host");
+                "because the request may already have been read");
             Harness.Check(result.IsUncertain, "so the caller rereads instead of retrying");
         }
 

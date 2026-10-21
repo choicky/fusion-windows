@@ -240,9 +240,11 @@ try {
 
   $currentStep = 'settings-shortcut'
   Write-Step 'creating the Start Menu shortcut for Fusion Settings'
-  $settingsExe = Join-Path $versionDir 'bin\FusionSettings.exe'
+  # The WinUI settings client ships in its own folder: it carries the .NET and Windows App
+  # SDK runtimes, which must not be mixed with the Host's and the Qt client's DLLs in bin\.
+  $settingsExe = Join-Path $versionDir 'bin\settings\FusionSettings.exe'
   if (-not (Test-Path -LiteralPath $settingsExe)) {
-    throw "the package does not contain bin\FusionSettings.exe ($settingsExe)"
+    throw "the package does not contain bin\settings\FusionSettings.exe ($settingsExe)"
   }
   $settingsShortcutPath = Join-Path $startMenu 'Fusion Settings.lnk'
   $settingsShortcut = $shell.CreateShortcut($settingsShortcutPath)

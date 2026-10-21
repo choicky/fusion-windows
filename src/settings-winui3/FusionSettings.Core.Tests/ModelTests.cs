@@ -13,6 +13,7 @@ internal static class ModelTests
         DraftLifecycle();
         SharedViews();
         SchemaHelpers();
+        StringLists();
     }
 
     private static void Identity()
@@ -252,5 +253,103 @@ internal static class ModelTests
             "the pinyin view does not");
         Harness.CheckEqual(1, view.Types.Count(t => t.Name == "Fuzzy$FuzzyConfig"),
             "the nested type appears once");
+
+        Harness.Section("schema: which view may carry which field");
+        Harness.Check(view.Describes("PageSize"), "a root option is described");
+        Harness.Check(view.Describes("Fuzzy/VE_UE"), "a nested option is described through its container");
+        Harness.Check(!view.Describes("ShowShuangpinMode"),
+            "a Shuangpin-only field is not described by the Pinyin view");
+        Harness.Check(view.Describes("Fuzzy/Nope") == false, "an unknown nested option is not described");
+        Harness.Check(!view.Describes("Nope"), "an unknown root option is not described");
+        Harness.Check(!view.Describes("Nope/VE_UE"), "nor through a container that is not there");
+        Harness.Check(shuangpin.Describes("ShowShuangpinMode"),
+            "the Shuangpin view does describe it");
+    }
+
+    /// <summary>
+    /// The write shape of a <c>List|String</c> option, which is not its read shape.
+    /// </summary>
+    /// <remarks>
+    /// The Host writes a vector as an indexed map and reads an empty one back as the empty
+    /// scalar, but on write it requires a map for every <c>List|</c> option and answers
+    /// "A list-valued Fcitx option has an invalid value" to a scalar. These checks pin the three
+    /// values that must stay distinct.
+    /// </remarks>
+    private static void StringLists()
+    {
+        Harness.Section("string list: an empty list is written as an empty map");
+
+        var empty = StringListValue.ToValue(Array.Empty<string>());
+        Harness.Check(empty.IsMap, "no lines is a map, not a scalar");
+        Harness.CheckEqual(0, empty.Children.Count, "and it has no entries");
+
+        var blank = StringListValue.ToValue(new[] { string.Empty });
+        Harness.Check(blank.IsMap, "empty text is a map too");
+        Harness.CheckEqual(0, blank.Children.Count, "with no entries, which is what an empty box means");
+
+        var fromControl = StringListValue.ToValue(string.Empty.Split('\n'));
+        Harness.Check(fromControl.IsMap, "the control's own empty text produces a map");
+        Harness.CheckEqual(0, fromControl.Children.Count, "and no entries");
+
+        Harness.Section("string list: entries keep their positions");
+
+        var lines = StringListValue.ToValue(new[] { "a", string.Empty, "c" });
+        Harness.Check(lines.IsMap, "a list of lines is a map");
+        Harness.CheckEqual(3, lines.Children.Count, "every line is an entry");
+        Harness.CheckEqual("a", lines.Children["0"].Scalar, "the first entry");
+        Harness.CheckEqual(string.Empty, lines.Children["1"].Scalar,
+            "an empty positional entry keeps its own index instead of being dropped");
+        Harness.CheckEqual("c", lines.Children["2"].Scalar, "the third entry did not move up");
+
+        var crlf = StringListValue.ToValue(new[] { "a\r", "b\r" });
+        Harness.CheckEqual("a", crlf.Children["0"].Scalar, "a trailing CR is not part of the entry");
+        Harness.CheckEqual("b", crlf.Children["1"].Scalar, "for every line");
+
+        Harness.Section("string list: reading still accepts both shapes");
+
+        Harness.CheckEqual(0, StringListValue.Lines(SettingsValue.Text(string.Empty)).Count,
+            "the empty scalar the Host reads back is an empty list");
+        Harness.CheckEqual(0, StringListValue.Lines(SettingsValue.EmptyMap()).Count,
+            "so is an empty map");
+        Harness.CheckEqual("a,,c", string.Join(",", StringListValue.Lines(lines)),
+            "a map reads back in index order, with the empty entry still in its own place");
+        Harness.CheckEqual("a,b",
+            string.Join(",", StringListValue.Lines(SettingsValue.Text("a b"))),
+            "a scalar written by an older client is split rather than shown as empty");
+
+        Harness.Section("string list: the text a control shows round-trips exactly");
+
+        var shown = StringListValue.ToText(lines);
+        Harness.Check(shown.Contains("\r\n", StringComparison.Ordinal),
+            "lines are separated by CRLF, which is what a WinUI text box keeps");
+        Harness.Check(!shown.Replace("\r\n", string.Empty).Contains('\n'),
+            "and never by a bare LF, which the control would collapse");
+        var roundTrip = StringListValue.ToValue(StringListValue.SplitLines(shown));
+        Harness.CheckEqual(string.Join("|", StringListValue.Lines(lines)),
+            string.Join("|", StringListValue.Lines(roundTrip)),
+            "so the text a control shows converts back to the same list");
+        Harness.CheckEqual(3, StringListValue.Lines(roundTrip).Count,
+            "with every entry still present");
+
+        Harness.Section("string list: every line break a control can give back");
+
+        Harness.CheckEqual(2, StringListValue.SplitLines("a\r\nb").Length, "CRLF splits");
+        Harness.CheckEqual(2, StringListValue.SplitLines("a\rb").Length,
+            "CR alone splits — a text box reads text set with CRLF back this way");
+        Harness.CheckEqual(2, StringListValue.SplitLines("a\nb").Length, "LF alone splits");
+        Harness.CheckEqual(0, StringListValue.SplitLines(string.Empty).Length, "empty text has no lines");
+        Harness.CheckEqual(4, StringListValue.SplitLines("a\r\nb\rc\nd").Length,
+            "a mixture is split at every break");
+        Harness.CheckEqual(4,
+            StringListValue.Lines(StringListValue.ToValue(
+                StringListValue.SplitLines(".(/|@)$\r^(www|bbs|forum|mail)\\.\r^(http|https|ftp|telnet|mailto):\r^https?://x/"))).Count,
+            "four patterns stored with CR separators are four entries, not one");
+
+        Harness.Section("string list: a scalar option is not reinterpreted");
+
+        var scalar = SettingsValue.Text(string.Empty);
+        Harness.Check(!scalar.IsMap, "an empty string stays an empty scalar");
+        Harness.Check(!scalar.Equals(empty),
+            "and it is not the same value as an empty list, so a string option is untouched");
     }
 }

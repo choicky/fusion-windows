@@ -261,12 +261,18 @@ public sealed class KeyBindingList
         return new KeyBindingList(items, isPositional);
     }
 
-    /// <summary>Writes the list back in the shape the Host expects.</summary>
+    /// <summary>
+    /// Writes the list in the shape the Host's <b>write</b> path requires: a map of indices.
+    /// An empty list is an empty <b>map</b>, not an empty scalar — the Host returns the empty
+    /// scalar when it reads one, but rejects a non-map for a <c>List|</c> option on write
+    /// ("A list-valued Fcitx option has an invalid value"), so clearing the last binding only
+    /// works with a map. Read and write representations are deliberately not the same.
+    /// </summary>
     public SettingsValue ToValue()
     {
         if (_items.Count == 0)
         {
-            return SettingsValue.Text(string.Empty);
+            return SettingsValue.EmptyMap();
         }
 
         var entries = new (string, SettingsValue)[_items.Count];

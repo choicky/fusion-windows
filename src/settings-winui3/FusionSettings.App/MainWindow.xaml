@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="Fusion.Settings.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <NavigationView
+            x:Name="Navigation"
+            Grid.Row="0"
+            PaneDisplayMode="Left"
+            IsBackButtonVisible="Collapsed"
+            IsSettingsVisible="False"
+            IsPaneToggleButtonVisible="True"
+            OpenPaneLength="240"
+            SelectionChanged="OnNavigationSelectionChanged">
+
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="输入方式" Tag="methods">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8FD;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="按键" Tag="keys">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE765;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="候选与输入" Tag="candidates">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE8A1;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="关于与诊断" Tag="about">
+                    <NavigationViewItem.Icon>
+                        <FontIcon Glyph="&#xE946;" />
+                    </NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+
+            <!--
+              A ContentControl rather than a Frame: the pages are built in code from the
+              Host schema, and Frame.Navigate faults when the page type carries no XAML of
+              its own. There is no navigation stack to preserve here.
+            -->
+            <ContentControl
+                x:Name="PageHost"
+                HorizontalContentAlignment="Stretch"
+                VerticalContentAlignment="Stretch" />
+        </NavigationView>
+
+        <!-- Save bar: current state on the left, the two actions on the right. -->
+        <Border
+            Grid.Row="1"
+            Padding="16,10"
+            BorderThickness="0,1,0,0"
+            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+            Background="{ThemeResource LayerFillColorDefaultBrush}">
+            <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                    <TextBlock
+                        x:Name="StatusLine"
+                        Text="正在启动…"
+                        TextWrapping="Wrap"
+                        Style="{StaticResource CaptionTextBlockStyle}" />
+                    <TextBlock
+                        x:Name="SaveLine"
+                        Text=""
+                        TextWrapping="Wrap"
+                        Visibility="Collapsed"
+                        Style="{StaticResource CaptionTextBlockStyle}"
+                        Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                </StackPanel>
+
+                <!-- Recovery: shown when the Host was absent at startup or went away. -->
+                <Button
+                    x:Name="RetryButton"
+                    Grid.Column="1"
+                    Content="重试连接"
+                    Visibility="Collapsed"
+                    Click="OnRetryClick" />
+
+                <Button
+                    x:Name="ReloadButton"
+                    Grid.Column="2"
+                    Content="重新加载"
+                    Visibility="Collapsed"
+                    Click="OnReloadClick" />
+
+                <Button
+                    x:Name="DiscardButton"
+                    Grid.Column="3"
+                    Content="放弃修改"
+                    IsEnabled="False"
+                    Click="OnDiscardClick" />
+
+                <Button
+                    x:Name="SaveButton"
+                    Grid.Column="4"
+                    Content="保存"
+                    Style="{StaticResource AccentButtonStyle}"
+                    IsEnabled="False"
+                    Click="OnSaveClick" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

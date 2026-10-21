@@ -26,6 +26,10 @@ param(
   [Parameter(Mandatory = $true)][string]$BuildDir,
   [string]$RuntimeIdentity = 'runtime-wp3-20261018',
   [string]$UpstreamRoot = '',
+  # The published WinUI settings client (dotnet publish output). It ships in its own
+  # folder because it carries the .NET and Windows App SDK runtimes, which must not be
+  # merged into bin\ beside the Host's and the Qt client's DLLs.
+  [string]$SettingsAppDir = '',
   [string]$SettingsSourceRoot = '',
   [string]$VcpkgRoot = '',
   [string]$OutDir = '',
@@ -49,7 +53,6 @@ $libDir = Join-Path $BuildDir 'lib'
 foreach ($required in @(
     (Join-Path $binDir 'FusionHost.exe'),
     (Join-Path $binDir 'FusionTray.exe'),
-    (Join-Path $binDir 'FusionSettings.exe'),
     (Join-Path $binDir 'FusionTsf.dll'),
     (Join-Path $binDir 'FusionFcitxHost.dll'),
     (Join-Path $binDir 'Fcitx5Core.dll'),
@@ -79,22 +82,50 @@ try {
   foreach ($file in Get-ChildItem -LiteralPath $binDir -File -Filter '*.dll') {
     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $stage 'bin') -Force
   }
-  foreach ($name in @('FusionHost.exe', 'FusionTray.exe', 'FusionSettings.exe')) {
+  # The Qt settings client is the rollback path. It is included when the Release build has
+  # it; a build configured with FUSION_WITH_SETTINGS_UI=OFF ships only the WinUI client,
+  # which is the default entry point either way.
+  $qtSettingsExe = Join-Path $binDir 'FusionSettings.exe'
+  $includeQtSettings = Test-Path -LiteralPath $qtSettingsExe
+  foreach ($name in @('FusionHost.exe', 'FusionTray.exe')) {
     Copy-Item -LiteralPath (Join-Path $binDir $name) -Destination (Join-Path $stage 'bin') -Force
   }
-  foreach ($name in @('FusionHost.exe', 'FusionTray.exe', 'FusionSettings.exe', 'FusionTsf.dll', 'FusionFcitxHost.dll')) {
+  if ($includeQtSettings) {
+    Copy-Item -LiteralPath $qtSettingsExe -Destination (Join-Path $stage 'bin') -Force
+  }
+  foreach ($name in @('FusionHost.exe', 'FusionTray.exe', 'FusionTsf.dll', 'FusionFcitxHost.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $stage "bin\$name"))) {
       throw "Release build did not produce bin\$name"
     }
   }
-  $qtPlugins = Join-Path $binDir 'plugins'
-  if (-not (Test-Path -LiteralPath (Join-Path $qtPlugins 'platforms\qwindows.dll'))) {
-    throw "Release build did not stage Qt's Windows platform plugin: $qtPlugins"
+  if ($includeQtSettings) {
+    # Its Qt runtime is only staged when the client is actually shipped.
+    $qtPluginsCheck = Join-Path $binDir 'plugins\platforms\qwindows.dll'
+    if (-not (Test-Path -LiteralPath $qtPluginsCheck)) {
+      throw "the Release build has FusionSettings.exe but not Qt's platform plugin: $qtPluginsCheck"
+    }
   }
-  Copy-Item -LiteralPath $qtPlugins -Destination (Join-Path $stage 'bin\plugins') -Recurse -Force
-  $qtConf = Join-Path $binDir 'qt.conf'
-  if (-not (Test-Path -LiteralPath $qtConf)) { throw 'Release build did not stage bin\qt.conf' }
-  Copy-Item -LiteralPath $qtConf -Destination (Join-Path $stage 'bin\qt.conf') -Force
+  # bin\settings: the WinUI client, and the default settings entry point for the tray and
+  # the Start Menu shortcut. The Qt client stays at bin\FusionSettings.exe as the rollback
+  # path; nothing links to it, so there is only one "Settings" entry.
+  if (-not $SettingsAppDir) {
+    throw 'SettingsAppDir is required: pass the published WinUI settings client folder'
+  }
+  $settingsApp = (Resolve-Path -LiteralPath $SettingsAppDir).Path
+  foreach ($requiredAppFile in @('FusionSettings.exe', 'FusionSettings.dll', 'hostfxr.dll')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $settingsApp $requiredAppFile))) {
+      throw "the published settings client is missing $requiredAppFile ($settingsApp)"
+    }
+  }
+  Copy-Item -LiteralPath $settingsApp -Destination (Join-Path $stage 'bin\settings') -Recurse -Force
+
+  if ($includeQtSettings) {
+    $qtPlugins = Join-Path $binDir 'plugins'
+    Copy-Item -LiteralPath $qtPlugins -Destination (Join-Path $stage 'bin\plugins') -Recurse -Force
+    $qtConf = Join-Path $binDir 'qt.conf'
+    if (-not (Test-Path -LiteralPath $qtConf)) { throw 'Release build did not stage bin\qt.conf' }
+    Copy-Item -LiteralPath $qtConf -Destination (Join-Path $stage 'bin\qt.conf') -Force
+  }
 
   # data/ and lib/libime: the Fcitx data root the runtime resolves from ..\data.
   Copy-Item -LiteralPath $dataDir -Destination (Join-Path $stage 'data') -Recurse -Force
@@ -147,7 +178,10 @@ try {
 
   # Package the exact upstream Chinese translation catalogs used by the Host and
   # build the settings catalog from its pinned upstream .po file.
-  if (-not $SettingsSourceRoot -or -not (Test-Path -LiteralPath (Join-Path $SettingsSourceRoot 'fcitx5-configtool\po\fcitx5-configtool\zh_CN.po'))) {
+  # The Host and engine catalogs always ship. The settings catalog belongs to the Qt
+  # client, so it is only built when that client is included and its source tree is given.
+  if ($includeQtSettings -and (-not $SettingsSourceRoot -or
+      -not (Test-Path -LiteralPath (Join-Path $SettingsSourceRoot 'fcitx5-configtool\po\fcitx5-configtool\zh_CN.po')))) {
     throw 'Pass the patch-applied pinned settings source tree as -SettingsSourceRoot'
   }
   if (-not $VcpkgRoot) { throw 'Pass the pinned vcpkg root as -VcpkgRoot to locate msgfmt.exe' }
@@ -156,9 +190,14 @@ try {
   if (-not (Test-Path -LiteralPath $msgfmt)) { throw "Pinned gettext msgfmt.exe not found: $msgfmt" }
   $localeDir = Join-Path $stage 'data\locale\zh_CN\LC_MESSAGES'
   New-Item -ItemType Directory -Force $localeDir | Out-Null
-  foreach ($translation in @(
-      @((Join-Path $SettingsSourceRoot 'fcitx5-configtool\po\fcitx5-configtool\zh_CN.po'), 'fcitx5-configtool.mo'),
-      @((Join-Path $UpstreamRoot 'fcitx5-chinese-addons\po\zh_CN.po'), 'fcitx5-chinese-addons.mo'))) {
+  # The unary comma keeps each entry as a pair; without it @() unrolls a single pair into
+  # two strings and the loop below would index the first character of the path.
+  $catalogs = @()
+  $catalogs += , @((Join-Path $UpstreamRoot 'fcitx5-chinese-addons\po\zh_CN.po'), 'fcitx5-chinese-addons.mo')
+  if ($includeQtSettings -and $SettingsSourceRoot) {
+    $catalogs += , @((Join-Path $SettingsSourceRoot 'fcitx5-configtool\po\fcitx5-configtool\zh_CN.po'), 'fcitx5-configtool.mo')
+  }
+  foreach ($translation in $catalogs) {
     if (-not (Test-Path -LiteralPath $translation[0])) { throw "Pinned translation source missing: $($translation[0])" }
     $oldPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -215,7 +254,11 @@ try {
     if (-not $match.Success) { throw "Missing settings source pin $($pair[1])" }
     $runtime[$pair[0]] = $match.Groups[1].Value
   }
-  $runtime.qt = '6.8.3 win64_msvc2022_64'
+  # Qt is only a runtime dependency when the configtool-derived client is actually shipped.
+  if ($includeQtSettings) {
+    $runtime.qt = '6.8.3 win64_msvc2022_64'
+  }
+
   $runtime.ecm = '6.30.0 build-time only'
   # The settings manifest below records the fork revision the settings executable was
   # actually built from. Read it from the same pin file the build reads, so the manifest
@@ -258,17 +301,38 @@ try {
     configuration = 'Release'
     runtime       = $runtime
     settings      = [ordered]@{
-      implementationStatus = 'implemented; built and validated against an isolated Host + GUI from this source commit'
+      implementationStatus = 'implemented, compiled and tested against an isolated Host; the window was launched and its pages captured'
       experimentalResult   = 'not owner-installed, not owner-accepted, not registered; owner-test package only'
+      defaultClient        = 'Fusion-owned C# + WinUI 3 (fusion-windows src/settings-winui3)'
+      defaultClientPath    = 'bin/settings/FusionSettings.exe'
+      defaultClientDeployment = 'self-contained .NET 8 + Windows App SDK 2.5.1; needs no runtime installed on the target'
+      defaultClientPackages   = @('Microsoft.WindowsAppSDK 2.5.1', 'Microsoft.Windows.SDK.BuildTools 10.0.28000.2705 (build-time only)')
+      defaultClientSource     = 'covered by package sourceCommit'
       selectionUi          = 'official InputMethodManager group APIs; Items/0 selected, DefaultIM preserved as fallback'
-      applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; changed apply checks contexts and preserves unexposed values'
-      sourceCommit         = 'covered by package sourceCommit'
-      repository           = $configtoolRepository.Groups[1].Value
-      branch               = $configtoolBranchName
-      commit               = $runtime['fcitx5-configtool']
-      sourceAccess         = 'licenses/settings-ui/SOURCE-ACCESS.txt'
+      applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; only changed fields are submitted, split across the URIs whose schemas describe them'
+      qtClient             = if ($includeQtSettings) {
+        [ordered]@{
+          included  = $true
+          path      = 'bin/FusionSettings.exe'
+          role      = 'rollback path only; no shortcut or tray action targets it'
+          repository = $configtoolRepository.Groups[1].Value
+          branch     = $configtoolBranchName
+          commit     = $runtime['fcitx5-configtool']
+          sourceAccess = 'licenses/settings-ui/SOURCE-ACCESS.txt'
+        }
+      } else {
+        [ordered]@{
+          included = $false
+          reason   = 'this build has FUSION_WITH_SETTINGS_UI=OFF, so no configtool-derived executable was produced'
+          rollback = 'use the previous package (fusion-0.0.0-wp7+d095a44.zip), which ships the Qt client as its settings entry'
+        }
+      }
     }
-    layout        = 'bin\ (Host + Tray + Settings + TSF DLL + runtime/Qt/plugins), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    layout        = if ($includeQtSettings) {
+      'bin\ (Host + Tray + TSF DLL + runtime + Qt client and plugins), bin\settings\ (WinUI settings client with its own runtimes), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    } else {
+      'bin\ (Host + Tray + TSF DLL + runtime; no Qt client in this package), bin\settings\ (WinUI settings client with its own runtimes), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    }
     files         = $files
   }
   $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'package.json') -Encoding UTF8

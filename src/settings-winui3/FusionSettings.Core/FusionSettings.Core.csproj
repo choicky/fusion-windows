@@ -9,7 +9,12 @@
     core package-free is also what lets its tests run without a test framework.
   -->
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <!--
+      net8.0 is what the WinUI app targets, because the owner's machine has the .NET 8
+      Desktop Runtime and not .NET 10. net10.0 stays so the existing checks keep running on
+      the toolchain they were written against. The code is identical for both.
+    -->
+    <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>

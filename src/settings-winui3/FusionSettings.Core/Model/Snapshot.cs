@@ -219,6 +219,41 @@ public sealed class SettingsSnapshot
     }
 
     /// <summary>
+    /// True when this view describes the option at <paramref name="path"/> — a top-level
+    /// name, or <c>Container/Option</c> inside a nested configuration. This is the check the
+    /// save path uses to decide which URI may carry a pending edit: the Host rejects a field
+    /// the URI's schema does not describe, so the client must not send one there.
+    /// </summary>
+    public bool Describes(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return false;
+        }
+
+        var segments = path.Split('/');
+        if (segments.Length == 1)
+        {
+            return FindRootOption(segments[0]) is not null;
+        }
+
+        if (segments.Length != 2)
+        {
+            return false;
+        }
+
+        var container = FindRootOption(segments[0]);
+        if (container is null || !container.IsNested)
+        {
+            return false;
+        }
+
+        var type = Types.FirstOrDefault(t => string.Equals(t.Name, container.Type, StringComparison.Ordinal));
+        return type is not null &&
+               type.Options.Any(option => string.Equals(option.Name, segments[1], StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// Every option name this view exposes. A value the view does not describe is
     /// never submitted from that view: the pinyin view, for example, does not describe
     /// <c>ShuangpinProfile</c>, and writing it from there would change the other
