@@ -9,6 +9,9 @@
 //     and a tray that already exited for a session end that was then cancelled is
 //     restarted by its own task's cancellation trigger, like the Host;
 //   - explicit Restart FusionHost and Open log folder actions, plus Exit;
+//   - left click on the icon opens the settings window, or brings the window that is
+//     already open to the foreground instead of stacking a duplicate; the right-click
+//     menu keeps every action above and stays keyboard reachable;
 //   - automatic restart and hang detection are NOT here. A running process is
 //     not reported as healthy: the status is "running (pid N)" / "not running".
 //
@@ -24,6 +27,7 @@
 //                             exit 0 host=running, 1 host=absent, 2 unverified
 
 #include "tray/host_watch.hpp"
+#include "tray/settings_window.hpp"
 #include "tray/tray_state.hpp"
 
 #ifndef NOMINMAX
@@ -221,6 +225,16 @@ void open_settings() {
                 MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     return;
   }
+  // A settings window that is already open is activated, not duplicated. The match is
+  // on the executable name, so a future client keeps working as long as it ships as
+  // FusionSettings.exe in the same version directory.
+  DWORD session = 0;
+  if (ProcessIdToSessionId(GetCurrentProcessId(), &session) != 0) {
+    HWND existing = fusion::tray::find_window_of_process_image(L"FusionSettings.exe", session, 0);
+    if (existing != nullptr && fusion::tray::activate_window(existing)) {
+      return;
+    }
+  }
   const std::wstring executable = g_version_dir + L"\\bin\\FusionSettings.exe";
   const auto result = reinterpret_cast<INT_PTR>(
       ShellExecuteW(nullptr, L"open", executable.c_str(), nullptr, g_version_dir.c_str(),
@@ -302,6 +316,12 @@ LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM wparam, LPAR
     return 0;
   case tray_callback_message:
     switch (LOWORD(lparam)) {
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+      // Left click is the settings entry point; the context menu stays on the right
+      // button so every existing action keeps its place.
+      open_settings();
+      return 0;
     case WM_RBUTTONUP:
     case WM_CONTEXTMENU: {
       POINT point{};
