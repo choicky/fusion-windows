@@ -29,14 +29,42 @@ void test_selection() {
   using fusion::selection::binding_input_method;
   using fusion::selection::plan_startup_group;
 
-  // The profile's order wins: a bound context follows the group's current input
-  // method (Items/0), not Fcitx's fallback DefaultIM.
-  require(binding_input_method("shuangpin", "pinyin") == "shuangpin",
-          "the group's current input method is selected");
-  require(binding_input_method("pinyin", "shuangpin") == "pinyin",
-          "DefaultIM is a fallback, not the selection");
+  // A bound context is activated (its switch needs an active state), and Fcitx then
+  // resolves DefaultIM: `Instance::inputMethod` reads localIM, then
+  // `defaultInputMethod()`, and only returns Items/0 while the state is inactive. The
+  // group therefore carries the method in use as Items[0] *and* as DefaultIM (see
+  // group_items_with_off_slot), so the selection is DefaultIM's.
+  require(binding_input_method("shuangpin", "pinyin") == "pinyin",
+          "DefaultIM is the input method a bound context resolves to");
+  require(binding_input_method("pinyin", "shuangpin") == "shuangpin",
+          "Items/0 alone never overrides DefaultIM");
+  require(binding_input_method("pinyin", "") == "pinyin", "an empty DefaultIM keeps Items/0");
   require(binding_input_method("", "pinyin") == "pinyin", "an empty list falls back to DefaultIM");
   require(binding_input_method("", "").empty(), "no group means no input method to select");
+
+  // The off slot: Items/0 repeats the method in use, which is what gives the group the
+  // second entry Fcitx's switch requires and keeps DefaultIM from being rewritten.
+  require(same(fusion::selection::group_items_with_off_slot(
+                   {"shuangpin"}, "shuangpin", {"pinyin", "shuangpin"}),
+               {"pinyin", "shuangpin"}),
+          "a single-method list gains the other method as its off slot");
+  require(same(fusion::selection::group_items_with_off_slot(
+                   {"pinyin", "shuangpin"}, "pinyin", {"pinyin", "shuangpin"}),
+               {"shuangpin", "pinyin", "shuangpin"}),
+          "an all-methods list still gets a different off slot");
+  require(same(fusion::selection::group_items_with_off_slot(
+                   {"pinyin"}, "pinyin", {"pinyin", "shuangpin"}),
+               {"shuangpin", "pinyin"}),
+          "the enabled order is untouched after the slot");
+  require(fusion::selection::group_has_off_slot({"shuangpin", "pinyin"}, "pinyin"),
+          "the normalized shape is recognized");
+  require(!fusion::selection::group_has_off_slot({"shuangpin"}, "shuangpin"),
+          "a single-entry group is not normalized yet");
+  // A two-entry group whose DefaultIM already is Items/0 resolves to the same method in
+  // both states, so it needs nothing; Fcitx cannot produce it (setDefaultInputMethod
+  // rewrites that pair), which is exactly why the slot is written explicitly.
+  require(fusion::selection::group_has_off_slot({"shuangpin", "pinyin", "shuangpin"}, "pinyin"),
+          "a repeated method is still an off slot");
 
   const auto kept =
       plan_startup_group(true, "shuangpin", {"pinyin", "shuangpin"}, {"pinyin", "shuangpin"});

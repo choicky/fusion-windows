@@ -219,7 +219,11 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
   if (!binding || !stimulus_id || !type_byte || !character || !keysym || !modifiers ||
       !index_bits || !r.at_end())
     return std::nullopt;
-  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::PagePrev))
+  // The known range, not merely the first types: a value outside it is a payload this
+  // Host does not implement and is rejected rather than guessed at. KeyRelease is the
+  // key-up half of a modifier-only key; it carries no index and its keysym is its
+  // identity, exactly like the key-down that preceded it.
+  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::KeyRelease))
     return std::nullopt;
   const auto type = static_cast<BackendStimulus::Type>(*type_byte);
   const auto index = static_cast<std::int32_t>(*index_bits);

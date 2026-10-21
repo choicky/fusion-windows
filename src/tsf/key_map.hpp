@@ -33,6 +33,17 @@ inline constexpr std::uint32_t kKeysymDown = 0xff54;
 inline constexpr std::uint32_t kKeysymEnd = 0xff57;
 inline constexpr std::uint32_t kKeysymDelete = 0xffff;
 
+// The two Shift keys, kept apart: Fcitx matches its modifier-only bindings against the
+// exact key (`Hotkey/AltTriggerKeys` defaults to Shift_L only), so a right Shift must
+// never be presented as a left one.
+inline constexpr std::uint32_t kVkLShift = 0xA0;
+inline constexpr std::uint32_t kVkRShift = 0xA1;
+inline constexpr std::uint32_t kKeysymShiftL = 0xffe1;
+inline constexpr std::uint32_t kKeysymShiftR = 0xffe2;
+// Scan codes that separate the two Shift keys when Windows reports the generic VK_SHIFT.
+inline constexpr std::uint32_t kScanShiftLeft = 0x2A;
+inline constexpr std::uint32_t kScanShiftRight = 0x36;
+
 struct KeyAction {
   enum class Type {
     AppendChar, // append one raw character to the composition buffer (STATE input)
@@ -45,6 +56,10 @@ struct KeyAction {
   char ch = '\0'; // valid only for AppendChar
   std::uint32_t virtual_key = 0;
   bool modified = false;
+  // True for the key-up half of a key the engine may bind as a modifier-only hotkey. A
+  // release carries no text and owns no composition: it exists so Fcitx can decide
+  // whether a lone modifier press completed within its own configured timeout.
+  bool release = false;
   std::uint32_t keysym = 0;
   std::uint32_t modifiers = 0;
 };
@@ -53,8 +68,11 @@ struct KeyAction {
 // key outside the development vocabulary classify as Pass.
 KeyAction classify_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win);
 
-// Physical-key translation; this does not predict engine consumption.
+// Physical-key translation; this does not predict engine consumption. `scan_code` is the
+// low byte of the lparam scan field and is needed only to tell the two Shift keys apart
+// when Windows reports the generic VK_SHIFT.
 KeyAction translate_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win,
-                        char32_t character = 0, bool shift = false, bool caps = false);
+                        char32_t character = 0, bool shift = false, bool caps = false,
+                        std::uint32_t scan_code = 0);
 
 } // namespace fusion::tsf

@@ -102,6 +102,20 @@ public:
   // admission -> Mock Backend response -> routing. See SemanticDecision.
   SemanticDecision begin_key(const KeyAction &action, bool policy_allows);
 
+  // Key-up entry point for a modifier-only key whose down this shell relayed. It owns no
+  // composition and materializes nothing: it asks the engine whether the press completed
+  // one of its own modifier-only bindings, and reports what the engine decided. Only the
+  // Shift keys are relayed (see routes_release); every other release is not ours.
+  SemanticDecision release_key(const KeyAction &action);
+
+  // Whether a key-up of this key may be relayed at all: a Shift key whose press this
+  // shell relayed and that stayed lone, nothing else.
+  bool routes_release(const KeyAction &action) const;
+
+  // Records whether a key-down starts the press a modifier-only release may settle.
+  // Called from both T and K (the application may deliver either), and idempotent.
+  void observe_key_down(const KeyAction &action);
+
   // Candidate-callback entry point (real frontend only). Runs the same admission
   // and ordered Core settlement as a real key dispatch, minus the physical-key
   // eligibility answers, and only against a currently displayed, unfenced page.
@@ -206,6 +220,10 @@ private:
   std::uint64_t bound_incarnation_ = 0;
   std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
+  // The Shift key whose press this shell relayed and that no other key-down has ended
+  // yet; 0 when there is no such press. Per context, cleared by any other key-down and by
+  // the release it belongs to, so a combination can never be settled as a lone modifier.
+  std::uint32_t shift_press_keysym_ = 0;
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
   // The composition-state work that makes a gated key engine work: raw input, a projected
   // page, queued frontend work, an unresolved pass barrier. The Mock Backend answers true

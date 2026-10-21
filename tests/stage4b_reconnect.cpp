@@ -135,8 +135,11 @@ KeyAction physical(char character) {
 KeyAction space_key() { return translate_key(kVkSpace, false, false, false); }
 
 // A key outside the development vocabulary with no keysym: a genuine PASS
-// candidate that the real frontend does not route to the engine.
-KeyAction unrouted_pass_key() { return translate_key(0x10 /*VK_SHIFT*/, false, false, false); }
+// candidate that the real frontend does not route to the engine. A bare Shift is no
+// longer such a key — it is relayed for Fcitx's own modifier-only binding
+// (Hotkey/AltTriggerKeys, stage3c) — so this uses another modifier that stays
+// unrouted.
+KeyAction unrouted_pass_key() { return translate_key(0x11 /*VK_CONTROL*/, false, false, false); }
 
 // --- Host-side response scripting -------------------------------------------
 

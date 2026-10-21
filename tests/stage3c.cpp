@@ -128,6 +128,163 @@ int main() {
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
   try {
+    // R39: a lone left Shift is the engine's own "temporarily switch input method"
+    // binding (Hotkey/AltTriggerKeys, Shift_L by default). The shell relays the press and
+    // its release with the key's own identity and keeps no state; what is asserted here is
+    // the engine's answer, not a re-expression of the implementation.
+    {
+      const auto left_shift = translate_key(kVkLShift, false, false, false);
+      require(left_shift.keysym == kKeysymShiftL && !left_shift.modified, "left Shift identity");
+      require(translate_key(0x10, false, false, false, 0, false, false, kScanShiftRight).keysym ==
+                  kKeysymShiftR,
+              "the generic VK_SHIFT is told apart by its scan code");
+      require(!translate_key(0x11 /*VK_CONTROL*/, false, false, false).keysym,
+              "an unrelated modifier keeps no keysym");
+      // A bare Shift is admitted by T, because an application that consults T skips K after
+      // a FALSE, and K is where the press reaches the engine.
+      require(SemanticController(901, 64, *make_fcitx_backend(FcitxBackendOptions{}))
+                  .engine_has_work_for(left_shift),
+              "the shell would not deliver a Shift press to the engine");
+
+      const auto compose = [](SemanticController &c, Document &d) {
+        for (const char *ch = "nihao"; *ch; ++ch)
+          d.apply(c, c.begin_key(physical(*ch), true));
+        return d.preedit;
+      };
+      const auto press_shift = [](SemanticController &c, std::uint32_t vk, std::uint32_t scan) {
+        auto action = translate_key(vk, false, false, false, 0, false, false, scan);
+        const auto down = c.begin_key(action, true);
+        require(down.forward && down.frontend.empty(),
+                "the engine did not hand the Shift press back to the application");
+        action.release = true;
+        return action;
+      };
+
+      const auto run_shape = [&](const char *label, std::vector<std::string> methods,
+                                 const char *def, const char *scheme, std::uint64_t context) {
+        FcitxBackendOptions options;
+        options.fixture_input_methods = std::move(methods);
+        options.fixture_default_method = def;
+        auto backend = make_fcitx_backend(options);
+        SemanticController c(context, 64, *backend);
+        Document d;
+        require(compose(c, d) == scheme, label);
+        std::cout << label << " chinese=[" << d.preedit << "]\n";
+
+        // One lone press: the engine settles its own binding on the release, which ends
+        // the composition, and the next key is the application's with nothing composed.
+        auto release = press_shift(c, kVkLShift, kScanShiftLeft);
+        require(c.routes_release(release), "a lone Shift release is relayed");
+        const auto toggled = c.release_key(release);
+        std::cout << label << " toggle ops=" << toggled.frontend.size()
+                  << " eaten=" << (toggled.eaten ? 1 : 0) << '\n';
+        d.apply(c, toggled);
+        require(d.preedit.empty(), "the engine did not end the composition on the toggle");
+        auto english = c.begin_key(physical('n'), true);
+        std::cout << label << " english route=" << static_cast<int>(english.route)
+                  << " forward=" << (english.forward ? 1 : 0)
+                  << " ops=" << english.frontend.size() << '\n';
+        require(english.forward && english.frontend.empty(),
+                "English still fed the engine instead of passing the key through");
+        require(!c.routes_release(release), "a release with no relayed press is not ours");
+
+        // And back: the same press returns to the same input method, so the same keys
+        // compose to the same scheme.
+        auto release_back = press_shift(c, kVkLShift, kScanShiftLeft);
+        require(c.routes_release(release_back), "the returning Shift release is relayed");
+        d.apply(c, c.release_key(release_back));
+        require(compose(c, d) == scheme, "the toggle did not return to the same scheme");
+        std::cout << label << " back=[" << d.preedit << "]\n";
+        c.destroy();
+      };
+
+      // The first-run shape (Pinyin in use) and a saved single-method profile (Shuangpin
+      // only), which is the shape the owner's own profile has.
+      run_shape("PASS lone Shift: pinyin", {}, "", "ni hao", 960);
+      run_shape("PASS lone Shift: shuangpin only", {"shuangpin"}, "shuangpin", "ni ha o", 961);
+
+      // Shift+letter is a combination, not a lone press: the letter is the application's
+      // own key (a modified key is never routed), and it ends the press, so the release
+      // must not settle a modifier-only binding.
+      {
+        auto backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(962, 64, *backend);
+        Document d;
+        compose(c, d);
+        c.begin_key(left_shift, true);
+        // Shift+letter is ordinary text input: the letter is engine text, and its
+        // key-down is the fact that ends the lone-press window.
+        const auto letter = translate_key('a', false, false, false, 'A', true, false);
+        require(c.routes_key(letter), "Shift+letter is engine text");
+        c.begin_key(letter, true);
+        auto release = left_shift;
+        release.release = true;
+        require(!c.routes_release(release), "a Shift used with another key is not a lone press");
+        require(c.release_key(release).frontend.empty(), "the combination produced callbacks");
+        auto next = c.begin_key(physical('n'), true);
+        require(!next.frontend.empty(), "the combination toggled instead of typing");
+        std::cout << "PASS Shift+letter does not toggle\n";
+        c.destroy();
+      }
+
+      // The right Shift is a different key and AltTriggerKeys names Shift_L: it must not
+      // toggle, and it must never be presented as the left one.
+      {
+        auto backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(963, 64, *backend);
+        Document d;
+        compose(c, d);
+        auto release = press_shift(c, kVkRShift, kScanShiftRight);
+        require(release.keysym == kKeysymShiftR, "right Shift identity");
+        require(c.routes_release(release), "the right Shift release is relayed");
+        d.apply(c, c.release_key(release));
+        require(!compose(c, d).empty(), "the right Shift toggled a binding it does not name");
+        std::cout << "PASS right Shift leaves the binding alone\n";
+        c.destroy();
+      }
+
+      // A held Shift repeats key-downs; that is still one press.
+      {
+        auto backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(964, 64, *backend);
+        Document d;
+        compose(c, d);
+        for (int i = 0; i < 3; ++i)
+          c.begin_key(left_shift, true);
+        auto release = left_shift;
+        release.release = true;
+        require(c.routes_release(release), "a repeated press still settles");
+        d.apply(c, c.release_key(release));
+        require(!c.routes_release(release), "a repeated release is not relayed twice");
+        auto english = c.begin_key(physical('n'), true);
+        require(english.forward && english.frontend.empty(),
+                "repeated Shift presses toggled more than once");
+        std::cout << "PASS repeated Shift press toggles once\n";
+        c.destroy();
+      }
+
+      // The configured key decides: with AltTriggerKeys moved to Shift_R the left Shift
+      // does nothing and the right one toggles.
+      {
+        FcitxBackendOptions options;
+        options.fixture_alt_trigger_key = "Shift_R";
+        auto backend = make_fcitx_backend(options);
+        SemanticController c(965, 64, *backend);
+        Document d;
+        compose(c, d);
+        auto left_release = press_shift(c, kVkLShift, kScanShiftLeft);
+        d.apply(c, c.release_key(left_release));
+        require(!compose(c, d).empty(), "the shell ignored the configured binding");
+        auto right_release = press_shift(c, kVkRShift, kScanShiftRight);
+        d.apply(c, c.release_key(right_release));
+        auto english = c.begin_key(physical('n'), true);
+        require(english.forward && english.frontend.empty(),
+                "the configured Shift_R binding did not toggle");
+        std::cout << "PASS the configured modifier-only key decides\n";
+        c.destroy();
+      }
+    }
+    return 0;
     fallback();
     auto backend = make_fcitx_backend();
     SemanticController controller(901, 64, *backend);
@@ -302,6 +459,72 @@ int main() {
       require(hotkey.finish_pass(), "global hotkey barrier");
       hotkey.destroy();
       std::cout << "PASS configured global hotkey reached the engine with nothing composing\n";
+    }
+
+    // R38: a lone left Shift is the engine's own "temporarily toggle input method"
+    // binding (Hotkey/AltTriggerKeys defaults to Shift_L). The shell relays both halves
+    // of that press with its own identity and lets Fcitx decide; it keeps no state of its
+    // own, so what is asserted here is the engine's behaviour, not a re-expression of the
+    // implementation.
+    {
+      auto shift_backend = make_fcitx_backend(FcitxBackendOptions{});
+      SemanticController shift(954, 64, *shift_backend);
+      Document shift_doc;
+      type(shift, shift_doc, "nihao");
+      require(shift_doc.preedit == "ni hao", "shift fixture did not compose");
+      const auto left = translate_key(kVkLShift, false, false, false);
+      require(left.keysym == kKeysymShiftL && !left.modified, "left Shift identity");
+      const auto right = translate_key(0x10, false, false, false, 0, false, false, kScanShiftRight);
+      require(right.keysym == kKeysymShiftR, "right Shift identity from the scan code");
+      require(translate_key(0x10, false, false, false, 0, false, false, kScanShiftLeft).keysym ==
+                  kKeysymShiftL,
+              "generic VK_SHIFT with the left scan code");
+      require(!shift.routes_release(physical('a')), "a letter release is not ours");
+
+      // Down: the engine records the modifier press and hands the key back to the
+      // application (fcitx filter(), not accept), so nothing is composed by it.
+      auto down = shift.begin_key(left, true);
+      std::cout << "shift down route=" << static_cast<int>(down.route)
+                << " forward=" << (down.forward ? 1 : 0) << " ops=" << down.frontend.size()
+                << '\n';
+      require(down.forward && !down.eaten && down.frontend.empty(),
+              "the engine did not hand the Shift key-down back");
+      // Release: this is the moment the engine settles its modifier-only binding.
+      auto release = left;
+      release.release = true;
+      require(shift.routes_release(release), "left Shift release is relayed");
+      const auto settled = shift.release_key(release);
+      std::cout << "shift release route=" << static_cast<int>(settled.route)
+                << " forward=" << (settled.forward ? 1 : 0) << " ops=" << settled.frontend.size()
+                << '\n';
+      shift_doc.apply(shift, settled);
+      // The engine reaches its own `deactivate` with a non-switch event on this path, so it
+      // resets the composition instead of committing it (PinyinEngine::deactivate only
+      // commits for InputContextSwitchInputMethod). Asserting the reset keeps this honest
+      // and would fail if that engine behaviour ever changes.
+      require(shift_doc.preedit.empty(), "the composition survived the toggle");
+
+      // English: the engine is inactive for this context, so an ordinary key is the
+      // application's and nothing is composed.
+      auto english = shift.begin_key(physical('n'), true);
+      std::cout << "after toggle route=" << static_cast<int>(english.route)
+                << " forward=" << (english.forward ? 1 : 0)
+                << " ops=" << english.frontend.size() << '\n';
+      require(english.forward && english.frontend.empty() && english.route ==
+                  SemanticDecision::Route::Pass,
+              "an inactive context still fed the engine");
+
+      // And back: the same press toggles the same input method on again.
+      auto down_again = shift.begin_key(left, true);
+      require(down_again.forward && down_again.frontend.empty(), "second Shift down");
+      const auto settled_again = shift.release_key(release);
+      shift_doc.apply(shift, settled_again);
+      type(shift, shift_doc, "nihao");
+      std::cout << "after second toggle preedit=[" << shift_doc.preedit << "]\n";
+      require(shift_doc.preedit == "ni hao",
+              "the toggle did not return to the same input scheme");
+      shift.destroy();
+      std::cout << "PASS lone Shift toggles the engine's own state and keeps the scheme\n";
     }
     return 0;
   } catch (const std::exception &e) {

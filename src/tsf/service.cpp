@@ -106,7 +106,8 @@ KeyAction physical_key(WPARAM vk, LPARAM scan) {
       character = 0x10000u + ((text[0] - 0xd800u) << 10) + text[1] - 0xdc00u;
   }
   return translate_key(static_cast<std::uint32_t>(vk), ctrl, alt, win, character,
-                       (state[VK_SHIFT] & 0x80) != 0, (state[VK_CAPITAL] & 1) != 0);
+                       (state[VK_SHIFT] & 0x80) != 0, (state[VK_CAPITAL] & 1) != 0,
+                       static_cast<std::uint32_t>((scan >> 16) & 0xff));
 #endif
 }
 const char *route_name(SemanticDecision::Route route) {
@@ -866,6 +867,9 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (!entry)
     return S_OK;
   const auto action = physical_key(wparam, lparam);
+  // The application may deliver only T or only K, so both record the press a
+  // modifier-only release could settle; a key-down of anything else ends it.
+  entry->semantic.observe_key_down(action);
   bool mapped = entry->semantic.routes_key(action) && entry->semantic.engine_has_work_for(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
@@ -875,24 +879,65 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
 
 STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam,
                                       BOOL *pfEaten) {
-  (void)pic;
-  (void)wparam;
-  (void)lparam;
   if (pfEaten == nullptr) {
     return E_INVALIDARG;
   }
   *pfEaten = FALSE;
+  if (pic == nullptr || handling_key_) {
+    return S_OK;
+  }
+  ContextEntry *entry = find_entry(pic);
+  if (entry == nullptr) {
+    return S_OK;
+  }
+  auto action = physical_key(wparam, lparam);
+  action.release = true;
+  // Only the Shift key-ups this shell relayed are claimed, and only so that OnKeyUp is
+  // reached at all: the engine decides whether the press completed one of its own
+  // modifier-only bindings (Hotkey/AltTriggerKeys). Every other key-up stays the
+  // application's, exactly as before.
+  *pfEaten = entry->semantic.routes_release(action);
+  diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
+        *pfEaten);
   return S_OK;
 }
 
 STDMETHODIMP TextService::OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) {
-  (void)pic;
-  (void)wparam;
-  (void)lparam;
   if (pfEaten == nullptr) {
     return E_INVALIDARG;
   }
   *pfEaten = FALSE;
+  if (pic == nullptr) {
+    return S_OK;
+  }
+  if (handling_key_) {
+    return S_OK; // a key-up never nests inside another key's ownership handling
+  }
+  ContextEntry *entry = find_entry(pic);
+  if (entry == nullptr) {
+    return S_OK;
+  }
+  auto action = physical_key(wparam, lparam);
+  action.release = true;
+  if (!entry->semantic.routes_release(action)) {
+    return S_OK;
+  }
+  auto lifetime_guard = hold_entry(entry);
+  handling_key_ = true;
+  const SemanticDecision decision = entry->semantic.release_key(action);
+  diagf("BACKEND", "symbolic=%s route=%s eaten=%d", decision.symbolic.c_str(),
+        route_name(decision.route), decision.eaten ? 1 : 0);
+  if (decision.route != SemanticDecision::Route::FailOpen &&
+      decision.route != SemanticDecision::Route::CancelledRecovery) {
+    // The engine has had its say: it either consumed the release or handed it back. A
+    // release owns no composition, so nothing else needs settling here.
+    if (decision.eaten) {
+      *pfEaten = TRUE;
+    }
+    sync_candidate_view(*entry);
+  }
+  entry->semantic.retire_terminals();
+  handling_key_ = false;
   return S_OK;
 }
 

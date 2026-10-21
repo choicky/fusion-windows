@@ -32,6 +32,8 @@ SemanticController::SemanticController(std::uint64_t context_id, std::size_t cap
       core_(Binding{context_id, 1, 1}, capacity), host_(core_), backend_(&backend) {}
 
 SemanticDecision SemanticController::begin_key(const KeyAction &action, bool policy_allows) {
+  if (action.release)
+    return release_key(action); // a release is never a key-down
   if (real_backend_)
     return begin_real_key(action, policy_allows);
   SemanticDecision decision;
@@ -245,6 +247,7 @@ bool SemanticController::routes_key(const KeyAction &action) const {
 
 SemanticDecision SemanticController::begin_real_key(const KeyAction &action, bool policy_allows) {
   SemanticDecision decision;
+  observe_key_down(action);
   if (!policy_allows) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
@@ -300,6 +303,55 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     return decision;
   }
   decision.symbolic = "fcitx:" + std::to_string(stimulus.keysym);
+  dispatch_real(stimulus, decision);
+  return decision;
+}
+
+bool SemanticController::routes_release(const KeyAction &action) const {
+  // Only the two Shift keys are relayed. They are the modifier-only keys the pinned
+  // engine can interpret, and the ones its own Hotkey/AltTriggerKeys is configured with;
+  // which keys actually toggle stays Fcitx's decision, taken from its configuration.
+  if (!real_backend_)
+    return false; // the Mock fixture has no engine state to toggle
+  if (action.keysym != kKeysymShiftL && action.keysym != kKeysymShiftR)
+    return false;
+  // The release belongs to the press this shell relayed and only if nothing else was
+  // pressed in between: Fcitx settles a modifier-only binding on the release of a press
+  // that was not followed by another key, and the one fact it cannot observe here is a
+  // key press it never received (a Shift+letter combination is the application's own
+  // text). Delivering the release of such a press would present a combination as a lone
+  // modifier and toggle on it.
+  return shift_press_keysym_ == action.keysym;
+}
+
+void SemanticController::observe_key_down(const KeyAction &action) {
+  if (!real_backend_)
+    return;
+  // Every key-down either starts the press a modifier-only release may settle, or ends
+  // it by making the press a combination. Called from T and K, so an application that
+  // only delivers one of them still gets the same answer; both callbacks see the same
+  // physical key, and calling it twice is idempotent.
+  shift_press_keysym_ =
+      (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR) ? action.keysym : 0;
+}
+
+SemanticDecision SemanticController::release_key(const KeyAction &action) {
+  SemanticDecision decision;
+  if (!routes_release(action))
+    return decision;
+  // A release owns nothing and materializes nothing, so it needs the link but not the
+  // ownership admission: what it can do is make the engine settle a modifier-only binding
+  // it recorded on the matching key-down.
+  if (!ensure_semantic_ready())
+    return decision;
+  if (!backend_ready_ || !real_backend_->healthy())
+    return decision;
+  shift_press_keysym_ = 0; // one release per press
+  BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.type = BackendStimulus::Type::KeyRelease;
+  stimulus.keysym = action.keysym;
+  stimulus.modifiers = action.modifiers;
+  decision.symbolic = "release:" + std::to_string(stimulus.keysym);
   dispatch_real(stimulus, decision);
   return decision;
 }
@@ -535,6 +587,14 @@ bool SemanticController::engine_has_composition_work() const {
 }
 
 bool SemanticController::engine_has_work_for(const KeyAction &action) const {
+  // A lone Shift may be one of the engine's own modifier-only bindings
+  // (Hotkey/AltTriggerKeys), which it settles from the press/release pair with nothing
+  // composing. Admitting it here is what lets the press reach the engine at all: an
+  // application that consults T skips K after a FALSE, so the engine would never record
+  // the press the release then settles. Whether the press actually toggles stays
+  // Fcitx's decision, taken from its configuration; this shell keeps no state for it.
+  if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR)
+    return true;
   // Every key this shell admitted before R37 keeps its admission; only the keys whose
   // Fcitx handling needs a live composition are gated on the composition state.
   if (!editing_key_needs_composition(action))

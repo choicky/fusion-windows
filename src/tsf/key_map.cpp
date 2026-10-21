@@ -30,11 +30,19 @@ KeyAction classify_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win)
 }
 
 KeyAction translate_key(std::uint32_t vk, bool ctrl, bool alt, bool win, char32_t character,
-                        bool shift, bool caps) {
+                        bool shift, bool caps, std::uint32_t scan_code) {
   KeyAction action = classify_key(vk, ctrl, alt, win);
   if (ctrl || alt || win)
     return action; // unsupported system/modifier combinations: platform policy
   action.modifiers = (shift ? 1u : 0u) | (caps ? 2u : 0u);
+  // A bare Shift is identity only: no text, no composition. Windows reports the generic
+  // VK_SHIFT for either key, so the scan code decides which one this is.
+  if (vk == kVkLShift || vk == kVkRShift || vk == 0x10) {
+    action.keysym = (vk == kVkRShift || (vk == 0x10 && scan_code == kScanShiftRight))
+                        ? kKeysymShiftR
+                        : kKeysymShiftL;
+    return action;
+  }
   if (character >= 0x20 && character <= 0x10ffff && !(character >= 0xd800 && character <= 0xdfff)) {
     action.keysym = character < 0x100 ? static_cast<std::uint32_t>(character)
                                       : 0x01000000u | static_cast<std::uint32_t>(character);

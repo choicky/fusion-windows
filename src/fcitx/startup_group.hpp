@@ -73,21 +73,81 @@ inline GroupPlan plan_startup_group(bool profile_present, const std::string &def
 }
 
 // The input method a bound context starts in — what Fcitx itself resolves for a
-// context that is not switched locally: the group's **current** input method, i.e.
-// `inputMethodList()[0]` (Instance::inputMethod returns exactly this while the input
-// state is inactive), falling back to `DefaultIM` when the list is empty.
+// context whose input state is **active**: the group's `DefaultIM`, unless a local
+// selection was made for that context (`Instance::inputMethod` reads
+// `localIM_` first and falls back to `defaultInputMethod()`). The inactive branch
+// returns `inputMethodList()[0]`, which is why Items/0 is the group's *other* slot
+// (see group_items_with_off_slot) and not the method in use.
 //
-// This distinction matters: in Fcitx's model `Items/0` is the input method in use
-// and `DefaultIM` is the fallback it switches back to — InputMethodGroup::
-// setDefaultInputMethod even rewrites a default equal to the first item to the
-// second one. Reading `DefaultIM` here would select the *fallback*, not the input
-// method the profile's order asks for.
+// Reading Items/0 here would select the slot Fcitx treats as inactive. That was the
+// behaviour while contexts were only ever inactive; a context that can be switched
+// (Hotkey/AltTriggerKeys, the settings' "temporarily switch input method") must
+// start in the same method the active state resolves to, or the first toggle would
+// change the typing scheme.
 inline std::string binding_input_method(const std::string &current_method,
                                         const std::string &default_method) {
-  if (!current_method.empty()) {
-    return current_method;
+  if (!default_method.empty()) {
+    return default_method;
   }
-  return default_method;
+  return current_method;
+}
+
+// The method Items/0 carries: the group's *other* slot, which upstream fills with the
+// keyboard layout. A method the user has not enabled is preferred, so the slot is
+// never mistaken for one of theirs; otherwise any method other than the one in use.
+//
+// It must be a **different** method, because that is what makes Fcitx see an input
+// method change when the state flips: `CheckInputMethodChanged` compares the resolved
+// method and only then calls the engine's deactivate, whose `reset()` clears the
+// preedit (PinyinEngine::deactivate). With the slot repeating the method in use the
+// toggle would leave a composition on screen while reporting English.
+inline std::string group_off_slot_method(const std::vector<std::string> &methods,
+                                         const std::string &active,
+                                         const std::vector<std::string> &available) {
+  for (const auto &name : available) {
+    if (name != active && std::find(methods.begin(), methods.end(), name) == methods.end()) {
+      return name;
+    }
+  }
+  for (const auto &name : available) {
+    if (name != active) {
+      return name;
+    }
+  }
+  return active;
+}
+
+// The group's Items for an ordered enabled list and the method in use.
+//
+// Fcitx's on/off state needs a second group entry to exist at all: `canTrigger()` is
+// `inputMethodList().size() > 1`, and `activate()`, `toggle()` and
+// `setCurrentInputMethod()` all return early without it. It also refuses a `DefaultIM`
+// equal to Items/0 (InputMethodGroup::setDefaultInputMethod rewrites that to Items/1),
+// so a group whose only entry is the method in use can neither be activated nor
+// switched. Items/0 therefore holds the other method (`group_off_slot_method`) and
+// Items[1..] are the user's list unchanged.
+//
+// The disabled half of that state is implemented by the frontend instead (see
+// InputContext::inactive_passthrough): an inactive context's keys are the
+// application's, so Items/0 is never composed through.
+inline std::vector<std::string> group_items_with_off_slot(const std::vector<std::string> &methods,
+                                                         const std::string &active,
+                                                         const std::vector<std::string> &available) {
+  if (active.empty()) {
+    return methods;
+  }
+  std::vector<std::string> items;
+  items.reserve(methods.size() + 1);
+  items.emplace_back(group_off_slot_method(methods, active, available));
+  items.insert(items.end(), methods.begin(), methods.end());
+  return items;
+}
+
+// Whether a group already has the shape group_items_with_off_slot produces: Items/0 is
+// the other slot and Items/1 is the method in use, which is what DefaultIM names.
+inline bool group_has_off_slot(const std::vector<std::string> &items,
+                               const std::string &default_method) {
+  return items.size() > 1 && !default_method.empty() && items[1] == default_method;
 }
 
 } // namespace fusion::selection
