@@ -42,8 +42,8 @@ These are the properties the presentation may rely on, each covered by a check:
 ## Prerequisites
 
 - **.NET SDK 10.0.402** (current LTS at the time of writing; SDK 10 is supported until
-  2028-11-14). Any SDK that supports `net10.0` works; the version is pinned here because
-  that is what was used and verified.
+  2028-11-14). Any SDK that supports `net8.0` and `net10.0` works; this is the version the
+  build and the checks were verified with.
 - **`Microsoft.WindowsAppSDK` 2.5.1** and **`Microsoft.Windows.SDK.BuildTools` 10.0.28000.2705**
   from a NuGet feed. On a machine with normal nuget.org access the project files restore from
   there; in the environment this was built in a mirror was used as transport only, and every
