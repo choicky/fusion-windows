@@ -219,7 +219,9 @@ void restart_host() {
                 SW_SHOWNORMAL);
 }
 
-std::wstring settings_executable() { return g_version_dir + L"\\bin\\FusionSettings.exe"; }
+// The WinUI settings client lives in bin\settings\ because it carries its own .NET and
+// Windows App SDK runtimes; the Qt client stays in bin\ as the rollback path.
+std::wstring settings_executable() { return g_version_dir + L"\\bin\\settings\\FusionSettings.exe"; }
 
 // One in-flight launch at a time: a second click while the process is still starting must
 // not stack another window, and a launch that failed or exited must not lock the action.
@@ -270,7 +272,7 @@ void open_settings() {
   info.nShow = SW_SHOWNORMAL;
   if (!ShellExecuteExW(&info)) {
     MessageBoxW(nullptr,
-                L"无法启动 Fusion 设置。请确认当前安装包包含 bin\\FusionSettings.exe，"
+                L"无法启动 Fusion 设置。请确认当前安装包包含 bin\\settings\\FusionSettings.exe，"
                 L"且 FusionHost 正在运行。",
                 L"Fusion 设置", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
     return;

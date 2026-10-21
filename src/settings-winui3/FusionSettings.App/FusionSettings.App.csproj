@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The WinUI 3 settings application (D087).
+
+    Deployment, chosen from measured build/run results on the owner's machine:
+    - Windows App SDK is **self-contained**, so the ZIP runs without installing the
+      Windows App Runtime machine-wide (nothing is installed by this project).
+    - .NET is **self-contained** too, so the ZIP needs nothing installed on the target
+      machine. That is larger than a framework-dependent build, and it is what was
+      actually built, launched and captured here.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Fusion.Settings.App</RootNamespace>
+    <AssemblyName>FusionSettings</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!--
+      Self-contained .NET as well: the ZIP then needs no runtime installed on the target,
+      and the apphost loads hostfxr from its own folder instead of the machine-wide
+      location. That is the deployment this was built and launched with.
+    -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <!--
+      CA1859 and CA1822 are noise here: the page builders return FrameworkElement on purpose
+      so a row can be any control, and page helpers read the workspace through the page.
+    -->
+    <NoWarn>$(NoWarn);CA1859;CA1822</NoWarn>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FusionSettings.Core\FusionSettings.Core.csproj" />
+  </ItemGroup>
+
+</Project>

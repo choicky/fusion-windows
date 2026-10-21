@@ -26,6 +26,10 @@ param(
   [Parameter(Mandatory = $true)][string]$BuildDir,
   [string]$RuntimeIdentity = 'runtime-wp3-20261018',
   [string]$UpstreamRoot = '',
+  # The published WinUI settings client (dotnet publish output). It ships in its own
+  # folder because it carries the .NET and Windows App SDK runtimes, which must not be
+  # merged into bin\ beside the Host's and the Qt client's DLLs.
+  [string]$SettingsAppDir = '',
   [string]$SettingsSourceRoot = '',
   [string]$VcpkgRoot = '',
   [string]$OutDir = '',
@@ -87,6 +91,20 @@ try {
       throw "Release build did not produce bin\$name"
     }
   }
+  # bin\settings: the WinUI client, and the default settings entry point for the tray and
+  # the Start Menu shortcut. The Qt client stays at bin\FusionSettings.exe as the rollback
+  # path; nothing links to it, so there is only one "Settings" entry.
+  if (-not $SettingsAppDir) {
+    throw 'SettingsAppDir is required: pass the published WinUI settings client folder'
+  }
+  $settingsApp = (Resolve-Path -LiteralPath $SettingsAppDir).Path
+  foreach ($requiredAppFile in @('FusionSettings.exe', 'FusionSettings.dll', 'hostfxr.dll')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $settingsApp $requiredAppFile))) {
+      throw "the published settings client is missing $requiredAppFile ($settingsApp)"
+    }
+  }
+  Copy-Item -LiteralPath $settingsApp -Destination (Join-Path $stage 'bin\settings') -Recurse -Force
+
   $qtPlugins = Join-Path $binDir 'plugins'
   if (-not (Test-Path -LiteralPath (Join-Path $qtPlugins 'platforms\qwindows.dll'))) {
     throw "Release build did not stage Qt's Windows platform plugin: $qtPlugins"
