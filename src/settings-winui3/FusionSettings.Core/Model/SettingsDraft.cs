@@ -9,9 +9,17 @@ namespace Fusion.Settings.Model;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The draft stores only <b>pending edits</b>, keyed by option path, against a baseline
-/// that is the Host's last confirmed state. That shape is what makes the required
-/// behaviour fall out rather than need guarding:
+/// A draft holds the <b>values</b> — a confirmed baseline and a set of pending edits — and
+/// nothing else. The schema belongs to the view that is asking, and is passed in on every
+/// call. That split is what keeps the two Pinyin views honest: they share one value
+/// baseline (both URIs resolve to one <c>PinyinEngineConfig</c>) but describe it with
+/// different schemas, so a draft that stored one view's schema would let the other view
+/// edit — and submit — a field it does not display. Adopting a reply from one view
+/// therefore cannot replace the other view's schema, because no schema is stored here.
+/// </para>
+/// <para>
+/// The draft stores only <b>pending edits</b> against the confirmed baseline, which makes
+/// the rest structural rather than guarded:
 /// </para>
 /// <list type="bullet">
 /// <item>Only changed options are submitted, because the change set is built from the
@@ -20,24 +28,34 @@ namespace Fusion.Settings.Model;
 /// engine setter or learning file is touched.</item>
 /// <item>Reconnecting refreshes the baseline and leaves the pending edits alone, so a
 /// reconnect can never overwrite unsaved work.</item>
-/// <item>An option the view's schema does not describe cannot be edited here, so a view
-/// never writes a field it does not show.</item>
+/// <item>An option the requesting view's schema does not describe cannot be edited here,
+/// so a view never writes a field it does not show.</item>
 /// </list>
 /// </remarks>
 public sealed class SettingsDraft
 {
     private readonly Dictionary<string, SettingsValue> _pending = new(StringComparer.Ordinal);
 
-    public SettingsDraft(ConfigIdentity identity, SettingsSnapshot baseline)
+    public SettingsDraft(ConfigIdentity identity, SettingsValue baselineValues)
     {
         Identity = identity ?? throw new ArgumentNullException(nameof(identity));
-        Baseline = baseline ?? throw new ArgumentNullException(nameof(baseline));
+        BaselineValues = baselineValues ?? throw new ArgumentNullException(nameof(baselineValues));
+    }
+
+    /// <summary>Builds a draft from a reply, keeping the reply's values and discarding its schema.</summary>
+    public static SettingsDraft FromSnapshot(ConfigIdentity identity, SettingsSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new SettingsDraft(identity, snapshot.Values);
     }
 
     public ConfigIdentity Identity { get; }
 
-    /// <summary>The Host's last confirmed state. Never modified locally.</summary>
-    public SettingsSnapshot Baseline { get; private set; }
+    /// <summary>
+    /// The Host's last confirmed values. Never modified locally, and never carries a
+    /// schema: the two views over one configuration keep their own.
+    /// </summary>
+    public SettingsValue BaselineValues { get; private set; }
 
     /// <summary>Increments on every accepted edit, so a stale reply can be detected.</summary>
     public long Revision { get; private set; }
@@ -58,19 +76,21 @@ public sealed class SettingsDraft
             return pending;
         }
 
-        return Baseline.Values.TryGet(optionName, out var confirmed)
+        return BaselineValues.TryGet(optionName, out var confirmed)
             ? confirmed
             : SettingsValue.Text(string.Empty);
     }
 
     /// <summary>
-    /// Edits one top-level option. Returns false when the option is not part of this
-    /// view's schema: the client must not write a field the view does not describe.
+    /// Edits one top-level option through <paramref name="view"/>. Returns false when the
+    /// option is not part of <b>that view's</b> schema: the client must not write a field
+    /// the view does not describe, even when a sibling view describes it.
     /// </summary>
-    public bool TrySet(string optionName, SettingsValue value)
+    public bool TrySet(SettingsSnapshot view, string optionName, SettingsValue value)
     {
+        ArgumentNullException.ThrowIfNull(view);
         ArgumentNullException.ThrowIfNull(value);
-        if (Baseline.FindRootOption(optionName) is null)
+        if (view.FindRootOption(optionName) is null)
         {
             return false;
         }
@@ -93,19 +113,22 @@ public sealed class SettingsDraft
 
     /// <summary>
     /// Edits a leaf inside a nested configuration, addressed by the nested type's name
-    /// (e.g. <c>Fuzzy$FuzzyConfig</c>). The stored path uses the <b>value tree</b> key of
-    /// the owning option (<c>Fuzzy/VE_UE</c>), which is what the Host merges.
+    /// (e.g. <c>Fuzzy$FuzzyConfig</c>) as <paramref name="view"/> describes it. The stored
+    /// path uses the <b>value tree</b> key of the owning option (<c>Fuzzy/VE_UE</c>),
+    /// which is what the Host merges.
     /// </summary>
-    public bool TrySetPath(string nestedTypeName, string optionName, SettingsValue value)
+    public bool TrySetNested(SettingsSnapshot view, string nestedTypeName, string optionName,
+                             SettingsValue value)
     {
+        ArgumentNullException.ThrowIfNull(view);
         ArgumentNullException.ThrowIfNull(value);
-        if (!TryNestedPath(nestedTypeName, optionName, out var path) ||
-            !IsKnownNestedOption(nestedTypeName, optionName))
+        if (!TryNestedPath(view, nestedTypeName, optionName, out var path) ||
+            !IsKnownNestedOption(view, nestedTypeName, optionName))
         {
             return false;
         }
 
-        if (value.Equals(ConfirmedNested(nestedTypeName, optionName)))
+        if (value.Equals(ConfirmedNested(view, nestedTypeName, optionName)))
         {
             _pending.Remove(path);
         }
@@ -118,63 +141,26 @@ public sealed class SettingsDraft
         return true;
     }
 
-    public SettingsValue EffectiveNested(string nestedTypeName, string optionName)
+    public SettingsValue EffectiveNested(SettingsSnapshot view, string nestedTypeName,
+                                         string optionName)
     {
-        if (!TryNestedPath(nestedTypeName, optionName, out var path))
+        ArgumentNullException.ThrowIfNull(view);
+        if (!TryNestedPath(view, nestedTypeName, optionName, out var path))
         {
             return SettingsValue.Text(string.Empty);
         }
 
-        return _pending.TryGetValue(path, out var pending) ? pending : ConfirmedNested(nestedTypeName, optionName);
+        return _pending.TryGetValue(path, out var pending)
+            ? pending
+            : ConfirmedNested(view, nestedTypeName, optionName);
     }
 
-    private SettingsValue ConfirmedNested(string nestedTypeName, string optionName)
+    /// <summary>True when <paramref name="view"/> describes this nested option.</summary>
+    public static bool IsKnownNestedOption(SettingsSnapshot view, string nestedTypeName,
+                                           string optionName)
     {
-        if (!TryNestedPath(nestedTypeName, optionName, out var path))
-        {
-            return SettingsValue.Text(string.Empty);
-        }
-
-        var segments = path.Split('/');
-        return Baseline.Values.TryGetPath(segments, out var confirmed)
-            ? confirmed
-            : SettingsValue.Text(string.Empty);
-    }
-
-    private SettingsValue Confirmed(string optionName) =>
-        Baseline.Values.TryGet(optionName, out var confirmed)
-            ? confirmed
-            : SettingsValue.Text(string.Empty);
-
-    /// <summary>
-    /// Maps a nested type plus option name to the value-tree path. The root option whose
-    /// declared type is the nested type supplies the key, so no second table of nested
-    /// container names is needed.
-    /// </summary>
-    private bool TryNestedPath(string nestedTypeName, string optionName, out string path)
-    {
-        path = string.Empty;
-        var root = Baseline.RootType;
-        if (root is null)
-        {
-            return false;
-        }
-
-        foreach (var option in root.Options)
-        {
-            if (string.Equals(option.Type, nestedTypeName, StringComparison.Ordinal))
-            {
-                path = option.Name + "/" + optionName;
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    public bool IsKnownNestedOption(string nestedTypeName, string optionName)
-    {
-        var type = Baseline.Types.FirstOrDefault(t =>
+        ArgumentNullException.ThrowIfNull(view);
+        var type = view.Types.FirstOrDefault(t =>
             string.Equals(t.Name, nestedTypeName, StringComparison.Ordinal));
         return type is not null && type.Options.Any(o =>
             string.Equals(o.Name, optionName, StringComparison.Ordinal));
@@ -206,14 +192,22 @@ public sealed class SettingsDraft
     }
 
     /// <summary>
-    /// Adopts the Host's confirmed state after a save. Pending edits that the Host
-    /// agreed with are dropped; edits it did not receive stay pending, so a partial
-    /// success keeps the remaining work instead of pretending it was saved.
+    /// Adopts the Host's confirmed values after a save. Pending edits that the Host agreed
+    /// with are dropped; edits it did not receive stay pending, so a partial success keeps
+    /// the remaining work instead of pretending it was saved. The reply's schema is not
+    /// kept: each view continues to render through its own.
     /// </summary>
+    public void AdoptConfirmed(SettingsValue confirmedValues)
+    {
+        ArgumentNullException.ThrowIfNull(confirmedValues);
+        AdoptConfirmed(new SettingsSnapshot(confirmedValues, Array.Empty<ConfigType>()));
+    }
+
+    /// <inheritdoc cref="AdoptConfirmed(SettingsValue)"/>
     public void AdoptConfirmed(SettingsSnapshot confirmed)
     {
         ArgumentNullException.ThrowIfNull(confirmed);
-        Baseline = confirmed;
+        BaselineValues = confirmed.Values;
 
         foreach (var path in _pending.Keys.ToArray())
         {
@@ -230,11 +224,18 @@ public sealed class SettingsDraft
     /// Refreshes the baseline from a fresh read without touching pending edits. Used
     /// after a reconnect or an uncertain write: reread and reconcile, never replay.
     /// </summary>
+    public void RefreshBaseline(SettingsValue freshValues)
+    {
+        ArgumentNullException.ThrowIfNull(freshValues);
+        BaselineValues = freshValues;
+        Revision++;
+    }
+
+    /// <inheritdoc cref="RefreshBaseline(SettingsValue)"/>
     public void RefreshBaseline(SettingsSnapshot fresh)
     {
         ArgumentNullException.ThrowIfNull(fresh);
-        Baseline = fresh;
-        Revision++;
+        RefreshBaseline(fresh.Values);
     }
 
     /// <summary>
@@ -242,6 +243,52 @@ public sealed class SettingsDraft
     /// A late reply for an older revision must not overwrite newer edits.
     /// </summary>
     public bool IsCurrent(long sentRevision) => sentRevision == Revision;
+
+    private SettingsValue ConfirmedNested(SettingsSnapshot view, string nestedTypeName,
+                                          string optionName)
+    {
+        if (!TryNestedPath(view, nestedTypeName, optionName, out var path))
+        {
+            return SettingsValue.Text(string.Empty);
+        }
+
+        var segments = path.Split('/');
+        return BaselineValues.TryGetPath(segments, out var confirmed)
+            ? confirmed
+            : SettingsValue.Text(string.Empty);
+    }
+
+    private SettingsValue Confirmed(string optionName) =>
+        BaselineValues.TryGet(optionName, out var confirmed)
+            ? confirmed
+            : SettingsValue.Text(string.Empty);
+
+    /// <summary>
+    /// Maps a nested type plus option name to the value-tree path. The view's root option
+    /// whose declared type is the nested type supplies the key, so no second table of
+    /// nested container names is needed — and the mapping follows the view that is asking.
+    /// </summary>
+    private static bool TryNestedPath(SettingsSnapshot view, string nestedTypeName,
+                                      string optionName, out string path)
+    {
+        path = string.Empty;
+        var root = view.RootType;
+        if (root is null)
+        {
+            return false;
+        }
+
+        foreach (var option in root.Options)
+        {
+            if (string.Equals(option.Type, nestedTypeName, StringComparison.Ordinal))
+            {
+                path = option.Name + "/" + optionName;
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static SettingsValue? ValueAt(SettingsValue root, string path)
     {

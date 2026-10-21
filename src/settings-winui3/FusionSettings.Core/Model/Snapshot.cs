@@ -285,12 +285,15 @@ public sealed class ImList
 /// <summary>The Host's answer, with the incarnation that produced it.</summary>
 public sealed class SettingsResult<T>
 {
-    public SettingsResult(SettingsStatus status, string error, T? value, ulong incarnation)
+    public SettingsResult(SettingsStatus status, string error, T? value, ulong incarnation,
+                          bool mutationMayHaveBeenApplied = false, bool cancelled = false)
     {
         Status = status;
         Error = error;
         Value = value;
         HostIncarnation = incarnation;
+        MutationMayHaveBeenApplied = mutationMayHaveBeenApplied;
+        Cancelled = cancelled;
     }
 
     public SettingsStatus Status { get; }
@@ -301,7 +304,27 @@ public sealed class SettingsResult<T>
 
     public ulong HostIncarnation { get; }
 
+    /// <summary>
+    /// True when this result is about a mutation whose request had already started down the
+    /// pipe, so the Host may have applied it even though no usable reply came back. It is
+    /// the signal to reread and reconcile, and never a reason to replay.
+    /// </summary>
+    public bool MutationMayHaveBeenApplied { get; }
+
+    /// <summary>
+    /// True when the caller's own cancellation token ended the request. A cancellation that
+    /// arrives after a mutation started does not prove the write was rejected, so the result
+    /// keeps that fact instead of throwing it away.
+    /// </summary>
+    public bool Cancelled { get; }
+
     public bool IsOk => Status == SettingsStatus.Ok;
+
+    /// <summary>
+    /// True when the outcome is unknown: either the Host said so, or the request may have
+    /// reached it without a usable reply. Both mean "reread before deciding", not "retry".
+    /// </summary>
+    public bool IsUncertain => Status == SettingsStatus.Indeterminate || MutationMayHaveBeenApplied;
 
 }
 
@@ -312,6 +335,8 @@ public static class SettingsResult
         new(SettingsStatus.Ok, string.Empty, value, incarnation);
 
     public static SettingsResult<T> Failure<T>(SettingsStatus status, string error,
-                                               ulong incarnation = 0) =>
-        new(status, error, default, incarnation);
+                                               ulong incarnation = 0,
+                                               bool mutationMayHaveBeenApplied = false,
+                                               bool cancelled = false) =>
+        new(status, error, default, incarnation, mutationMayHaveBeenApplied, cancelled);
 }

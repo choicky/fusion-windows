@@ -15,6 +15,9 @@ internal static class Program
         KeyTests.Run();
         ImListAndEndpointTests.Run();
 
+        // The controlled-peer checks use a real pipe in this process, so they need no Host.
+        await ClientTests.RunAsync().ConfigureAwait(false);
+
         // The real-Host checks run only when an isolated endpoint is supplied; they never
         // fall back to the installed product's pipe.
         var includeIntegration = args.Length == 0 || Array.IndexOf(args, "--no-integration") < 0;

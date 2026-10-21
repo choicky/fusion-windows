@@ -22,10 +22,11 @@ public sealed class KeyChord : IEquatable<KeyChord>
     private static readonly Dictionary<string, string> CanonicalModifiers =
         ModifierOrder.ToDictionary(name => name, name => name, StringComparer.OrdinalIgnoreCase);
 
-    private KeyChord(IReadOnlyList<string> modifiers, string keyName)
+    private KeyChord(IReadOnlyList<string> modifiers, string keyName, string? opaqueText)
     {
         Modifiers = modifiers;
         KeyName = keyName;
+        OpaqueText = opaqueText;
     }
 
     public IReadOnlyList<string> Modifiers { get; }
@@ -33,8 +34,18 @@ public sealed class KeyChord : IEquatable<KeyChord>
     /// <summary>The key itself, e.g. <c>space</c>, <c>KP_Enter</c>, <c>bracketleft</c>.</summary>
     public string KeyName { get; }
 
+    /// <summary>
+    /// The original text of a binding this client could not interpret, or null. Such a
+    /// binding is carried through unchanged rather than replaced, so editing a neighbour
+    /// cannot corrupt it.
+    /// </summary>
+    public string? OpaqueText { get; }
+
+    /// <summary>True when the binding is kept verbatim because it could not be parsed.</summary>
+    public bool IsOpaque => OpaqueText is not null;
+
     /// <summary>An empty chord carries no key at all (<c>FcitxKey_None</c>).</summary>
-    public bool IsEmpty => KeyName.Length == 0;
+    public bool IsEmpty => !IsOpaque && KeyName.Length == 0;
 
     /// <summary>
     /// True when the binding is only a modifier (e.g. bare <c>Shift_L</c>). Such keys are
@@ -42,7 +53,17 @@ public sealed class KeyChord : IEquatable<KeyChord>
     /// </summary>
     public bool IsModifierOnly => IsModifierKeyName(KeyName);
 
-    public static KeyChord Empty { get; } = new(Array.Empty<string>(), string.Empty);
+    public static KeyChord Empty { get; } = new(Array.Empty<string>(), string.Empty, null);
+
+    /// <summary>
+    /// Wraps text this client cannot interpret so it survives a load/save round trip. The
+    /// text is never normalised, because normalising it would be inventing an interpretation.
+    /// </summary>
+    public static KeyChord Opaque(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        return text.Length == 0 ? Empty : new KeyChord(Array.Empty<string>(), string.Empty, text);
+    }
 
     public static bool IsModifierKeyName(string keyName) =>
         keyName is "Shift_L" or "Shift_R" or "Control_L" or "Control_R" or "Alt_L" or "Alt_R"
@@ -105,7 +126,7 @@ public sealed class KeyChord : IEquatable<KeyChord>
 
         modifiers.Sort((left, right) =>
             IndexOfModifier(left).CompareTo(IndexOfModifier(right)));
-        return new KeyChord(modifiers, keyName);
+        return new KeyChord(modifiers, keyName, null);
     }
 
     private static int IndexOfModifier(string name)
@@ -122,18 +143,37 @@ public sealed class KeyChord : IEquatable<KeyChord>
     }
 
     public override string ToString() =>
-        Modifiers.Count == 0 ? KeyName : string.Join("+", Modifiers) + "+" + KeyName;
+        IsOpaque ? OpaqueText!
+        : Modifiers.Count == 0 ? KeyName
+        : string.Join("+", Modifiers) + "+" + KeyName;
 
-    public bool Equals(KeyChord? other) =>
-        other is not null &&
-        string.Equals(KeyName, other.KeyName, StringComparison.Ordinal) &&
-        Modifiers.SequenceEqual(other.Modifiers, StringComparer.Ordinal);
+    public bool Equals(KeyChord? other)
+    {
+        if (other is null)
+        {
+            return false;
+        }
+
+        if (IsOpaque || other.IsOpaque)
+        {
+            return string.Equals(OpaqueText, other.OpaqueText, StringComparison.Ordinal);
+        }
+
+        return string.Equals(KeyName, other.KeyName, StringComparison.Ordinal) &&
+               Modifiers.SequenceEqual(other.Modifiers, StringComparer.Ordinal);
+    }
 
     public override bool Equals(object? obj) => Equals(obj as KeyChord);
 
     public override int GetHashCode()
     {
         var hash = new HashCode();
+        if (IsOpaque)
+        {
+            hash.Add(OpaqueText, StringComparer.Ordinal);
+            return hash.ToHashCode();
+        }
+
         foreach (var modifier in Modifiers)
         {
             hash.Add(modifier, StringComparer.Ordinal);
@@ -204,7 +244,7 @@ public sealed class KeyBindingList
 
             foreach (var token in value.Scalar.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
             {
-                items.Add(KeyChord.Parse(token) ?? KeyChord.Empty);
+                items.Add(KeyChord.Parse(token) ?? KeyChord.Opaque(token));
             }
 
             return new KeyBindingList(items, isPositional);
@@ -213,7 +253,9 @@ public sealed class KeyBindingList
         foreach (var (key, child) in value.Children
                      .OrderBy(entry => int.TryParse(entry.Key, out var index) ? index : int.MaxValue))
         {
-            items.Add(KeyChord.Parse(child.Scalar) ?? KeyChord.Empty);
+            // An unparsable binding keeps its text. Replacing it with Empty would turn a
+            // binding this client does not understand into a deletion on the next save.
+            items.Add(KeyChord.Parse(child.Scalar) ?? KeyChord.Opaque(child.Scalar));
         }
 
         return new KeyBindingList(items, isPositional);
@@ -237,13 +279,15 @@ public sealed class KeyBindingList
         return SettingsValue.Map(entries);
     }
 
+    /// <summary>
+    /// Appends a binding verbatim, including an empty or unparsable one. This is a list
+    /// model: it does not decide what may be added, because silently dropping an entry here
+    /// would change a user's configuration on any copy or replacement path.
+    /// </summary>
     public void Add(KeyChord chord)
     {
         ArgumentNullException.ThrowIfNull(chord);
-        if (!chord.IsEmpty)
-        {
-            _items.Add(chord);
-        }
+        _items.Add(chord);
     }
 
     public void Clear() => _items.Clear();

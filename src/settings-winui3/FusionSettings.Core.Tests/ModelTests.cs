@@ -11,6 +11,7 @@ internal static class ModelTests
         Identity();
         Draft();
         DraftLifecycle();
+        SharedViews();
         SchemaHelpers();
     }
 
@@ -41,13 +42,15 @@ internal static class ModelTests
     {
         Harness.Section("draft: one draft, changed options only");
 
-        var draft = new SettingsDraft(ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"),
-                                      TestSchema.PinyinView());
+        var view = TestSchema.PinyinView();
+        var draft = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), view);
         Harness.Check(!draft.HasChanges, "a fresh draft has no changes");
         Harness.CheckEqual(0, draft.BuildChangeSet().Children.Count,
             "a no-change save has an empty change set (nothing to send)");
 
-        Harness.Check(draft.TrySet("PageSize", SettingsValue.Text("9")), "a schema option is editable");
+        Harness.Check(draft.TrySet(view, "PageSize", SettingsValue.Text("9")),
+            "a schema option is editable");
         Harness.Check(draft.HasChanges, "the edit is pending");
         var changeSet = draft.BuildChangeSet();
         Harness.CheckEqual(1, changeSet.Children.Count, "only the changed option is in the change set");
@@ -55,17 +58,17 @@ internal static class ModelTests
         Harness.Check(!changeSet.Children.ContainsKey("Learning"),
             "an untouched option is not submitted");
 
-        Harness.Check(!draft.TrySet("ShuangpinProfile", SettingsValue.Text("abc")),
+        Harness.Check(!draft.TrySet(view, "ShuangpinProfile", SettingsValue.Text("abc")),
             "an option this view does not describe cannot be edited here");
-        Harness.Check(!draft.TrySet("FirstRun", SettingsValue.Text("True")),
+        Harness.Check(!draft.TrySet(view, "FirstRun", SettingsValue.Text("True")),
             "a value with no schema in this view cannot be edited here");
 
-        draft.TrySet("PageSize", SettingsValue.Text("7"));
+        draft.TrySet(view, "PageSize", SettingsValue.Text("7"));
         Harness.Check(!draft.HasChanges, "setting a value back to the confirmed one is not a change");
         Harness.CheckEqual(0, draft.BuildChangeSet().Children.Count, "and it empties the change set");
 
         Harness.Section("draft: nested configuration");
-        Harness.Check(draft.TrySetPath("Fuzzy$FuzzyConfig", "VE_UE", SettingsValue.Text("False")),
+        Harness.Check(draft.TrySetNested(view, "Fuzzy$FuzzyConfig", "VE_UE", SettingsValue.Text("False")),
             "a nested option is editable through its type");
         var nested = draft.BuildChangeSet();
         Harness.Check(nested.Children.ContainsKey("Fuzzy"), "the change set keeps the nesting");
@@ -73,63 +76,48 @@ internal static class ModelTests
             "the nested value is carried");
         Harness.Check(!nested.Children["Fuzzy"].Children.ContainsKey("Inner"),
             "an untouched nested sibling is not submitted");
-        Harness.Check(!draft.TrySetPath("Fuzzy$FuzzyConfig", "Nope", SettingsValue.Text("1")),
+        Harness.Check(!draft.TrySetNested(view, "Fuzzy$FuzzyConfig", "Nope", SettingsValue.Text("1")),
             "an unknown nested option is refused");
-
-        Harness.Section("draft: two views of one configuration cannot diverge");
-        var shuangpinView = new SettingsDraft(
-            ConfigIdentity.ForUri("fcitx://config/inputmethod/shuangpin"), TestSchema.ShuangpinView());
-        Harness.CheckEqual(draft.Identity.Id, shuangpinView.Identity.Id,
-            "both views resolve to the same draft identity");
-        Harness.Check(shuangpinView.TrySet("ShuangpinProfile", SettingsValue.Text("abc")),
-            "the shuangpin view can edit its own field");
-        Harness.Check(!draft.TrySet("ShuangpinProfile", SettingsValue.Text("zzz")),
-            "the pinyin view cannot, so it cannot revert it either");
+        Harness.Check(!draft.TrySetNested(view, "Hotkey$HotkeyConfig", "TriggerKeys",
+                SettingsValue.Text("Control+space")),
+            "a nested type this view does not contain is refused");
     }
 
     private static void DraftLifecycle()
     {
         Harness.Section("draft: save, adopt, reconnect, stale replies");
 
-        var draft = new SettingsDraft(ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"),
-                                      TestSchema.PinyinView());
-        draft.TrySet("PageSize", SettingsValue.Text("9"));
-        draft.TrySet("Learning", SettingsValue.Text("False"));
+        var view = TestSchema.PinyinView();
+        var draft = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), view);
+        draft.TrySet(view, "PageSize", SettingsValue.Text("9"));
+        draft.TrySet(view, "Learning", SettingsValue.Text("False"));
         var revisionSent = draft.Revision;
 
-        // The Host confirmed the write and returns the resulting state.
-        var confirmed = TestSchema.PinyinView();
-        confirmed = new SettingsSnapshot(
-            confirmed.Values
-                .WithPath(new[] { "PageSize" }, SettingsValue.Text("9"))
-                .WithPath(new[] { "Learning" }, SettingsValue.Text("False")),
-            confirmed.Types);
-        draft.AdoptConfirmed(confirmed);
+        var confirmedValues = view.Values
+            .WithPath(new[] { "PageSize" }, SettingsValue.Text("9"))
+            .WithPath(new[] { "Learning" }, SettingsValue.Text("False"));
+        draft.AdoptConfirmed(confirmedValues);
         Harness.Check(!draft.HasChanges, "confirmed edits leave nothing pending");
         Harness.CheckEqual("9", draft.Effective("PageSize").Scalar, "the confirmed value is now the baseline");
         Harness.Check(!draft.IsCurrent(revisionSent), "the reply's revision is no longer current");
 
         Harness.Section("draft: partial success keeps the rest");
-        var partial = new SettingsDraft(ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"),
-                                        TestSchema.PinyinView());
-        partial.TrySet("PageSize", SettingsValue.Text("9"));
-        partial.TrySet("Learning", SettingsValue.Text("False"));
-        var onlyOne = new SettingsSnapshot(
-            TestSchema.PinyinView().Values.WithPath(new[] { "PageSize" }, SettingsValue.Text("9")),
-            TestSchema.PinyinView().Types);
-        partial.AdoptConfirmed(onlyOne);
+        var partial = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), view);
+        partial.TrySet(view, "PageSize", SettingsValue.Text("9"));
+        partial.TrySet(view, "Learning", SettingsValue.Text("False"));
+        partial.AdoptConfirmed(view.Values.WithPath(new[] { "PageSize" }, SettingsValue.Text("9")));
         Harness.CheckEqual(1, partial.PendingPaths.Count, "the unconfirmed edit is still pending");
         Harness.Check(partial.PendingPaths.Contains("Learning"), "and it is the one not applied");
 
         Harness.Section("draft: reconnect refreshes the baseline without touching drafts");
-        var reconnecting = new SettingsDraft(ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"),
-                                             TestSchema.PinyinView());
-        reconnecting.TrySet("PageSize", SettingsValue.Text("9"));
-        var fresh = new SettingsSnapshot(
-            TestSchema.PinyinView().Values
-                .WithPath(new[] { "PageSize" }, SettingsValue.Text("8"))
-                .WithPath(new[] { "Learning" }, SettingsValue.Text("False")),
-            TestSchema.PinyinView().Types);
+        var reconnecting = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), view);
+        reconnecting.TrySet(view, "PageSize", SettingsValue.Text("9"));
+        var fresh = view.Values
+            .WithPath(new[] { "PageSize" }, SettingsValue.Text("8"))
+            .WithPath(new[] { "Learning" }, SettingsValue.Text("False"));
         reconnecting.RefreshBaseline(fresh);
         Harness.CheckEqual("9", reconnecting.Effective("PageSize").Scalar,
             "the unsaved edit survives the reconnect");
@@ -140,9 +128,94 @@ internal static class ModelTests
         Harness.Section("draft: revert");
         reconnecting.Revert("PageSize");
         Harness.Check(!reconnecting.HasChanges, "reverting the only edit clears the change set");
-        reconnecting.TrySet("PageSize", SettingsValue.Text("6"));
+        reconnecting.TrySet(view, "PageSize", SettingsValue.Text("6"));
         reconnecting.RevertAll();
         Harness.Check(!reconnecting.HasChanges, "revert all discards every pending edit");
+    }
+
+    /// <summary>
+    /// The two Pinyin views share one draft and one value baseline, and keep their own
+    /// schemas. These are the cases that a draft storing a schema would fail.
+    /// </summary>
+    private static void SharedViews()
+    {
+        Harness.Section("shared draft: one draft, two views, two schemas");
+
+        var pinyin = TestSchema.PinyinView();
+        var shuangpin = TestSchema.ShuangpinView();
+        var draft = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), pinyin);
+
+        Harness.CheckEqual(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin").Id,
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/shuangpin").Id,
+            "both views address the same draft identity");
+        Harness.Check(draft.BaselineValues.Equals(pinyin.Values),
+            "the baseline holds values only, so it is the same baseline for both views");
+
+        Harness.Section("shared draft: a shared edit is visible through the other view");
+        Harness.Check(draft.TrySet(pinyin, "PageSize", SettingsValue.Text("9")),
+            "the pinyin view edits a shared option");
+        Harness.CheckEqual("9", draft.Effective("PageSize").Scalar,
+            "the shared draft reports the edit");
+        Harness.CheckEqual("9", draft.BuildChangeSet().Children["PageSize"].Scalar,
+            "and it is what a save from either view would submit");
+
+        Harness.Section("shared draft: the Shuangpin view edits its own field");
+        Harness.Check(draft.TrySet(shuangpin, "ShuangpinProfile", SettingsValue.Text("abc")),
+            "the shuangpin view can edit ShuangpinProfile");
+        Harness.CheckEqual("abc", draft.Effective("ShuangpinProfile").Scalar,
+            "the value lands in the one shared draft");
+        Harness.CheckEqual("abc", draft.BuildChangeSet().Children["ShuangpinProfile"].Scalar,
+            "and is submitted from the same change set");
+
+        Harness.Section("shared draft: the Pinyin view cannot touch a Shuangpin-only field");
+        Harness.Check(!draft.TrySet(pinyin, "ShuangpinProfile", SettingsValue.Text("zzz")),
+            "the pinyin view refuses the field its schema does not describe");
+        Harness.CheckEqual("abc", draft.Effective("ShuangpinProfile").Scalar,
+            "and the existing value is untouched");
+
+        Harness.Section("shared draft: adopting a reply from one view keeps the other's schema");
+        // The Host replies through the shuangpin URI: same values, shuangpin schema.
+        var shuangpinReply = TestSchema.ShuangpinView().Values
+            .WithPath(new[] { "PageSize" }, SettingsValue.Text("9"));
+        draft.AdoptConfirmed(new SettingsSnapshot(shuangpinReply, shuangpin.Types));
+        Harness.CheckEqual("9", draft.Effective("PageSize").Scalar, "the shared value was adopted");
+        Harness.Check(!draft.TrySet(pinyin, "ShuangpinProfile", SettingsValue.Text("zzz")),
+            "the pinyin view still refuses the field after a shuangpin reply");
+        Harness.Check(draft.TrySet(shuangpin, "ShuangpinProfile", SettingsValue.Text("ms")),
+            "the shuangpin view still accepts it");
+
+        Harness.Section("shared draft: refreshing from one view keeps the other's schema");
+        draft.RefreshBaseline(TestSchema.ShuangpinView());
+        Harness.Check(!draft.TrySet(pinyin, "ShuangpinProfile", SettingsValue.Text("zzz")),
+            "a refresh through the shuangpin view does not widen the pinyin view");
+        Harness.Check(draft.TrySet(pinyin, "Learning", SettingsValue.Text("False")),
+            "the pinyin view still edits the options it does describe");
+
+        Harness.Section("shared draft: nested edits follow the asking view's schema");
+        Harness.Check(draft.TrySetNested(pinyin, "Fuzzy$FuzzyConfig", "Inner", SettingsValue.Text("False")),
+            "the pinyin view edits a nested option");
+        Harness.Check(draft.TrySetNested(shuangpin, "Fuzzy$FuzzyConfig", "VE_UE", SettingsValue.Text("False")),
+            "the shuangpin view edits the same nested container");
+        var changeSet = draft.BuildChangeSet();
+        Harness.CheckEqual("False", changeSet.Children["Fuzzy"].Children["Inner"].Scalar,
+            "both nested edits live in one change set");
+        Harness.CheckEqual("False", changeSet.Children["Fuzzy"].Children["VE_UE"].Scalar,
+            "with one entry per option");
+        Harness.Check(!SettingsDraft.IsKnownNestedOption(pinyin, "Fuzzy$FuzzyConfig", "NotAnOption"),
+            "an unknown nested option is not described by either view");
+
+        Harness.Section("shared draft: partial success across the two views");
+        var shared = SettingsDraft.FromSnapshot(
+            ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin"), pinyin);
+        shared.TrySet(pinyin, "PageSize", SettingsValue.Text("9"));
+        shared.TrySet(shuangpin, "ShuangpinProfile", SettingsValue.Text("abc"));
+        // The Host applied only PageSize.
+        shared.AdoptConfirmed(pinyin.Values.WithPath(new[] { "PageSize" }, SettingsValue.Text("9")));
+        Harness.CheckEqual(1, shared.PendingPaths.Count, "the unapplied edit stays pending");
+        Harness.Check(shared.PendingPaths.Contains("ShuangpinProfile"),
+            "and it is the shuangpin-specific one");
     }
 
     private static void SchemaHelpers()

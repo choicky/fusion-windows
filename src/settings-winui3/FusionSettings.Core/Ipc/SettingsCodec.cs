@@ -276,8 +276,10 @@ public static class SettingsCodec
             return true;
         }
 
+        // A capacity check only: each child is counted when it is decoded, exactly as the
+        // Host counts. Consuming `count` here as well would charge every child twice.
         if (!reader.TryU32(out var count) || count > WireLimits.MaxSettingsMapEntries ||
-            !budget.TryReserve((int)count))
+            !budget.HasCapacityFor((int)count))
         {
             return false;
         }
@@ -360,15 +362,10 @@ public static class SettingsCodec
             return true;
         }
 
-        public bool TryReserve(int count)
-        {
-            if (_used + count > WireLimits.MaxSettingsNodes)
-            {
-                return false;
-            }
-
-            _used += count;
-            return true;
-        }
+        /// <summary>
+        /// True when <paramref name="count"/> further nodes still fit. It does not consume
+        /// them: the recursion consumes one node per value it actually decodes.
+        /// </summary>
+        public bool HasCapacityFor(int count) => _used + count <= WireLimits.MaxSettingsNodes;
     }
 }

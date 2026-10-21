@@ -69,7 +69,7 @@ internal static class IntegrationTests
             "two connections report the same Host incarnation");
 
         Harness.Section("integration: no-change save sends nothing");
-        var draft = new SettingsDraft(ConfigIdentity.ForUri(pinyinUri), snapshot);
+        var draft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(pinyinUri), snapshot);
         Harness.Check(!draft.HasChanges, "a fresh draft over the live state has no changes");
         Harness.CheckEqual(0, draft.BuildChangeSet().Children.Count,
             "so there is no request to send (and no setter runs)");
@@ -84,7 +84,8 @@ internal static class IntegrationTests
             ? (parsed + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)
             : minimum.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
-        Harness.Check(draft.TrySet("PageSize", SettingsValue.Text(target)), "the edit is accepted");
+        Harness.Check(draft.TrySet(snapshot, "PageSize", SettingsValue.Text(target)),
+            "the edit is accepted");
         var apply = await client.SetConfigAsync(pinyinUri, draft.BuildChangeSet(), cancellation.Token)
             .ConfigureAwait(false);
         Harness.CheckEqual(SettingsStatus.Ok, apply.Status, "SetConfig succeeds");
@@ -100,8 +101,8 @@ internal static class IntegrationTests
                 "a fresh read confirms the value persisted");
 
             // Restore, so a reused isolated Host is left as it was found.
-            var restore = new SettingsDraft(ConfigIdentity.ForUri(pinyinUri), reread.Value!);
-            restore.TrySet("PageSize", SettingsValue.Text(original));
+            var restore = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(pinyinUri), reread.Value!);
+            restore.TrySet(reread.Value!, "PageSize", SettingsValue.Text(original));
             var restored = await client.SetConfigAsync(pinyinUri, restore.BuildChangeSet(),
                                                        cancellation.Token).ConfigureAwait(false);
             Harness.CheckEqual(SettingsStatus.Ok, restored.Status, "the original value is restored");
@@ -120,8 +121,9 @@ internal static class IntegrationTests
             edited.Add(KeyChord.Parse("Left")!);
         }
 
-        var keyDraft = new SettingsDraft(ConfigIdentity.ForUri(pinyinUri), current.Value!);
-        Harness.Check(keyDraft.TrySet("PrevPage", edited.ToValue()), "the key list edit is accepted");
+        var keyDraft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(pinyinUri), current.Value!);
+        Harness.Check(keyDraft.TrySet(current.Value!, "PrevPage", edited.ToValue()),
+            "the key list edit is accepted");
         var keyApply = await client.SetConfigAsync(pinyinUri, keyDraft.BuildChangeSet(),
                                                    cancellation.Token).ConfigureAwait(false);
         Harness.CheckEqual(SettingsStatus.Ok, keyApply.Status, "the key list applies");
@@ -131,8 +133,8 @@ internal static class IntegrationTests
             Harness.CheckEqual(edited.Count, after.Count, "the list kept its length");
             Harness.CheckEqual(edited[0].ToString(), after[0].ToString(), "and its first binding");
 
-            var undo = new SettingsDraft(ConfigIdentity.ForUri(pinyinUri), keyApply.Value!);
-            undo.TrySet("PrevPage", currentList.ToValue());
+            var undo = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(pinyinUri), keyApply.Value!);
+            undo.TrySet(keyApply.Value!, "PrevPage", currentList.ToValue());
             var undone = await client.SetConfigAsync(pinyinUri, undo.BuildChangeSet(),
                                                      cancellation.Token).ConfigureAwait(false);
             Harness.CheckEqual(SettingsStatus.Ok, undone.Status, "the original list is restored");

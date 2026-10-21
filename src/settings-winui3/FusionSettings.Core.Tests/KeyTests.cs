@@ -11,6 +11,7 @@ internal static class KeyTests
         Chords();
         Lists();
         Editor();
+        Preservation();
     }
 
     private static void Chords()
@@ -166,5 +167,92 @@ internal static class KeyTests
         Harness.Section("key editor: modifier-only bindings are flagged");
         var modifierOnly = new KeyListEditor(KeyBindingList.FromValue(TestSchema.KeyList("Shift_L")));
         Harness.Check(modifierOnly.HasModifierOnlyBinding, "a bare modifier is reported");
+    }
+
+    /// <summary>
+    /// A binding this client cannot interpret must survive load, edit and save. Replacing
+    /// it with an empty chord would silently delete it the next time anything is saved.
+    /// </summary>
+    private static void Preservation()
+    {
+        Harness.Section("key list: an unrecognised binding is kept verbatim");
+        var list = KeyBindingList.FromValue(TestSchema.KeyList("minus", "Foo+Bar", "Up"));
+        Harness.CheckEqual(3, list.Count, "every entry is read, including the odd one");
+        Harness.Check(list[1].IsOpaque, "the unparsable entry is marked opaque");
+        Harness.CheckEqual("Foo+Bar", list[1].ToString(), "and keeps its original text");
+        Harness.Check(!list[1].IsEmpty, "an opaque entry is not an empty binding");
+        Harness.Check(KeyChord.Parse("Foo+Bar") is null, "it really is unparsable");
+
+        var roundTripped = KeyBindingList.FromValue(list.ToValue());
+        Harness.CheckEqual(3, roundTripped.Count, "a load/save round trip keeps the count");
+        Harness.CheckEqual("Foo+Bar", roundTripped[1].ToString(), "and the unknown text");
+        Harness.CheckEqual("Up", roundTripped[2].ToString(), "and the order around it");
+
+        Harness.Section("key list: editing a neighbour leaves the unknown entry alone");
+        var editor = new KeyListEditor(list);
+        editor.BeginRecording(0);
+        Harness.Check(editor.ApplyRecorded(KeyChord.Parse("Page_Up")), "the neighbour is replaced");
+        Harness.CheckEqual(3, editor.Bindings.Count, "the list length is unchanged");
+        Harness.CheckEqual("Page_Up", editor.Bindings[0].ToString(), "the edited binding changed");
+        Harness.CheckEqual("Foo+Bar", editor.Bindings[1].ToString(), "the unknown binding is untouched");
+        Harness.CheckEqual("Up", editor.Bindings[2].ToString(), "and stays in its position");
+
+        Harness.Section("key list: an empty entry survives a copy and a replacement");
+        var withEmpty = KeyBindingList.FromValue(TestSchema.KeyList("minus", string.Empty, "Up"));
+        Harness.CheckEqual(3, withEmpty.Count, "the empty entry is read as an entry");
+        Harness.Check(withEmpty[1].IsEmpty, "and is recognised as empty");
+
+        var copied = withEmpty.Clone();
+        Harness.CheckEqual(3, copied.Count, "a clone keeps every position");
+        Harness.Check(copied[1].IsEmpty, "including the empty one");
+
+        var emptyEditor = new KeyListEditor(withEmpty);
+        emptyEditor.BeginRecording(2);
+        Harness.Check(emptyEditor.ApplyRecorded(KeyChord.Parse("Tab")), "a later binding is replaced");
+        Harness.CheckEqual(3, emptyEditor.Bindings.Count, "the replacement keeps the list length");
+        Harness.Check(emptyEditor.Bindings[1].IsEmpty, "the empty entry is not silently dropped");
+        Harness.CheckEqual("Tab", emptyEditor.Bindings[2].ToString(), "the replaced binding is in place");
+
+        Harness.Section("key list: positional order is preserved through an edit");
+        var positional = KeyBindingList.FromValue(
+            TestSchema.KeyList("a", "Foo+Bar", "c"), isPositional: true);
+        var positionalEditor = new KeyListEditor(positional);
+        positionalEditor.BeginRecording(0);
+        positionalEditor.ApplyRecorded(KeyChord.Parse("b"));
+        Harness.CheckEqual("b", positionalEditor.Bindings[0].ToString(), "position 0 was replaced");
+        Harness.CheckEqual("Foo+Bar", positionalEditor.Bindings[1].ToString(),
+            "position 1 still selects the second character");
+        Harness.CheckEqual("c", positionalEditor.Bindings[2].ToString(), "position 2 is unchanged");
+
+        Harness.Section("key list: a cancelled or failed recording changes nothing");
+        var untouched = KeyBindingList.FromValue(TestSchema.KeyList("minus", "Foo+Bar"));
+        var cancelling = new KeyListEditor(untouched);
+        cancelling.BeginRecording(0);
+        cancelling.CancelRecording();
+        Harness.CheckEqual(2, cancelling.Bindings.Count, "the list is intact after Escape");
+        Harness.CheckEqual("minus", cancelling.Bindings[0].ToString(), "the first binding is unchanged");
+        Harness.CheckEqual("Foo+Bar", cancelling.Bindings[1].ToString(), "the unknown one too");
+
+        cancelling.BeginRecording(0);
+        Harness.Check(!cancelling.ApplyRecorded(null), "a failed recording is rejected");
+        Harness.CheckEqual("minus", cancelling.Bindings[0].ToString(), "the binding survives");
+        cancelling.BeginRecording(0);
+        Harness.Check(!cancelling.ApplyRecorded(KeyChord.Empty), "an empty chord is rejected");
+        Harness.CheckEqual("minus", cancelling.Bindings[0].ToString(), "and is not written over it");
+        Harness.CheckEqual("Foo+Bar", cancelling.Bindings[1].ToString(), "the unknown entry survives");
+
+        Harness.Section("key list: a preset still replaces or extends explicitly");
+        var preset = new KeyListEditor(KeyBindingList.FromValue(
+            TestSchema.KeyList("minus", "Foo+Bar")));
+        preset.ApplyPreset(new[] { KeyChord.Parse("comma")! }, replaceExisting: true);
+        Harness.CheckEqual(1, preset.Bindings.Count, "replace drops the previous bindings");
+        preset.ApplyPreset(new[] { KeyChord.Parse("period")! }, replaceExisting: false);
+        Harness.CheckEqual(2, preset.Bindings.Count, "extend keeps them");
+        Harness.CheckEqual("comma", preset.Bindings[0].ToString(), "in order");
+
+        Harness.Section("key list: duplicates are still reported, not rewritten");
+        var duplicated = KeyBindingList.FromValue(TestSchema.KeyList("Tab", "Foo+Bar", "Tab"));
+        Harness.CheckEqual(1, duplicated.DuplicateIndices().Count, "the duplicate is reported");
+        Harness.CheckEqual(3, duplicated.Count, "and nothing is removed");
     }
 }
