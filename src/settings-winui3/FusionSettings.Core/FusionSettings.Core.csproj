@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The settings client's transport, protocol and configuration model.
+
+    This project deliberately has NO PackageReference. It must build on a machine whose
+    only toolchain is a .NET SDK, because that is what this environment has: NuGet
+    package acquisition is unreachable here (see the task's blocker record). Keeping the
+    core package-free is also what lets its tests run without a test framework.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <RootNamespace>Fusion.Settings</RootNamespace>
+    <AssemblyName>FusionSettings.Core</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>

@@ -17,3 +17,8 @@
 # Local agent/workspace data; never project content, and an untracked entry here
 # would make every package manifest look "dirty".
 /.workbuddy-ai/
+
+# .NET build output for the C# settings client (src/settings-winui3). Anchored so a
+# stray directory named bin/obj elsewhere is still visible to review.
+/src/settings-winui3/**/bin/
+/src/settings-winui3/**/obj/
