@@ -105,7 +105,13 @@ int main() {
 
   // 1. No consumer connected: Instance::outputFilter is the identity.
   {
-    const auto page = fusion::project_candidate_page(instance, &frontend, list, 10, 4096, 4096);
+    // This list reports no layout hint (CommonCandidateList defaults to NotSet), so the
+    // stored preference is what the page carries — and the default preference is vertical,
+    // which is why the presentation is unchanged for a user who never configures it.
+    CHECK(list->layoutHint() == fcitx::CandidateLayoutHint::NotSet);
+    const auto page = fusion::project_candidate_page(instance, &frontend, list,
+                                                     fusion::CandidateLayout::Vertical, 10, 4096,
+                                                     4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "你好");
@@ -114,9 +120,47 @@ int main() {
     CHECK(page->entries[1].placeholder);
     CHECK(page->entries[2].text == "尼");
     CHECK(page->cursor_index == 0);
-    CHECK(page->layout ==
-          static_cast<fusion::CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint())));
+    CHECK(page->layout == fusion::CandidateLayout::Vertical);
     CHECK(!page->truncated);
+  }
+
+  // 1b. Layout precedence, which is classicui's own rule (inputwindow.cpp:598-603, and
+  //     again at 938-943, pinned fcitx5 a7f2528): an engine hint that names a layout wins
+  //     and the stored preference applies only when the hint is NotSet. Asserted through
+  //     the projection rather than the helper alone, so it is the page the renderer
+  //     receives that is being checked.
+  {
+    using fusion::CandidateLayout;
+    struct Case {
+      fcitx::CandidateLayoutHint hint;
+      CandidateLayout preference;
+      CandidateLayout expected;
+    };
+    const Case cases[] = {
+        {fcitx::CandidateLayoutHint::NotSet, CandidateLayout::Vertical, CandidateLayout::Vertical},
+        {fcitx::CandidateLayoutHint::NotSet, CandidateLayout::Horizontal,
+         CandidateLayout::Horizontal},
+        {fcitx::CandidateLayoutHint::Vertical, CandidateLayout::Horizontal,
+         CandidateLayout::Vertical},
+        {fcitx::CandidateLayoutHint::Horizontal, CandidateLayout::Vertical,
+         CandidateLayout::Horizontal},
+    };
+    for (const auto &one : cases) {
+      list->setLayoutHint(one.hint);
+      const auto page = fusion::project_candidate_page(instance, &frontend, list, one.preference,
+                                                       10, 4096, 4096);
+      CHECK(page.has_value());
+      CHECK(page->layout == one.expected);
+    }
+    // A hint is never downgraded to NotSet, so a renderer that treats NotSet as "vertical"
+    // can never turn a semantic hint into the wrong geometry.
+    CHECK(fusion::resolve_candidate_layout(CandidateLayout::NotSet,
+                                           CandidateLayout::Horizontal) ==
+          CandidateLayout::Horizontal);
+    CHECK(fusion::resolve_candidate_layout(CandidateLayout::Vertical,
+                                           CandidateLayout::Horizontal) ==
+          CandidateLayout::Vertical);
+    list->setLayoutHint(fcitx::CandidateLayoutHint::NotSet); // restore the list's own default
   }
 
   // 2. A connected consumer rewrites every display Text it is given; the
@@ -129,7 +173,9 @@ int main() {
             orig = text("F:" + orig.toString());
           }));
   {
-    const auto page = fusion::project_candidate_page(instance, &frontend, list, 10, 4096, 4096);
+    const auto page = fusion::project_candidate_page(instance, &frontend, list,
+                                                     fusion::CandidateLayout::Vertical, 10, 4096,
+                                                     4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "F:你好");
@@ -154,7 +200,9 @@ int main() {
   // page records truncation and normalizes a dropped cursor to no-highlight.
   {
     list->setCursorIndex(2);
-    const auto page = fusion::project_candidate_page(instance, &frontend, list, 1, 4096, 4096);
+    const auto page = fusion::project_candidate_page(instance, &frontend, list,
+                                                     fusion::CandidateLayout::Vertical, 1, 4096,
+                                                     4096);
     CHECK(page.has_value());
     CHECK(page->truncated);
     CHECK(page->entries.size() == 1);

@@ -48,6 +48,12 @@ public:
   void destroy();
   bool visible() const { return hwnd_ != nullptr && IsWindowVisible(hwnd_); }
 
+  // The popup's real window handle, null until ensure_created succeeds. Exposed so a
+  // check can read the window's actual rectangle and extended style instead of
+  // re-deriving the geometry it is supposed to be verifying; nothing in the product
+  // path uses it.
+  HWND window() const { return hwnd_; }
+
 private:
   static bool register_window_class();
   static LRESULT CALLBACK window_proc(HWND, UINT, WPARAM, LPARAM);

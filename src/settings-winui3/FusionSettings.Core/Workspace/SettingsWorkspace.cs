@@ -16,6 +16,12 @@ public enum SettingsTarget
     Pinyin,
     Shuangpin,
     Global,
+
+    /// <summary>
+    /// The Windows candidate-presentation configuration: a Fusion-owned Fcitx
+    /// configuration that holds presentation only (today the layout direction).
+    /// </summary>
+    Presentation,
 }
 
 /// <summary>
@@ -44,6 +50,14 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     public const string PinyinUri = "fcitx://config/inputmethod/pinyin";
     public const string ShuangpinUri = "fcitx://config/inputmethod/shuangpin";
     public const string GlobalUri = "fcitx://config/global";
+
+    /// <summary>
+    /// The Windows candidate-presentation configuration. Owner authorization 2026-10-22: a
+    /// Windows-specific presentation setting may have its own configuration, while official
+    /// input semantics must not acquire duplicate stores. The Host owns and reads/writes the
+    /// value; this window only edits it through the Host.
+    /// </summary>
+    public const string PresentationUri = "fcitx://config/candidate-presentation";
 
     private readonly SettingsClient _client;
     private readonly List<string> _log = new();
@@ -153,9 +167,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public SettingsSnapshot? GlobalSnapshot { get; private set; }
 
+    public SettingsSnapshot? PresentationSnapshot { get; private set; }
+
     public SettingsDraft? PinyinDraft { get; private set; }
 
     public SettingsDraft? GlobalDraft { get; private set; }
+
+    public SettingsDraft? PresentationDraft { get; private set; }
 
     public ImListDraft? Methods { get; private set; }
 
@@ -163,22 +181,32 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         EditingMethod == "shuangpin" ? SettingsTarget.Shuangpin : SettingsTarget.Pinyin;
 
     /// <summary>The schema the editor should use for a target.</summary>
+    /// <remarks>
+    /// Every target is named explicitly. An unknown target resolves to nothing rather than
+    /// to some other configuration, because silently falling through would let a control
+    /// write to a draft it does not belong to — the defect this routing exists to prevent.
+    /// </remarks>
     public SettingsSnapshot? SnapshotFor(SettingsTarget target) => target switch
     {
         SettingsTarget.Pinyin => PinyinSnapshot,
         SettingsTarget.Shuangpin => ShuangpinSnapshot,
-        _ => GlobalSnapshot,
+        SettingsTarget.Global => GlobalSnapshot,
+        SettingsTarget.Presentation => PresentationSnapshot,
+        _ => null,
     };
 
     public SettingsDraft? DraftFor(SettingsTarget target) => target switch
     {
         SettingsTarget.Global => GlobalDraft,
-        _ => PinyinDraft,
+        SettingsTarget.Presentation => PresentationDraft,
+        SettingsTarget.Pinyin => PinyinDraft,
+        SettingsTarget.Shuangpin => PinyinDraft,
+        _ => null,
     };
 
     public bool HasChanges =>
         (PinyinDraft?.HasChanges ?? false) || (GlobalDraft?.HasChanges ?? false) ||
-        (Methods?.HasChanges ?? false);
+        (PresentationDraft?.HasChanges ?? false) || (Methods?.HasChanges ?? false);
 
     public IReadOnlyList<string> Diagnostics => _log;
 
@@ -272,6 +300,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return Fail(global.Status, global.Error);
             }
 
+            var presentation = await _client.GetConfigAsync(PresentationUri, cancellationToken)
+                .ConfigureAwait(true);
+            if (!presentation.IsOk)
+            {
+                return Fail(presentation.Status, presentation.Error);
+            }
+
             var methods = await _client.GetImListAsync(cancellationToken).ConfigureAwait(true);
             if (!methods.IsOk)
             {
@@ -279,9 +314,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             }
 
             // One load must come from one Host. If the incarnation moved between replies, the
-            // four snapshots describe different processes and must not be adopted as one state.
+            // snapshots describe different processes and must not be adopted as one state.
             var incarnation = pinyin.HostIncarnation;
             if (shuangpin.HostIncarnation != incarnation || global.HostIncarnation != incarnation ||
+                presentation.HostIncarnation != incarnation ||
                 methods.HostIncarnation != incarnation)
             {
                 Log("load rejected: replies came from different Host incarnations");
@@ -295,11 +331,14 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             PinyinSnapshot = pinyin.Value;
             ShuangpinSnapshot = shuangpin.Value;
             GlobalSnapshot = global.Value;
+            PresentationSnapshot = presentation.Value;
 
             if (recreateDrafts)
             {
                 PinyinDraft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(PinyinUri), pinyin.Value!);
                 GlobalDraft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(GlobalUri), global.Value!);
+                PresentationDraft = SettingsDraft.FromSnapshot(
+                    ConfigIdentity.ForUri(PresentationUri), presentation.Value!);
                 Methods = new ImListDraft(methods.Value!);
             }
             else
@@ -309,6 +348,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 // rather than be reported as a local edit.
                 PinyinDraft?.RefreshBaseline(pinyin.Value!);
                 GlobalDraft?.RefreshBaseline(global.Value!);
+                PresentationDraft?.RefreshBaseline(presentation.Value!);
                 MergeMethods(methods.Value!);
             }
 
@@ -453,6 +493,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
         PinyinDraft?.RevertAll();
         GlobalDraft?.RevertAll();
+        PresentationDraft?.RevertAll();
         Methods?.Revert();
         SaveSummary = "已放弃未保存的修改。";
         Raise(nameof(HasChanges));
@@ -491,6 +532,14 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 reports.Add(await SaveConfigurationAsync(
                     GlobalUri, SettingsTarget.Global, globalDraft.BuildChangeSet(),
                     globalDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "全局配置",
+                    cancellationToken).ConfigureAwait(true));
+            }
+
+            if (PresentationDraft is { HasChanges: true } presentationDraft)
+            {
+                reports.Add(await SaveConfigurationAsync(
+                    PresentationUri, SettingsTarget.Presentation, presentationDraft.BuildChangeSet(),
+                    presentationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "候选窗口",
                     cancellationToken).ConfigureAwait(true));
             }
 
@@ -614,7 +663,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             case SettingsTarget.Shuangpin:
                 ShuangpinSnapshot = snapshot;
                 break;
-            default:
+            case SettingsTarget.Presentation:
+                PresentationSnapshot = snapshot;
+                break;
+            case SettingsTarget.Global:
                 GlobalSnapshot = snapshot;
                 break;
         }

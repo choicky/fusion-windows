@@ -1,7 +1,9 @@
 #include "fusion/backend.hpp"
 #include "fusion/settings_protocol.hpp"
 #include "candidate_projection.hpp"
+#include "presentation_config.hpp"
 #include <fcitx-config/configuration.h>
+#include <fcitx-config/iniparser.h>
 #include <fcitx-config/rawconfig.h>
 #include "startup_group.hpp"
 #include "im_list.hpp"
@@ -66,6 +68,14 @@ constexpr char input_method_config_prefix[] = "fcitx://config/inputmethod/";
 // and the same dumpDescription/save/load+safeSave+reloadConfig semantics as the
 // D-Bus controller uses; no Fusion-specific schema is introduced.
 constexpr char global_config_uri[] = "fcitx://config/global";
+// The Windows candidate-presentation configuration. Owner authorization 2026-10-22: a
+// Windows-specific presentation setting may have its own configuration, while official
+// input semantics must not acquire duplicate stores. It is served with the same
+// GetConfig/SetConfig messages and the same dumpDescription/safeSave/reload semantics as
+// the three official URIs, and it is a normal Fcitx configuration stored in Fcitx's own
+// per-user directory — not an additional configuration system. It holds presentation
+// only: no Pinyin/Shuangpin value and no global value is repeated here.
+constexpr char candidate_presentation_uri[] = "fcitx://config/candidate-presentation";
 
 bool parse_supported_input_method_uri(const std::string &uri, std::string &name) {
   const std::string prefix = input_method_config_prefix;
@@ -77,6 +87,19 @@ bool parse_supported_input_method_uri(const std::string &uri, std::string &name)
 }
 
 bool is_global_config_uri(const std::string &uri) { return uri == global_config_uri; }
+
+bool is_candidate_presentation_uri(const std::string &uri) {
+  return uri == candidate_presentation_uri;
+}
+
+// The stored preference and the transport enum are two vocabularies for one decision: the
+// configuration persists Horizontal/Vertical, while CandidatePage::layout mirrors
+// fcitx::CandidateLayoutHint. Converting in one place keeps the stored value from ever
+// becoming a second layout model.
+CandidateLayout candidate_layout_for(CandidateLayoutPreference preference) {
+  return preference == CandidateLayoutPreference::Horizontal ? CandidateLayout::Horizontal
+                                                             : CandidateLayout::Vertical;
+}
 
 // Convert the public RawConfig tree to the same string/map shape used by Fcitx's
 // Controller1.GetConfig. An empty map key carries a node's own scalar value.
@@ -315,8 +338,10 @@ inline bool is_candidate_action(BackendStimulus::Type type) {
 
 class InputContext final : public fcitx::InputContext {
 public:
-  InputContext(fcitx::Instance &instance, Binding value)
-      : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value) {
+  InputContext(fcitx::Instance &instance, Binding value,
+               const std::atomic<CandidateLayout> &layout_preference)
+      : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value),
+        layout_preference_(layout_preference) {
     instance_ = &instance;
     setCapabilityFlags(fcitx::CapabilityFlag::Preedit);
     created();
@@ -368,8 +393,9 @@ public:
       return;
     CandidatePage page;
     if (auto list = inputPanel().candidateList()) {
-      auto projected = project_candidate_page(*instance_, this, list, candidate_page_entries,
-                                              candidate_page_bytes, payload_bound);
+      auto projected = project_candidate_page(
+          *instance_, this, list, layout_preference_.load(std::memory_order_relaxed),
+          candidate_page_entries, candidate_page_bytes, payload_bound);
       if (!projected) {
         invalid = true;
         return;
@@ -423,6 +449,10 @@ public:
   fcitx::Key dispatched_key;
   Binding binding;
   fcitx::Instance *instance_ = nullptr; // owned by the Host worker thread
+  // The Host's one stored presentation preference, read at projection time. It lives in
+  // the backend and outlives every context, so a save is visible to the next projection
+  // of every context without any per-context copy that could drift.
+  const std::atomic<CandidateLayout> &layout_preference_;
   std::uint64_t last_stimulus = 0;
   BackendBatch *batch = nullptr;
   bool lifecycle = true;
@@ -447,7 +477,7 @@ public:
     return invoke([this, binding] {
       if (contexts_.contains(binding.context) || contexts_.size() >= context_bound)
         return false;
-      auto context = std::make_unique<InputContext>(*instance_, binding);
+      auto context = std::make_unique<InputContext>(*instance_, binding, candidate_layout_);
       context->focusIn();
       // The profile decides the input method (U1): the bound context starts in the
       // group's current input method (Items/0) as Fcitx resolves it, never in a
@@ -543,10 +573,22 @@ public:
       }
       return status;
     }
+    if (is_candidate_presentation_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, result](std::string &taskError) {
+                          return read_presentation_settings_on_loop(*result, taskError);
+                        },
+                        error, SettingsStatus::Timeout);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
     std::string method;
     if (!parse_supported_input_method_uri(uri, method)) {
-      error = "Only the Global configuration and the Pinyin and Shuangpin input-method settings "
-              "are available.";
+      error = "Only the Global, candidate-presentation and Pinyin/Shuangpin input-method "
+              "settings are available.";
       return SettingsStatus::Invalid;
     }
     auto result = std::make_shared<SettingsSnapshot>();
@@ -572,6 +614,19 @@ public:
       const auto status =
           invoke_settings([this, submitted, result](std::string &taskError) {
                             return apply_global_settings_on_loop(submitted, *result, taskError);
+                          },
+                          error, SettingsStatus::Indeterminate);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
+    if (is_candidate_presentation_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, submitted, result](std::string &taskError) {
+                            return apply_presentation_settings_on_loop(submitted, *result,
+                                                                      taskError);
                           },
                           error, SettingsStatus::Indeterminate);
       if (status == SettingsStatus::Ok) {
@@ -829,6 +884,65 @@ private:
     }
     instance_->reloadConfig();
     return read_global_settings_on_loop(snapshot, error);
+  }
+
+  // The candidate-presentation configuration follows the same sequence as the global one,
+  // minus reloadConfig: no addon caches this value, so the save plus the in-memory update
+  // below is the whole apply. Nothing here touches the engine, and the merge/no-change
+  // path is shared, so an Apply with nothing changed writes no file.
+  SettingsStatus read_presentation_settings_on_loop(SettingsSnapshot &snapshot,
+                                                    std::string &error) {
+    fcitx::RawConfig values;
+    presentation_config_.save(values);
+    snapshot.values = raw_config_to_settings_value(values);
+    snapshot.types = dump_settings_description(presentation_config_);
+    (void)error;
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus apply_presentation_settings_on_loop(const SettingsValue &submitted,
+                                                     SettingsSnapshot &snapshot,
+                                                     std::string &error) {
+    SettingsSnapshot current;
+    if (const auto status = read_presentation_settings_on_loop(current, error);
+        status != SettingsStatus::Ok) {
+      return status;
+    }
+    if (current.types.empty()) {
+      error = "Fcitx returned no schema for the candidate-presentation configuration.";
+      return SettingsStatus::Error;
+    }
+    SettingsValue merged = current.values;
+    if (!merge_schema_values(current.types, current.types.front().name, submitted, merged,
+                             error)) {
+      return SettingsStatus::Invalid;
+    }
+    if (merged == current.values) {
+      snapshot = std::move(current);
+      return SettingsStatus::Ok;
+    }
+    // Refused while a composition is live for the same reason the other pages are: the
+    // candidate window is already on screen, and moving it mid-composition would relocate
+    // the panel under the user's pointer.
+    if (has_active_composition_on_loop()) {
+      error = "Finish the current composition, then retry applying the candidate layout.";
+      return SettingsStatus::Busy;
+    }
+    fcitx::RawConfig raw;
+    if (!settings_value_fill_raw_config(merged, raw)) {
+      error = "The candidate-presentation settings value tree is malformed.";
+      return SettingsStatus::Invalid;
+    }
+    presentation_config_.load(raw, /*partial=*/true);
+    if (!fcitx::safeSaveAsIni(presentation_config_, candidate_presentation_config_path)) {
+      error = "Fcitx could not save the candidate-presentation configuration; reload before "
+              "retrying.";
+      return SettingsStatus::Error;
+    }
+    // The in-memory configuration is the authority from here on; the file is the record
+    // that survives a restart. A save therefore takes effect on the next projected page.
+    candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
+    return read_presentation_settings_on_loop(snapshot, error);
   }
 
   SettingsStatus read_settings_on_loop(const std::string &method, SettingsSnapshot &snapshot,
@@ -1164,6 +1278,13 @@ private:
         }
         const bool available = instance.addonManager().addon("pinyin", true) != nullptr;
         if (available) {
+          // The Host's one stored presentation value, read from Fcitx's per-user
+          // configuration directory before the first page can be projected. A missing file
+          // reads as the schema default (vertical), which is exactly the presentation this
+          // product shipped before the option existed, so an upgrade changes nothing for a
+          // user who never opens the setting.
+          fcitx::readAsIni(presentation_config_, candidate_presentation_config_path);
+          candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
           ensure_usable_group(instance);
           // Development observable for the WP3 verification: where Fcitx resolves its
           // per-user directories (U1 storage). The group line is printed by
@@ -1246,6 +1367,12 @@ private:
   std::thread thread_;
   fcitx::Instance *instance_ = nullptr; // dispatch_ protects publication; worker owns it
   std::map<std::uint64_t, std::unique_ptr<InputContext>> contexts_;
+  // The Windows candidate-presentation configuration is the Host's single authoritative
+  // store for presentation, read from Fcitx's per-user directory at startup and written
+  // only through the settings path below. candidate_layout_ mirrors its layout value for
+  // the projection, so no code reads the file or the schema on a keystroke.
+  CandidatePresentationConfig presentation_config_;
+  std::atomic<CandidateLayout> candidate_layout_{CandidateLayout::Vertical};
 };
 } // namespace
 std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options) {

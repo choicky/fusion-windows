@@ -22,6 +22,11 @@ public sealed class CandidatesPage : SettingsPageBase
 
         body.Children.Add(PageChrome.MethodSelector(Workspace, Refresh));
 
+        // The candidate window's own presentation comes first: it governs how the list is
+        // drawn, before anything about which candidates are produced.
+        AddGroupedSections(body, PresentationRows(Workspace, PresentationMap.PageCandidates),
+            PresentationMap.CandidateSections);
+
         AddGroupedSections(body, PinyinRows(Workspace, PresentationMap.PageCandidates),
             PresentationMap.CandidateSections);
 

@@ -16,9 +16,11 @@ internal static class Program
         // started again against the same profile, and all this run does is read what the
         // previous one wrote. Nothing is edited, so nothing is overwritten.
         var expectation = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_EXPECT");
-        if (!string.IsNullOrWhiteSpace(expectation))
+        var presentationExpectation =
+            Environment.GetEnvironmentVariable("FUSION_SETTINGS_PRESENTATION_EXPECT");
+        if (!string.IsNullOrWhiteSpace(expectation) || !string.IsNullOrWhiteSpace(presentationExpectation))
         {
-            return await VerifyPersistedAsync(expectation).ConfigureAwait(false);
+            return await VerifyPersistedAsync(expectation, presentationExpectation).ConfigureAwait(false);
         }
 
         WireTests.Run();
@@ -38,6 +40,9 @@ internal static class Program
 
         // The global save needs a real Host with a writable profile; it skips without one.
         await GlobalSaveSectionAsync().ConfigureAwait(false);
+
+        // The candidate-presentation save needs the same writable profile, for the same reason.
+        await PresentationSaveSectionAsync().ConfigureAwait(false);
 
         // The real-Host checks run only when an isolated endpoint is supplied; they never
         // fall back to the installed product's pipe.
@@ -72,7 +77,25 @@ internal static class Program
         await GlobalSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
     }
 
-    private static async Task<int> VerifyPersistedAsync(string expectation)
+    private static async Task PresentationSaveSectionAsync()
+    {
+        var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            Harness.Section("candidate layout: SKIPPED (FUSION_SETTINGS_GLOBAL_PROFILE is not set)");
+            return;
+        }
+
+        if (!TryIsolatedEndpoint(out var endpoint))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await PresentationSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
+    }
+
+    private static async Task<int> VerifyPersistedAsync(string? expectation, string? presentationExpectation)
     {
         if (!TryIsolatedEndpoint(out var endpoint))
         {
@@ -80,8 +103,18 @@ internal static class Program
         }
 
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-        await GlobalSaveTests.VerifyPersistedAsync(endpoint, expectation, cancellation.Token)
-            .ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(expectation))
+        {
+            await GlobalSaveTests.VerifyPersistedAsync(endpoint, expectation, cancellation.Token)
+                .ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(presentationExpectation))
+        {
+            await PresentationSaveTests.VerifyPersistedAsync(endpoint, presentationExpectation,
+                cancellation.Token).ConfigureAwait(false);
+        }
+
         return Harness.Report();
     }
 

@@ -386,6 +386,25 @@ if(BUILD_TESTING)
   foreach(test page select refuse paging truncation focus utf16 preedit panel comment)
     add_test(NAME stage5_candidates_${test} COMMAND stage5_candidates ${test})
   endforeach()
+  # The candidate popup itself, on Windows: a stored layout value proves nothing about the
+  # window, so this creates the real popup (the same window class, layout and paint path
+  # the TSF service uses) and reads its actual rectangle back for each geometry. It is an
+  # isolated process — no TIP, no installed product — so it is safe on a machine in daily
+  # use. It does not cover a composition inside a real application.
+  if(WIN32)
+    add_executable(candidate_window_layout
+      tests/candidate_window_layout.cpp src/tsf/candidate_view.cpp src/tsf/diag.cpp)
+    # Same include roots and same mock backend the TSF target itself uses: semantic.hpp
+    # pulls the mock header in unconditionally, so the popup cannot be compiled alone.
+    target_include_directories(candidate_window_layout PRIVATE include src tests)
+    target_link_libraries(candidate_window_layout PRIVATE MockBackend)
+    target_compile_features(candidate_window_layout PRIVATE cxx_std_20)
+    target_compile_definitions(candidate_window_layout PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(candidate_window_layout PRIVATE /W4 /WX /utf-8)
+    endif()
+    add_test(NAME candidate_window_layout COMMAND candidate_window_layout)
+  endif()
   # The projection outputFilter contract against the real Fcitx5 engine (system
   # libraries) on non-Windows builds, registered only when Fcitx5 development
   # libraries are found. The Windows FUSION_WITH_FCITX5 build registers the same

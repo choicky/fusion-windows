@@ -10,11 +10,17 @@ namespace fusion {
 
 std::optional<CandidatePage>
 project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
-                       const std::shared_ptr<fcitx::CandidateList> &list, std::size_t entry_bound,
+                       const std::shared_ptr<fcitx::CandidateList> &list,
+                       CandidateLayout preferred_layout, std::size_t entry_bound,
                        std::size_t byte_bound, std::size_t field_bound) {
   CandidatePage page;
   page.cursor_index = list->cursorIndex();
-  page.layout = static_cast<CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint()));
+  // The page carries the *effective* layout: the engine's hint when it names one, the
+  // user's stored preference when it does not. The renderer therefore never has to know
+  // about the preference, and no stored value can be silently overwritten by a hint.
+  page.layout = resolve_candidate_layout(
+      static_cast<CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint())),
+      preferred_layout);
   if (auto *pager = list->toPageable()) {
     page.has_prev = pager->hasPrev();
     page.has_next = pager->hasNext();
