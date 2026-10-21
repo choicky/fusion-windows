@@ -39,6 +39,16 @@ public sealed class KeyEditor : UserControl
     private readonly Button _moreButton = new() { Padding = new Thickness(10, 4, 10, 4) };
     private readonly Button _addButton = new() { Content = "添加按键", Padding = new Thickness(10, 4, 10, 4) };
     private readonly Button _editButton = new() { Content = "编辑", Padding = new Thickness(10, 4, 10, 4) };
+    private readonly Button _resetButton = new() { Content = "恢复默认", Padding = new Thickness(10, 4, 10, 4) };
+    private readonly TextBlock _warning = new()
+    {
+        TextWrapping = TextWrapping.Wrap,
+        Visibility = Visibility.Collapsed,
+        Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+        Foreground = (Brush)Application.Current.Resources["SystemFillColorCautionBrush"],
+    };
+    private readonly Func<KeyChord, string?>? _overlapProbe;
+    private SettingsValue? _defaultValue;
     private readonly TextBlock _hint = new()
     {
         VerticalAlignment = VerticalAlignment.Center,
@@ -54,10 +64,11 @@ public sealed class KeyEditor : UserControl
     private bool _recording;
     private int _recordingIndex = -1;
 
-    public KeyEditor(bool positional, Action onChanged)
+    public KeyEditor(bool positional, Action onChanged, Func<KeyChord, string?>? overlapProbe = null)
     {
         _positional = positional;
         _onChanged = onChanged;
+        _overlapProbe = overlapProbe;
 
         var buttons = new StackPanel
         {
@@ -68,11 +79,13 @@ public sealed class KeyEditor : UserControl
         buttons.Children.Add(_moreButton);
         buttons.Children.Add(_addButton);
         buttons.Children.Add(_editButton);
+        buttons.Children.Add(_resetButton);
         buttons.Children.Add(_hint);
 
         var root = new StackPanel { Spacing = 6 };
         root.Children.Add(_tagRows);
         root.Children.Add(buttons);
+        root.Children.Add(_warning);
         Content = root;
 
         _moreButton.Click += (_, _) =>
@@ -81,6 +94,7 @@ public sealed class KeyEditor : UserControl
             Render();
         };
         _addButton.Click += (_, _) => BeginRecording(-1);
+        _resetButton.Click += (_, _) => ResetToDefault();
         _editButton.Click += (_, _) =>
         {
             _editing = !_editing;
@@ -104,6 +118,16 @@ public sealed class KeyEditor : UserControl
     /// <summary>Raised after any accepted change, so the page can push it into the draft.</summary>
     public event EventHandler? ValueChanged;
 
+    /// <summary>
+    /// The schema's default for this option. Reset writes it into the draft only — nothing is
+    /// sent to the Host until Save, and the button is absent when the Host sent no default.
+    /// </summary>
+    public void SetDefaultValue(SettingsValue defaultValue)
+    {
+        _defaultValue = defaultValue;
+        Render();
+    }
+
     public void SetValue(KeyBindingList list)
     {
         _list = list ?? throw new ArgumentNullException(nameof(list));
@@ -115,6 +139,8 @@ public sealed class KeyEditor : UserControl
     private void Render()
     {
         _tagRows.Children.Clear();
+        // A change of contents must reflow even at the same width.
+        _laidOutWidth = -1;
 
         if (_list.Count == 0)
         {
@@ -143,6 +169,13 @@ public sealed class KeyEditor : UserControl
 
         _addButton.Visibility = _recording ? Visibility.Collapsed : Visibility.Visible;
         _editButton.Content = _editing ? "完成" : "编辑";
+        _resetButton.Visibility = _defaultValue is not null && !_recording
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        var warning = DescribeWarnings();
+        _warning.Text = warning ?? string.Empty;
+        _warning.Visibility = warning is null ? Visibility.Collapsed : Visibility.Visible;
 
         _hint.Text = _recording
             ? "请按下要使用的按键，Esc 取消。"
@@ -179,6 +212,20 @@ public sealed class KeyEditor : UserControl
 
         if (_editing)
         {
+            // A real replacement entry point: recording at this index keeps the position.
+            var replace = new Button
+            {
+                Content = new FontIcon { Glyph = "\uE70F", FontSize = 10 },
+                Padding = new Thickness(4, 0, 4, 0),
+                MinWidth = 20,
+                Height = 20,
+                Background = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(0),
+            };
+            ToolTipService.SetToolTip(replace, new ToolTip { Content = "替换这个绑定" });
+            replace.Click += (_, _) => BeginRecording(index);
+            content.Children.Add(replace);
+
             var remove = new Button
             {
                 Content = new FontIcon { Glyph = "\uE711", FontSize = 10 },
@@ -342,6 +389,52 @@ public sealed class KeyEditor : UserControl
         _list = updated;
         CancelRecording();
         RaiseChanged();
+    }
+
+    /// <summary>
+    /// Writes the schema default into the draft. It is a draft edit like any other: nothing
+    /// reaches the Host until Save, and Discard reverts it.
+    /// </summary>
+    private void ResetToDefault()
+    {
+        if (_defaultValue is null)
+        {
+            return;
+        }
+
+        _list = KeyBindingList.FromValue(_defaultValue, _positional);
+        _expanded = false;
+        CancelRecording();
+        RaiseChanged();
+    }
+
+    /// <summary>
+    /// Duplicates and overlaps, reported as text. Neither rewrites anything: which binding wins
+    /// is the engine's business, and inventing a priority here would change behaviour the user
+    /// did not ask to change.
+    /// </summary>
+    private string? DescribeWarnings()
+    {
+        var notes = new List<string>();
+
+        var duplicates = _list.DuplicateIndices();
+        if (duplicates.Count > 0)
+        {
+            var labels = duplicates.Select(index => KeyNames.Label(_list[index])).Distinct();
+            notes.Add($"有重复绑定：{string.Join("、", labels)}。保存后哪个生效由引擎决定，这里不会自动删除。");
+        }
+
+        if (_overlapProbe is not null)
+        {
+            var overlaps = _list.Items
+                .Select(_overlapProbe)
+                .Where(note => note is not null)
+                .Distinct()
+                .ToList();
+            notes.AddRange(overlaps!);
+        }
+
+        return notes.Count == 0 ? null : string.Join(" ", notes);
     }
 
     private void RaiseChanged()

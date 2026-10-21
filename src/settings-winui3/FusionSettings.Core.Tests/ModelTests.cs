@@ -252,5 +252,16 @@ internal static class ModelTests
             "the pinyin view does not");
         Harness.CheckEqual(1, view.Types.Count(t => t.Name == "Fuzzy$FuzzyConfig"),
             "the nested type appears once");
+
+        Harness.Section("schema: which view may carry which field");
+        Harness.Check(view.Describes("PageSize"), "a root option is described");
+        Harness.Check(view.Describes("Fuzzy/VE_UE"), "a nested option is described through its container");
+        Harness.Check(!view.Describes("ShowShuangpinMode"),
+            "a Shuangpin-only field is not described by the Pinyin view");
+        Harness.Check(view.Describes("Fuzzy/Nope") == false, "an unknown nested option is not described");
+        Harness.Check(!view.Describes("Nope"), "an unknown root option is not described");
+        Harness.Check(!view.Describes("Nope/VE_UE"), "nor through a container that is not there");
+        Harness.Check(shuangpin.Describes("ShowShuangpinMode"),
+            "the Shuangpin view does describe it");
     }
 }

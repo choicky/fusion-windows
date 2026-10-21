@@ -28,7 +28,8 @@ public static class OptionRows
     /// </summary>
     public static FrameworkElement Build(OptionDescription option, SettingsValue current,
                                          Func<SettingsValue, bool> apply,
-                                         string? label = null, string? help = null)
+                                         string? label = null, string? help = null,
+                                         Func<KeyChord, string?>? overlapProbe = null)
     {
         var title = new TextBlock
         {
@@ -61,7 +62,7 @@ public static class OptionRows
         }
 
         Services.Trace.Write("option " + option.Name + " type=" + option.Type);
-        var control = CreateControl(option, current, apply);
+        var control = CreateControl(option, current, apply, overlapProbe);
         var row = new Grid { ColumnSpacing = 16 };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -88,7 +89,8 @@ public static class OptionRows
     }
 
     private static FrameworkElement CreateControl(OptionDescription option, SettingsValue current,
-                                                  Func<SettingsValue, bool> apply)
+                                                  Func<SettingsValue, bool> apply,
+                                                  Func<KeyChord, string?>? overlapProbe)
     {
         if (option.IsExternal)
         {
@@ -97,8 +99,14 @@ public static class OptionRows
 
         if (option.IsKeyList)
         {
-            var editor = new KeyEditor(positional: option.Name == "ChooseCharFromPhrase", onChanged: () => { });
+            var editor = new KeyEditor(
+                positional: option.Name == "ChooseCharFromPhrase",
+                onChanged: () => { },
+                overlapProbe: overlapProbe);
             editor.SetValue(KeyBindingList.FromValue(current, option.Name == "ChooseCharFromPhrase"));
+
+            // Reset writes the Host's own default into the draft; no invented default.
+            editor.SetDefaultValue(option.DefaultValue);
             editor.ValueChanged += (_, _) => apply(editor.Value.ToValue());
             return editor;
         }

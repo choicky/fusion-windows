@@ -174,7 +174,14 @@ public sealed class SettingsDraft
     /// The tree a save submits: only the pending edits, with their nesting preserved.
     /// Empty when nothing changed, which is the signal not to send a request at all.
     /// </summary>
-    public SettingsValue BuildChangeSet()
+    public SettingsValue BuildChangeSet() => BuildChangeSet(null);
+
+    /// <summary>
+    /// The same tree, limited to the given paths. A save uses this to split one shared draft
+    /// across the URIs whose schemas actually describe each field: the Host refuses a field a
+    /// URI does not describe, and both Pinyin views share this draft.
+    /// </summary>
+    public SettingsValue BuildChangeSet(IReadOnlySet<string>? paths)
     {
         if (_pending.Count == 0)
         {
@@ -184,6 +191,11 @@ public sealed class SettingsDraft
         var changeSet = SettingsValue.EmptyMap();
         foreach (var (path, value) in _pending)
         {
+            if (paths is not null && !paths.Contains(path))
+            {
+                continue;
+            }
+
             var segments = path.Split('/');
             changeSet = changeSet.WithPath(segments, value);
         }
@@ -204,14 +216,29 @@ public sealed class SettingsDraft
     }
 
     /// <inheritdoc cref="AdoptConfirmed(SettingsValue)"/>
-    public void AdoptConfirmed(SettingsSnapshot confirmed)
+    public void AdoptConfirmed(SettingsSnapshot confirmed) => AdoptConfirmed(confirmed, null);
+
+    /// <summary>
+    /// Adopts a reply, dropping the edits it confirms.
+    /// </summary>
+    /// <param name="appliedPaths">
+    /// The paths the Host accepted, when the caller knows them from a successful write. They are
+    /// dropped unconditionally: a successful apply is authoritative, and comparing values would
+    /// miss the cases where the stored form differs from the submitted one — an empty list is
+    /// written as an empty map and read back as an empty scalar. Null means "compare instead",
+    /// which is what an uncertain outcome needs.
+    /// </param>
+    public void AdoptConfirmed(SettingsSnapshot confirmed, IReadOnlySet<string>? appliedPaths)
     {
         ArgumentNullException.ThrowIfNull(confirmed);
         BaselineValues = confirmed.Values;
 
         foreach (var path in _pending.Keys.ToArray())
         {
-            if (ValueAt(confirmed.Values, path) is { } saved && saved.Equals(_pending[path]))
+            var drop = appliedPaths is not null
+                ? appliedPaths.Contains(path)
+                : ValueAt(confirmed.Values, path) is { } saved && SameStoredValue(saved, _pending[path]);
+            if (drop)
             {
                 _pending.Remove(path);
             }
@@ -219,6 +246,19 @@ public sealed class SettingsDraft
 
         Revision++;
     }
+
+    /// <summary>
+    /// Compares a confirmed value with a pending one, allowing for the Host's read/write
+    /// asymmetry on lists: an empty list is written as an empty map and read back as the empty
+    /// scalar, and those two describe the same stored state.
+    /// </summary>
+    private static bool SameStoredValue(SettingsValue confirmed, SettingsValue pending) =>
+        confirmed.Equals(pending) ||
+        (IsEmptyList(confirmed) && IsEmptyList(pending));
+
+    private static bool IsEmptyList(SettingsValue value) =>
+        (value.IsMap && value.Children.Count == 0) ||
+        (!value.IsMap && value.Scalar.Length == 0);
 
     /// <summary>
     /// Refreshes the baseline from a fresh read without touching pending edits. Used

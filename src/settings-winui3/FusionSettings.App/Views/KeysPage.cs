@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Fusion.Settings.App.Services;
+using Fusion.Settings.Workspace;
 using Fusion.Settings.Model;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -24,7 +25,7 @@ public sealed class KeysPage : SettingsPageBase
 
         body.Children.Add(PageChrome.MethodSelector(Workspace, Refresh));
 
-        var rows = PinyinRows(Workspace).ToList();
+        var rows = PinyinRows(Workspace, PresentationMap.PageKeys).ToList();
 
         // The paging preset edits the same official PrevPage/NextPage lists, so it lives in
         // that section rather than inventing a separate paging switch.
@@ -32,7 +33,7 @@ public sealed class KeysPage : SettingsPageBase
 
         AddGroupedSections(body, rows, PresentationMap.KeysSections);
 
-        var globalRows = GlobalRows(Workspace).ToList();
+        var globalRows = GlobalRows(Workspace, PresentationMap.PageKeys).ToList();
         AddGroupedSections(body, globalRows, PresentationMap.KeysSections);
 
         if (globalRows.Count > 0)
@@ -43,46 +44,6 @@ public sealed class KeysPage : SettingsPageBase
         }
 
         return page;
-    }
-
-    /// <summary>Rows for the global configuration's nested Hotkey/Behavior containers.</summary>
-    private static IEnumerable<(string Section, int Order, FrameworkElement Row)> GlobalRows(
-        SettingsWorkspace workspace)
-    {
-        var snapshot = workspace.SnapshotFor(SettingsTarget.Global);
-        var draft = workspace.DraftFor(SettingsTarget.Global);
-        if (snapshot is null || draft is null || snapshot.Types.Count == 0)
-        {
-            yield break;
-        }
-
-        var root = snapshot.Types[0];
-        foreach (var type in snapshot.Types.Skip(1))
-        {
-            // The value-tree key is the root option whose declared type is this container.
-            var container = root.Options.FirstOrDefault(option =>
-                string.Equals(option.Type, type.Name, StringComparison.Ordinal))?.Name;
-            if (container is null)
-            {
-                continue;
-            }
-
-            foreach (var option in type.Options)
-            {
-                var placement = PresentationMap.FindGlobal(container, option.Name);
-                var section = placement?.Section ?? "更多设置";
-                var order = placement?.Order ?? 900;
-
-                var row = Controls.OptionRows.Build(
-                    option,
-                    draft.EffectiveNested(snapshot, type.Name, option.Name),
-                    value => workspace.TrySetNested(type.Name, option.Name, value),
-                    placement?.Label,
-                    placement?.Help);
-
-                yield return (section, order, row);
-            }
-        }
     }
 
     /// <summary>
@@ -170,6 +131,6 @@ public sealed class KeysPage : SettingsPageBase
             updated.Add(chord);
         }
 
-        Workspace.TrySet(optionName, updated.ToValue());
+        Workspace.TrySet(Workspace.CurrentTarget, optionName, updated.ToValue());
     }
 }

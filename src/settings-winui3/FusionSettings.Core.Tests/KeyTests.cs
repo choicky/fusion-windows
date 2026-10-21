@@ -63,8 +63,15 @@ internal static class KeyTests
 
         var empty = KeyBindingList.FromValue(SettingsValue.Text(string.Empty));
         Harness.CheckEqual(0, empty.Count, "an empty scalar is the empty list");
-        Harness.Check(empty.ToValue().Equals(SettingsValue.Text(string.Empty)),
-            "and it writes back as the empty scalar");
+
+        // Read and write are deliberately different. The Host returns an empty list as an empty
+        // scalar, but its write path rejects a non-map for a List| option ("A list-valued Fcitx
+        // option has an invalid value"), so clearing the last binding only works with a map.
+        // This assertion used to encode the read shape as the write shape, which is why the
+        // defect survived: it asserted the client agreed with itself, not with the Host.
+        var emptyWrite = empty.ToValue();
+        Harness.Check(emptyWrite.IsMap, "an empty list is written as a map, not a scalar");
+        Harness.CheckEqual(0, emptyWrite.Children.Count, "and the map is empty");
 
         var roundTrip = KeyBindingList.FromValue(list.ToValue());
         Harness.CheckEqual(list.Count, roundTrip.Count, "the list survives a write/read round trip");

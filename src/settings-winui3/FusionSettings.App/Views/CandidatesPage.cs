@@ -22,7 +22,12 @@ public sealed class CandidatesPage : SettingsPageBase
 
         body.Children.Add(PageChrome.MethodSelector(Workspace, Refresh));
 
-        AddGroupedSections(body, PinyinRows(Workspace), PresentationMap.CandidateSections);
+        AddGroupedSections(body, PinyinRows(Workspace, PresentationMap.PageCandidates),
+            PresentationMap.CandidateSections);
+
+        // The global behaviour options belong to this page; the global hotkeys belong to Keys.
+        AddGroupedSections(body, GlobalRows(Workspace, PresentationMap.PageCandidates),
+            PresentationMap.CandidateSections);
         AddFuzzySection(body);
         AddExternalTools(body);
 
@@ -55,7 +60,7 @@ public sealed class CandidatesPage : SettingsPageBase
             rows.Add(Controls.OptionRows.Build(
                 option,
                 draft.EffectiveNested(snapshot, fuzzyType.Name, option.Name),
-                value => Workspace.TrySetNested(fuzzyType.Name, option.Name, value)));
+                value => Workspace.TrySetNested(Workspace.CurrentTarget, fuzzyType.Name, option.Name, value)));
         }
 
         PageChrome.AddSection(body, "模糊音",

@@ -254,7 +254,11 @@ try {
     if (-not $match.Success) { throw "Missing settings source pin $($pair[1])" }
     $runtime[$pair[0]] = $match.Groups[1].Value
   }
-  $runtime.qt = '6.8.3 win64_msvc2022_64'
+  # Qt is only a runtime dependency when the configtool-derived client is actually shipped.
+  if ($includeQtSettings) {
+    $runtime.qt = '6.8.3 win64_msvc2022_64'
+  }
+
   $runtime.ecm = '6.30.0 build-time only'
   # The settings manifest below records the fork revision the settings executable was
   # actually built from. Read it from the same pin file the build reads, so the manifest
@@ -297,17 +301,38 @@ try {
     configuration = 'Release'
     runtime       = $runtime
     settings      = [ordered]@{
-      implementationStatus = 'implemented; built and validated against an isolated Host + GUI from this source commit'
+      implementationStatus = 'implemented, compiled and tested against an isolated Host; the window was launched and its pages captured'
       experimentalResult   = 'not owner-installed, not owner-accepted, not registered; owner-test package only'
+      defaultClient        = 'Fusion-owned C# + WinUI 3 (fusion-windows src/settings-winui3)'
+      defaultClientPath    = 'bin/settings/FusionSettings.exe'
+      defaultClientDeployment = 'self-contained .NET 8 + Windows App SDK 2.5.1; needs no runtime installed on the target'
+      defaultClientPackages   = @('Microsoft.WindowsAppSDK 2.5.1', 'Microsoft.Windows.SDK.BuildTools 10.0.28000.2705 (build-time only)')
+      defaultClientSource     = 'covered by package sourceCommit'
       selectionUi          = 'official InputMethodManager group APIs; Items/0 selected, DefaultIM preserved as fallback'
-      applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; changed apply checks contexts and preserves unexposed values'
-      sourceCommit         = 'covered by package sourceCommit'
-      repository           = $configtoolRepository.Groups[1].Value
-      branch               = $configtoolBranchName
-      commit               = $runtime['fcitx5-configtool']
-      sourceAccess         = 'licenses/settings-ui/SOURCE-ACCESS.txt'
+      applySemantics       = 'official inputmethod/<name> schema and setConfigForInputMethod; only changed fields are submitted, split across the URIs whose schemas describe them'
+      qtClient             = if ($includeQtSettings) {
+        [ordered]@{
+          included  = $true
+          path      = 'bin/FusionSettings.exe'
+          role      = 'rollback path only; no shortcut or tray action targets it'
+          repository = $configtoolRepository.Groups[1].Value
+          branch     = $configtoolBranchName
+          commit     = $runtime['fcitx5-configtool']
+          sourceAccess = 'licenses/settings-ui/SOURCE-ACCESS.txt'
+        }
+      } else {
+        [ordered]@{
+          included = $false
+          reason   = 'this build has FUSION_WITH_SETTINGS_UI=OFF, so no configtool-derived executable was produced'
+          rollback = 'use the previous package (fusion-0.0.0-wp7+d095a44.zip), which ships the Qt client as its settings entry'
+        }
+      }
     }
-    layout        = 'bin\ (Host + Tray + Settings + TSF DLL + runtime/Qt/plugins), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    layout        = if ($includeQtSettings) {
+      'bin\ (Host + Tray + TSF DLL + runtime + Qt client and plugins), bin\settings\ (WinUI settings client with its own runtimes), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    } else {
+      'bin\ (Host + Tray + TSF DLL + runtime; no Qt client in this package), bin\settings\ (WinUI settings client with its own runtimes), Fcitx data under bin\data\, lib\libime\, licenses\, source\'
+    }
     files         = $files
   }
   $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'package.json') -Encoding UTF8

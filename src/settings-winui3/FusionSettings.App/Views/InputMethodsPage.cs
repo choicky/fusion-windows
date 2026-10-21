@@ -99,9 +99,10 @@ public sealed class InputMethodsPage : SettingsPageBase
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
 
         var up = new Button { Content = "上移", IsEnabled = index > 0, Padding = new Thickness(10, 4, 10, 4) };
+        // Through the workspace, so the save bar and the close guard see the change.
         up.Click += (_, _) =>
         {
-            if (Workspace.Methods is { } current && current.Move(index, index - 1))
+            if (Workspace.MoveMethod(index, index - 1))
             {
                 Refresh();
             }
@@ -115,7 +116,7 @@ public sealed class InputMethodsPage : SettingsPageBase
         };
         down.Click += (_, _) =>
         {
-            if (Workspace.Methods is { } current && current.Move(index, index + 1))
+            if (Workspace.MoveMethod(index, index + 1))
             {
                 Refresh();
             }
@@ -129,7 +130,7 @@ public sealed class InputMethodsPage : SettingsPageBase
         };
         remove.Click += (_, _) =>
         {
-            if (Workspace.Methods is { } current && current.Remove(name))
+            if (Workspace.RemoveMethod(name))
             {
                 Refresh();
             }
@@ -163,7 +164,7 @@ public sealed class InputMethodsPage : SettingsPageBase
         var add = new Button { Content = "添加", Padding = new Thickness(10, 4, 10, 4) };
         add.Click += (_, _) =>
         {
-            if (Workspace.Methods is { } current && current.Add(name))
+            if (Workspace.AddMethod(name))
             {
                 Refresh();
             }

@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using Fusion.Settings.App.Services;
+using Fusion.Settings.Workspace;
 using Microsoft.UI.Xaml;
 
 namespace Fusion.Settings.App;

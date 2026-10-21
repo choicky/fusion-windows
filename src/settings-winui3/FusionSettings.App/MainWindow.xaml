@@ -66,6 +66,8 @@
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
@@ -83,16 +85,31 @@
                         Foreground="{ThemeResource SystemFillColorCautionBrush}" />
                 </StackPanel>
 
+                <!-- Recovery: shown when the Host was absent at startup or went away. -->
+                <Button
+                    x:Name="RetryButton"
+                    Grid.Column="1"
+                    Content="重试连接"
+                    Visibility="Collapsed"
+                    Click="OnRetryClick" />
+
+                <Button
+                    x:Name="ReloadButton"
+                    Grid.Column="2"
+                    Content="重新加载"
+                    Visibility="Collapsed"
+                    Click="OnReloadClick" />
+
                 <Button
                     x:Name="DiscardButton"
-                    Grid.Column="1"
+                    Grid.Column="3"
                     Content="放弃修改"
                     IsEnabled="False"
                     Click="OnDiscardClick" />
 
                 <Button
                     x:Name="SaveButton"
-                    Grid.Column="2"
+                    Grid.Column="4"
                     Content="保存"
                     Style="{StaticResource AccentButtonStyle}"
                     IsEnabled="False"
