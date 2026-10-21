@@ -122,12 +122,21 @@ public:
   // requires the caller to drain (drain_work) or explicitly cancel.
   Pass pass_probe() const;
 
-  // Whether Return is engine work right now: raw input, a displayed candidate/panel
-  // page, unsettled frontend work or an unresolved pass barrier. When this is false the
-  // engine only answers Return with ForwardKey, so the TSF shell must not claim the key
-  // in OnTestKeyDown: an application that honours only that callback then loses it
-  // (observed in Notepad-- 3.4, R36).
-  bool return_has_engine_work() const;
+  // Whether routing this key through the engine can achieve anything right now.
+  //
+  // A key that carries a character always can: it starts, extends or commits a
+  // composition, and the engine may translate it (punctuation, quickphrase). A key that
+  // carries none — Backspace, Delete, the arrows, Home/End, PageUp/PageDown, Tab,
+  // Return — is engine work only while a composition, a projected page, queued work or
+  // a pass barrier exists; with none of those the engine can only answer it with
+  // ForwardKey.
+  //
+  // The TSF shell must not claim such a key in OnTestKeyDown, because a claim made in T
+  // cannot be retracted in K: an application that honours only T routes the key to the
+  // TIP and does not deliver it natively when K answers "not eaten". That is how Notepad--
+  // 3.4 lost Return (R36) and how WeChat lost Backspace/Delete/arrows after a commit
+  // (R37).
+  bool engine_has_work_for(const KeyAction &action) const;
 
   // The unresolved effect to drain synchronously before allowing PASS, if any.
   std::optional<PendingWork> drain_work();
@@ -201,6 +210,10 @@ private:
   std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
+  // The composition-state work that makes a character-less key engine work: raw input,
+  // a projected page, queued frontend work, an unresolved pass barrier. The Mock Backend
+  // answers true so the development fixture keeps its previous routing.
+  bool engine_has_composition_work() const;
   // Shared real-frontend tail: dispatch one stimulus, validate the returned
   // batch, own the ordered Core records, and project any candidate snapshot.
   // Used by both the key and the candidate-action paths.

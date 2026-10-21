@@ -187,7 +187,7 @@ int main() {
     doc.apply(controller, commit);
     require(controller.finish_pass(), "commit barrier");
     require(controller.raw_buffer().empty(), "commit clears the client preedit projection");
-    require(!controller.return_has_engine_work(),
+    require(!controller.engine_has_work_for(translate_key(kVkReturn, false, false, false)),
             "idle Return after a commit is not engine work, so the shell must not claim it");
     require(controller.routes_key(translate_key(kVkReturn, false, false, false)),
             "Return is still T-routable while the engine is ready");
@@ -200,12 +200,53 @@ int main() {
             "idle Return must only be forwarded to the application");
     doc.apply(controller, idle_return);
     require(controller.finish_pass(), "idle Return Forward barrier");
+    // R37: the same shape for the editing keys. After a commit the engine has no work
+    // for Backspace, Delete or the arrows — pinyin handles them only inside its
+    // non-empty input branch — so it answers them with ForwardKey only. The oracle here
+    // is that engine answer, not the fixed expression: the key must come back as the
+    // application's own key, and only then must T stop claiming it. WeChat lost exactly
+    // these keys after a commit while they worked with the TIP unloaded (owner report,
+    // 2026-10-22), which is what an overstated T claim looks like in an application that
+    // honours only that callback.
+    for (const auto &[vk, name] : {std::pair{0x08u, "Backspace"}, {0x2eu, "Delete"},
+                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x24u, "Home"},
+                                   {0x23u, "End"}}) {
+      const auto idle_key = translate_key(vk, false, false, false);
+      require(controller.routes_key(idle_key), "editing key is no longer an engine key class");
+      const auto idle = controller.begin_key(idle_key, true);
+      std::cout << "idle " << name << " forward=" << (idle.forward ? 1 : 0)
+                << " route=" << static_cast<int>(idle.route)
+                << " ops=" << idle.frontend.size() << '\n';
+      require(idle.forward && !idle.eaten && idle.frontend.empty() &&
+                  idle.route == SemanticDecision::Route::Pass,
+              "the engine did not hand an idle editing key back to the application");
+      require(controller.finish_pass(), "idle editing key Forward barrier");
+      require(!controller.engine_has_work_for(idle_key),
+              "OnTestKeyDown would claim an editing key the engine only forwards");
+    }
+    // A held key arrives as further key-downs of the same key, each with its own T/K
+    // pair: every repeat must reach the application on its own, not only the first.
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      const auto held = controller.begin_key(translate_key(kVkBack, false, false, false), true);
+      require(held.forward && !held.eaten && held.frontend.empty(),
+              "a repeated idle Backspace did not reach the application");
+      require(controller.finish_pass(), "repeated idle Backspace Forward barrier");
+    }
     type(controller, doc, "nihao");
+    // While composing, the same keys stay engine work: the engine deletes, moves and
+    // navigates the composition with them.
+    for (const auto &[vk, name] : {std::pair{0x08u, "Backspace"}, {0x2eu, "Delete"},
+                                   {0x25u, "Left"}, {0x27u, "Right"}, {0x24u, "Home"},
+                                   {0x23u, "End"}}) {
+      (void)name;
+      require(controller.engine_has_work_for(translate_key(vk, false, false, false)),
+              "composing editing key left the engine, so the shell would stop claiming it");
+    }
     auto back = controller.begin_key(translate_key(kVkBack, false, false, false), true);
     require(back.eaten && !back.frontend.empty(), "real Backspace");
     doc.apply(controller, back);
     auto ret = controller.begin_key(translate_key(kVkReturn, false, false, false), true);
-    require(controller.return_has_engine_work(),
+    require(controller.engine_has_work_for(translate_key(kVkReturn, false, false, false)),
             "composing Return stays engine work, so the shell claims it");
     require(ret.backend_session_id && ret.route != SemanticDecision::Route::CancelledRecovery,
             "real Return composition");

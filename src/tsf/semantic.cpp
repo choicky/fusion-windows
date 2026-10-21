@@ -528,10 +528,20 @@ Result SemanticController::settle_state(Key key, EditResult observed) {
 
 Pass SemanticController::pass_probe() const { return host_.pass_barrier(); }
 
-bool SemanticController::return_has_engine_work() const {
+bool SemanticController::engine_has_composition_work() const {
   if (!real_backend_)
     return true; // the Mock Backend keeps the shell's previous routing
   return !buffer_.empty() || page_present_ || !pending_.empty() || pass_probe() != Pass::Clear;
+}
+
+bool SemanticController::engine_has_work_for(const KeyAction &action) const {
+  if (action.type == KeyAction::Type::AppendChar || action.type == KeyAction::Type::Commit)
+    return true; // raw input: starts, extends or commits a composition
+  if (action.keysym != 0 && action.keysym < 0x0100u)
+    return true; // a printable ASCII character, which the engine may translate
+  if (action.keysym >= 0x01000000u)
+    return true; // a non-ASCII character, in the same X11 keysym convention
+  return engine_has_composition_work();
 }
 
 std::optional<PendingWork> SemanticController::drain_work() {
