@@ -232,9 +232,6 @@ void open_settings() {
     return;
   }
   const ULONGLONG now = GetTickCount64();
-  if (g_settings_launch.pending(now)) {
-    return; // the previous launch is still starting
-  }
   const std::wstring executable = settings_executable();
   DWORD session = 0;
   if (ProcessIdToSessionId(GetCurrentProcessId(), &session) != 0) {
@@ -247,15 +244,22 @@ void open_settings() {
     const bool activated = found && fusion::tray::activate_window(instance.window);
     switch (fusion::tray::decide_settings_action(found, activated)) {
     case fusion::tray::SettingsAction::Activate:
+      g_settings_launch.clear();
       return;
     case fusion::tray::SettingsAction::NotifyOnly:
       // The window exists but Windows refused the foreground change. Launching again would
       // only add a second window, so ask for attention instead.
+      g_settings_launch.clear();
       fusion::tray::request_attention(instance.window);
       return;
     case fusion::tray::SettingsAction::Launch:
       break;
     }
+  }
+  // Only the launch path is guarded: a click while the previous process is still starting
+  // must not stack another window.
+  if (g_settings_launch.pending(now)) {
+    return;
   }
   SHELLEXECUTEINFOW info{};
   info.cbSize = sizeof(info);
