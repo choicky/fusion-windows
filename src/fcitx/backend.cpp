@@ -1302,6 +1302,18 @@ private:
           fcitx::readAsIni(presentation_config_, candidate_presentation_config_path);
           candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
           ensure_usable_group(instance);
+          if (!options_.fixture_global_hotkey.empty()) {
+            // Fixture-only global key. Fcitx exposes no setter for its global hotkeys, and
+            // their configuration layer is only reachable through this instance, so the
+            // value is loaded the same way the product loads its presentation option. The
+            // partial load leaves every other hotkey at its own value.
+            // A Fcitx key list is stored as indexed children of the option node, and the
+            // list unmarshaller clears the value first: writing a scalar here would leave
+            // the list empty instead of replacing it.
+            fcitx::RawConfig hotkeys;
+            hotkeys["Hotkey"]["TriggerKeys"]["0"] = options_.fixture_global_hotkey;
+            instance.globalConfig().load(hotkeys, true);
+          }
           // Development observable for the WP3 verification: where Fcitx resolves its
           // per-user directories (U1 storage). The group line is printed by
           // ensure_usable_group together with where the group came from.

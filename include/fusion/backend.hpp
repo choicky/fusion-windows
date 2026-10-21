@@ -251,6 +251,11 @@ public:
 // override on Windows and a test must never touch real per-user data.
 struct FcitxBackendOptions {
   bool user_path = false;
+  // Fixture-only: bind Fcitx's own global "toggle input method" action to this key (for
+  // example "F6") in the instance this backend starts, so a test can prove that a
+  // configured global hotkey is handled with nothing composing. Empty keeps Fcitx's
+  // configured key list. The product Host never sets it.
+  std::string fixture_global_hotkey;
 };
 FUSION_FCITX_API std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options = {});
 } // namespace fusion

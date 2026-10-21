@@ -844,7 +844,12 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   // Eligibility only: no engine consumption prediction or dispatch in T.
   // An application that consults T must receive TRUE to route the key to K, so T
   // claims what the engine is ready to receive — except a key the engine would only
-  // hand back (the Return rule below), which the application handles itself.
+  // hand back, which the application handles itself. A claim made here cannot be
+  // retracted in K: the application routes the key to the TIP and does not deliver it
+  // natively when K answers "not eaten", so an overstated claim loses the key (R36
+  // Return in Notepad-- 3.4; R37 the editing keys in WeChat). The gate is deliberately
+  // narrow — the measured editing/navigation keys and Return — because a configured
+  // Fcitx global hotkey is handled with no composition and must still arrive.
   (void)lparam;
   if (pfEaten == nullptr)
     return E_INVALIDARG;
@@ -861,15 +866,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (!entry)
     return S_OK;
   const auto action = physical_key(wparam, lparam);
-  bool mapped = entry->semantic.routes_key(action);
-  // R36: an idle Return is not engine work — the engine answers it with ForwardKey only
-  // (real Fcitx: one operation, no document callback). Claiming it here makes the shell
-  // own a key it has to hand back in K, and Notepad-- 3.4 then inserts no newline: the
-  // batch carried ForwardKey, the shell answered "not eaten" in K, and nothing arrived.
-  // Leaving the key unclaimed lets the application handle it natively. While composing,
-  // with a candidate page or with unsettled work, Return stays engine-owned as before.
-  if (mapped && action.virtual_key == kVkReturn && !entry->semantic.return_has_engine_work())
-    mapped = false;
+  bool mapped = entry->semantic.routes_key(action) && entry->semantic.engine_has_work_for(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
   diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);

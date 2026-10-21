@@ -528,10 +528,39 @@ Result SemanticController::settle_state(Key key, EditResult observed) {
 
 Pass SemanticController::pass_probe() const { return host_.pass_barrier(); }
 
-bool SemanticController::return_has_engine_work() const {
+bool SemanticController::engine_has_composition_work() const {
   if (!real_backend_)
     return true; // the Mock Backend keeps the shell's previous routing
   return !buffer_.empty() || page_present_ || !pending_.empty() || pass_probe() != Pass::Clear;
+}
+
+bool SemanticController::engine_has_work_for(const KeyAction &action) const {
+  // Every key this shell admitted before R37 keeps its admission; only the keys whose
+  // Fcitx handling needs a live composition are gated on the composition state.
+  if (!editing_key_needs_composition(action))
+    return true;
+  return engine_has_composition_work();
+}
+
+bool SemanticController::editing_key_needs_composition(const KeyAction &action) {
+  // The keys the pinned pinyin engine handles only inside its non-empty-input branch
+  // (stage3c measures the idle and composing behaviour of each one): with nothing
+  // composing it can only forward them. Return belongs here through R36, whose idle case
+  // is the same claim-then-hand-back shape.
+  switch (action.keysym) {
+  case kKeysymBackSpace:
+  case kKeysymDelete:
+  case kKeysymUp:
+  case kKeysymDown:
+  case kKeysymLeft:
+  case kKeysymRight:
+  case kKeysymHome:
+  case kKeysymEnd:
+  case kKeysymReturn:
+    return true;
+  default:
+    return false;
+  }
 }
 
 std::optional<PendingWork> SemanticController::drain_work() {
