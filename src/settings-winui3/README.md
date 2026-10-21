@@ -17,6 +17,25 @@ new configuration path.
 and test with nothing but a .NET SDK, and it keeps the client's correctness-critical logic
 independently verifiable.
 
+## Behaviour the core guarantees
+
+These are the properties the presentation may rely on, each covered by a check:
+
+- **One draft, one value baseline, one schema per view.** `SettingsDraft` holds values only;
+  every edit passes the requesting view's snapshot, so the Pinyin view cannot write a field
+  only the Shuangpin view describes, and adopting a reply from either view cannot replace the
+  other's schema.
+- **Only changed options are submitted**, and a no-change save sends no request at all.
+- **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
+  truncated, late or cancelled reply returns `Indeterminate` with
+  `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
+  starts is `Unreachable`. Nothing is ever replayed; the caller rereads and reconciles.
+- **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
+  replaced with an empty one, and empty entries keep their positions through a copy or a
+  replacement.
+- **A newer Host is accepted and an older one refused**, per the additive settings-API
+  contract; the IPC protocol version is still matched exactly.
+
 ## Prerequisites
 
 - **.NET SDK 10.0.402** (current LTS at the time of writing; SDK 10 is supported until
@@ -37,7 +56,9 @@ dotnet build src/settings-winui3/FusionSettings.Core.Tests/FusionSettings.Core.T
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
-Exit code 0 means every check passed. `--no-integration` skips the real-Host section.
+Exit code 0 means every check passed: **368 checks** as of this revision — 333 focused (including a controlled pipe
+peer for mutation outcomes and handshake versions) and 35 against a real Host when one is supplied. `--no-integration`
+skips the real-Host section.
 
 ### Running the real-Host checks
 
