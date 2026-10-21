@@ -56,7 +56,7 @@ dotnet build src/settings-winui3/FusionSettings.Core.Tests/FusionSettings.Core.T
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
-Exit code 0 means every check passed: **368 checks** as of this revision — 333 focused (including a controlled pipe
+Exit code 0 means every check passed: **371 checks** as of this revision — 336 focused (including a controlled pipe
 peer for mutation outcomes and handshake versions) and 35 against a real Host when one is supplied. `--no-integration`
 skips the real-Host section.
 
