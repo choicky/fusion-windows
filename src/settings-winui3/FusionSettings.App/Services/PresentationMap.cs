@@ -138,6 +138,20 @@ public static class PresentationMap
                 "提示由 notifications 组件提供，本安装包未包含该组件。"),
         };
 
+    /// <summary>
+    /// Windows candidate-presentation options, keyed by the name the Host uses. This is the
+    /// one configuration that is not an official Fcitx addon or global schema: it is the
+    /// Windows presentation configuration the owner authorized on 2026-10-22, and the Host
+    /// owns the stored value.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, Placement> Presentation =
+        new Dictionary<string, Placement>(StringComparer.Ordinal)
+        {
+            ["CandidateLayout"] = new(PageCandidates, "候选窗口", 10, "候选排列方向",
+                "横向排成一行，纵向排成一列。若输入法为某个候选列表指定了排列方向（例如快捷短语、"
+                + "Unicode 等模式），输入法的指定优先于这里的设置。"),
+        };
+
     /// <summary>Section order within a page; anything unknown sorts last.</summary>
     public static readonly IReadOnlyList<string> KeysSections = new[]
     {
@@ -147,7 +161,7 @@ public static class PresentationMap
 
     public static readonly IReadOnlyList<string> CandidateSections = new[]
     {
-        "候选", "预编辑", "学习", "双拼", "系统输入行为", "更多设置",
+        "候选窗口", "候选", "预编辑", "学习", "双拼", "系统输入行为", "更多设置",
     };
 
     public static Placement? FindPinyin(string optionName) =>
@@ -155,6 +169,9 @@ public static class PresentationMap
 
     public static Placement? FindGlobal(string container, string optionName) =>
         Global.TryGetValue(container + "/" + optionName, out var placement) ? placement : null;
+
+    public static Placement? FindPresentation(string optionName) =>
+        Presentation.TryGetValue(optionName, out var placement) ? placement : null;
 
     /// <summary>Options that are links to other tools rather than values.</summary>
     public static readonly IReadOnlyDictionary<string, string> ExternalToolReason =

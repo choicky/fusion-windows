@@ -154,6 +154,42 @@ public abstract class SettingsPageBase : Page
         }
     }
 
+    /// <summary>
+    /// Rows for the Windows candidate-presentation configuration on
+    /// <paramref name="page"/>. The target is fixed to Presentation, so these controls can
+    /// only ever write the presentation configuration — never a Pinyin, Shuangpin or global
+    /// value, which each keep exactly one store of their own.
+    /// </summary>
+    protected static IEnumerable<(string Section, int Order, FrameworkElement Row)> PresentationRows(
+        SettingsWorkspace workspace, string page)
+    {
+        var snapshot = workspace.SnapshotFor(SettingsTarget.Presentation);
+        var draft = workspace.DraftFor(SettingsTarget.Presentation);
+        if (snapshot is null || draft is null || snapshot.Types.Count == 0)
+        {
+            yield break;
+        }
+
+        foreach (var option in snapshot.Types[0].Options)
+        {
+            var placement = PresentationMap.FindPresentation(option.Name);
+            var optionPage = placement?.Page ?? PresentationMap.PageCandidates;
+            if (!string.Equals(optionPage, page, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var row = OptionRows.Build(
+                option,
+                draft.Effective(option.Name),
+                value => workspace.TrySet(SettingsTarget.Presentation, option.Name, value),
+                placement?.Label,
+                placement?.Help);
+
+            yield return (placement?.Section ?? "更多设置", placement?.Order ?? 900, row);
+        }
+    }
+
     /// <summary>Groups rows into sections in the order the presentation table declares.</summary>
     protected static void AddGroupedSections(StackPanel body, IEnumerable<(string Section, int Order, FrameworkElement Row)> rows,
                                              IReadOnlyList<string> sectionOrder)

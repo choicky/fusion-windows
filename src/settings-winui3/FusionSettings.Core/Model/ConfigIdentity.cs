@@ -35,6 +35,13 @@ public sealed class ConfigIdentity : IEquatable<ConfigIdentity>
 
             // The global configuration is its own object.
             ["fcitx://config/global"] = "global",
+
+            // The Windows candidate-presentation configuration is its own object too: one
+            // Fusion-owned Fcitx configuration, stored in Fcitx's per-user directory, that
+            // holds presentation only. It deliberately does not share an identity with the
+            // pinyin addon or with the global configuration, because it repeats no value
+            // either of them owns (owner authorization 2026-10-22).
+            ["fcitx://config/candidate-presentation"] = "presentation",
         };
 
     private ConfigIdentity(string id, string publicUri)
