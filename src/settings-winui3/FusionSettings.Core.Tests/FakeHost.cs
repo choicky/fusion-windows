@@ -33,6 +33,9 @@ internal enum FakeBehaviour
 
     /// <summary>Read the request, then never reply.</summary>
     ReadThenHold,
+
+    /// <summary>Answer each request with what the test's script returns for it.</summary>
+    Scripted,
 }
 
 /// <summary>
@@ -49,6 +52,7 @@ internal sealed class FakeHost : IAsyncDisposable
     private readonly SettingsStatus _helloStatus;
     private readonly SettingsStatus _replyStatus;
     private readonly ulong _incarnation;
+    private readonly Func<MessageType, byte[], byte[]?>? _script;
     private readonly CancellationTokenSource _stop = new();
     private readonly TaskCompletionSource _frameReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Task _loop;
@@ -56,7 +60,8 @@ internal sealed class FakeHost : IAsyncDisposable
     private int _requestFrames;
 
     private FakeHost(string name, FakeBehaviour behaviour, uint protocol, uint api,
-                     SettingsStatus helloStatus, SettingsStatus replyStatus, ulong incarnation)
+                     SettingsStatus helloStatus, SettingsStatus replyStatus, ulong incarnation,
+                     Func<MessageType, byte[], byte[]?>? script)
     {
         _name = name;
         _behaviour = behaviour;
@@ -65,6 +70,7 @@ internal sealed class FakeHost : IAsyncDisposable
         _helloStatus = helloStatus;
         _replyStatus = replyStatus;
         _incarnation = incarnation;
+        _script = script;
         _server = CreateServer();
         _loop = AcceptAsync();
     }
@@ -85,7 +91,21 @@ internal sealed class FakeHost : IAsyncDisposable
                                  SettingsStatus replyStatus = SettingsStatus.Invalid,
                                  ulong incarnation = 0x5EED_1234_ABCD_0001)
     {
-        return new FakeHost(name, behaviour, protocol, api, helloStatus, replyStatus, incarnation);
+        return new FakeHost(name, behaviour, protocol, api, helloStatus, replyStatus, incarnation, null);
+    }
+
+    /// <summary>
+    /// A peer whose answer depends on the request, so a sequence such as "the write is uncertain,
+    /// then the reread says X" can be driven. The script returns the reply body without the
+    /// incarnation envelope, or null to close the connection instead of answering.
+    /// </summary>
+    public static FakeHost StartScripted(string name, Func<MessageType, byte[], byte[]?> script,
+                                         ulong incarnation = 0x5EED_1234_ABCD_0002)
+    {
+        ArgumentNullException.ThrowIfNull(script);
+        return new FakeHost(name, FakeBehaviour.Scripted, WireLimits.ProtocolVersion,
+                            WireLimits.SettingsApiVersion, SettingsStatus.Ok, SettingsStatus.Invalid,
+                            incarnation, script);
     }
 
     public static string UniqueName() => "fusion-test-" + Guid.NewGuid().ToString("N")[..10];
@@ -115,6 +135,10 @@ internal sealed class FakeHost : IAsyncDisposable
         catch (OperationCanceledException)
         {
             // Disposal ended the loop.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Disposal closed the listening instance this loop was waiting on.
         }
         catch (IOException)
         {
@@ -175,6 +199,16 @@ internal sealed class FakeHost : IAsyncDisposable
             case FakeBehaviour.ReplyStatus:
                 await WriteReplyAsync(server, request.Value.Type,
                     Bytes.Concat(Bytes.U8((byte)_replyStatus), Bytes.Str("the Host refused"))).ConfigureAwait(false);
+                return;
+            case FakeBehaviour.Scripted:
+                var scripted = _script!(request.Value.Type, request.Value.Payload);
+                if (scripted is null)
+                {
+                    // Closing without a reply is how a lost answer is produced.
+                    return;
+                }
+
+                await WriteReplyAsync(server, request.Value.Type, scripted).ConfigureAwait(false);
                 return;
             default:
                 await WriteReplyAsync(server, request.Value.Type, SuccessBody(request.Value.Type))
@@ -267,6 +301,18 @@ internal sealed class FakeHost : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await _stop.CancelAsync().ConfigureAwait(false);
+
+        // Release the name as well: a check that brings a Host back on the same endpoint needs
+        // this instance to stop listening, not just to stop answering.
+        try
+        {
+            _server?.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already closed by the accept loop.
+        }
+
         try
         {
             await _loop.ConfigureAwait(false);

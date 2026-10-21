@@ -215,31 +215,66 @@ public static class OptionRows
 
     private static FrameworkElement StringListControl(SettingsValue current, Func<SettingsValue, bool> apply)
     {
-        var lines = current.IsMap
-            ? current.Children.OrderBy(entry => int.TryParse(entry.Key, out var index) ? index : int.MaxValue)
-                .Select(entry => entry.Value.Scalar)
-            : current.Scalar.Length == 0
-                ? Array.Empty<string>()
-                : new[] { current.Scalar };
-
+        // One entry per line. The value that leaves this control is always an indexed map —
+        // empty text included — because that is the only shape the Host accepts for a list
+        // option; see StringListValue for why the read shape differs.
+        //
+        // AcceptsReturn is set *before* Text: a single-line text box strips line breaks out of
+        // the text it is given, so assigning the text first left one pattern where there were
+        // three, and the next save wrote the list back truncated.
         var box = new TextBox
         {
-            Text = string.Join("\n", lines),
             AcceptsReturn = true,
             TextWrapping = TextWrapping.Wrap,
             Height = 90,
             PlaceholderText = "每行一条",
         };
+        box.Text = StringListValue.ToText(current);
 
-        box.LostFocus += (_, _) => apply(ToIndexedMap(box.Text.Split('\n')));
+        AttachCommit(box, box.Text, text => apply(StringListValue.ToValue(StringListValue.SplitLines(text))));
         return box;
     }
 
     private static FrameworkElement TextControl(SettingsValue current, Func<SettingsValue, bool> apply)
     {
+        // A scalar option keeps the scalar path: an empty string here is an empty string, not
+        // an empty list.
         var box = new TextBox { Text = current.Scalar, MinWidth = 200 };
-        box.LostFocus += (_, _) => apply(SettingsValue.Text(box.Text));
+        AttachCommit(box, current.Scalar, text => apply(SettingsValue.Text(text)));
         return box;
+    }
+
+    /// <summary>
+    /// Makes a text field commit on lost focus <b>and</b> on demand, once per actual edit.
+    /// </summary>
+    /// <remarks>
+    /// The callback compares the current text with the text the draft last accepted, so the
+    /// window can ask at any time — before a save, before deciding whether closing would lose
+    /// something — without submitting the same edit twice. A refusal leaves the accepted text
+    /// alone, so a later attempt still carries what the user typed.
+    /// </remarks>
+    private static void AttachCommit(TextBox box, string initial, Func<string, bool> apply)
+    {
+        var committed = initial ?? string.Empty;
+        bool Commit()
+        {
+            var text = box.Text ?? string.Empty;
+            if (string.Equals(text, committed, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (!apply(text))
+            {
+                return false;
+            }
+
+            committed = text;
+            return true;
+        }
+
+        box.LostFocus += (_, _) => Commit();
+        PendingEdit.SetCommit(box, Commit);
     }
 
     private static FrameworkElement ExternalLink(OptionDescription option)
@@ -262,24 +297,6 @@ public static class OptionRows
             Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
         });
         return stack;
-    }
-
-    /// <summary>Turns lines into the indexed map a Fcitx string list is stored as.</summary>
-    public static SettingsValue ToIndexedMap(IEnumerable<string> lines)
-    {
-        var kept = lines.Select(line => line.TrimEnd('\r')).ToList();
-        if (kept.Count == 0 || (kept.Count == 1 && kept[0].Length == 0))
-        {
-            return SettingsValue.Text(string.Empty);
-        }
-
-        var entries = new (string, SettingsValue)[kept.Count];
-        for (var i = 0; i < kept.Count; i++)
-        {
-            entries[i] = (i.ToString(CultureInfo.InvariantCulture), SettingsValue.Text(kept[i]));
-        }
-
-        return SettingsValue.Map(entries);
     }
 }
 

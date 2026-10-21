@@ -29,10 +29,20 @@ These are the properties the presentation may rely on, each covered by a check:
   only the Shuangpin view describes, and adopting a reply from either view cannot replace the
   other's schema.
 - **Only changed options are submitted**, and a no-change save sends no request at all.
+- **A list is written as an indexed map, empty or not.** The Host reads an empty list back as the
+  empty scalar but refuses one on write, so `StringListValue` and `KeyBindingList.ToValue` emit a
+  map and an empty map for an empty list. An empty scalar, an empty list and a list holding an
+  empty positional entry stay three different values.
 - **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
   truncated, late or cancelled reply returns `Indeterminate` with
   `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
   starts is `Unreachable`. Nothing is ever replayed; the caller rereads and reconciles.
+- **An uncertain method-list write keeps the request.** The reread becomes the baseline and the
+  requested order stays pending unless the reread shows it applied, so "not applied" is never
+  reported as saved.
+- **A reconnect preserves pending edits**, and a retry after a first load that never succeeded
+  creates the drafts it does not have. Losing the connection is tracked separately from having
+  loaded, so the window offers the retry in both cases.
 - **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
   replaced with an empty one, and empty entries keep their positions through a copy or a
   replacement.
@@ -69,27 +79,57 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **422 checks** as of this revision — 347 without a Host, and 75 more against one
-(the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, and the
-workspace path: Global routing, a Shuangpin-only save, clearing the last binding, the method list, a
-failed start and its retry). `--no-integration`
+Exit code 0 means every check passed: **515 checks** as of this revision — 423 without a Host, and 92 more against one
+(the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the workspace path — Global
+routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list, a failed start and its
+retry — a scripted peer for an uncertain method-list write and for a reconnect, a successful global save with its
+persistence check, and read/apply/read-back with incarnation stability). `--no-integration`
 skips the real-Host section.
 
 ### Running the real-Host checks
 
 They need a Host on an isolated endpoint, and they never fall back to the installed
-product's pipe. Start one with no user data, so it cannot touch the owner's profile:
+product's pipe. The Host must have a **writable** profile, because the global configuration is
+applied through Fcitx's own `safeSave()` and cannot be saved without one: a Host started with
+`FUSION_FCITX_SKIP_USER_PATH=1` has no user configuration directory, so the global-save checks
+would report the Host's own failure instead of exercising the path.
+
+Point the Host's per-user directories at a throwaway profile. Nothing outside it is read or
+written, and the pipe name is refused if it is the production one:
 
 ```powershell
-$pipe = "\\.\pipe\fusion-settings-test"
-$env:FUSION_FCITX_SKIP_USER_PATH = "1"
-Start-Process .\FusionHost.exe -ArgumentList '--pipe-name', $pipe
+$profileRoot = "$env:TEMP\fusion-settings-profile"
+New-Item -ItemType Directory -Force "$profileRoot\User\AppData\Roaming","$profileRoot\AppData\Local" | Out-Null
+$env:APPDATA = "$profileRoot\User\AppData\Roaming"
+$env:LOCALAPPDATA = "$profileRoot\AppData\Local"
+$env:USERPROFILE = "$profileRoot\User"
+Remove-Item Env:\FUSION_FCITX_SKIP_USER_PATH -ErrorAction SilentlyContinue
+Start-Process .\FusionHost.exe -ArgumentList '--pipe-name', '\\.\pipe\fusion-settings-test',
+  '--stop-event-scope', 'fusion-settings-test'
 ```
 
-Then point the checks at the same name (the logical name, without the device path):
+The Host prints where it resolved its paths; both lines must point inside `$profileRoot`:
+
+```
+[FusionHost] fcitx user config: ...\fusion-settings-profile\User\AppData\Roaming\Fcitx5\config
+[FusionHost] fcitx user data:   ...\fusion-settings-profile\User\AppData\Roaming\Fcitx5\data
+```
+
+Then point the checks at the same name (the logical name, without the device path) and at the
+profile root, so the no-change save can be checked against the files on disk:
 
 ```powershell
 $env:FUSION_SETTINGS_TEST_PIPE = "fusion-settings-test"
+$env:FUSION_SETTINGS_GLOBAL_PROFILE = $profileRoot
+dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
+```
+
+The run ends by printing `GLOBAL_EXPECT=<option>=<value>`. Stop the Host with its stop event
+(signalling `Local\FusionHost-stop-<scope>` requests the orderly shutdown that saves state),
+start it again against the same profile, and confirm the value survived:
+
+```powershell
+$env:FUSION_SETTINGS_GLOBAL_EXPECT = "DefaultPageSize=6"
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 

@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.Threading.Tasks;
+using Fusion.Settings.App.Controls;
 using Fusion.Settings.App.Services;
 using Fusion.Settings.App.Views;
 using Fusion.Settings.Workspace;
@@ -112,6 +113,8 @@ public sealed partial class MainWindow : Window
             case nameof(SettingsWorkspace.HasChanges):
             case nameof(SettingsWorkspace.SaveSummary):
             case nameof(SettingsWorkspace.IsLoaded):
+            case nameof(SettingsWorkspace.IsConnected):
+            case nameof(SettingsWorkspace.NeedsRetry):
                 UpdateStatus();
                 break;
         }
@@ -134,10 +137,13 @@ public sealed partial class MainWindow : Window
         // request that has already been captured.
         PageHost.IsEnabled = _workspace.CanEdit;
 
+        // Retry is offered whenever the Host is not answering — before the first load and after
+        // a connection lost mid-session. The workspace decides whether it creates or preserves
+        // the drafts; the button is the same either way.
         RetryButton.Visibility = _workspace.NeedsRetry ? Visibility.Visible : Visibility.Collapsed;
         RetryButton.IsEnabled = idle;
 
-        // A reload is only useful once something has loaded; before that the retry is the action.
+        // Reload is only useful once there is state to reload; before that the retry is the action.
         ReloadButton.Visibility = _workspace.IsLoaded ? Visibility.Visible : Visibility.Collapsed;
         ReloadButton.IsEnabled = idle;
 
@@ -149,7 +155,7 @@ public sealed partial class MainWindow : Window
 
     private async void OnSaveClick(object sender, RoutedEventArgs e)
     {
-        // A focused TextBox or NumberBox commits on lost focus; move focus first so Save sees
+        // A focused text field commits on lost focus; commit it explicitly first so Save sees
         // what the user typed rather than the previous value.
         CommitPendingInput();
 
@@ -160,6 +166,7 @@ public sealed partial class MainWindow : Window
 
     private void OnDiscardClick(object sender, RoutedEventArgs e)
     {
+        CommitPendingInput();
         _workspace.Discard();
         UpdateStatus();
         RefreshCurrentPage();
@@ -167,14 +174,20 @@ public sealed partial class MainWindow : Window
 
     private async void OnRetryClick(object sender, RoutedEventArgs e)
     {
-        // A retry after a failed start: nothing was loaded, so there is nothing to preserve.
-        await _workspace.InitializeAsync().ConfigureAwait(true);
+        // Reconnect through the workspace, which preserves pending edits when drafts exist and
+        // creates them when the first load never succeeded.
+        await _workspace.RetryAsync().ConfigureAwait(true);
         UpdateStatus();
         RefreshCurrentPage();
     }
 
     private async void OnReloadClick(object sender, RoutedEventArgs e)
     {
+        // The question below is "would this discard anything?", so the focused field has to be
+        // committed before it is asked; otherwise an edit that only exists in the control is
+        // discarded without ever being counted.
+        CommitPendingInput();
+
         if (_workspace.HasChanges)
         {
             var dialog = new ContentDialog
@@ -201,34 +214,45 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Moves focus off whatever is being edited so a lost-focus commit runs before the draft is
-    /// read. Harmless when nothing has focus.
+    /// Commits whatever is still sitting in a control, and reports whether it all landed.
     /// </summary>
-    private void CommitPendingInput()
+    /// <remarks>
+    /// Moving focus is the ordinary way a text field commits, so it is tried first. It is not
+    /// enough on its own: the move can fail, and a caught failure proves nothing about whether
+    /// the text reached the draft. The controls are therefore asked directly afterwards, which
+    /// is what makes "edit and close" behave like "edit, tab away, close".
+    /// </remarks>
+    private bool CommitPendingInput()
     {
         if (PageHost.XamlRoot is null || PageHost.Content is null)
         {
-            return;
+            return true;
         }
 
-        if (FocusManager.GetFocusedElement(PageHost.XamlRoot) is null)
+        if (FocusManager.GetFocusedElement(PageHost.XamlRoot) is not null)
         {
-            return;
+            try
+            {
+                // The desktop overload needs an explicit search root; the bare overload throws in a
+                // WinUI Desktop app and takes the window down with it.
+                FocusManager.TryMoveFocus(
+                    FocusNavigationDirection.Next,
+                    new FindNextElementOptions { SearchRoot = PageHost });
+            }
+            catch (Exception exception)
+            {
+                // Moving focus is a convenience; the direct commit below is what has to work.
+                Trace.Write("commit focus failed: " + exception.Message);
+            }
         }
 
-        try
+        var committed = PendingEdit.CommitAll(PageHost);
+        if (!committed)
         {
-            // The desktop overload needs an explicit search root; the bare overload throws in a
-            // WinUI Desktop app and takes the window down with it.
-            FocusManager.TryMoveFocus(
-                FocusNavigationDirection.Next,
-                new FindNextElementOptions { SearchRoot = PageHost });
+            Trace.Write("commit refused: a control kept its edit");
         }
-        catch (Exception exception)
-        {
-            // Moving focus is a convenience: a failure must never block a save.
-            Trace.Write("commit focus failed: " + exception.Message);
-        }
+
+        return committed;
     }
 
     private void RefreshCurrentPage()
@@ -246,6 +270,20 @@ public sealed partial class MainWindow : Window
     private async void OnClosing(Microsoft.UI.Windowing.AppWindow sender,
                                  Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
     {
+        // An operation is reading the drafts right now. Discarding them under it would change the
+        // state a request already in flight is being reconciled against, so the close is refused
+        // rather than raced — and the reason is shown instead of a dialog that cannot be honoured.
+        if (_workspace.IsBusy)
+        {
+            args.Cancel = true;
+            _workspace.Report("正在与 Host 通信，请等这次操作结束后再关闭窗口。");
+            return;
+        }
+
+        // The focused field may hold the last edit, and it only reaches the draft when it is
+        // committed. Ask before deciding whether the window is dirty.
+        CommitPendingInput();
+
         if (!_workspace.HasChanges)
         {
             return;
@@ -276,11 +314,14 @@ public sealed partial class MainWindow : Window
             var result = await dialog.ShowAsync();
             if (result == ContentDialogResult.Primary)
             {
+                // Nothing was typed while the dialog was up, but a control can still hold an
+                // uncommitted edit that the save would otherwise miss.
                 CommitPendingInput();
                 await _workspace.SaveAsync().ConfigureAwait(true);
                 if (_workspace.HasChanges)
                 {
                     // The save did not take; keep the window open rather than lose the edits.
+                    UpdateStatus();
                     return;
                 }
             }
@@ -289,6 +330,7 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            // Cancel returns above; both remaining answers close, and only one of them discards.
             _workspace.Discard();
             Close();
         }

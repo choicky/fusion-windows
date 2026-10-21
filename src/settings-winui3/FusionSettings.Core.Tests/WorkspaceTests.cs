@@ -56,6 +56,7 @@ internal static class WorkspaceTests
         await GlobalRoutingAsync(workspace, endpoint, cancellation.Token).ConfigureAwait(false);
         await ShuangpinSaveAsync(workspace, endpoint, cancellation.Token).ConfigureAwait(false);
         await ClearListAsync(workspace, endpoint, cancellation.Token).ConfigureAwait(false);
+        await ClearStringListAsync(workspace, endpoint, cancellation.Token).ConfigureAwait(false);
         await MethodListAsync(workspace, endpoint, cancellation.Token).ConfigureAwait(false);
     }
 
@@ -75,12 +76,11 @@ internal static class WorkspaceTests
     /// A Global control must reach the Global draft, not the Pinyin one.
     /// </summary>
     /// <remarks>
-    /// This is the defect the correction fixes, so it is checked directly. A successful global
-    /// <b>save</b> cannot be exercised on this Host: the isolated Host runs without a user
-    /// config path, and the Host's global apply ends in <c>safeSave()</c>, which needs one — it
-    /// answers "Fcitx could not save the global configuration; reload before retrying." That is
-    /// a Host/environment constraint, not a client one, and the client's handling of it (report
-    /// the failure, keep the edits) is what is asserted here instead.
+    /// This is the defect the correction fixed, so it is checked directly. It is a routing
+    /// question and stops at routing: whether a global save can <b>persist</b> depends on the
+    /// Host having a writable user configuration directory, which is a property of the Host it
+    /// was started against, so that half lives in <see cref="GlobalSaveTests"/> where the profile
+    /// is known. Encoding it here would make this check pass or fail with the environment.
     /// </remarks>
     private static async Task GlobalRoutingAsync(SettingsWorkspace workspace, string endpoint,
                                                  CancellationToken cancellationToken)
@@ -103,6 +103,10 @@ internal static class WorkspaceTests
         Harness.CheckEqual(flipped, workspace.GlobalDraft.EffectiveNested(snapshot, behavior.Name, option.Name).Scalar,
             "and the Global draft reports the new value");
 
+        // Routing is settled; drop the edit so the save below carries only the Pinyin change.
+        workspace.Discard();
+        Harness.Check(!workspace.HasChanges, "discard clears the Global edit");
+
         // A Pinyin edit still goes to the shared draft, and both drafts stay separate.
         var pinyinSnapshot = workspace.SnapshotFor(workspace.CurrentTarget)!;
         var pageSize = pinyinSnapshot.FindRootOption("PageSize")!;
@@ -113,16 +117,14 @@ internal static class WorkspaceTests
         Harness.Check(workspace.TrySet(workspace.CurrentTarget, "PageSize", SettingsValue.Text(next)),
             "a Pinyin edit is accepted");
         Harness.Check(workspace.PinyinDraft.HasChanges, "and it is pending in the shared draft");
-        Harness.CheckEqual(1, workspace.GlobalDraft.PendingPaths.Count,
-            "while the Global draft still holds exactly its own edit");
+        Harness.Check(!workspace.GlobalDraft.HasChanges,
+            "while the Global draft stays clean, because the two configurations are separate");
 
         await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
         Harness.Check(!workspace.PinyinDraft.HasChanges,
             "the Pinyin edit saves and is confirmed");
-        Harness.Check(workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
-            "the Global save is reported as a failure rather than as done");
-        Harness.Check(workspace.GlobalDraft.HasChanges,
-            "and the Global edit is kept for a Host that can persist it");
+        Harness.Check(!workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+            "and the save reports no failure");
 
         // Read back the Pinyin value through a fresh client: it really changed.
         var reader = new SettingsClient(endpoint, TimeSpan.FromSeconds(10));
@@ -130,9 +132,6 @@ internal static class WorkspaceTests
             .ConfigureAwait(false);
         Harness.CheckEqual(next, pinyin.Value!.Values.Children["PageSize"].Scalar,
             "the Pinyin value was written to the Host");
-
-        workspace.Discard();
-        Harness.Check(!workspace.HasChanges, "discard clears the remaining Global edit");
     }
 
     /// <summary>
@@ -222,6 +221,57 @@ internal static class WorkspaceTests
         var cleared = KeyBindingList.FromValue(afterClear.Value!.Values.Children["ThirdCandidate"]);
         Harness.CheckEqual(0, cleared.Count, "the Host stored an empty list");
         Harness.Check(!workspace.PinyinDraft!.HasChanges, "and nothing is pending afterwards");
+    }
+
+    /// <summary>
+    /// Clearing a <c>List|String</c> option through the production conversion, and restoring it.
+    /// </summary>
+    /// <remarks>
+    /// <c>QuickPhraseTriggerRegex</c> is the one real <c>List|String</c> option in the Pinyin
+    /// schema: the quick-phrase trigger patterns, one per line. The value is built by
+    /// <see cref="StringListValue"/> — the same call the multi-line control makes — so this
+    /// covers the conversion and the Host request together, not a hand-made map.
+    /// </remarks>
+    private static async Task ClearStringListAsync(SettingsWorkspace workspace, string endpoint,
+                                                   CancellationToken cancellationToken)
+    {
+        Harness.Section("workspace: clearing a string list saves and reads back empty");
+
+        const string optionName = "QuickPhraseTriggerRegex";
+        var reader = new SettingsClient(endpoint, TimeSpan.FromSeconds(10));
+        var before = await reader.GetConfigAsync(SettingsWorkspace.PinyinUri, cancellationToken)
+            .ConfigureAwait(false);
+        var original = before.Value!.Values.Children[optionName];
+        var originalLines = StringListValue.Lines(original);
+        Harness.Check(originalLines.Count > 0,
+            "the Host ships trigger patterns by default, so clearing them is a change");
+        Console.WriteLine($"   trigger patterns: {originalLines.Count} -> {string.Join(" | ", originalLines)}");
+
+        // Exactly what the control does with empty text.
+        var empty = StringListValue.ToValue(string.Empty.Split('\n'));
+        Harness.Check(empty.IsMap, "the cleared control produces an empty map");
+        Harness.Check(workspace.TrySet(SettingsTarget.Pinyin, optionName, empty),
+            "the cleared list is accepted into the draft");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Harness.Check(!workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+            "clearing a string list saves: the Host accepts an empty map for a list option");
+
+        var afterClear = await reader.GetConfigAsync(SettingsWorkspace.PinyinUri, cancellationToken)
+            .ConfigureAwait(false);
+        var clearedLines = StringListValue.Lines(afterClear.Value!.Values.Children[optionName]);
+        Harness.CheckEqual(0, clearedLines.Count, "the Host stored an empty list");
+        Harness.Check(!workspace.PinyinDraft!.HasChanges, "and nothing is pending afterwards");
+
+        // Put the patterns back, so the rest of the checks start from the Host's own values.
+        Harness.Check(workspace.TrySet(SettingsTarget.Pinyin, optionName,
+                StringListValue.ToValue(originalLines)),
+            "the original patterns are restored in the draft");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        var restored = await reader.GetConfigAsync(SettingsWorkspace.PinyinUri, cancellationToken)
+            .ConfigureAwait(false);
+        var restoredLines = StringListValue.Lines(restored.Value!.Values.Children[optionName]);
+        Harness.CheckEqual(string.Join("\n", originalLines), string.Join("\n", restoredLines),
+            "and the Host holds them again, in their original order");
     }
 
     /// <summary>The method list is a draft too: editing it must enable Save and be saved.</summary>

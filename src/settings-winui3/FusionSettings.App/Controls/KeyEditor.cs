@@ -5,6 +5,7 @@ using Fusion.Settings.Model;
 using Microsoft.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
@@ -35,7 +36,7 @@ public sealed class KeyEditor : UserControl
 
     private readonly bool _positional;
     private readonly Action _onChanged;
-    private readonly StackPanel _tagRows = new() { Spacing = 6 };
+    private readonly WrapPanel _tagRows = new();
     private readonly Button _moreButton = new() { Padding = new Thickness(10, 4, 10, 4) };
     private readonly Button _addButton = new() { Content = "添加按键", Padding = new Thickness(10, 4, 10, 4) };
     private readonly Button _editButton = new() { Content = "编辑", Padding = new Thickness(10, 4, 10, 4) };
@@ -57,8 +58,6 @@ public sealed class KeyEditor : UserControl
     };
 
     private KeyBindingList _list = KeyBindingList.Empty();
-    private bool _layingOut;
-    private double _laidOutWidth = -1;
     private bool _expanded;
     private bool _editing;
     private bool _recording;
@@ -108,7 +107,6 @@ public sealed class KeyEditor : UserControl
 
         // Capture the key wherever focus is inside the editor while recording.
         AddHandler(KeyDownEvent, new KeyEventHandler(OnRecordingKeyDown), handledEventsToo: true);
-        SizeChanged += (_, _) => LayoutTags();
         Render();
     }
 
@@ -138,9 +136,9 @@ public sealed class KeyEditor : UserControl
 
     private void Render()
     {
+        // The panel lays the chips out itself, so a change of contents is all this needs:
+        // the next measure wraps whatever is there at whatever width it is given.
         _tagRows.Children.Clear();
-        // A change of contents must reflow even at the same width.
-        _laidOutWidth = -1;
 
         if (_list.Count == 0)
         {
@@ -159,8 +157,6 @@ public sealed class KeyEditor : UserControl
             {
                 AddChip(i);
             }
-
-            LayoutTags();
         }
 
         var hidden = _list.Count - (_expanded ? _list.Count : Math.Min(InitialVisible, _list.Count));
@@ -223,6 +219,9 @@ public sealed class KeyEditor : UserControl
                 BorderThickness = new Thickness(0),
             };
             ToolTipService.SetToolTip(replace, new ToolTip { Content = "替换这个绑定" });
+            // An icon-only button has no text for a screen reader or for automation to read,
+            // so the tooltip is also its accessible name.
+            AutomationProperties.SetName(replace, "替换第 " + (index + 1) + " 个绑定");
             replace.Click += (_, _) => BeginRecording(index);
             content.Children.Add(replace);
 
@@ -236,6 +235,7 @@ public sealed class KeyEditor : UserControl
                 BorderThickness = new Thickness(0),
             };
             ToolTipService.SetToolTip(remove, new ToolTip { Content = "移除这个绑定" });
+            AutomationProperties.SetName(remove, "移除第 " + (index + 1) + " 个绑定");
             remove.Click += (_, _) =>
             {
                 if (_list.RemoveAt(index))
@@ -255,56 +255,6 @@ public sealed class KeyEditor : UserControl
         };
 
         _tagRows.Children.Add(chip);
-    }
-
-    /// <summary>
-    /// Reflows the chips into rows that fit the available width. A wrap panel would be
-    /// shorter, but laying the rows out here keeps the chips ordinary controls with their
-    /// own focus and tooltips.
-    /// </summary>
-    private void LayoutTags()
-    {
-        if (_list.Count == 0 || _layingOut)
-        {
-            return;
-        }
-
-        var chips = _tagRows.Children.OfType<Border>().ToList();
-        if (chips.Count == 0)
-        {
-            return;
-        }
-
-        var available = Math.Max(240, ActualWidth - 4);
-        if (Math.Abs(available - _laidOutWidth) < 8 && _laidOutWidth > 0)
-        {
-            return;
-        }
-
-        // Rebuilding the rows from inside a SizeChanged handler re-enters layout; the guard
-        // above and this flag keep it to one pass per real width change.
-        _layingOut = true;
-        _laidOutWidth = available;
-        _tagRows.Children.Clear();
-
-        StackPanel? row = null;
-        double used = 0;
-        foreach (var chip in chips)
-        {
-            chip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-            var width = chip.DesiredSize.Width + 6;
-            if (row is null || (used + width > available && row.Children.Count > 0))
-            {
-                row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-                _tagRows.Children.Add(row);
-                used = 0;
-            }
-
-            row.Children.Add(chip);
-            used += width;
-        }
-
-        _layingOut = false;
     }
 
     private void BeginRecording(int index)

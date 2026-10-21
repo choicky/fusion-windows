@@ -75,8 +75,13 @@ public partial class App : Application
 
     private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
     {
-        Trace.Write("UNHANDLED: " + e.Message);
+        // The message alone is not enough to find a XAML fault: the type and the stack say which
+        // control and which call. Nothing here contains user content.
+        var detail = e.Exception is null
+            ? e.Message
+            : e.Exception.GetType().FullName + ": " + e.Message + Environment.NewLine + e.Exception.StackTrace;
+        Trace.Write("UNHANDLED: " + detail);
         // Keep the app alive long enough to report, instead of vanishing silently.
-        System.Diagnostics.Debug.WriteLine("unhandled: " + e.Message);
+        System.Diagnostics.Debug.WriteLine("unhandled: " + detail);
     }
 }

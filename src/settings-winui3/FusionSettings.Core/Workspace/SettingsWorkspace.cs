@@ -53,6 +53,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     private string _statusText = "尚未连接 Host。";
     private bool _isBusy;
     private bool _isLoaded;
+    private bool _isConnected;
     private string _editingMethod = "pinyin";
     private string _saveSummary = string.Empty;
 
@@ -96,10 +97,33 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// <summary>Editing is allowed only when nothing is in flight.</summary>
     public bool CanEdit => !_isBusy;
 
+    /// <summary>True once a load has produced state this window can show.</summary>
+    /// <remarks>
+    /// This is deliberately not "the last operation succeeded". A failed reconnect keeps the
+    /// loaded state on screen — the drafts are still there and still worth saving — so clearing
+    /// this on failure would hide a page that is still valid.
+    /// </remarks>
     public bool IsLoaded
     {
         get => _isLoaded;
         private set => Set(ref _isLoaded, value);
+    }
+
+    /// <summary>
+    /// True while the Host is answering. It goes false when a load or a save cannot reach the
+    /// Host, which is a different fact from "nothing was ever loaded": a connection lost after a
+    /// successful load still has drafts to preserve.
+    /// </summary>
+    public bool IsConnected
+    {
+        get => _isConnected;
+        private set
+        {
+            if (Set(ref _isConnected, value))
+            {
+                Raise(nameof(NeedsRetry));
+            }
+        }
     }
 
     /// <summary>The method whose schema the editor is showing. Not the active method.</summary>
@@ -158,8 +182,11 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public IReadOnlyList<string> Diagnostics => _log;
 
-    /// <summary>True when the last load failed and a retry is meaningful.</summary>
-    public bool NeedsRetry => !IsLoaded && Status != SettingsStatus.Ok;
+    /// <summary>True when a retry is meaningful: nothing loaded yet, or the Host went away.</summary>
+    public bool NeedsRetry => !IsConnected;
+
+    /// <summary>True once drafts exist, which is when a reconnect has something to preserve.</summary>
+    public bool HasDrafts => PinyinDraft is not null;
 
     /// <summary>
     /// The first load. Creates the drafts, so it is only used when there is nothing to lose;
@@ -182,6 +209,18 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             EndOperation();
         }
     }
+
+    /// <summary>
+    /// The visible retry action: reconnect without losing work.
+    /// </summary>
+    /// <remarks>
+    /// Before the first successful load there are no drafts, so the retry has to create them.
+    /// After one there are, and the retry must not: a connection lost with edits pending is
+    /// exactly the case where recreating the drafts would throw the user's work away. The
+    /// choice is made from the state, not from the button that was pressed.
+    /// </remarks>
+    public Task<bool> RetryAsync(CancellationToken cancellationToken = default) =>
+        ReloadAsync(preserveEdits: HasDrafts, cancellationToken);
 
     /// <summary>
     /// Re-reads the Host without losing work.
@@ -248,7 +287,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 Log("load rejected: replies came from different Host incarnations");
                 Status = SettingsStatus.Unreachable;
                 StatusText = "Host 在读取过程中被替换，已放弃这次读取。请重试。";
-                IsLoaded = false;
+                IsConnected = false;
+                IsLoaded = HasDrafts;
                 return false;
             }
 
@@ -278,6 +318,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
             Status = SettingsStatus.Ok;
             StatusText = $"已连接 Host（incarnation {incarnation}）。";
+            IsConnected = true;
             IsLoaded = true;
             Log($"loaded: pinyin={pinyin.Value!.Types.Count} types, global={global.Value!.Types.Count} types");
             return true;
@@ -293,6 +334,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         finally
         {
             Raise(nameof(HasChanges));
+            Raise(nameof(HasDrafts));
         }
     }
 
@@ -301,7 +343,11 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         Status = status;
         StatusText = Describe(status, error);
         Log($"load failed: status={status} error={error}");
-        IsLoaded = false;
+        IsConnected = false;
+
+        // Whatever was loaded before is still on screen and still editable, so a failed
+        // reconnect does not pretend the window is empty.
+        IsLoaded = HasDrafts;
         return false;
     }
 
@@ -396,12 +442,26 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public void Discard()
     {
+        // An operation owns the drafts while it runs; clearing them underneath it would change
+        // the answer a request already in flight is being reconciled against.
+        if (IsBusy)
+        {
+            Report("正在与 Host 通信，暂时不能放弃修改。");
+            return;
+        }
+
         PinyinDraft?.RevertAll();
         GlobalDraft?.RevertAll();
         Methods?.Revert();
         SaveSummary = "已放弃未保存的修改。";
         Raise(nameof(HasChanges));
     }
+
+    /// <summary>
+    /// Puts a short message in the save bar without touching a draft. Used for outcomes that are
+    /// not a save result, such as refusing to close while a request is in flight.
+    /// </summary>
+    public void Report(string message) => SaveSummary = message;
 
     /// <summary>
     /// Saves every configuration that changed and reports each result separately.
@@ -511,6 +571,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 // A successful apply is authoritative for exactly what was sent.
                 draft.AdoptConfirmed(result.Value!, sentPaths);
                 SetSnapshot(target, result.Value!);
+                MarkConnected();
                 Log($"save {uri}: ok");
                 return $"{name}：已保存。";
 
@@ -520,12 +581,14 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 if (!reread.IsOk)
                 {
                     Log($"save {uri}: indeterminate, reread failed {reread.Status}");
+                    MarkDisconnected(reread.Status, reread.Error);
                     return $"{name}：写入结果不确定，可能已生效；重新读取也失败了，修改已保留，请手动重新加载核对。";
                 }
 
                 // Adopting the reread drops exactly the edits it confirms and keeps the rest.
                 draft.AdoptConfirmed(reread.Value!);
                 SetSnapshot(target, reread.Value!);
+                MarkConnected();
                 Log($"save {uri}: indeterminate, reconciled from a reread");
                 return $"{name}：写入结果不确定，可能已生效。已重新读取当前配置并据此核对。";
 
@@ -535,6 +598,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
             default:
                 Log($"save {uri}: {result.Status} {result.Error}");
+                NoteIfConnectionLost(result);
                 return $"{name}：未保存（{Describe(result.Status, result.Error)}）。修改已保留。";
         }
     }
@@ -567,36 +631,52 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return "输入方式列表：已保存。";
 
             case SettingsStatus.Indeterminate:
+                // The Host may have applied the list. The reread is authoritative for what it
+                // now holds, but it is not evidence that the request was dropped: the order the
+                // user asked for stays pending unless the reread shows it. Nothing is replayed.
                 var fresh = await _client.GetImListAsync(cancellationToken).ConfigureAwait(true);
                 if (!fresh.IsOk)
                 {
                     Log("save im-list: indeterminate, reread failed");
-                    return "输入方式列表：写入结果不确定，可能已生效；重新读取也失败了，修改已保留。";
+                    MarkDisconnected(fresh.Status, fresh.Error);
+                    return "输入方式列表：写入结果不确定，可能已生效；重新读取也失败了，修改仍保留，请重试连接后核对。";
                 }
 
-                Methods = new ImListDraft(fresh.Value!);
-                Log("save im-list: indeterminate, reconciled");
-                return "输入方式列表：写入结果不确定，可能已生效。已重新读取并据此核对。";
+                MarkConnected();
+                methods.RefreshBaseline(fresh.Value!);
+                if (methods.HasChanges)
+                {
+                    Log("save im-list: indeterminate, reread shows the request was not applied");
+                    return "输入方式列表：写入结果不确定；重新读取显示这次修改尚未生效，修改仍保留，可再次保存。";
+                }
+
+                Log("save im-list: indeterminate, reread shows the request was applied");
+                return "输入方式列表：写入结果不确定，但重新读取显示已生效。";
 
             case SettingsStatus.Busy:
                 return "输入方式列表：当前正在输入或组合中，未保存。";
 
             default:
                 Log($"save im-list: {result.Status} {result.Error}");
+                NoteIfConnectionLost(result);
                 return $"输入方式列表：未保存（{Describe(result.Status, result.Error)}）。修改已保留。";
         }
     }
 
     /// <summary>
-    /// Keeps a refresh from discarding list edits: a pending list is left alone, and only a
-    /// clean one takes the freshly read baseline.
+    /// Keeps a refresh from discarding list edits: the baseline moves to the fresh read and a
+    /// pending order stays pending, so a reconnect can neither drop the user's work nor claim it
+    /// was saved.
     /// </summary>
     private void MergeMethods(ImList fresh)
     {
-        if (Methods is null || !Methods.HasChanges)
+        if (Methods is null)
         {
             Methods = new ImListDraft(fresh);
+            return;
         }
+
+        Methods.RefreshBaseline(fresh);
     }
 
     /// <summary>A short, user-facing sentence for a status.</summary>
@@ -616,6 +696,37 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             : $"无法连接 FusionHost：{error}",
         _ => string.IsNullOrEmpty(error) ? "未知错误。" : error,
     };
+
+    private void MarkConnected()
+    {
+        if (!IsConnected)
+        {
+            IsConnected = true;
+            Status = SettingsStatus.Ok;
+            StatusText = "已重新连接 Host。";
+        }
+    }
+
+    /// <summary>
+    /// Records that the Host could not be reached. Only the statuses that actually mean "no
+    /// usable connection" do this: a refusal (<c>Busy</c>, <c>Invalid</c>, a schema rejection)
+    /// proves the Host answered, so it must not offer a reconnect.
+    /// </summary>
+    private void MarkDisconnected(SettingsStatus status, string error)
+    {
+        if (status is not (SettingsStatus.Unreachable or SettingsStatus.Timeout))
+        {
+            return;
+        }
+
+        IsConnected = false;
+        Status = status;
+        StatusText = Describe(status, error);
+        Log($"connection lost: status={status} error={error}");
+    }
+
+    private void NoteIfConnectionLost<T>(SettingsResult<T> result) =>
+        MarkDisconnected(result.Status, result.Error);
 
     private bool TryBeginOperation()
     {

@@ -31,7 +31,12 @@ public sealed class ImListDraft
         _enabled = new List<string>(baseline.Enabled);
     }
 
-    public ImList Baseline { get; }
+    /// <summary>
+    /// The Host's last confirmed membership. It moves when a fresh read is adopted; the
+    /// requested order is held separately, so the two can disagree — and that disagreement is
+    /// exactly what <see cref="HasChanges"/> reports.
+    /// </summary>
+    public ImList Baseline { get; private set; }
 
     public IReadOnlyList<string> Enabled => _enabled;
 
@@ -93,6 +98,23 @@ public sealed class ImListDraft
     {
         _enabled.Clear();
         _enabled.AddRange(Baseline.Enabled);
+    }
+
+    /// <summary>
+    /// Moves the baseline to a fresh read and leaves the requested order alone.
+    /// </summary>
+    /// <remarks>
+    /// This is the reconciliation for an uncertain write and for a reconnect, and it is
+    /// deliberately the same operation for both. The reread is authoritative, so it becomes the
+    /// baseline; the user's order stays pending, so nothing they asked for is thrown away. Which
+    /// of the two happened is then read off <see cref="HasChanges"/>: false means the reread
+    /// shows the request applied (and there is nothing left to save), true means it does not (and
+    /// the request is still pending). Neither outcome replays the mutation.
+    /// </remarks>
+    public void RefreshBaseline(ImList fresh)
+    {
+        ArgumentNullException.ThrowIfNull(fresh);
+        Baseline = fresh;
     }
 
     /// <summary>The ordered list a save submits.</summary>
