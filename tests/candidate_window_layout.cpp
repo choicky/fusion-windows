@@ -109,6 +109,33 @@ fusion::CandidatePage make_all_long_page(fusion::CandidateLayout layout, int ent
   return page;
 }
 
+// A scroll window: `rows` engine pages of `page_size` candidates, with the engine sitting on
+// row `current_row`. This is the shape the Host projects (the engine's own paging facts), so
+// the layout is exercised with the numbers it really receives.
+fusion::CandidatePage make_scroll_page(int page_size, int rows, int current_row) {
+  fusion::CandidatePage page;
+  page.arrangement = fusion::CandidateArrangement::Scroll;
+  page.layout = fusion::CandidateLayout::Horizontal;
+  page.page_size = page_size;
+  page.window_first_page = 1;
+  page.current_page = 1 + current_row;
+  page.total_pages = 12;
+  page.has_prev = true;
+  page.has_next = true;
+  for (int row = 0; row < rows; ++row) {
+    for (int column = 0; column < page_size; ++column) {
+      fusion::CandidateEntry entry;
+      // Labels exist only on the engine's own page — it is the row the number keys act on.
+      if (row == current_row)
+        entry.label = std::to_string(column + 1) + ".";
+      entry.text = "候选" + std::to_string(row * page_size + column + 1);
+      page.entries.push_back(std::move(entry));
+    }
+  }
+  page.cursor_index = current_row * page_size;
+  return page;
+}
+
 // The test places the popup in the coordinates the process actually uses, so the inset is
 // scaled by the DPI the window reports rather than assumed to be pixels.
 int scaled_for_test(int value) {
@@ -976,7 +1003,7 @@ int main() {
     auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
     page.cursor_index = 3; // the keyboard case: no pointer involved
     page.entries[3].text.clear();
-    for (int i = 0; i < 600; ++i)
+    for (int i = 0; i < 2000; ++i)
       page.entries[3].text += "很长的候选内容";
     show_and_measure(view, page);
     CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
@@ -991,6 +1018,11 @@ int main() {
       CHECK(independent > 0);
       // The height the popup counted is the height this width really produces.
       CHECK(independent == view.tip_content_height());
+      // The premise of the rest: this text is taller than the box it gets. It is stated,
+      // not assumed — the band a popup is allowed is the *work area*, so a text that just
+      // fits would make "it scrolls" a false claim about a fine implementation (and did:
+      // 600 repeats of this string fit a 144-dpi display's band exactly).
+      CHECK(independent > view.tip_view_height());
       CHECK(view.tip_scrollable());
 
       // At maximum scroll the whole text is inside the window: the last line is not past
@@ -1057,6 +1089,188 @@ int main() {
     // A single-pass measure would set the scroll extent from the first number and stop
     // short of the real end, which is exactly the defect.
     CHECK(placed_height > requested_height);
+  }
+
+  // 25. Automatic scrolling is a grid, and it is drawn by the same popup: columns are the
+  //     engine's own page size, every cell has one width, and each row is one engine page.
+  {
+    const auto page = make_scroll_page(5, 5, 2);
+    const RECT rect = show_and_measure(view, page);
+    CHECK(view.visible());
+    const auto &layout = view.layout();
+    CHECK(layout.total_rows == 5);
+    CHECK(layout.visible_rows >= 1 && layout.visible_rows <= 5);
+    CHECK(layout.slots.size() == page.entries.size());
+    CHECK(slots_hold_the_text(view));
+
+    // Row 0's five cells share a top and are consecutive in x; the sixth cell starts a row.
+    const int cell_width = layout.slots[0].right - layout.slots[0].left;
+    CHECK(cell_width > 0);
+    for (std::size_t column = 1; column < 5; ++column) {
+      CHECK(layout.slots[column].top == layout.slots[0].top);
+      CHECK(layout.slots[column].left > layout.slots[column - 1].left);
+      CHECK(layout.slots[column].right - layout.slots[column].left == cell_width);
+    }
+    CHECK(layout.slots[5].top > layout.slots[0].top);
+    // Column alignment, not per-row packing: the cell below column c starts at the same x.
+    for (std::size_t index = 5; index < 25; ++index) {
+      const std::size_t column = index % 5;
+      CHECK(layout.slots[index].left == layout.slots[column].left);
+      CHECK(layout.slots[index].right - layout.slots[index].left == cell_width);
+    }
+    // Every visible cell is its own click target, and the index the hit reports is the one
+    // the page carries — the page-local index the semantic layer turns into a global one.
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      if (layout.slots[index].empty())
+        continue;
+      const auto hit = fusion::tsf::hit_test_candidate_panel(
+          layout, layout.slots[index].left + 1,
+          (layout.slots[index].top + layout.slots[index].bottom) / 2);
+      CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+            hit->index == static_cast<std::int32_t>(index));
+    }
+    // The window fits the work area and is wider than it is tall.
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{120, 120}, MONITOR_DEFAULTTONEAREST), &info))
+      work = info.rcWork;
+    CHECK(width_of(rect) <= width_of(work) && height_of(rect) <= height_of(work));
+  }
+
+  // 26. A different PageSize is a different number of columns, with no setting of ours in
+  //     between: seven per row is seven per row, and the eighth candidate starts row two.
+  {
+    const auto page = make_scroll_page(7, 3, 0);
+    const RECT rect = show_and_measure(view, page);
+    CHECK(view.visible());
+    const auto &layout = view.layout();
+    CHECK(layout.total_rows == 3);
+    CHECK(layout.slots.size() == 21);
+    CHECK(layout.slots[6].top == layout.slots[0].top);
+    CHECK(layout.slots[7].top > layout.slots[0].top);
+    CHECK(width_of(rect) > 0);
+  }
+
+  // 27. A short last row keeps its columns: two candidates sit under columns one and two, and
+  //     nothing is invented for the empty cells.
+  {
+    fusion::CandidatePage page = make_scroll_page(5, 5, 4);
+    page.entries.resize(22);
+    page.cursor_index = 20;
+    show_and_measure(view, page);
+    const auto &layout = view.layout();
+    CHECK(layout.slots.size() == 22);
+    const auto &last = layout.slots[21];
+    const auto &first_of_row = layout.slots[20];
+    CHECK(last.top == first_of_row.top);
+    CHECK(last.left > first_of_row.left);
+    CHECK(last.right - last.left == first_of_row.right - first_of_row.left);
+    // No candidate exists for columns three to five, so there is nothing to click there.
+    const auto nowhere = fusion::tsf::hit_test_candidate_panel(
+        layout, last.right + 4, (last.top + last.bottom) / 2);
+    CHECK(!nowhere || nowhere->kind != fusion::tsf::PanelHit::Kind::Select);
+  }
+
+  // 28. A work area that cannot hold five rows shows fewer, and the row the paging keys are
+  //     on is one of them. The user's font is not touched to make more fit.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 12;
+    };
+    for (const int budget : {160, 220, 400}) {
+      fusion::tsf::LayoutLimits limits;
+      limits.max_width = 900;
+      limits.max_height = budget;
+      for (const int current_row : {0, 2, 4}) {
+        const auto page = make_scroll_page(5, 5, current_row);
+        const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+        CHECK(layout.total_rows == 5);
+        CHECK(layout.visible_rows >= 1 && layout.visible_rows <= 5);
+        CHECK(layout.height <= budget);
+        // The current row's first cell is visible (it has a rect).
+        const std::size_t anchor = static_cast<std::size_t>(current_row) * 5;
+        CHECK(!layout.slots[anchor].empty());
+        // Rows outside the window keep their index and have no rect.
+        int shown = 0;
+        for (std::size_t index = 0; index < layout.slots.size(); ++index)
+          shown += layout.slots[index].empty() ? 0 : 1;
+        CHECK(shown == layout.visible_rows * 5);
+      }
+    }
+    // At the smallest budget the row count really is reduced, not merely clipped.
+    fusion::tsf::LayoutLimits tight;
+    tight.max_width = 900;
+    tight.max_height = 160;
+    const auto layout = fusion::tsf::layout_candidate_panel(make_scroll_page(5, 5, 4), measure,
+                                                            metrics, tight);
+    CHECK(layout.visible_rows < 5);
+  }
+
+  // 28b. The capacity the popup reports is the number of rows it can really draw: the host
+  //      groups scroll pages by it, so a disagreement here is the "sliding window" defect —
+  //      a page of five rows drawn as three, whose last visible row is not the page's last.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 12;
+    };
+    for (const int budget : {152, 190, 266, 342, 1000}) {
+      fusion::tsf::LayoutLimits limits;
+      limits.max_width = 900;
+      limits.max_height = budget;
+      const auto page = make_scroll_page(5, 5, 0);
+      const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+      CHECK(layout.row_capacity >= 1 && layout.row_capacity <= 5);
+      // What it says it can hold is what it did hold: with a five-row page and a capacity of
+      // n, exactly n rows are on screen and no row is silently dropped.
+      CHECK(layout.visible_rows == layout.row_capacity);
+      CHECK(layout.height <= budget);
+      // The capacity is a ceiling on rows, not a squeeze on their size: every visible row is
+      // still a whole row of the metrics above.
+      std::vector<int> row_tops;
+      for (const auto &slot : layout.slots) {
+        if (slot.empty())
+          continue;
+        if (std::find(row_tops.begin(), row_tops.end(), slot.top) == row_tops.end())
+          row_tops.push_back(slot.top);
+        CHECK(slot.bottom - slot.top >= metrics.line_height);
+      }
+      CHECK(static_cast<int>(row_tops.size()) == layout.row_capacity);
+    }
+    // A bigger font buys fewer rows, never smaller text.
+    const auto large = fusion::tsf::layout_metrics_for(60, 96);
+    fusion::tsf::LayoutLimits short_area;
+    short_area.max_width = 900;
+    short_area.max_height = 260;
+    const auto big = fusion::tsf::layout_candidate_panel(make_scroll_page(5, 5, 0), measure,
+                                                         large, short_area);
+    CHECK(big.row_capacity < 5);
+    CHECK(big.visible_rows == big.row_capacity);
+    for (const auto &slot : big.slots) {
+      if (!slot.empty())
+        CHECK(slot.bottom - slot.top >= large.line_height);
+    }
+  }
+
+  // 29. A long candidate in a scroll cell is ellipsized like any other, and its full text is
+  //     still reachable from the same detail popup — one mechanism, not a second one.
+  {
+    auto page = make_scroll_page(5, 3, 0);
+    for (int i = 0; i < 40; ++i)
+      page.entries[6].text += "很长的候选内容";
+    page.cursor_index = -1;
+    show_and_measure(view, page);
+    const auto &slot = view.layout().slots[6];
+    CHECK(!slot.empty());
+    CHECK(view.layout().slot_clipped(6));
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    // Leaving the cell hides it again; the popped box belongs to the cell it describes.
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0, MAKELPARAM(1, 1));
+    CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
   }
 
   view.destroy();

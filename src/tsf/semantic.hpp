@@ -108,6 +108,13 @@ public:
   // Shift keys are relayed (see routes_release); every other release is not ours.
   SemanticDecision release_key(const KeyAction &action);
 
+  // How many complete candidate rows the popup can draw with the current work area, display
+  // DPI and font. Sent with every stimulus: it is the only part of "where the scroll page
+  // ends" that this side knows, and the Host needs it to group rows the same way the popup
+  // draws them. 0 keeps the Host maximum.
+  void set_window_rows(int rows) { window_rows_ = rows < 0 ? 0 : (rows > 5 ? 5 : rows); }
+  int window_rows() const { return window_rows_; }
+
   // Whether a key-up of this key may be relayed at all: a Shift key whose press this
   // shell relayed and that stayed lone, nothing else.
   bool routes_release(const KeyAction &action) const;
@@ -226,6 +233,8 @@ private:
   std::uint64_t bound_incarnation_ = 0;
   std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
+  // The popup's current row capacity, updated whenever it lays a page out.
+  std::int32_t window_rows_ = 0;
   // The Shift key whose physical press was last observed (T or K); 0 when none. Only a
   // physical fact: it never claims the engine received anything.
   std::uint32_t shift_pressed_keysym_ = 0;

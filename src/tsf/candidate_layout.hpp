@@ -84,6 +84,11 @@ struct CandidatePanelLayout {
   int first_row = 0;
   int visible_rows = 0;
   int total_rows = 0;
+  // How many complete rows of this arrangement the work area can hold at the font and DPI the
+  // panel was laid out with (at most five). The host groups scroll pages by this number, so
+  // what the paging keys call a page and what the popup shows are the same thing; 0 means the
+  // layout had no ceiling to apply (an unbounded test layout).
+  int row_capacity = 0;
   bool rows_hidden_above() const { return first_row > 0; }
   bool rows_hidden_below() const { return first_row + visible_rows < total_rows; }
 };
@@ -182,6 +187,95 @@ layout_candidate_panel(const CandidatePage &page,
   for (const auto &entry : page.entries)
     if (!entry.placeholder)
       ++count;
+
+  // The automatic scrolling arrangement: a grid whose columns are the engine's own page
+  // size and whose rows are the engine's own pages. `entries` already is a contiguous run of
+  // engine pages (see CandidateScrollWindow), so placement is pure index arithmetic over the
+  // engine's order — no re-sorting, no renumbering, and a cell's position in entries is the
+  // only identity the hit test needs.
+  if (page.arrangement == CandidateArrangement::Scroll && page.page_size > 0 &&
+      !page.entries.empty()) {
+    const int columns =
+        (std::max)(1, (std::min)(page.page_size, static_cast<int>(page.entries.size())));
+    const int rows = (static_cast<int>(page.entries.size()) + columns - 1) / columns;
+    const int band = pager ? row_height : 0;
+
+    // One width for every cell on every row, taken from the widest text in the window and
+    // then divided by the budget: columns line up, a row cannot be squeezed into a different
+    // shape by its own text, and the panel is inside the screen by construction.
+    std::vector<int> text_width(page.entries.size(), 0);
+    int natural = 0;
+    for (std::size_t index = 0; index < page.entries.size(); ++index) {
+      if (page.entries[index].placeholder)
+        continue;
+      text_width[index] = measure(slot_full_text(page.entries[index]));
+      natural = (std::max)(natural, text_width[index]);
+    }
+    int cell = natural;
+    if (bounded_width) {
+      const int content = limits.max_width - 2 * side_margin - (columns - 1) * item_gap;
+      const int share = content > 0 ? content / columns : 1;
+      cell = (std::min)(cell, share);
+    }
+    if (limits.max_slot_width > 0)
+      cell = (std::min)(cell, limits.max_slot_width);
+    cell = (std::max)(1, cell);
+
+    int panel_width = 2 * side_margin + columns * cell + (columns - 1) * item_gap;
+    // The pager arrows live in the band above the grid, so they are not taken out of any
+    // row's width — but the panel still has to be wide enough to hold them.
+    if (pager)
+      panel_width = (std::max)(panel_width, 2 * side_margin + 2 * pager_width + item_gap);
+    if (bounded_width)
+      panel_width = (std::min)(panel_width, (std::max)(limits.max_width, metrics.min_width));
+    width = (std::max)(width, panel_width);
+
+    out.total_rows = rows;
+    // Five rows is the window's own size; a work area that cannot hold them shows fewer,
+    // anchored so the row the paging keys are on stays visible. The font is never shrunk to
+    // make more fit, and a row outside the window keeps its index with an empty rect.
+    // The capacity is what the panel can hold, measured with the same numbers it places rows
+    // with — the text rows above it and the pager band included, so a host that groups by
+    // this number never asks for a row that would not fit.
+    constexpr int max_scroll_rows = 5;
+    int capacity = max_scroll_rows;
+    if (bounded_height) {
+      const int available = limits.max_height - top - band - side_margin;
+      capacity = (std::clamp)(available / (std::max)(1, row_height), 1, max_scroll_rows);
+    }
+    out.row_capacity = capacity;
+    int visible = (std::min)(rows, capacity);
+    int first = 0;
+    if (visible < rows) {
+      const int anchor = (std::min)(page.current_row(), rows - 1);
+      first = (std::clamp)(anchor - (visible - 1), 0, rows - visible);
+    }
+    out.first_row = first;
+    out.visible_rows = visible;
+
+    for (std::size_t index = 0; index < page.entries.size(); ++index) {
+      if (page.entries[index].placeholder)
+        continue; // keeps its cell, draws nothing
+      const int row = static_cast<int>(index) / columns;
+      const int column = static_cast<int>(index) % columns;
+      const int shown = row - first;
+      if (shown < 0 || shown >= visible)
+        continue;
+      const int left = side_margin + column * (cell + item_gap);
+      const int y = top + band + shown * row_height;
+      out.slots[index] = LayoutRect{left, y, left + cell, y + row_height};
+      out.clipped[index] = text_width[index] > cell ? 1 : 0;
+    }
+    if (page.has_prev)
+      out.prev = LayoutRect{side_margin, top, side_margin + pager_width, top + band};
+    if (page.has_next)
+      out.next = LayoutRect{width - side_margin - pager_width, top, width - side_margin,
+                            top + band};
+    top = top + band + visible * row_height + side_margin;
+    out.width = width;
+    out.height = top;
+    return out;
+  }
 
   if (page.layout == CandidateLayout::Horizontal) {
     // One row, in page order. The row has a fixed budget: margins, gaps, the pager arrows

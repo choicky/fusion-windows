@@ -60,6 +60,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -811,11 +812,15 @@ void test_protocol() {
 
     std::vector<std::uint8_t> broken;
     serialize(broken, page);
-    // Rewrite the trailing size field (the last four bytes) to an implausible value.
+    // Rewrite the size field. It is not the last field on the wire any more, so the offset
+    // is derived from the fields that follow it (arrangement + four page numbers) instead of
+    // being "the last four bytes" — which would now corrupt a page number and quietly stop
+    // testing the size at all.
+    const std::size_t trailing = 1 + 4 * sizeof(std::uint32_t);
+    const std::size_t size_offset = broken.size() - trailing - sizeof(std::uint32_t);
     const std::uint32_t absurd = 401;
-    for (int i = 0; i < 4; ++i)
-      broken[broken.size() - 4 + static_cast<std::size_t>(i)] =
-          static_cast<std::uint8_t>(absurd >> (i * 8));
+    for (std::size_t i = 0; i < 4; ++i)
+      broken[size_offset + i] = static_cast<std::uint8_t>(absurd >> (i * 8));
     detail::Reader bad{broken.data(), broken.size()};
     require(!deserialize_page(bad), "an implausible font size fails closed");
 
@@ -830,6 +835,160 @@ void test_protocol() {
     require(plain_decoded && plain_decoded->font.family.empty() &&
                 plain_decoded->font.size_pt == 0,
             "a page without a font keeps the empty projection");
+  }
+
+  // A scroll window carries the engine's paging facts, and the reader refuses a window that
+  // does not describe its own entries: a mis-addressed page would select a candidate the
+  // user never saw.
+  {
+    CandidatePage page;
+    page.layout = CandidateLayout::Horizontal;
+    page.arrangement = CandidateArrangement::Scroll;
+    page.page_size = 5;
+    page.window_first_page = 1;
+    page.current_page = 2;
+    page.total_pages = 9;
+    page.has_prev = true;
+    page.has_next = true;
+    for (int index = 0; index < 15; ++index)
+      page.entries.push_back(
+          CandidateEntry{std::to_string(index + 1), "\u4f60", "", false});
+    std::vector<std::uint8_t> payload;
+    serialize(payload, page);
+    detail::Reader reader{payload.data(), payload.size()};
+    const auto decoded = deserialize_page(reader);
+    require(decoded && reader.at_end(), "the scroll window parses back");
+    require(decoded->arrangement == CandidateArrangement::Scroll &&
+                decoded->page_size == 5 && decoded->current_page == 2 &&
+                decoded->window_first_page == 1 && decoded->total_pages == 9,
+            "the paging facts survive the wire unchanged");
+    require(decoded->global_index_of(0) == 5 && decoded->current_row() == 1,
+            "the window addresses its entries by the engine's global index");
+
+    const auto rejected = [&](const std::function<void(CandidatePage &)> &mutate,
+                              const char *reason) {
+      CandidatePage copy = page;
+      mutate(copy);
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, copy);
+      detail::Reader r{bytes.data(), bytes.size()};
+      require(!deserialize_page(r), reason);
+    };
+    // Each case breaks exactly one relation, and nothing else, so a failure names the rule it
+    // is testing rather than a neighbour it disturbed on the way.
+    rejected([](CandidatePage &p) { p.page_size = 0; },
+             "a scroll window without a page size is rejected");
+    rejected([](CandidatePage &p) { p.current_page = p.total_pages; },
+             "a current page at the end of the list is rejected");
+    rejected([](CandidatePage &p) { p.current_page = 40; },
+             "a current page far past the end is rejected");
+    rejected([](CandidatePage &p) { p.window_first_page = 5; },
+             "a window that starts after the current page is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          p.entries.resize(3); // page 1 only: the payload stops before the engine's page
+        },
+        "a window whose entries stop before the current page is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          p.window_first_page = 7;
+          p.current_page = 8; // two pages left, so ten entries at most
+          p.entries.resize(15);
+        },
+        "a window with more entries than its pages can address is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          // The page shape with one scrolling field and nothing else changed: page_size stays
+          // 0, so the only rule this can break is "the ordinary page carries none of these".
+          p.arrangement = CandidateArrangement::Page;
+          p.page_size = 0;
+          p.current_page = 0;
+          p.window_first_page = 0;
+          p.total_pages = 3;
+        },
+        "a plain page that carries paging facts is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          p.arrangement = CandidateArrangement::Page;
+          p.page_size = 0;
+          p.current_page = 0;
+          p.window_first_page = 0;
+          p.total_pages = 0;
+          p.page_size = 5; // the page shape may not carry a page size either
+        },
+        "a plain page that carries a page size is rejected");
+
+    // A short last page is legal: the window ends where the candidates do, and the current
+    // page is still inside what the payload covers.
+    {
+      CandidatePage last = page;
+      last.total_pages = 3;
+      last.window_first_page = 2;
+      last.current_page = 2;
+      last.entries.resize(2);
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, last);
+      detail::Reader r{bytes.data(), bytes.size()};
+      const auto decoded_last = deserialize_page(r);
+      require(decoded_last && r.at_end(), "a short last page parses back");
+      require(decoded_last->current_row() == 0 && decoded_last->entries.size() == 2,
+              "the short last page is the window's only row");
+      require(decoded_last->global_index_of(1) == 11,
+              "its entries are still addressed from the engine's first page of the window");
+    }
+  }
+
+  // The global selection stimulus: it is a candidate action like any other on the wire,
+  // and its index is bounded as a list index rather than a page slot.
+  {
+    BackendStimulus stimulus;
+    stimulus.binding = Binding{7, 8, 9};
+    stimulus.stimulus_id = 12;
+    stimulus.type = BackendStimulus::Type::SelectCandidateGlobal;
+    stimulus.candidate_index = 137;
+    std::vector<std::uint8_t> payload;
+    serialize(payload, stimulus);
+    const auto decoded = deserialize_stimulus(payload.data(), payload.size());
+    require(decoded && decoded->type == BackendStimulus::Type::SelectCandidateGlobal &&
+                decoded->candidate_index == 137,
+            "a global selection round-trips");
+
+    for (const std::int32_t bad : {-1, 100001}) {
+      auto broken = stimulus;
+      broken.candidate_index = bad;
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, broken);
+      require(!deserialize_stimulus(bytes.data(), bytes.size()),
+              "an out-of-range global index is rejected");
+    }
+    // The presentation's row capacity rides the same stimulus, and only inside its own
+    // range: it is a count of rows the popup can draw, never a command to the engine.
+    {
+      auto with_rows = stimulus;
+      with_rows.window_rows = 3;
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, with_rows);
+      const auto decoded_rows = deserialize_stimulus(bytes.data(), bytes.size());
+      require(decoded_rows && decoded_rows->window_rows == 3,
+              "the row capacity round-trips with the stimulus");
+      for (const std::int32_t bad : {-1, 6}) {
+        auto broken = stimulus;
+        broken.window_rows = bad;
+        std::vector<std::uint8_t> bad_bytes;
+        serialize(bad_bytes, broken);
+        require(!deserialize_stimulus(bad_bytes.data(), bad_bytes.size()),
+                "a row capacity outside 0..5 is rejected");
+      }
+    }
+
+    // A key stimulus still carries no index at all.
+    auto key = stimulus;
+    key.type = BackendStimulus::Type::Character;
+    key.candidate_index = 5;
+    std::vector<std::uint8_t> bytes;
+    serialize(bytes, key);
+    require(!deserialize_stimulus(bytes.data(), bytes.size()),
+            "a character stimulus that names a candidate is rejected");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";

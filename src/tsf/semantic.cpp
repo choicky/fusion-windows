@@ -275,6 +275,7 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     return decision;
   }
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   switch (action.type) {
   case KeyAction::Type::AppendChar:
     stimulus.type = BackendStimulus::Type::Character;
@@ -386,6 +387,7 @@ SemanticDecision SemanticController::release_key(const KeyAction &action) {
   shift_forwarded_.reset();
   shift_pressed_keysym_ = 0;
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   stimulus.type = BackendStimulus::Type::KeyRelease;
   stimulus.keysym = action.keysym;
   stimulus.modifiers = action.modifiers;
@@ -447,10 +449,27 @@ SemanticDecision SemanticController::begin_candidate_action(CandidateAction acti
     return decision;
   }
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   switch (action) {
   case CandidateAction::Select:
-    stimulus.type = BackendStimulus::Type::SelectCandidate;
-    stimulus.candidate_index = index;
+    // A cell of a scroll window can belong to an engine page the engine is not on, where a
+    // page-local number does not exist; then the selection is addressed by the engine's own
+    // global index, which the page already carries. A page shaped the ordinary way keeps
+    // the page-local index it has always used.
+    if (displayed_page_->arrangement == CandidateArrangement::Scroll &&
+        displayed_page_->paging_known()) {
+      const std::int32_t global = displayed_page_->global_index_of(
+          static_cast<std::size_t>(index));
+      if (global < 0) {
+        decision.route = SemanticDecision::Route::FailOpen;
+        return decision;
+      }
+      stimulus.type = BackendStimulus::Type::SelectCandidateGlobal;
+      stimulus.candidate_index = global;
+    } else {
+      stimulus.type = BackendStimulus::Type::SelectCandidate;
+      stimulus.candidate_index = index;
+    }
     break;
   case CandidateAction::PageNext:
     stimulus.type = BackendStimulus::Type::PageNext;

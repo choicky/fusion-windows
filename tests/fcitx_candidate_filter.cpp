@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,9 +110,8 @@ int main() {
     // stored preference is what the page carries — and the default preference is vertical,
     // which is why the presentation is unchanged for a user who never configures it.
     CHECK(list->layoutHint() == fcitx::CandidateLayoutHint::NotSet);
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 10, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 10, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "你好");
@@ -147,7 +147,8 @@ int main() {
     };
     for (const auto &one : cases) {
       list->setLayoutHint(one.hint);
-      const auto page = fusion::project_candidate_page(instance, &frontend, list, one.preference,
+      const auto page = fusion::project_candidate_page(
+          instance, &frontend, list, fusion::CandidateProjectionOptions{one.preference},
                                                        10, 4096, 4096);
       CHECK(page.has_value());
       CHECK(page->layout == one.expected);
@@ -173,9 +174,8 @@ int main() {
             orig = text("F:" + orig.toString());
           }));
   {
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 10, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 10, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "F:你好");
@@ -200,9 +200,8 @@ int main() {
   // page records truncation and normalizes a dropped cursor to no-highlight.
   {
     list->setCursorIndex(2);
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 1, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 1, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->truncated);
     CHECK(page->entries.size() == 1);
@@ -303,6 +302,147 @@ int main() {
     fusion::CandidatePage bounded;
     CHECK(!fusion::project_panel_text(instance, &frontend, bounded, 3)); // fail closed
     frontend.inputPanel().reset();
+  }
+
+  // 6. The scrolling arrangement's window: what it reads, what it refuses to publish, and
+  //    what it falls back to. These are assertions about the projection's own decision —
+  //    "the window the renderer gets always contains the engine's page" — which the
+  //    real-engine test cannot provoke (a healthy pinyin page never runs out of budget).
+  {
+    using fusion::CandidateArrangement;
+
+    // A list of five-candidate pages with long display text, positioned on its third page by
+    // the engine's own paging, so  is set the way it is after a real turn.
+    const auto make_paged = [&](int pages) {
+      auto paged = std::make_shared<fcitx::CommonCandidateList>();
+      for (int index = 0; index < pages * 5; ++index) {
+        std::string value;
+        for (int repeat = 0; repeat < 40; ++repeat)
+          value += "候选文本";
+        paged->append(std::make_unique<fcitx::DisplayOnlyCandidateWord>(text(value),
+                                                                       text("comment")));
+      }
+      paged->setPageSize(5);
+      paged->setLabels({"1.", "2.", "3.", "4.", "5."});
+      paged->next();
+      paged->next();
+      return paged;
+    };
+
+    fusion::CandidateProjectionOptions scrolling;
+    scrolling.auto_scroll = true;
+    scrolling.layout = fusion::CandidateLayout::Horizontal;
+    scrolling.max_scroll_rows = 5;
+
+    {
+      auto paged = make_paged(8);
+      const auto window = fusion::project_candidate_page(instance, &frontend, paged, scrolling,
+                                                         64, 1 << 20, 4096);
+      CHECK(window.has_value());
+      CHECK(window->arrangement == CandidateArrangement::Scroll);
+      CHECK(window->current_page == 2);
+      CHECK(window->window_first_page == 1);
+      CHECK(window->entries.size() == 25); // five rows of five, from the second page
+      CHECK(!window->truncated);
+      // The engine's page is on the second row of the window, and that is where its labels
+      // are: nowhere else.
+      CHECK(window->current_row() == 1);
+      CHECK(window->entries[0].label.empty());      // page 1, already turned past
+      CHECK(!window->entries[5].label.empty());     // page 2, the engine's own row
+      CHECK(!window->entries[9].label.empty());
+    }
+
+    // The byte budget cannot hold the earlier rows of the window, so the window would arrive
+    // without the page the engine is on. A window that cannot contain the current page is
+    // not published at all: the ordinary page is sent instead, which is what the renderer
+    // drew before this arrangement existed.
+    {
+      auto paged = make_paged(8);
+      // 1200 bytes: enough for a couple of these long candidates, nowhere near the five rows
+      // of the window.
+      const auto squeezed = fusion::project_candidate_page(instance, &frontend, paged, scrolling,
+                                                           64, 1200, 4096);
+      CHECK(squeezed.has_value());
+      CHECK(squeezed->arrangement == CandidateArrangement::Page);
+      CHECK(squeezed->page_size == 0 && squeezed->total_pages == 0);
+      CHECK(squeezed->truncated);
+      // The fallback is not "something similar": it is the ordinary page projection, entry for
+      // entry, under the same bounds.
+      fusion::CandidateProjectionOptions plain;
+      plain.layout = fusion::CandidateLayout::Horizontal;
+      const auto reference = fusion::project_candidate_page(instance, &frontend, paged, plain, 64,
+                                                            1200, 4096);
+      CHECK(reference.has_value());
+      CHECK(squeezed->entries.size() == reference->entries.size());
+      CHECK(squeezed->cursor_index == reference->cursor_index);
+      CHECK(!reference->entries.empty());
+      if (!reference->entries.empty()) {
+        CHECK(squeezed->entries[0].text == reference->entries[0].text);
+        CHECK(!squeezed->entries[0].text.empty());
+      }
+    }
+
+    // A list whose bulk view refuses an index in the middle of the window: no hole, no
+    // guessed grid — the same fallback.
+    {
+      class FaultyList final : public fcitx::CommonCandidateList {
+      public:
+        explicit FaultyList(int refuse_from) : refuse_from_(refuse_from) {}
+        const fcitx::CandidateWord &candidateFromAll(int idx) const override {
+          if (idx >= refuse_from_)
+            throw std::invalid_argument("this list refuses that candidate");
+          return fcitx::CommonCandidateList::candidateFromAll(idx);
+        }
+
+      private:
+        int refuse_from_;
+      };
+      auto faulty = std::make_shared<FaultyList>(12); // page 1 is readable, later pages are not
+      for (int index = 0; index < 40; ++index)
+        faulty->append(std::make_unique<fcitx::DisplayOnlyCandidateWord>(
+            text("词" + std::to_string(index))));
+      faulty->setPageSize(5);
+      faulty->next();
+      faulty->next();
+      const auto page = fusion::project_candidate_page(instance, &frontend, faulty, scrolling,
+                                                       64, 1 << 20, 4096);
+      CHECK(page.has_value());
+      CHECK(page->arrangement == CandidateArrangement::Page);
+      CHECK(page->entries.size() == 5); // the current page, readable in full
+    }
+
+    // A list that does not publish pages at all (display-only, no pager) keeps the ordinary
+    // shape: there is no window to build and none is invented.
+    {
+      fcitx::DisplayOnlyCandidateList display_only;
+      display_only.setContent(std::vector<std::string>{"一", "二", "三"});
+      auto shared = std::shared_ptr<fcitx::CandidateList>(&display_only,
+                                                          [](fcitx::CandidateList *) {});
+      const auto page = fusion::project_candidate_page(instance, &frontend, shared, scrolling,
+                                                       64, 4096, 4096);
+      CHECK(page.has_value());
+      CHECK(page->arrangement == CandidateArrangement::Page);
+      CHECK(page->entries.size() == 3);
+    }
+
+    // A short last page is not a failure: the window simply ends where the candidates end.
+    {
+      auto paged = std::make_shared<fcitx::CommonCandidateList>();
+      for (int index = 0; index < 12; ++index)
+        paged->append(std::make_unique<fcitx::DisplayOnlyCandidateWord>(
+            text("词" + std::to_string(index))));
+      paged->setPageSize(5);
+      paged->next();
+      paged->next(); // page 2 holds the last two candidates
+      const auto page = fusion::project_candidate_page(instance, &frontend, paged, scrolling,
+                                                       64, 1 << 20, 4096);
+      CHECK(page.has_value());
+      CHECK(page->arrangement == CandidateArrangement::Scroll);
+      CHECK(page->entries.size() == 7); // page 1 (five) and page 2 (two)
+      CHECK(page->current_row() == 1);
+      CHECK(!page->truncated);
+      CHECK(!page->entries.back().placeholder);
+    }
   }
 
   if (failures != 0) {

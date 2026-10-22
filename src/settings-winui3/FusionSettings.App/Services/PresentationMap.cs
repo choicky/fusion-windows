@@ -155,12 +155,16 @@ public static class PresentationMap
         new Dictionary<string, Placement>(StringComparer.Ordinal)
         {
             ["CandidateLayout"] = new(PageCandidates, "候选窗口", 10, "候选排列方向",
-                "竖排每个候选占一行，横排把这一页的候选排在同一行。若输入法为某个候选列表指定了"
-                + "排列方向（例如快捷短语、Unicode 等模式），输入法的指定优先于这里的设置。",
+                "竖排每个候选占一行；横排把这一页的候选排在同一行；自动卷轴先显示一行，"
+                + "按过第一个“下一页”后展开成多行，每行候选数取输入法自己的每页候选数（最多五行，"
+                + "屏幕放不下时少显示几行），“下一页”先下移一行并保持所在列，到底再进入下一屏。"
+                + "若输入法为某个候选列表指定了排列方向"
+                + "（例如快捷短语、Unicode 等模式），输入法的指定优先于这里的设置。",
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["Vertical"] = "竖排",
                     ["Horizontal"] = "横排",
+                    ["AutoScroll"] = "自动卷轴",
                 }),
             ["FontFamily"] = new(PageCandidates, "候选窗口", 20, "候选字体",
                 "候选窗口中候选文字使用的字体。字体不存在时由 Windows 自动替换为相近字体，"

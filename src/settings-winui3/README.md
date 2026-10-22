@@ -83,8 +83,8 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **622 checks** as of this revision — **457 without a Host** (`--no-integration`), and
-**165 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
+Exit code 0 means every check passed: **634 checks** as of this revision — **457 without a Host** (`--no-integration`), and
+**177 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
 a failed start and its retry — a scripted peer for an uncertain method-list write and for the three reconnect cases of the
 list, a successful global save with its persistence check, and read/apply/read-back with incarnation stability). A third

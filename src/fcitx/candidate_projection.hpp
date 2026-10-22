@@ -29,13 +29,45 @@ namespace fusion {
 // semantic page size; cursor normalization keeps a prefix truncated by a bound
 // self-consistent.
 //
-// preferred_layout is the user's stored presentation preference. It applies only
-// when the engine set no hint; see resolve_candidate_layout.
+// What the user asked the Windows window to do, and — when it asks for scrolling — how
+// many engine pages one window may hold. The preference is applied only when the engine
+// set no hint; see resolve_candidate_layout.
+struct CandidateProjectionOptions {
+  CandidateLayout layout = CandidateLayout::Vertical;
+  bool auto_scroll = false;
+  // The window's tallest shape, in engine pages (one page = one row). Five is the
+  // owner-confirmed maximum; the renderer shows fewer when the work area cannot hold them.
+  int max_scroll_rows = 5;
+};
+
 std::optional<CandidatePage>
 project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
                        const std::shared_ptr<fcitx::CandidateList> &list,
-                       CandidateLayout preferred_layout, std::size_t entry_bound,
+                       const CandidateProjectionOptions &options, std::size_t entry_bound,
                        std::size_t byte_bound, std::size_t field_bound);
+
+// Which engine pages a scroll window shows, given the list's own paging state.
+//
+// This is a pure function of the engine's numbers — no session state on the Windows side,
+// nothing remembered between pages — which is what keeps one authority: the highlighted
+// row *is* the engine's current page, the rows above it are the pages already turned, and
+// a new list starts from its own first page again (usedNextBefore false). The rules are
+// the owner-confirmed ones:
+//
+//   * nothing turned yet, or back on the first page → one row (the session's first line);
+//   * after that, the window is one scroll page of up to `max_rows` rows, starting after
+//     that first line, so the line already passed is not shown again;
+//   * a list whose remaining rows fit in one row stays one row.
+struct CandidateScrollWindow {
+  bool active = false; // false = the page keeps its ordinary one-row/one-column shape
+  int page_size = 0;
+  int current_page = 0;
+  int first_page = 0;
+  int rows = 0;
+  int total_pages = 0;
+};
+CandidateScrollWindow plan_scroll_window(int page_size, int current_page, int total_pages,
+                                         bool used_next_before, int max_rows, int entry_bound);
 
 // The effective layout of one projected page: an engine hint that names a layout wins,
 // and the stored preference applies only when the hint is NotSet.
