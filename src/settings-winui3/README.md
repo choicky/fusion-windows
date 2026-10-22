@@ -97,12 +97,14 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **648 checks** as of this revision — **457 without a Host** (`--no-integration`), and
+Exit code 0 means every check passed: **681 checks** as of this revision — **490 without a Host** (`--no-integration`), and
 **191 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
-a failed start and its retry — a scripted peer for an uncertain method-list write and for the three reconnect cases of the
-list, a successful global save with its persistence check, a save that stores one page and is refused for another with the
-refused edit kept, and read/apply/read-back with incarnation stability). A third
+a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
+list, and for the four cases of a save that meets a busy Host (busy twice then stored with no second click, a saved page
+not resubmitted, the wait reported as unsaved and stoppable, and an ordinary refusal that ends in one request), a
+successful global save with its persistence check, a save that stores one page and is refused for another with the refused
+edit kept, and read/apply/read-back with incarnation stability). A third
 run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **8 checks**:
 the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
 
