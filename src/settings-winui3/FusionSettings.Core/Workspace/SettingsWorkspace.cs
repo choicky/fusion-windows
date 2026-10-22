@@ -59,6 +59,23 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// </summary>
     public const string PresentationUri = "fcitx://config/candidate-presentation";
 
+    /// <summary>
+    /// What the window says while a save is waiting for the Host to be free. It says what is
+    /// true — nothing is on disk — and it does not name a cause, because the Host's
+    /// <c>Busy</c> covers both a live composition and another request in flight.
+    /// </summary>
+    public const string WaitingForHostText = "尚未保存，等待当前输入结束或 Host 空闲后自动重试。";
+
+    /// <summary>How long one wait lasts before the next attempt.</summary>
+    private static readonly TimeSpan HostRetryInterval = TimeSpan.FromMilliseconds(400);
+
+    /// <summary>
+    /// A ceiling on the whole wait, so a Host that never becomes free ends in a stated
+    /// "still unsaved" rather than in a window that looks frozen. 150 attempts is a minute of
+    /// uninterrupted composition.
+    /// </summary>
+    private const int MaxHostWaitAttempts = 150;
+
     private readonly SettingsClient _client;
     private readonly List<string> _log = new();
     private readonly object _operationGate = new();
@@ -66,6 +83,11 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     private SettingsStatus _status = SettingsStatus.Unreachable;
     private string _statusText = "尚未连接 Host。";
     private bool _isBusy;
+    private CancellationTokenSource? _hostWait;
+    private bool _waitingForHost;
+    private ulong _saveIncarnation;
+    private bool _hostChangedDuringSave;
+    private TaskCompletionSource _idle = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _isLoaded;
     private bool _isConnected;
     private string _editingMethod = "pinyin";
@@ -110,6 +132,33 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     /// <summary>Editing is allowed only when nothing is in flight.</summary>
     public bool CanEdit => !_isBusy;
+
+    /// <summary>
+    /// True while a save is waiting for the Host to be free. Nothing has been written; the
+    /// bar is not allowed to say otherwise, and the wait can be stopped.
+    /// </summary>
+    public bool IsWaitingForHost => _waitingForHost;
+
+    /// <summary>
+    /// Stops the automatic retries. The draft stays unsaved, and a request that has already
+    /// been sent is not abandoned: the save in flight finishes and reports its own outcome,
+    /// because claiming to have cancelled a write the Host may be performing would be a lie.
+    /// </summary>
+    public void StopWaiting() => _hostWait?.Cancel();
+
+    /// <summary>
+    /// Completes when no operation is running. Used before a reload so the wait is stopped
+    /// first and the new state is not raced by a late reply.
+    /// </summary>
+    public Task WhenIdleAsync()
+    {
+        lock (_operationGate)
+        {
+            // Nothing is running, so there is nothing to wait for. Returning the next gate would
+            // wait for an operation that may never start.
+            return IsBusy ? _idle.Task : Task.CompletedTask;
+        }
+    }
 
     /// <summary>True once a load has produced state this window can show.</summary>
     /// <remarks>
@@ -259,6 +308,11 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// </param>
     public async Task<bool> ReloadAsync(bool preserveEdits, CancellationToken cancellationToken = default)
     {
+        // A waiting save is stopped before the state is replaced: a late retry must not write a
+        // draft the reload is discarding. The wait ends at the next attempt boundary, and a
+        // request already sent is awaited rather than abandoned.
+        StopWaiting();
+        await WhenIdleAsync().ConfigureAwait(true);
         if (!TryBeginOperation())
         {
             return false;
@@ -506,13 +560,31 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     public void Report(string message) => SaveSummary = message;
 
     /// <summary>
-    /// Saves every configuration that changed and reports each result separately.
+    /// Saves every configuration that changed and reports each result separately, in one user
+    /// action.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The shared Pinyin/Shuangpin draft is split by which view's schema describes each field,
     /// because the Host validates a submitted field against the URI's own schema: sending
     /// <c>ShuangpinProfile</c> through the Pinyin URI is refused. An uncertain outcome is never
     /// replayed — the state is reread and the edits the reread confirms are dropped.
+    /// </para>
+    /// <para>
+    /// <c>Busy</c> is the one answer this Host gives without having written anything: the two
+    /// pages whose only official setter publishes by applying — the Pinyin/Shuangpin
+    /// configuration and the input-method list — are refused while a buffer is live, and the
+    /// request lands nowhere. So instead of making the user come back and click again, the same
+    /// save waits a short interval and resubmits what is still unsaved, until the Host is free.
+    /// Nothing else is retried: a timeout, a dropped connection, a cancellation, an
+    /// <c>Indeterminate</c> outcome or an <c>Invalid</c> rejection is handled exactly as it was.
+    /// </para>
+    /// <para>
+    /// Each attempt submits only the drafts that are still dirty, so a target that already
+    /// succeeded is never sent twice, and an edit made while waiting is what the next attempt
+    /// sends. The wait is off the UI thread and cancellable; a request already sent is awaited
+    /// to its own end, because cancelling the read would turn a real write into an unknown one.
+    /// </para>
     /// </remarks>
     public async Task SaveAsync(CancellationToken cancellationToken = default)
     {
@@ -522,53 +594,208 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             return;
         }
 
-        var reports = new List<string>();
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _hostWait = wait;
+        _saveIncarnation = 0;
+        _hostChangedDuringSave = false;
+        var reports = new List<SaveReport>();
+        var busy = new HashSet<string>(StringComparer.Ordinal);
+        var stopped = string.Empty;
         try
         {
-            reports.AddRange(await SavePinyinFamilyAsync(cancellationToken).ConfigureAwait(true));
-
-            if (GlobalDraft is { HasChanges: true } globalDraft)
+            // The first pass is the user's save: every changed page is submitted once. Later
+            // passes exist for one reason only — a page that answered `Busy` — so they are
+            // given that set and touch nothing else.
+            await SavePassAsync(reports, busy, only: null, cancellationToken).ConfigureAwait(true);
+            var attempts = 0;
+            while (busy.Count > 0)
             {
-                reports.Add(await SaveConfigurationAsync(
-                    GlobalUri, SettingsTarget.Global, globalDraft.BuildChangeSet(),
-                    globalDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "全局配置",
-                    cancellationToken).ConfigureAwait(true));
+                if (wait.IsCancellationRequested)
+                {
+                    stopped = "已停止自动重试，仍有未保存的修改。";
+                    break;
+                }
+
+                if (attempts >= MaxHostWaitAttempts)
+                {
+                    stopped = "等待 Host 空闲超时，仍有未保存的修改。";
+                    break;
+                }
+
+                // Waiting is reported as waiting: nothing has been written, so the bar must not
+                // say the change is saved, and the drafts stay dirty for the next attempt.
+                var composed = Compose(reports);
+                SaveSummary = composed.Contains(WaitingForHostText, StringComparison.Ordinal)
+                    ? composed
+                    : composed + "\n" + WaitingForHostText;
+                SetWaitingForHost(true);
+                bool waited;
+                try
+                {
+                    waited = await WaitForHostAsync(wait.Token).ConfigureAwait(true);
+                }
+                finally
+                {
+                    SetWaitingForHost(false);
+                }
+
+                if (!waited)
+                {
+                    stopped = "已停止自动重试，仍有未保存的修改。";
+                    break;
+                }
+
+                ++attempts;
+                // A snapshot, because this pass rewrites `busy` as it goes: a page that answers
+                // something other than Busy leaves the set, and one that is still busy stays.
+                var retry = new HashSet<string>(busy, StringComparer.Ordinal);
+                await SavePassAsync(reports, busy, retry, cancellationToken).ConfigureAwait(true);
+                if (_hostChangedDuringSave)
+                {
+                    // A different Host answered. Writing to it would apply an intent formed
+                    // against another instance's state, so the wait ends here.
+                    stopped = "Host 已重新启动，已停止自动重试；修改已保留。";
+                    break;
+                }
             }
 
-            if (PresentationDraft is { HasChanges: true } presentationDraft)
-            {
-                reports.Add(await SaveConfigurationAsync(
-                    PresentationUri, SettingsTarget.Presentation, presentationDraft.BuildChangeSet(),
-                    presentationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "候选窗口",
-                    cancellationToken).ConfigureAwait(true));
-            }
-
-            if (Methods is { HasChanges: true } methods)
-            {
-                reports.Add(await SaveMethodsAsync(methods, cancellationToken).ConfigureAwait(true));
-            }
-
-            SaveSummary = reports.Count == 0
+            SaveSummary = reports.Count == 0 && stopped.Length == 0
                 ? "没有需要保存的修改。"
-                : string.Join("\n", reports);
+                : string.Join("\n", new[] { Compose(reports), stopped }
+                    .Where(line => line.Length > 0));
         }
         finally
         {
+            _hostWait = null;
+            SetWaitingForHost(false);
             EndOperation();
         }
     }
+
+    /// <summary>
+    /// One pass over the targets, submitting only the drafts that are still dirty.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="only"/> is null on the first pass — the user's save submits every changed
+    /// page — and on a retry it is exactly the pages that answered <c>Busy</c> in the previous
+    /// pass. Nothing else is submitted again: a page that failed with <c>Error</c>, was rejected
+    /// as <c>Invalid</c>, came back <c>Indeterminate</c> or was cancelled keeps its draft, and it
+    /// is not re-sent merely because some other page is still waiting for the Host. A retried
+    /// page's draft was never adopted, so it is still dirty here and its change set is rebuilt
+    /// from the current values rather than replayed from the first attempt. The two Pinyin views
+    /// are one draft submitted as two requests, so they are two pages here: one group answering
+    /// <c>Busy</c> may not drag the other group's failed fields back to the Host.
+    /// </remarks>
+    private async Task SavePassAsync(List<SaveReport> reports, HashSet<string> busy,
+                                     IReadOnlySet<string>? only,
+                                     CancellationToken cancellationToken)
+    {
+        await SavePinyinFamilyAsync(reports, busy, only, cancellationToken).ConfigureAwait(true);
+
+        if (Wants(only, SavePage.Global) && GlobalDraft is { HasChanges: true } globalDraft)
+        {
+            Record(reports, busy, SavePage.Global, await SaveConfigurationAsync(
+                GlobalUri, SettingsTarget.Global, globalDraft.BuildChangeSet(),
+                globalDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "全局配置",
+                cancellationToken).ConfigureAwait(true));
+        }
+
+        if (Wants(only, SavePage.Presentation) &&
+            PresentationDraft is { HasChanges: true } presentationDraft)
+        {
+            Record(reports, busy, SavePage.Presentation, await SaveConfigurationAsync(
+                PresentationUri, SettingsTarget.Presentation, presentationDraft.BuildChangeSet(),
+                presentationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "候选窗口",
+                cancellationToken).ConfigureAwait(true));
+        }
+
+        if (Wants(only, SavePage.Methods) && Methods is { HasChanges: true } methods)
+        {
+            Record(reports, busy, SavePage.Methods,
+                await SaveMethodsAsync(methods, cancellationToken).ConfigureAwait(true));
+        }
+    }
+
+    /// <summary>
+    /// Keeps one line per target: a retried target replaces the sentence of its earlier attempt
+    /// instead of adding a second one.
+    /// </summary>
+    private static void Record(List<SaveReport> reports, HashSet<string> busy, string page,
+                               SaveOutcome outcome)
+    {
+        reports.RemoveAll(report => report.Page == page);
+        reports.Add(new SaveReport(page, outcome.Text));
+        if (outcome.RetryWhenFree)
+        {
+            busy.Add(page);
+        }
+        else
+        {
+            busy.Remove(page);
+        }
+    }
+
+    /// <summary>
+    /// Records which Host instance answered <c>Busy</c>, and reports whether a later answer came
+    /// from a different one — in which case the wait must not continue against it.
+    /// </summary>
+    private bool NoteBusyIncarnation(ulong incarnation)
+    {
+        if (_saveIncarnation == 0)
+        {
+            _saveIncarnation = incarnation;
+            return false;
+        }
+
+        if (_saveIncarnation != incarnation)
+        {
+            _hostChangedDuringSave = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void SetWaitingForHost(bool waiting)
+    {
+        if (_waitingForHost == waiting)
+        {
+            return;
+        }
+
+        _waitingForHost = waiting;
+        Raise(nameof(IsWaitingForHost));
+    }
+
+    private static string Compose(List<SaveReport> reports) =>
+        string.Join("\n", reports.Select(report => report.Text));
+
+    private static async Task<bool> WaitForHostAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(HostRetryInterval, token).ConfigureAwait(true);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
 
     /// <summary>
     /// Splits the one shared draft across the two URIs whose schemas describe its fields, and
     /// submits each part separately. A field neither view describes cannot be pending, because
     /// the draft refuses it; if one appears anyway it is reported rather than sent.
     /// </summary>
-    private async Task<List<string>> SavePinyinFamilyAsync(CancellationToken cancellationToken)
+    private async Task SavePinyinFamilyAsync(List<SaveReport> reports, HashSet<string> busy,
+                                             IReadOnlySet<string>? only,
+                                             CancellationToken cancellationToken)
     {
-        var reports = new List<string>();
         if (PinyinDraft is not { HasChanges: true } draft)
         {
-            return reports;
+            return;
         }
 
         var pending = draft.PendingPaths.ToList();
@@ -582,35 +809,37 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             .Where(path => !viaPinyin.Contains(path) && !viaShuangpin.Contains(path))
             .ToList();
 
-        if (orphaned.Count > 0)
+        // Only the first pass reports a routing problem: it is not something a retry can fix.
+        if (orphaned.Count > 0 && only is null)
         {
             // Should not happen: the draft refuses an option the asking view does not
             // describe. Report it instead of guessing a URI.
             Log("save: refused to send fields no view describes: " + string.Join(",", orphaned));
-            reports.Add($"拼音/双拼：有 {orphaned.Count} 项无法确定归属，未提交。");
+            // Not a refusal to retry: nothing can ever route these.
+            Record(reports, busy, SavePage.PinyinOrphan,
+                new SaveOutcome($"拼音/双拼：有 {orphaned.Count} 项无法确定归属，未提交。", false));
         }
 
-        if (viaPinyin.Count > 0)
+        if (viaPinyin.Count > 0 && Wants(only, SavePage.Pinyin))
         {
-            reports.Add(await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Pinyin, await SaveConfigurationAsync(
                 PinyinUri, SettingsTarget.Pinyin, draft.BuildChangeSet(viaPinyin), viaPinyin,
                 "拼音/双拼", cancellationToken).ConfigureAwait(true));
         }
 
-        if (viaShuangpin.Count > 0)
+        if (viaShuangpin.Count > 0 && Wants(only, SavePage.Shuangpin))
         {
-            reports.Add(await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Shuangpin, await SaveConfigurationAsync(
                 ShuangpinUri, SettingsTarget.Shuangpin, draft.BuildChangeSet(viaShuangpin),
                 viaShuangpin, "双拼", cancellationToken).ConfigureAwait(true));
         }
-
-        return reports;
     }
 
-    private async Task<string> SaveConfigurationAsync(string uri, SettingsTarget target,
-                                                      SettingsValue changeSet,
-                                                      IReadOnlySet<string> sentPaths, string name,
-                                                      CancellationToken cancellationToken)
+    private async Task<SaveOutcome> SaveConfigurationAsync(string uri, SettingsTarget target,
+                                                           SettingsValue changeSet,
+                                                           IReadOnlySet<string> sentPaths,
+                                                           string name,
+                                                           CancellationToken cancellationToken)
     {
         var draft = DraftFor(target)!;
         var result = await _client.SetConfigAsync(uri, changeSet, cancellationToken).ConfigureAwait(true);
@@ -623,7 +852,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 SetSnapshot(target, result.Value!);
                 MarkConnected();
                 Log($"save {uri}: ok");
-                return $"{name}：已保存。";
+                return new SaveOutcome($"{name}：已保存。", false);
 
             case SettingsStatus.Indeterminate:
                 // The Host may have applied it. Reread and reconcile; never replay.
@@ -632,7 +861,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 {
                     Log($"save {uri}: indeterminate, reread failed {reread.Status}");
                     MarkDisconnected(reread.Status, reread.Error);
-                    return $"{name}：写入结果不确定，可能已生效；重新读取也失败了，修改已保留，请手动重新加载核对。";
+                    return new SaveOutcome(
+                        $"{name}：写入结果不确定，可能已生效；重新读取也失败了，修改已保留，请手动重新加载核对。",
+                        false);
                 }
 
                 // Adopting the reread drops exactly the edits it confirms and keeps the rest.
@@ -640,16 +871,26 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 SetSnapshot(target, reread.Value!);
                 MarkConnected();
                 Log($"save {uri}: indeterminate, reconciled from a reread");
-                return $"{name}：写入结果不确定，可能已生效。已重新读取当前配置并据此核对。";
+                return new SaveOutcome(
+                    $"{name}：写入结果不确定，可能已生效。已重新读取当前配置并据此核对。", false);
 
             case SettingsStatus.Busy:
-                Log($"save {uri}: busy");
-                return $"{name}：当前正在输入或组合中，未保存。请完成输入后重试。";
+                // The Host wrote nothing, so this is a wait, not a failure: the caller retries
+                // this same draft when the Host is free again.
+                Log($"save {uri}: busy ({result.HostIncarnation})");
+                if (NoteBusyIncarnation(result.HostIncarnation))
+                {
+                    return new SaveOutcome($"{name}：{WaitingForHostText}", false);
+                }
+
+                return new SaveOutcome($"{name}：{WaitingForHostText}", true);
 
             default:
                 Log($"save {uri}: {result.Status} {result.Error}");
                 NoteIfConnectionLost(result);
-                return $"{name}：未保存（{Describe(result.Status, result.Error)}）。修改已保留。";
+                return new SaveOutcome(
+                    $"{name}：未保存（{Describe(result.Status, result.Error)}）。修改已保留。",
+                    false);
         }
     }
 
@@ -672,7 +913,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         }
     }
 
-    private async Task<string> SaveMethodsAsync(ImListDraft methods, CancellationToken cancellationToken)
+    private async Task<SaveOutcome> SaveMethodsAsync(ImListDraft methods,
+                                                      CancellationToken cancellationToken)
     {
         var submitted = methods.BuildEnabledList();
         var result = await _client.SetImListAsync(submitted, cancellationToken).ConfigureAwait(true);
@@ -681,7 +923,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             case SettingsStatus.Ok:
                 Methods = new ImListDraft(result.Value!);
                 Log("save im-list: ok");
-                return "输入方式列表：已保存。";
+                return new SaveOutcome("输入方式列表：已保存。", false);
 
             case SettingsStatus.Indeterminate:
                 // The Host may have applied the list. The reread is authoritative for what it
@@ -692,7 +934,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 {
                     Log("save im-list: indeterminate, reread failed");
                     MarkDisconnected(fresh.Status, fresh.Error);
-                    return "输入方式列表：写入结果不确定，可能已生效；重新读取也失败了，修改仍保留，请重试连接后核对。";
+                    return new SaveOutcome(
+                        "输入方式列表：写入结果不确定，可能已生效；重新读取也失败了，修改仍保留，请重试连接后核对。",
+                        false);
                 }
 
                 MarkConnected();
@@ -700,19 +944,31 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 if (methods.HasChanges)
                 {
                     Log("save im-list: indeterminate, reread shows the request was not applied");
-                    return "输入方式列表：写入结果不确定；重新读取显示这次修改尚未生效，修改仍保留，可再次保存。";
+                    return new SaveOutcome(
+                        "输入方式列表：写入结果不确定；重新读取显示这次修改尚未生效，修改仍保留，可再次保存。",
+                        false);
                 }
 
                 Log("save im-list: indeterminate, reread shows the request was applied");
-                return "输入方式列表：写入结果不确定，但重新读取显示已生效。";
+                return new SaveOutcome("输入方式列表：写入结果不确定，但重新读取显示已生效。", false);
 
             case SettingsStatus.Busy:
-                return "输入方式列表：当前正在输入或组合中，未保存。";
+                // Nothing was written: the switch is stored by `setGroup`, which ends the
+                // composition, so the Host refuses it while a buffer is live. Retried below.
+                Log($"save im-list: busy ({result.HostIncarnation})");
+                if (NoteBusyIncarnation(result.HostIncarnation))
+                {
+                    return new SaveOutcome($"输入方式列表：{WaitingForHostText}", false);
+                }
+
+                return new SaveOutcome($"输入方式列表：{WaitingForHostText}", true);
 
             default:
                 Log($"save im-list: {result.Status} {result.Error}");
                 NoteIfConnectionLost(result);
-                return $"输入方式列表：未保存（{Describe(result.Status, result.Error)}）。修改已保留。";
+                return new SaveOutcome(
+                    $"输入方式列表：未保存（{Describe(result.Status, result.Error)}）。修改已保留。",
+                    false);
         }
     }
 
@@ -736,7 +992,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     public static string Describe(SettingsStatus status, string error) => status switch
     {
         SettingsStatus.Ok => "正常。",
-        SettingsStatus.Busy => "Host 正在处理输入，暂时无法写入。",
+        SettingsStatus.Busy => "Host 暂时没有接受这次请求：正在组合中，或另一次请求正在进行。",
         SettingsStatus.Unsupported => string.IsNullOrEmpty(error) ? "Host 不支持该操作。" : error,
         SettingsStatus.Invalid => string.IsNullOrEmpty(error) ? "请求无效。" : error,
         SettingsStatus.Timeout => "Host 没有在限定时间内响应。",
@@ -798,6 +1054,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     private void EndOperation()
     {
         IsBusy = false;
+        var idle = _idle;
+        _idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        idle.TrySetResult();
         Raise(nameof(HasChanges));
         Raise(nameof(NeedsRetry));
     }
@@ -810,6 +1069,39 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             _log.RemoveAt(0);
         }
     }
+
+    /// <summary>
+    /// The pages a save can submit. They are also the keys of the retry set, so a page is
+    /// retried only when the key it records its outcome under is the key that was refused.
+    /// </summary>
+    private static class SavePage
+    {
+        public const string Pinyin = "拼音/双拼";
+        public const string Shuangpin = "双拼";
+        public const string Global = "全局配置";
+        public const string Presentation = "候选窗口";
+        public const string Methods = "输入方式列表";
+
+        /// <summary>Fields no view's schema describes. Reported once, never submitted.</summary>
+        public const string PinyinOrphan = "拼音/双拼，一部分字段";
+    }
+
+    /// <summary>
+    /// Whether this pass may submit <paramref name="page"/>. The first pass may submit
+    /// everything; a retry may submit only what the previous pass reported as <c>Busy</c>.
+    /// </summary>
+    private static bool Wants(IReadOnlySet<string>? only, string page) =>
+        only is null || only.Contains(page);
+
+    /// <summary>One page's sentence in the save bar; one per page, replaced on a retry.</summary>
+    private sealed record SaveReport(string Page, string Text);
+
+    /// <summary>
+    /// The outcome of saving one page, and whether it is worth another attempt. Only a
+    /// <c>Busy</c> answer sets <c>RetryWhenFree</c>: it is the one status that guarantees the
+    /// Host wrote nothing.
+    /// </summary>
+    private sealed record SaveOutcome(string Text, bool RetryWhenFree);
 
     private bool Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
     {

@@ -115,6 +115,7 @@ public sealed partial class MainWindow : Window
             case nameof(SettingsWorkspace.IsLoaded):
             case nameof(SettingsWorkspace.IsConnected):
             case nameof(SettingsWorkspace.NeedsRetry):
+            case nameof(SettingsWorkspace.IsWaitingForHost):
                 UpdateStatus();
                 break;
         }
@@ -122,7 +123,10 @@ public sealed partial class MainWindow : Window
 
     private void UpdateStatus()
     {
-        StatusLine.Text = _workspace.IsBusy ? "正在与 Host 通信…" : _workspace.StatusText;
+        var waiting = _workspace.IsWaitingForHost;
+        StatusLine.Text = waiting ? "等待 Host 空闲…"
+            : _workspace.IsBusy ? "正在与 Host 通信…"
+            : _workspace.StatusText;
 
         var summary = _workspace.SaveSummary;
         SaveLine.Text = summary;
@@ -132,6 +136,12 @@ public sealed partial class MainWindow : Window
         var canSave = _workspace.HasChanges && idle;
         SaveButton.IsEnabled = canSave;
         DiscardButton.IsEnabled = canSave;
+
+        // While a save waits for the Host, the one action left is to stop waiting. It does not
+        // discard anything: the edit stays unsaved, and the draft is what the window shows.
+        SaveButton.Visibility = waiting ? Visibility.Collapsed : Visibility.Visible;
+        StopWaitButton.Visibility = waiting ? Visibility.Visible : Visibility.Collapsed;
+        StopWaitButton.IsEnabled = waiting;
 
         // Editing is disabled while an operation owns the Host, so nothing can change under a
         // request that has already been captured.
@@ -151,6 +161,11 @@ public sealed partial class MainWindow : Window
         {
             StatusLine.Text = _workspace.StatusText + " 有未保存的修改。";
         }
+
+        if (waiting)
+        {
+            StatusLine.Text = "等待 Host 空闲…（修改尚未保存）";
+        }
     }
 
     private async void OnSaveClick(object sender, RoutedEventArgs e)
@@ -162,6 +177,14 @@ public sealed partial class MainWindow : Window
         await _workspace.SaveAsync().ConfigureAwait(true);
         UpdateStatus();
         RefreshCurrentPage();
+    }
+
+    private void OnStopWaitClick(object sender, RoutedEventArgs e)
+    {
+        // Stops the retries; a request already sent still finishes and reports itself. The edit
+        // remains unsaved, which is what the status line then says.
+        _workspace.StopWaiting();
+        UpdateStatus();
     }
 
     private void OnDiscardClick(object sender, RoutedEventArgs e)
@@ -270,6 +293,18 @@ public sealed partial class MainWindow : Window
     private async void OnClosing(Microsoft.UI.Windowing.AppWindow sender,
                                  Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
     {
+        // A save is waiting for the Host to be free. Closing stops the wait rather than refusing
+        // the close; a request already sent is awaited, because abandoning it would leave the
+        // Host performing a write whose outcome nobody recorded.
+        if (_workspace.IsWaitingForHost)
+        {
+            args.Cancel = true;
+            _workspace.StopWaiting();
+            await _workspace.WhenIdleAsync();
+            Close();
+            return;
+        }
+
         // An operation is reading the drafts right now. Discarding them under it would change the
         // state a request already in flight is being reconciled against, so the close is refused
         // rather than raced — and the reason is shown instead of a dialog that cannot be honoured.

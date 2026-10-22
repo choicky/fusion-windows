@@ -50,6 +50,21 @@ These are the properties the presentation may rely on, each covered by a check:
 - **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
   replaced with an empty one, and empty entries keep their positions through a copy or a
   replacement.
+- **A refusal says which page it is about, and never reports it as saved.** The save bar
+  reports each configuration separately, so one page can say `已保存` while another says `未保存`
+  in the same click. Which pages can be refused at all is decided by the Host from what its own
+  apply step does, not by the client: the candidate-window and global pages are stored while a
+  composition is live, and only the Pinyin/Shuangpin configuration and the input-method list are
+  refused, because their official apply step ends the composition that is running. The edit is
+  kept in every refusal.
+- **One click does the waiting.** `Busy` is the one answer the Host gives without having written
+  anything, so a save that receives it keeps the edit, says it is not saved yet, and resubmits
+  **the pages that answered `Busy`** every 400 ms until the Host is free — serially, off the UI
+  thread, and cancellable through 停止等待. Nothing else is retried: a timeout, a lost
+  connection, a cancellation, an `Indeterminate` outcome or an `Invalid` rejection ends the save
+  exactly as it did before, and that page keeps its edit unsent even while another page waits. A
+  page that already succeeded is not sent again either, and a different Host incarnation ends the
+  wait rather than receiving an intent formed against another instance.
 - **A newer Host is accepted and an older one refused**, per the additive settings-API
   contract; the IPC protocol version is still matched exactly.
 
@@ -83,11 +98,16 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **634 checks** as of this revision — **457 without a Host** (`--no-integration`), and
-**177 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
+Exit code 0 means every check passed: **721 checks** as of this revision — **530 without a Host** (`--no-integration`), and
+**191 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
-a failed start and its retry — a scripted peer for an uncertain method-list write and for the three reconnect cases of the
-list, a successful global save with its persistence check, and read/apply/read-back with incarnation stability). A third
+a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
+list, and for the cases of a save that meets a busy Host (busy twice then stored with no second click, a saved page not
+resubmitted, the wait reported as unsaved and stoppable, an ordinary refusal that ends in one request, a page that failed
+another way — `Error`, `Invalid` or `Indeterminate` — while a different page waits and is submitted exactly once, and the
+failed half of the shared Pinyin/Shuangpin draft not resubmitted), a
+successful global save with its persistence check, a save that stores one page and is refused for another with the refused
+edit kept, and read/apply/read-back with incarnation stability). A third
 run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **8 checks**:
 the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
 
