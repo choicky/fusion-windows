@@ -222,10 +222,171 @@ internal static class PresentationSaveTests
                 StringComparison.Ordinal),
             "and the file really contains the retried value, so the success was not a no-op");
 
-        // 9. The value left behind is horizontal, a non-default one, so the post-restart run
-        //    proves persistence of a choice rather than of a default that would read the same
-        //    either way.
-        Console.WriteLine($"   PRESENTATION_EXPECT={Option}=Horizontal");
+        // 9. The candidate font, which is the other half of this configuration: a string and
+        //    an integer, so it exercises the schema and the save path in a way the enum does
+        //    not, and the renderer reads both values.
+        var familyOption = type.Options.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, "FontFamily", StringComparison.Ordinal));
+        var sizeOption = type.Options.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, "FontSize", StringComparison.Ordinal));
+        Harness.Check(familyOption is not null && sizeOption is not null,
+            "the configuration also exposes the candidate font and its size");
+        if (familyOption is null || sizeOption is null)
+        {
+            return;
+        }
+
+        Harness.CheckEqual("String", familyOption.Type, "the font family is a string option");
+        Harness.CheckEqual("Microsoft YaHei UI", familyOption.DefaultValue.Scalar,
+            "whose default is the font this product already drew with");
+        Harness.CheckEqual("Integer", sizeOption.Type, "the size is an integer option");
+        Harness.CheckEqual("11", sizeOption.DefaultValue.Scalar,
+            "in points, matching the 15 px height the popup used at 96 dpi");
+        Harness.Check(sizeOption.Properties.TryGet("IntMin", out var min) &&
+                      sizeOption.Properties.TryGet("IntMax", out var max) &&
+                      min.Scalar == "6" && max.Scalar == "48",
+            "with the bounds the popup's own arithmetic assumes");
+        Harness.CheckEqual("Microsoft YaHei UI",
+            workspace.PresentationDraft!.Effective("FontFamily").Scalar,
+            "a profile that never configured it reads the default family");
+        Harness.CheckEqual("11", workspace.PresentationDraft!.Effective("FontSize").Scalar,
+            "and the default size");
+
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontFamily",
+                SettingsValue.Text("Segoe UI")),
+            "the font family is edited in the same draft");
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontSize",
+                SettingsValue.Text("16")),
+            "the font size is edited too");
+        Harness.Check(workspace.PresentationDraft!.HasChanges, "both are pending");
+        Harness.Check(!workspace.GlobalDraft!.HasChanges && !workspace.PinyinDraft!.HasChanges,
+            "and no other configuration is touched by them");
+
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Console.WriteLine($"   font save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+        Harness.Check(!workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+            "the font save reports success");
+        // A save replaces the draft, so the current one is read again rather than reused.
+        Harness.Check(!workspace.PresentationDraft!.HasChanges, "and nothing is pending");
+
+        Harness.CheckEqual("16",
+            await ReadPresentationValueAsync(endpoint, "FontSize", cancellationToken)
+                .ConfigureAwait(false),
+            "the Host reads the size back");
+        Harness.CheckEqual("Segoe UI",
+            await ReadPresentationValueAsync(endpoint, "FontFamily", cancellationToken)
+                .ConfigureAwait(false),
+            "and the family");
+
+        var fontFile = FindConfigFile(profileRoot);
+        Harness.Check(fontFile is not null, "the presentation file is on disk");
+        if (fontFile is not null)
+        {
+            // The stored form is Fcitx's, not this test's: an option equal to its default is
+            // written as a comment, and a value with a space is quoted. Both are read back
+            // through the same parser the Host uses.
+            var storedFamily = ReadIniValue(File.ReadAllText(fontFile), "FontFamily");
+            var storedSize = ReadIniValue(File.ReadAllText(fontFile), "FontSize");
+            Harness.CheckEqual("Segoe UI", storedFamily,
+                "the family is really in the file, not only in the Host's memory");
+            Harness.CheckEqual("16", storedSize, "and so is the size");
+        }
+
+        // 10. A size outside the schema's bounds never becomes a stored value. The draft is a
+        //     value store and accepts it (validation belongs to the schema, not to the text
+        //     box), so the refusal has to come from the Host — and it must leave everything
+        //     as it was instead of writing a default in place of the rejected number.
+        var beforeRejection = File.ReadAllText(fontFile!);
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontSize",
+                SettingsValue.Text("400")),
+            "an out-of-range size can be typed into the draft");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Console.WriteLine(
+            $"   out-of-range save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+        Harness.Check(workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal),
+            "saving it is refused rather than silently clamped");
+        Harness.CheckEqual("16",
+            await ReadPresentationValueAsync(endpoint, "FontSize", cancellationToken)
+                .ConfigureAwait(false),
+            "the Host still holds the accepted size");
+        Harness.CheckEqual(beforeRejection, File.ReadAllText(fontFile!),
+            "and the file was not rewritten");
+        workspace.Discard();
+        Harness.Check(!workspace.PresentationDraft!.HasChanges, "the refused edit is discarded");
+
+        // 11. Restoring the defaults writes them, and the file follows: this is what the
+        //     settings window's 恢复默认字体 does, through the same schema values.
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontFamily",
+                familyOption.DefaultValue) &&
+                workspace.TrySet(SettingsTarget.Presentation, "FontSize", sizeOption.DefaultValue),
+            "the schema defaults are written back into the draft");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Harness.CheckEqual("11",
+            await ReadPresentationValueAsync(endpoint, "FontSize", cancellationToken)
+                .ConfigureAwait(false),
+            "the Host holds the default size again");
+        Harness.CheckEqual("Microsoft YaHei UI",
+            await ReadPresentationValueAsync(endpoint, "FontFamily", cancellationToken)
+                .ConfigureAwait(false),
+            "and the default family");
+        // A default is stored as a comment, which is still the file's own record of the value.
+        Harness.CheckEqual("11", ReadIniValue(File.ReadAllText(fontFile!), "FontSize"),
+            "and the file agrees");
+
+        // 12. Leave a non-default font behind, so the post-restart run proves persistence of a
+        //     choice rather than of a default that would read the same either way.
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontSize",
+                SettingsValue.Text("16")),
+            "a non-default size is set again for the restart check");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Harness.CheckEqual("16",
+            await ReadPresentationValueAsync(endpoint, "FontSize", cancellationToken)
+                .ConfigureAwait(false),
+            "and stored");
+
+        Console.WriteLine($"   PRESENTATION_EXPECT={Option}=Horizontal;FontSize=16");
+    }
+
+    /// <summary>
+    /// The stored value of <paramref name="key"/>. A live value is written as `Key=Value`, a
+    /// value equal to its default as `# Key=Value`, and a value containing a space is quoted;
+    /// all three are the same fact for a reader, and only the uncommented form is a choice.
+    /// </summary>
+    private static string ReadIniValue(string contents, string key)
+    {
+        foreach (var line in contents.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith('#'))
+            {
+                trimmed = trimmed.TrimStart('#').Trim();
+            }
+
+            var separator = trimmed.IndexOf('=');
+            if (separator <= 0 || !string.Equals(trimmed[..separator].Trim(), key, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return trimmed[(separator + 1)..].Trim().Trim('"');
+        }
+
+        return "(absent)";
+    }
+
+    private static async Task<string> ReadPresentationValueAsync(string endpoint, string name,
+                                                                CancellationToken cancellationToken)
+    {
+        var reader = new SettingsClient(endpoint, TimeSpan.FromSeconds(10));
+        var reread = await reader.GetConfigAsync(SettingsWorkspace.PresentationUri, cancellationToken)
+            .ConfigureAwait(false);
+        if (!reread.IsOk)
+        {
+            Console.WriteLine($"   reread failed: {SettingsWorkspace.Describe(reread.Status, reread.Error)}");
+            return "(reread failed)";
+        }
+
+        return reread.Value!.Values.TryGet(name, out var value) ? value.Scalar : "(absent)";
     }
 
     /// <summary>
@@ -234,17 +395,7 @@ internal static class PresentationSaveTests
     public static async Task VerifyPersistedAsync(string endpoint, string expectation,
                                                   CancellationToken cancellationToken)
     {
-        Harness.Section("candidate layout: the saved value survives a Host restart");
-
-        var separator = expectation.IndexOf('=');
-        Harness.Check(separator > 0, "the expectation is name=value");
-        if (separator <= 0)
-        {
-            return;
-        }
-
-        var name = expectation[..separator];
-        var expected = expectation[(separator + 1)..];
+        Harness.Section("candidate presentation: the saved values survive a Host restart");
 
         var reader = new SettingsClient(endpoint, TimeSpan.FromSeconds(10));
         var reread = await reader.GetConfigAsync(SettingsWorkspace.PresentationUri, cancellationToken)
@@ -256,8 +407,23 @@ internal static class PresentationSaveTests
             return;
         }
 
-        var stored = reread.Value!.Values.TryGet(name, out var value) ? value.Scalar : "(absent)";
-        Harness.CheckEqual(expected, stored, "the value written before the restart is still stored");
+        // One or more name=value pairs, separated by ';': the layout and the font are separate
+        // facts and the run leaves both non-default for exactly this check.
+        foreach (var pair in expectation.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var separator = pair.IndexOf('=');
+            Harness.Check(separator > 0, "the expectation is name=value");
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var name = pair[..separator];
+            var expected = pair[(separator + 1)..];
+            var stored = reread.Value!.Values.TryGet(name, out var value) ? value.Scalar : "(absent)";
+            Harness.CheckEqual(expected, stored,
+                "the " + name + " written before the restart is still stored");
+        }
     }
 
     private static async Task<string> ReadStoredAsync(string endpoint, CancellationToken cancellationToken)

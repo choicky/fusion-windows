@@ -184,7 +184,8 @@ public abstract class SettingsPageBase : Page
                 draft.Effective(option.Name),
                 value => workspace.TrySet(SettingsTarget.Presentation, option.Name, value),
                 placement?.Label,
-                placement?.Help);
+                placement?.Help,
+                enumLabels: placement?.EnumLabels);
 
             yield return (placement?.Section ?? "更多设置", placement?.Order ?? 900, row);
         }

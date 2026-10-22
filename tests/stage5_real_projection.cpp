@@ -209,6 +209,21 @@ int main() {
     require(!page_op->page->panel_empty(), "auxUp alone keeps the panel displayed");
     d.key(kEscape);
 
+    // --- Candidate presentation: the popup font --------------------------------
+    // The font the popup draws with is projected from the Host's own presentation
+    // configuration, per page. This isolated profile has no candidate-presentation.conf, so
+    // the page carries the schema defaults; an empty projection here would mean every user
+    // gets the popup's built-in default instead of their setting.
+    batch = d.type("ni");
+    page_op = last_of(batch, BackendOperation::Type::CandidateSnapshot);
+    require(page_op && page_op->page, "presentation snapshot");
+    std::cout << "font=[" << page_op->page->font.family << "] "
+              << page_op->page->font.size_pt << "pt\n";
+    require(page_op->page->font.family == "Microsoft YaHei UI",
+            "the page carries the configured candidate font family");
+    require(page_op->page->font.size_pt == 11, "the page carries the configured candidate font size");
+    d.key(kEscape);
+
     d.backend->unbind(d.binding);
     std::cout << "PASS stage5 real projection (preedit contract, aux producers, hide signal)\n";
     return 0;

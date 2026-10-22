@@ -779,16 +779,57 @@ void test_protocol() {
             "duplicate settings keys fail-closed");
   }
 
-  // Additive settings message types are framed under v4 without changing the TIP handshake.
+  // Additive settings message types are framed under the current version without changing
+  // the TIP handshake, and they carry their own version so a settings client can move
+  // independently of a TIP client.
   {
     const auto frame = frame_message(MessageType::SettingsHelloRequest,
                                      serialize_settings_hello(protocol_version,
                                                               settings_api_version));
     auto parsed = parse_header(frame.data(), frame.size());
     require(parsed && parsed->type == MessageType::SettingsHelloRequest,
-            "settings capability frame is accepted by the v4 parser");
-    require(protocol_version == 4,
-            "settings messages do not bump the existing TIP protocol version");
+            "settings capability frame is accepted by the current parser");
+    require(settings_api_version >= 1 && settings_api_version != protocol_version,
+            "settings messages carry their own version, not the TIP protocol's");
+  }
+
+  // The page's presentation half (the popup font) round-trips with the page it is drawn
+  // on, and a size outside any usable range is rejected rather than clamped.
+  {
+    CandidatePage page;
+    page.layout = CandidateLayout::Horizontal;
+    page.font.family = "Microsoft YaHei UI";
+    page.font.size_pt = 11;
+    page.entries.push_back(CandidateEntry{"1", "\u4f60", "(ni)", false});
+    std::vector<std::uint8_t> payload;
+    serialize(payload, page);
+    detail::Reader reader{payload.data(), payload.size()};
+    const auto decoded = deserialize_page(reader);
+    require(decoded && reader.at_end(), "the page with a font parses back");
+    require(decoded->font.family == page.font.family && decoded->font.size_pt == 11,
+            "the popup font survives the wire unchanged");
+
+    std::vector<std::uint8_t> broken;
+    serialize(broken, page);
+    // Rewrite the trailing size field (the last four bytes) to an implausible value.
+    const std::uint32_t absurd = 401;
+    for (int i = 0; i < 4; ++i)
+      broken[broken.size() - 4 + static_cast<std::size_t>(i)] =
+          static_cast<std::uint8_t>(absurd >> (i * 8));
+    detail::Reader bad{broken.data(), broken.size()};
+    require(!deserialize_page(bad), "an implausible font size fails closed");
+
+    // A page that carries no font — the shape Mock and every pre-existing test use —
+    // still parses, and the popup is what supplies the default.
+    CandidatePage plain{};
+    plain.entries.push_back(CandidateEntry{"1", "\u4f60", "", false});
+    std::vector<std::uint8_t> plain_payload;
+    serialize(plain_payload, plain);
+    detail::Reader plain_reader{plain_payload.data(), plain_payload.size()};
+    const auto plain_decoded = deserialize_page(plain_reader);
+    require(plain_decoded && plain_decoded->font.family.empty() &&
+                plain_decoded->font.size_pt == 0,
+            "a page without a font keeps the empty projection");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";

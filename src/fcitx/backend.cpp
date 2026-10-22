@@ -8,6 +8,7 @@
 #include "startup_group.hpp"
 #include "im_list.hpp"
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <fcitx-utils/environ.h>
@@ -99,6 +100,16 @@ bool is_candidate_presentation_uri(const std::string &uri) {
 CandidateLayout candidate_layout_for(CandidateLayoutPreference preference) {
   return preference == CandidateLayoutPreference::Horizontal ? CandidateLayout::Horizontal
                                                              : CandidateLayout::Vertical;
+}
+
+// The font the popup draws with, taken from the same stored configuration. Kept as one
+// immutable value published whole, so a page can never carry a family from one edit and a
+// size from another.
+std::shared_ptr<const CandidateFont> candidate_font_for(const CandidatePresentationConfig &config) {
+  auto font = std::make_shared<CandidateFont>();
+  font->family = config.font_family.value();
+  font->size_pt = config.font_size.value();
+  return font;
 }
 
 // Convert the public RawConfig tree to the same string/map shape used by Fcitx's
@@ -349,9 +360,10 @@ inline bool stimulus_carries_character(const BackendStimulus &stimulus) {
 class InputContext final : public fcitx::InputContext {
 public:
   InputContext(fcitx::Instance &instance, Binding value,
-               const std::atomic<CandidateLayout> &layout_preference)
+               const std::atomic<CandidateLayout> &layout_preference,
+               const std::atomic<std::shared_ptr<const CandidateFont>> &font)
       : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value),
-        layout_preference_(layout_preference) {
+        layout_preference_(layout_preference), font_(font) {
     instance_ = &instance;
     setCapabilityFlags(fcitx::CapabilityFlag::Preedit);
     created();
@@ -476,6 +488,10 @@ public:
       invalid = true;
       return;
     }
+    // The font is presentation, so it travels with the page it is drawn on. A page built
+    // without one (Mock, tests) leaves the fields empty and the popup uses its default.
+    if (auto font = font_.load())
+      page.font = *font;
     BackendOperation operation{BackendOperation::Type::CandidateSnapshot};
     operation.page = std::move(page);
     observe(std::move(operation));
@@ -521,6 +537,9 @@ public:
   // the backend and outlives every context, so a save is visible to the next projection
   // of every context without any per-context copy that could drift.
   const std::atomic<CandidateLayout> &layout_preference_;
+  // The font the same configuration carries, for the popup's drawing. Read once per
+  // projected page; the backend publishes a new immutable value on a save.
+  const std::atomic<std::shared_ptr<const CandidateFont>> &font_;
   std::uint64_t last_stimulus = 0;
   BackendBatch *batch = nullptr;
   bool lifecycle = true;
@@ -549,7 +568,8 @@ public:
     return invoke([this, binding] {
       if (contexts_.contains(binding.context) || contexts_.size() >= context_bound)
         return false;
-      auto context = std::make_unique<InputContext>(*instance_, binding, candidate_layout_);
+      auto context =
+          std::make_unique<InputContext>(*instance_, binding, candidate_layout_, candidate_font_);
       context->focusIn();
       // The profile decides the input method (U1): the bound context starts in the
       // group's current input method (Items/0) as Fcitx resolves it, never in a
@@ -1036,6 +1056,36 @@ private:
     // path startup already uses, and it validates the raw tree exactly once, before any I/O.
     CandidatePresentationConfig candidate;
     candidate.load(raw, /*partial=*/true);
+    // `Configuration::load` returns void and leaves an option whose value fails its own
+    // constraint (a font size outside 6..48, say) at the default. Writing that would report
+    // success for a number that was never stored, so the submitted size is compared with the
+    // one the schema actually accepted, and a value that did not survive is refused before
+    // anything is written. The bounds themselves stay in the schema, not here.
+    // The merged tree is keyed by option name; the schema types may add a level, so the
+    // leaf is looked for at both depths rather than assumed to sit at one of them.
+    const auto size_leaf = [](const SettingsValue &value) -> const SettingsValue * {
+      if (!value.is_map)
+        return nullptr;
+      const auto leaf = value.entries.find("FontSize");
+      return leaf != value.entries.end() ? &leaf->second : nullptr;
+    };
+    const SettingsValue *requested_size = size_leaf(merged);
+    for (const auto &child : merged.entries) {
+      if (requested_size != nullptr)
+        break;
+      requested_size = size_leaf(child.second);
+    }
+    if (requested_size != nullptr) {
+      int size = 0;
+      const auto &text = requested_size->scalar;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), size);
+      if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() ||
+          candidate.font_size.value() != size) {
+        error = "The candidate font size is outside the range this configuration accepts; "
+                "nothing was changed.";
+        return SettingsStatus::Invalid;
+      }
+    }
     if (!fcitx::safeSaveAsIni(candidate, candidate_presentation_config_path)) {
       error = "Fcitx could not save the candidate-presentation configuration; nothing was "
               "changed, so the same change can be retried.";
@@ -1047,6 +1097,7 @@ private:
     // the three moves.
     presentation_config_.load(raw, /*partial=*/true);
     candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
+    candidate_font_.store(candidate_font_for(presentation_config_));
     return read_presentation_settings_on_loop(snapshot, error);
   }
 
@@ -1429,6 +1480,7 @@ private:
           // user who never opens the setting.
           fcitx::readAsIni(presentation_config_, candidate_presentation_config_path);
           candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
+          candidate_font_.store(candidate_font_for(presentation_config_));
           ensure_usable_group(instance);
           if (!options_.fixture_input_methods.empty()) {
             // Fixture-only: apply a saved profile's list through the same
@@ -1562,6 +1614,8 @@ private:
   // the projection, so no code reads the file or the schema on a keystroke.
   CandidatePresentationConfig presentation_config_;
   std::atomic<CandidateLayout> candidate_layout_{CandidateLayout::Vertical};
+  std::atomic<std::shared_ptr<const CandidateFont>> candidate_font_{
+      std::make_shared<const CandidateFont>(CandidateFont{"Microsoft YaHei UI", 11})};
 };
 } // namespace
 std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options) {

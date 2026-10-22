@@ -29,7 +29,8 @@ public static class OptionRows
     public static FrameworkElement Build(OptionDescription option, SettingsValue current,
                                          Func<SettingsValue, bool> apply,
                                          string? label = null, string? help = null,
-                                         Func<KeyChord, string?>? overlapProbe = null)
+                                         Func<KeyChord, string?>? overlapProbe = null,
+                                         IReadOnlyDictionary<string, string>? enumLabels = null)
     {
         var title = new TextBlock
         {
@@ -62,7 +63,7 @@ public static class OptionRows
         }
 
         Services.Trace.Write("option " + option.Name + " type=" + option.Type);
-        var control = CreateControl(option, current, apply, overlapProbe);
+        var control = CreateControl(option, current, apply, overlapProbe, enumLabels);
         var row = new Grid { ColumnSpacing = 16 };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -90,7 +91,8 @@ public static class OptionRows
 
     private static FrameworkElement CreateControl(OptionDescription option, SettingsValue current,
                                                   Func<SettingsValue, bool> apply,
-                                                  Func<KeyChord, string?>? overlapProbe)
+                                                  Func<KeyChord, string?>? overlapProbe,
+                                                  IReadOnlyDictionary<string, string>? enumLabels)
     {
         if (option.IsExternal)
         {
@@ -120,7 +122,7 @@ public static class OptionRows
         {
             "Boolean" => BooleanControl(current, apply),
             "Integer" => IntegerControl(option, current, apply),
-            "Enum" => EnumControl(option, current, apply),
+            "Enum" => EnumControl(option, current, apply, enumLabels),
             "List|String" => StringListControl(current, apply),
             "Color" => new TextBlock { Text = current.Scalar, Opacity = 0.7 },
             _ => TextControl(current, apply),
@@ -182,7 +184,8 @@ public static class OptionRows
     }
 
     private static FrameworkElement EnumControl(OptionDescription option, SettingsValue current,
-                                                Func<SettingsValue, bool> apply)
+                                                Func<SettingsValue, bool> apply,
+                                                IReadOnlyDictionary<string, string>? enumLabels)
     {
         var labels = option.LocalizedEnumLabels;
         var stored = option.EnumLabels;
@@ -190,7 +193,10 @@ public static class OptionRows
 
         for (var i = 0; i < labels.Count; i++)
         {
-            combo.Items.Add(new ComboBoxItem { Content = labels[i], Tag = i < stored.Count ? stored[i] : labels[i] });
+            var value = i < stored.Count ? stored[i] : labels[i];
+            // The label is display text; the Tag stays the stored value the Host round-trips.
+            var shown = enumLabels is not null && enumLabels.TryGetValue(value, out var mapped) ? mapped : labels[i];
+            combo.Items.Add(new ComboBoxItem { Content = shown, Tag = value });
         }
 
         var index = stored.ToList().IndexOf(current.Scalar);
