@@ -89,6 +89,23 @@ struct CandidatePanelLayout {
   // what the paging keys call a page and what the popup shows are the same thing; 0 means the
   // layout had no ceiling to apply (an unbounded test layout).
   int row_capacity = 0;
+  // The padding inside every slot, on the left and on the right, that the layout already
+  // reserved when it sized the slot. The painter subtracts exactly this to get the rectangle
+  // it draws into, so the width the text was measured at and the width it is drawn in are the
+  // same number — the painting side must not add an inset of its own.
+  int text_inset = 0;
+  // The rectangle a slot's text is drawn into: the slot minus `text_inset` on both sides, never
+  // narrower than one pixel. One definition, used by the painter and by `clipped` above.
+  LayoutRect text_rect(std::size_t index) const {
+    if (index >= slots.size())
+      return LayoutRect{};
+    const LayoutRect &slot = slots[index];
+    if (slot.empty())
+      return LayoutRect{};
+    const int left = slot.left + text_inset;
+    const int right = slot.right - text_inset;
+    return LayoutRect{left, slot.top, (std::max)(left + 1, right), slot.bottom};
+  }
   bool rows_hidden_above() const { return first_row > 0; }
   bool rows_hidden_below() const { return first_row + visible_rows < total_rows; }
 };
@@ -100,6 +117,11 @@ struct LayoutMetrics {
   int line_height = 20; // measured text height of the popup font, device pixels
   int item_padding = 3; // vertical padding inside a slot, above and below the text
   int row_height = 0;   // line_height + 2 * item_padding; computed when left 0
+  // Horizontal padding inside a slot, on each side. A slot is sized as
+  // `text + 2 * item_inset`, and the text is drawn into exactly `slot - 2 * item_inset`, so a
+  // candidate that fits its own measurement is never ellipsized for want of two pixels. Zero
+  // would be consistent but leaves the text touching the highlight rectangle's edge.
+  int item_inset = 2;
   int side_margin = 6;
   int item_gap = 12;
   int pager_width = 20;
@@ -115,6 +137,7 @@ inline LayoutMetrics layout_metrics_for(int line_height, int dpi) {
   metrics.line_height = (std::max)(1, line_height);
   metrics.item_padding = (std::max)(2, scaled(3));
   metrics.row_height = metrics.line_height + 2 * metrics.item_padding;
+  metrics.item_inset = (std::max)(2, scaled(2));
   metrics.side_margin = (std::max)(3, scaled(6));
   metrics.item_gap = (std::max)(4, scaled(12));
   metrics.pager_width = (std::max)(12, scaled(20));
@@ -150,6 +173,10 @@ layout_candidate_panel(const CandidatePage &page,
   const int side_margin = (std::max)(0, metrics.side_margin);
   const int item_gap = (std::max)(0, metrics.item_gap);
   const int pager_width = (std::max)(0, metrics.pager_width);
+  // The text inside a slot never touches its edge, and the space that costs is reserved once
+  // here, so measuring, sizing and clipping all describe the same rectangle.
+  const int inset = (std::max)(1, metrics.item_inset);
+  out.text_inset = inset;
   const bool bounded_width = limits.max_width > 0;
   const bool bounded_height = limits.max_height > 0;
 
@@ -208,7 +235,9 @@ layout_candidate_panel(const CandidatePage &page,
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue;
-      text_width[index] = measure(slot_full_text(page.entries[index]));
+      // The cell has to hold the text *and* its own inset, so the inset is part of what the
+      // widest cell is measured at rather than something added to the drawing later.
+      text_width[index] = measure(slot_full_text(page.entries[index])) + 2 * inset;
       natural = (std::max)(natural, text_width[index]);
     }
     int cell = natural;
@@ -219,7 +248,7 @@ layout_candidate_panel(const CandidatePage &page,
     }
     if (limits.max_slot_width > 0)
       cell = (std::min)(cell, limits.max_slot_width);
-    cell = (std::max)(1, cell);
+    cell = (std::max)(2 * inset + 1, cell);
 
     int panel_width = 2 * side_margin + columns * cell + (columns - 1) * item_gap;
     // The pager arrows live in the band above the grid, so they are not taken out of any
@@ -307,7 +336,7 @@ layout_candidate_panel(const CandidatePage &page,
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue; // index kept, no displayed slot
-      const int natural = measure(slot_full_text(page.entries[index]));
+      const int natural = measure(slot_full_text(page.entries[index])) + 2 * inset;
       const int w = cap > 0 ? (std::min)(natural, cap) : natural;
       out.slots[index] = LayoutRect{x, top, x + w, top + row_height};
       out.clipped[index] = natural > w ? 1 : 0;
@@ -383,10 +412,10 @@ layout_candidate_panel(const CandidatePage &page,
         const int right = width - side_margin;
         const int y = top + band + shown * row_height;
         out.slots[index] = LayoutRect{left, y, (std::max)(left + 1, right), y + row_height};
-        out.clipped[index] = measure(slot_full_text(page.entries[index])) >
-                                     (std::max)(left + 1, right) - left
-                                 ? 1
-                                 : 0;
+        // The same rectangle the painter uses: the slot minus its inset on both sides.
+        const int text_width = (std::max)(left + 1, right) - left - 2 * inset;
+        out.clipped[index] =
+            measure(slot_full_text(page.entries[index])) > text_width ? 1 : 0;
       }
       ++row;
     }

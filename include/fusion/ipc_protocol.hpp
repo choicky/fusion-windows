@@ -71,7 +71,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 7;
+inline constexpr std::uint32_t protocol_version = 8;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -260,7 +260,7 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
   // Host does not implement and is rejected rather than guessed at. KeyRelease is the
   // key-up half of a modifier-only key; it carries no index and its keysym is its
   // identity, exactly like the key-down that preceded it.
-  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::KeyRelease))
+  if (*type_byte > static_cast<std::uint8_t>(BackendStimulus::Type::CursorNext))
     return std::nullopt;
   const auto type = static_cast<BackendStimulus::Type>(*type_byte);
   const auto index = static_cast<std::int32_t>(*index_bits);

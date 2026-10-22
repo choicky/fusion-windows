@@ -274,6 +274,14 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
+  // The automatic scrolling window has columns, so its left and right arrows move the engine's
+  // own candidate cursor. Everywhere else — 竖排, 横排, no page at all — and at the ends of the
+  // list, the keys keep exactly the meaning they had, which is also how the pinyin string
+  // stays editable with them.
+  if (!action.modified && (action.keysym == kKeysymLeft || action.keysym == kKeysymRight)) {
+    if (begin_candidate_cursor(action.keysym == kKeysymRight ? 1 : -1, decision))
+      return decision;
+  }
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
   stimulus.window_rows = window_rows_;
   switch (action.type) {
@@ -482,6 +490,54 @@ SemanticDecision SemanticController::begin_candidate_action(CandidateAction acti
   decision.symbolic = "candidate-action";
   dispatch_real(stimulus, decision);
   return decision;
+}
+
+bool SemanticController::begin_candidate_cursor(int step, SemanticDecision &decision) {
+  if (real_backend_ == nullptr || step == 0)
+    return false;
+  // Only the automatic scrolling window has columns to move between. 竖排 and 横排 keep the
+  // keys they have always had: this feature does not redefine them.
+  if (!page_present_ || !displayed_page_ || displayed_page_->empty() ||
+      displayed_page_->arrangement != CandidateArrangement::Scroll ||
+      !displayed_page_->paging_known()) {
+    return false;
+  }
+  // The same fence a candidate click passes: a page whose dispatch identity no longer matches
+  // the live session must not move anything.
+  const LinkStatus link = real_backend_->link_status();
+  if (displayed_fence_.backend_session_id != real_backend_->session_id() ||
+      displayed_fence_.binding != core_.binding() ||
+      displayed_fence_.host_incarnation != link.host_incarnation ||
+      displayed_fence_.connection_generation != link.connection_generation) {
+    clear_displayed_page();
+    return false;
+  }
+  const auto &page = *displayed_page_;
+  const int cursor = page.cursor_index;
+  if (cursor < 0 || cursor >= static_cast<int>(page.entries.size()))
+    return false; // nothing highlighted: the key is not ours
+  const int columns = page.page_size;
+  if (columns <= 0)
+    return false;
+  const int rows = (static_cast<int>(page.entries.size()) + columns - 1) / columns;
+  const bool window_ends_the_list = page.window_first_page + rows >= page.total_pages;
+  // No wrap: at the right edge of the list a right step is refused here, so the key falls
+  // through to the engine and keeps its pinyin-string meaning.
+  if (step > 0 && window_ends_the_list && cursor >= static_cast<int>(page.entries.size()) - 1)
+    return false;
+  if (step < 0 && page.window_first_page == 0 && cursor <= 0)
+    return false;
+  if (core_.records().size() + frontend_operation_bound + recovery_reserve_ > core_.capacity() ||
+      core_.probe_pass() == Pass::RecoveryRequired) {
+    return false;
+  }
+  BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
+  stimulus.type = step > 0 ? BackendStimulus::Type::CursorNext
+                           : BackendStimulus::Type::CursorPrev;
+  decision.symbolic = step > 0 ? "candidate-cursor-next" : "candidate-cursor-prev";
+  dispatch_real(stimulus, decision);
+  return decision.route != SemanticDecision::Route::FailOpen;
 }
 
 void SemanticController::dispatch_real(const BackendStimulus &stimulus,

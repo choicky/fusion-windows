@@ -179,13 +179,17 @@ public abstract class SettingsPageBase : Page
                 continue;
             }
 
-            var row = OptionRows.Build(
-                option,
-                draft.Effective(option.Name),
-                value => workspace.TrySet(SettingsTarget.Presentation, option.Name, value),
-                placement?.Label,
-                placement?.Help,
-                enumLabels: placement?.EnumLabels);
+            var current = draft.Effective(option.Name);
+            bool Apply(SettingsValue value) =>
+                workspace.TrySet(SettingsTarget.Presentation, option.Name, value);
+
+            // The font is the one presentation option whose value names something the system
+            // has to have: it gets the installed families behind it instead of a bare text
+            // box, while still accepting a name the system does not have.
+            var row = string.Equals(option.Name, "FontFamily", StringComparison.Ordinal)
+                ? OptionRows.BuildFontFamily(current, Apply, placement?.Label, placement?.Help)
+                : OptionRows.Build(option, current, Apply, placement?.Label, placement?.Help,
+                                   enumLabels: placement?.EnumLabels);
 
             yield return (placement?.Section ?? "更多设置", placement?.Order ?? 900, row);
         }

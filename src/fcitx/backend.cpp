@@ -387,7 +387,8 @@ std::vector<SettingsConfigType> dump_settings_description(const fcitx::Configura
 inline bool is_candidate_action(BackendStimulus::Type type) {
   return type == BackendStimulus::Type::SelectCandidate ||
          type == BackendStimulus::Type::SelectCandidateGlobal ||
-         type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev;
+         type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev ||
+         type == BackendStimulus::Type::CursorPrev || type == BackendStimulus::Type::CursorNext;
 }
 // Whether a stimulus carries a character, i.e. is something an input method would compose
 // from. Everything else — function keys, bare modifiers, navigation and editing keys — is a
@@ -608,6 +609,42 @@ public:
       if (!pager || !pager->hasPrev())
         return false;
       pager->prev();
+      updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+      return true;
+    }
+    case BackendStimulus::Type::CursorPrev:
+    case BackendStimulus::Type::CursorNext: {
+      // The engine's own candidate cursor, through the official interface: no second
+      // highlight is kept here, and selecting still goes through CandidateWord::select.
+      // `toCursorMovable()` answers from the list's own declaration of the interface; a list
+      // that is a CommonCandidateList but did not register the pointer is still the same
+      // official cursor, so the cast is the fallback rather than a second implementation.
+      auto *movable = list->toCursorMovable();
+      if (movable == nullptr)
+        movable = dynamic_cast<fcitx::CommonCandidateList *>(list.get());
+      if (movable == nullptr)
+        return false;
+      const bool forward = stimulus.type == BackendStimulus::Type::CursorNext;
+      // `CommonCandidateList::moveCursor` rotates: past the last candidate it lands on the
+      // first. The window must not wrap, so the boundary is decided here — from the engine's
+      // own numbers, before the call — and a move that would wrap is refused instead. That
+      // refusal is also what lets the frontend hand the key back to the engine as ordinary
+      // pinyin-string editing.
+      auto *common = dynamic_cast<fcitx::CommonCandidateList *>(list.get());
+      const int cursor = common != nullptr ? common->globalCursorIndex() : -1;
+      if (cursor >= 0) {
+        int total = -1;
+        if (auto *bulk = common->toBulk())
+          total = bulk->totalSize();
+        if (forward && total > 0 && cursor >= total - 1)
+          return false;
+        if (!forward && cursor <= 0)
+          return false;
+      }
+      if (forward)
+        movable->nextCandidate();
+      else
+        movable->prevCandidate();
       updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
       return true;
     }
@@ -1550,6 +1587,8 @@ private:
     case BackendStimulus::Type::SelectCandidate:
     case BackendStimulus::Type::PageNext:
     case BackendStimulus::Type::PagePrev:
+    case BackendStimulus::Type::CursorPrev:
+    case BackendStimulus::Type::CursorNext:
       break; // not a key: apply_candidate_action handled it
     }
     throw std::runtime_error("unsupported backend stimulus");

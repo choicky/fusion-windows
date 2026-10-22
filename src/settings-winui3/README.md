@@ -57,6 +57,10 @@ These are the properties the presentation may rely on, each covered by a check:
   composition is live, and only the Pinyin/Shuangpin configuration and the input-method list are
   refused, because their official apply step ends the composition that is running. The edit is
   kept in every refusal.
+- **The font list is the system's.** 候选字体 is an editable list of the families this session
+  has, read from GDI's own enumeration — the same collection the popup draws with — and it never
+  rewrites the stored value on open: a family this machine does not have keeps its name and the
+  row says Windows will substitute.
 - **One click does the waiting.** `Busy` is the one answer the Host gives without having written
   anything, so a save that receives it keeps the edit, says it is not saved yet, and resubmits
   **the pages that answered `Busy`** every 400 ms until the Host is free — serially, off the UI
@@ -98,7 +102,7 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **721 checks** as of this revision — **530 without a Host** (`--no-integration`), and
+Exit code 0 means every check passed: **731 checks** as of this revision — **540 without a Host** (`--no-integration`), and
 **191 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
 a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
@@ -107,7 +111,9 @@ resubmitted, the wait reported as unsaved and stoppable, an ordinary refusal tha
 another way — `Error`, `Invalid` or `Indeterminate` — while a different page waits and is submitted exactly once, and the
 failed half of the shared Pinyin/Shuangpin draft not resubmitted), a
 successful global save with its persistence check, a save that stores one page and is refused for another with the refused
-edit kept, and read/apply/read-back with incarnation stability). A third
+edit kept, and read/apply/read-back with incarnation stability). The no-Host half also covers the
+installed-font list the 候选字体 row offers: the families this session has, once each, sorted, a
+name it does not contain reported as missing, and a search that narrows. A third
 run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **8 checks**:
 the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
 
