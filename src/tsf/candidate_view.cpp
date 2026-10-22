@@ -361,22 +361,33 @@ void CandidateView::draw(HDC dc) {
     if (selected)
       FillRect(dc, &fill, GetSysColorBrush(COLOR_HIGHLIGHT));
     // "label text", then the engine comment after one space in a secondary color. Both
-    // halves are single-line and end-ellipsized inside the slot: a long candidate is
-    // shortened on screen, never the string the engine would commit.
+    // halves are single-line and end-ellipsized, but only inside the rectangle the layout
+    // measured the text at — the layout already reserved the inset, so nothing is taken off
+    // here. A candidate that fits its own measurement is therefore drawn whole: the ellipsis
+    // means the text is really wider than the slot, which is exactly what `clipped` says and
+    // exactly when the full text is offered beside the panel.
     const std::wstring main = to_wide(slot_main_text(entry));
-    RECT cell = fill;
-    cell.left += 2;
+    RECT cell = to_rect(layout_.text_rect(index));
+    const int available = cell.right - cell.left;
     SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(0, 0, 0));
     DrawTextW(dc, main.c_str(), -1, &cell, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     if (!entry.comment.empty()) {
-      SIZE extent{};
-      GetTextExtentPoint32W(dc, (main + L" ").c_str(), static_cast<int>(main.size() + 1), &extent);
-      RECT comment_cell = cell;
-      comment_cell.left += extent.cx;
-      if (comment_cell.left < comment_cell.right) {
-        SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(110, 110, 110));
-        DrawTextW(dc, to_wide(entry.comment).c_str(), -1, &comment_cell,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+      SIZE main_extent{};
+      GetTextExtentPoint32W(dc, main.c_str(), static_cast<int>(main.size()), &main_extent);
+      // A comment is drawn only beside a main text that was drawn whole: once the main text
+      // itself is ellipsized, there is no honest place to put it, and the full-text box
+      // already carries both.
+      if (main_extent.cx > 0 && main_extent.cx <= available) {
+        const std::wstring separator = main + L" ";
+        SIZE offset{};
+        GetTextExtentPoint32W(dc, separator.c_str(), static_cast<int>(separator.size()), &offset);
+        RECT comment_cell = cell;
+        comment_cell.left = to_rect(layout_.text_rect(index)).left + offset.cx;
+        if (comment_cell.left < comment_cell.right) {
+          SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(110, 110, 110));
+          DrawTextW(dc, to_wide(entry.comment).c_str(), -1, &comment_cell,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
       }
     }
   }

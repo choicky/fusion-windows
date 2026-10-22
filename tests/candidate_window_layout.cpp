@@ -238,6 +238,56 @@ bool slots_hold_the_text(const fusion::tsf::CandidateView &view) {
   return true;
 }
 
+// Whether a slot's text fits the rectangle the popup paints it into, asked of GDI with this
+// test's own device context and font rather than of the layout's arithmetic.
+//
+// This is the check the painting defect needed: the layout used to size a slot as exactly the
+// measured text and the painter then start drawing 2 px further right, so every candidate
+// that fit its own measurement was ellipsized. Comparing the drawn rectangle against an
+// independent measurement is a question about the geometry that reaches the screen; comparing
+// the layout with itself would only prove it agrees with itself.
+int natural_width(const fusion::CandidatePage &page, const std::string &utf8, int dpi) {
+  HDC dc = GetDC(nullptr);
+  if (dc == nullptr)
+    return -1;
+  const std::string family = page.font.family.empty() ? "Microsoft YaHei UI" : page.font.family;
+  const int size_pt = page.font.size_pt > 0 ? page.font.size_pt : 11;
+  HFONT font = CreateFontW(-MulDiv(size_pt, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY, FF_DONTCARE, to_wide(family).c_str());
+  HGDIOBJ previous = font != nullptr ? SelectObject(dc, font) : nullptr;
+  const std::wstring text = to_wide(utf8);
+  // `GetTextExtentPoint32W` rather than `DT_CALCRECT`: the popup sizes a slot with this call,
+  // and DrawText's own calculation adds cell overhang that belongs to the drawing, not to the
+  // text's width. The question here is whether the rectangle the popup paints into is the
+  // width the text needs — a 2 px offset is what must not come back, and this comparison still
+  // sees it with several pixels to spare.
+  SIZE extent{};
+  GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &extent);
+  const int width = static_cast<int>(extent.cx);
+  if (previous != nullptr)
+    SelectObject(dc, previous);
+  if (font != nullptr)
+    DeleteObject(font);
+  ReleaseDC(nullptr, dc);
+  return width;
+}
+
+bool slots_draw_their_text_whole(const fusion::tsf::CandidateView &view,
+                                 const fusion::CandidatePage &page, int dpi) {
+  const auto &layout = view.layout();
+  for (std::size_t index = 0; index < page.entries.size(); ++index) {
+    if (index >= layout.slots.size() || layout.slots[index].empty())
+      continue;
+    const auto &entry = page.entries[index];
+    const int available = layout.text_rect(index).right - layout.text_rect(index).left;
+    const int needed = natural_width(page, fusion::tsf::slot_full_text(entry), dpi);
+    if (needed < 0 || needed > available)
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +307,11 @@ int main() {
   CHECK((extended & WS_EX_NOACTIVATE) != 0);
   CHECK((extended & WS_EX_TOOLWINDOW) != 0);
 
+  // The DPI the popup actually drew for, so the independent measurements below use the same
+  // font size the layout did.
+  const UINT panel_dpi = GetDpiForWindow(view.window());
+  const int dpi = panel_dpi != 0 ? static_cast<int>(panel_dpi) : 96;
+
   // 2. A horizontal page makes a wide, short panel — and every slot is tall enough for the
   //    text it contains.
   const auto horizontal = make_page(fusion::CandidateLayout::Horizontal, entries);
@@ -269,6 +324,7 @@ int main() {
   CHECK(horizontal_width > 200);
   CHECK(view.line_height() > 0);
   CHECK(slots_hold_the_text(view));
+  CHECK(slots_draw_their_text_whole(view, horizontal, dpi));
   CHECK(horizontal_height >= view.line_height());
 
   // 3. A vertical page makes a tall, narrow panel — from the same popup and the same
@@ -282,6 +338,7 @@ int main() {
   CHECK(vertical_width > 0 && vertical_height > 0);
   CHECK(vertical_height > vertical_width);
   CHECK(slots_hold_the_text(view));
+  CHECK(slots_draw_their_text_whole(view, vertical, dpi));
 
   // 4. The two geometries are actually different, in the direction each one implies:
   //    the row is wider than the column, and the column is taller than the row.

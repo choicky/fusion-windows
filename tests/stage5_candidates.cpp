@@ -559,9 +559,18 @@ void mode_comment() {
             right->index == static_cast<std::int32_t>(index));
     }
     if (layout_kind == CandidateLayout::Horizontal) {
-      // The commented slot is as wide as "label text comment".
-      CHECK(layout.slots[0].right - layout.slots[0].left == measure(slot_full_text(first)));
-      CHECK(layout.slots[3].right - layout.slots[3].left == measure(slot_full_text(third)));
+      // A slot is the text plus the inset it reserves on both sides, and the rectangle the
+      // painter draws into is exactly the text's own width. Asserting the slot *is* the text
+      // width is what the painting defect looked like from the layout's side: the painter
+      // then started 2 px further in and every candidate that fit was ellipsized.
+      CHECK(layout.text_inset > 0);
+      CHECK(layout.slots[0].right - layout.slots[0].left ==
+            measure(slot_full_text(first)) + 2 * layout.text_inset);
+      CHECK(layout.slots[3].right - layout.slots[3].left ==
+            measure(slot_full_text(third)) + 2 * layout.text_inset);
+      CHECK(layout.text_rect(0).right - layout.text_rect(0).left == measure(slot_full_text(first)));
+      CHECK(layout.text_rect(3).right - layout.text_rect(3).left == measure(slot_full_text(third)));
+      CHECK(!layout.slot_clipped(0) && !layout.slot_clipped(3));
     }
     // Panel text rows are not actionable; the pager still is.
     CHECK(!hit_test_candidate_panel(layout, layout.upper.left + 1, layout.upper.top + 1));
