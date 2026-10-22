@@ -39,6 +39,13 @@ internal static class BusyWaitTests
         await DoesNotResubmitASavedPageAsync().ConfigureAwait(false);
         await CanBeStoppedAsync().ConfigureAwait(false);
         await DoesNotRetryOtherAnswersAsync().ConfigureAwait(false);
+        foreach (var failure in new[] { SettingsStatus.Error, SettingsStatus.Invalid,
+                                        SettingsStatus.Indeterminate })
+        {
+            await AnotherPageFailsWhileOneWaitsAsync(failure).ConfigureAwait(false);
+        }
+
+        await DoesNotResubmitTheFailedGroupOfTheSharedDraftAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -282,6 +289,176 @@ internal static class BusyWaitTests
         Harness.Check(workspace.SaveSummary.Contains("未保存", StringComparison.Ordinal) &&
                       !workspace.SaveSummary.Contains("等待", StringComparison.Ordinal),
             "and the bar does not claim to be waiting for anything");
+    }
+
+    /// <summary>
+    /// One save, two pages: one is waiting for the Host, the other has already failed. The page
+    /// that failed is submitted exactly once — a retry belongs to the <c>Busy</c> page, not to
+    /// the save — and it keeps its edit, so the user can see what is still unsaved.
+    /// </summary>
+    /// <remarks>
+    /// Parameterized over the three ways a page can fail without being worth another attempt:
+    /// a plain refusal, a schema rejection, and an outcome the Host could not report. None of
+    /// them may ride along on another page's wait.
+    /// </remarks>
+    private static async Task AnotherPageFailsWhileOneWaitsAsync(SettingsStatus failure)
+    {
+        Harness.Section($"busy: another page failing with {failure} is not resubmitted while one waits");
+
+        var name = FakeHost.UniqueName();
+        var configWrites = 0;
+        var listWrites = 0;
+        var stored = OldOrder.ToList();
+        var storedPageSize = "5";
+
+        await using var peer = FakeHost.StartScripted(name, (type, payload) =>
+        {
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return ConfigurableSnapshotBody(storedPageSize);
+                case MessageType.SettingsSetConfigRequest:
+                    ++configWrites;
+                    return StatusBody(failure, "the page could not be written");
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(stored.ToArray(), OldOrder);
+                case MessageType.SettingsSetImListRequest:
+                    ++listWrites;
+                    if (listWrites == 1)
+                    {
+                        return BusyBody();
+                    }
+
+                    stored = DecodeImListPayload(payload);
+                    return ImListBody(stored.ToArray(), OldOrder);
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.Check(workspace.TrySet(SettingsTarget.Global, "PageSize", SettingsValue.Text("6")),
+            "a global value is changed");
+        Harness.Check(workspace.MoveMethod(0, 1), "and the list is reordered in the same save");
+
+        await workspace.SaveAsync(cancellation.Token).ConfigureAwait(false);
+        Console.WriteLine($"   the save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+
+        Harness.CheckEqual(2, listWrites, "the page that was waiting is retried until it lands");
+        Harness.CheckEqual(1, configWrites,
+            $"the page that answered {failure} is submitted once and never re-sent");
+        Harness.Check(workspace.GlobalDraft!.HasChanges,
+            "and its edit is still an unsaved change");
+        Harness.Check(!workspace.Methods!.HasChanges, "while the page that landed has nothing left");
+        Harness.Check(workspace.SaveSummary.Contains("输入方式列表：已保存", StringComparison.Ordinal),
+            "the bar reports the page that was written as saved");
+        // Each failure keeps its own sentence — an uncertain outcome stays "may have applied",
+        // a refusal stays "not saved" — and none of them becomes "waiting" or "saved".
+        Harness.Check(!workspace.SaveSummary.Contains("全局配置：已保存", StringComparison.Ordinal),
+            "the page that failed is never reported as saved");
+        Harness.Check(workspace.SaveSummary.Contains(
+                failure == SettingsStatus.Indeterminate ? "全局配置：写入结果不确定"
+                                                       : "全局配置：未保存",
+                StringComparison.Ordinal),
+            "and it keeps its own words rather than the waiting page's");
+    }
+
+    /// <summary>
+    /// The one shared Pinyin/Shuangpin draft is submitted as two requests, so it is retried as
+    /// two: the group that is waiting is resubmitted, and the group that failed is not — even
+    /// though both live in one draft and both are still unsaved.
+    /// </summary>
+    private static async Task DoesNotResubmitTheFailedGroupOfTheSharedDraftAsync()
+    {
+        Harness.Section("busy: the failed half of the shared draft is not resubmitted");
+
+        const string pinyinUri = SettingsWorkspace.PinyinUri;
+        const string shuangpinUri = SettingsWorkspace.ShuangpinUri;
+        var name = FakeHost.UniqueName();
+        var pinyinWrites = 0;
+        var shuangpinWrites = 0;
+        var storedPageSize = "5";
+
+        await using var peer = FakeHost.StartScripted(name, (type, payload) =>
+        {
+            var uri = UriOf(payload);
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return FamilyBody(storedPageSize, uri == shuangpinUri);
+                case MessageType.SettingsSetConfigRequest when uri == shuangpinUri:
+                    ++shuangpinWrites;
+                    return StatusBody(SettingsStatus.Error, "the Shuangpin page could not be written");
+                case MessageType.SettingsSetConfigRequest when uri == pinyinUri:
+                    ++pinyinWrites;
+                    if (pinyinWrites == 1)
+                    {
+                        return BusyBody();
+                    }
+
+                    storedPageSize = "6";
+                    return FamilyBody(storedPageSize, shuangpin: false);
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(OldOrder, OldOrder);
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.Check(workspace.TrySet(SettingsTarget.Pinyin, "PageSize", SettingsValue.Text("6")),
+            "a field the Pinyin schema describes is changed");
+        Harness.Check(workspace.TrySet(SettingsTarget.Shuangpin, "FuzzyOne", SettingsValue.Text("2")),
+            "and a field only the Shuangpin schema describes is changed in the same draft");
+
+        await workspace.SaveAsync(cancellation.Token).ConfigureAwait(false);
+        Console.WriteLine($"   the save said: {workspace.SaveSummary.Replace("\n", " / ")}");
+
+        Harness.CheckEqual(2, pinyinWrites, "the group that was waiting is retried");
+        Harness.CheckEqual(1, shuangpinWrites,
+            "the group that failed is submitted once, although it shares the draft");
+        Harness.CheckEqual("2", workspace.PinyinDraft!.Effective("FuzzyOne").Scalar,
+            "and its edit is still there, unsaved");
+        Harness.Check(workspace.PinyinDraft.HasChanges,
+            "so the draft still reports something to save");
+        Harness.CheckEqual("6", workspace.PinyinDraft.Effective("PageSize").Scalar,
+            "while the group that landed keeps the value the user asked for");
+        Harness.Check(workspace.SaveSummary.Contains("双拼：未保存", StringComparison.Ordinal),
+            "the bar reports the failed group as unsaved");
+        Harness.Check(workspace.SaveSummary.Contains("拼音/双拼：已保存", StringComparison.Ordinal),
+            "and the retried group as saved");
+    }
+
+    private static string UriOf(byte[] payload)
+    {
+        var reader = new ProtoReader(payload);
+        return reader.TryString(out var uri) ? uri : string.Empty;
+    }
+
+    /// <summary>
+    /// One configuration's values and schema, disjoint between the two Pinyin URIs so the shared
+    /// draft really has to split: the Pinyin schema describes <c>PageSize</c> and the Shuangpin
+    /// schema describes <c>FuzzyOne</c>, and neither describes the other's field.
+    /// </summary>
+    private static byte[] FamilyBody(string pageSize, bool shuangpin)
+    {
+        var values = Bytes.Map(("PageSize", Bytes.Scalar(pageSize)),
+                               ("FuzzyOne", Bytes.Scalar("1")));
+        return shuangpin
+            ? Bytes.SnapshotPayload(values, ("ShuangpinConfig", new[]
+            {
+                Bytes.Option("FuzzyOne", "Integer", Bytes.Scalar("1"), Bytes.EmptyProperties()),
+            }))
+            : Bytes.SnapshotPayload(values, ("PinyinConfig", new[]
+            {
+                Bytes.Option("PageSize", "Integer", Bytes.Scalar("5"), Bytes.EmptyProperties()),
+            }));
     }
 
     private static byte[] SnapshotBody() =>

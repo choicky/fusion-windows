@@ -603,7 +603,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         var stopped = string.Empty;
         try
         {
-            await SavePassAsync(reports, busy, cancellationToken).ConfigureAwait(true);
+            // The first pass is the user's save: every changed page is submitted once. Later
+            // passes exist for one reason only — a page that answered `Busy` — so they are
+            // given that set and touch nothing else.
+            await SavePassAsync(reports, busy, only: null, cancellationToken).ConfigureAwait(true);
             var attempts = 0;
             while (busy.Count > 0)
             {
@@ -643,7 +646,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 }
 
                 ++attempts;
-                await SavePassAsync(reports, busy, cancellationToken).ConfigureAwait(true);
+                // A snapshot, because this pass rewrites `busy` as it goes: a page that answers
+                // something other than Busy leaves the set, and one that is still busy stays.
+                var retry = new HashSet<string>(busy, StringComparer.Ordinal);
+                await SavePassAsync(reports, busy, retry, cancellationToken).ConfigureAwait(true);
                 if (_hostChangedDuringSave)
                 {
                     // A different Host answered. Writing to it would apply an intent formed
@@ -667,37 +673,45 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// One pass over every target, submitting only the drafts that are still dirty.
+    /// One pass over the targets, submitting only the drafts that are still dirty.
     /// </summary>
     /// <remarks>
-    /// A target is retried only because it answered <c>Busy</c>; its draft was not adopted, so
-    /// it is still dirty here and its change set is rebuilt from the current values rather than
-    /// replayed from the first attempt.
+    /// <paramref name="only"/> is null on the first pass — the user's save submits every changed
+    /// page — and on a retry it is exactly the pages that answered <c>Busy</c> in the previous
+    /// pass. Nothing else is submitted again: a page that failed with <c>Error</c>, was rejected
+    /// as <c>Invalid</c>, came back <c>Indeterminate</c> or was cancelled keeps its draft, and it
+    /// is not re-sent merely because some other page is still waiting for the Host. A retried
+    /// page's draft was never adopted, so it is still dirty here and its change set is rebuilt
+    /// from the current values rather than replayed from the first attempt. The two Pinyin views
+    /// are one draft submitted as two requests, so they are two pages here: one group answering
+    /// <c>Busy</c> may not drag the other group's failed fields back to the Host.
     /// </remarks>
     private async Task SavePassAsync(List<SaveReport> reports, HashSet<string> busy,
+                                     IReadOnlySet<string>? only,
                                      CancellationToken cancellationToken)
     {
-        await SavePinyinFamilyAsync(reports, busy, cancellationToken).ConfigureAwait(true);
+        await SavePinyinFamilyAsync(reports, busy, only, cancellationToken).ConfigureAwait(true);
 
-        if (GlobalDraft is { HasChanges: true } globalDraft)
+        if (Wants(only, SavePage.Global) && GlobalDraft is { HasChanges: true } globalDraft)
         {
-            Record(reports, busy, "全局配置", await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Global, await SaveConfigurationAsync(
                 GlobalUri, SettingsTarget.Global, globalDraft.BuildChangeSet(),
                 globalDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "全局配置",
                 cancellationToken).ConfigureAwait(true));
         }
 
-        if (PresentationDraft is { HasChanges: true } presentationDraft)
+        if (Wants(only, SavePage.Presentation) &&
+            PresentationDraft is { HasChanges: true } presentationDraft)
         {
-            Record(reports, busy, "候选窗口", await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Presentation, await SaveConfigurationAsync(
                 PresentationUri, SettingsTarget.Presentation, presentationDraft.BuildChangeSet(),
                 presentationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "候选窗口",
                 cancellationToken).ConfigureAwait(true));
         }
 
-        if (Methods is { HasChanges: true } methods)
+        if (Wants(only, SavePage.Methods) && Methods is { HasChanges: true } methods)
         {
-            Record(reports, busy, "输入方式列表",
+            Record(reports, busy, SavePage.Methods,
                 await SaveMethodsAsync(methods, cancellationToken).ConfigureAwait(true));
         }
     }
@@ -776,6 +790,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// the draft refuses it; if one appears anyway it is reported rather than sent.
     /// </summary>
     private async Task SavePinyinFamilyAsync(List<SaveReport> reports, HashSet<string> busy,
+                                             IReadOnlySet<string>? only,
                                              CancellationToken cancellationToken)
     {
         if (PinyinDraft is not { HasChanges: true } draft)
@@ -794,26 +809,27 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             .Where(path => !viaPinyin.Contains(path) && !viaShuangpin.Contains(path))
             .ToList();
 
-        if (orphaned.Count > 0)
+        // Only the first pass reports a routing problem: it is not something a retry can fix.
+        if (orphaned.Count > 0 && only is null)
         {
             // Should not happen: the draft refuses an option the asking view does not
             // describe. Report it instead of guessing a URI.
             Log("save: refused to send fields no view describes: " + string.Join(",", orphaned));
             // Not a refusal to retry: nothing can ever route these.
-            Record(reports, busy, "拼音/双拼，一部分字段",
+            Record(reports, busy, SavePage.PinyinOrphan,
                 new SaveOutcome($"拼音/双拼：有 {orphaned.Count} 项无法确定归属，未提交。", false));
         }
 
-        if (viaPinyin.Count > 0)
+        if (viaPinyin.Count > 0 && Wants(only, SavePage.Pinyin))
         {
-            Record(reports, busy, "拼音/双拼", await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Pinyin, await SaveConfigurationAsync(
                 PinyinUri, SettingsTarget.Pinyin, draft.BuildChangeSet(viaPinyin), viaPinyin,
                 "拼音/双拼", cancellationToken).ConfigureAwait(true));
         }
 
-        if (viaShuangpin.Count > 0)
+        if (viaShuangpin.Count > 0 && Wants(only, SavePage.Shuangpin))
         {
-            Record(reports, busy, "双拼", await SaveConfigurationAsync(
+            Record(reports, busy, SavePage.Shuangpin, await SaveConfigurationAsync(
                 ShuangpinUri, SettingsTarget.Shuangpin, draft.BuildChangeSet(viaShuangpin),
                 viaShuangpin, "双拼", cancellationToken).ConfigureAwait(true));
         }
@@ -1053,6 +1069,29 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             _log.RemoveAt(0);
         }
     }
+
+    /// <summary>
+    /// The pages a save can submit. They are also the keys of the retry set, so a page is
+    /// retried only when the key it records its outcome under is the key that was refused.
+    /// </summary>
+    private static class SavePage
+    {
+        public const string Pinyin = "拼音/双拼";
+        public const string Shuangpin = "双拼";
+        public const string Global = "全局配置";
+        public const string Presentation = "候选窗口";
+        public const string Methods = "输入方式列表";
+
+        /// <summary>Fields no view's schema describes. Reported once, never submitted.</summary>
+        public const string PinyinOrphan = "拼音/双拼，一部分字段";
+    }
+
+    /// <summary>
+    /// Whether this pass may submit <paramref name="page"/>. The first pass may submit
+    /// everything; a retry may submit only what the previous pass reported as <c>Busy</c>.
+    /// </summary>
+    private static bool Wants(IReadOnlySet<string>? only, string page) =>
+        only is null || only.Contains(page);
 
     /// <summary>One page's sentence in the save bar; one per page, replaced on a retry.</summary>
     private sealed record SaveReport(string Page, string Text);
