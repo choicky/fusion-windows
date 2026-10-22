@@ -1197,14 +1197,22 @@ private:
     // The first enabled method is the one in use, so it is also Items/0's content and
     // DefaultIM; the rest follow in the user's order (see group_items_with_off_slot).
     auto group = current_group;
-    auto items = selection::group_items_with_off_slot(plan->methods, plan->methods.front(),
-                                                      available);
-    // A retained entry keeps the keyboard layout it had; the marked slot keeps its marker.
-    for (std::size_t i = 1; i < items.size(); ++i) {
-      const auto &layout = current_group.layoutFor(items[i].name);
-      if (!layout.empty())
-        items[i].layout = layout;
+    // A retained entry keeps the fields it had, taken from the user's own entries. The
+    // official `layoutFor(name)` cannot be used here: it returns the *first* item with that
+    // name, which is the slot when a user method and the slot share one, and the marker
+    // would be written onto a real entry.
+    const auto current_items = selection::group_enabled_items(group_items(current_group));
+    std::vector<selection::GroupItem> methods;
+    methods.reserve(plan->methods.size());
+    for (const auto &name : plan->methods) {
+      const auto kept = std::find_if(current_items.begin(), current_items.end(),
+                                     [&](const selection::GroupItem &item) {
+                                       return item.name == name;
+                                     });
+      methods.push_back(kept == current_items.end() ? selection::GroupItem{name, {}}
+                                                    : *kept);
     }
+    auto items = selection::group_items_with_off_slot(methods, plan->methods.front(), available);
     write_group(group, items, plan->methods.front());
     manager.setGroup(std::move(group));
     manager.save();
@@ -1263,34 +1271,19 @@ private:
                                       .locate(fcitx::StandardPathsType::PkgConfig, "profile")
                                       .empty();
     auto group = manager.currentGroup();
-    const auto stored = group_items(group);
     const auto plan = selection::plan_startup_group(
         profile_present, group.defaultInputMethod(), method_names(group), available);
-    if (!plan.replace && selection::group_has_off_slot(stored)) {
-      // Already this feature's shape: the user's methods and the method in use are what
-      // was written last time. Rewriting would churn the profile for nothing.
+    const auto normalization =
+        selection::normalize_group(group_items(group), group.defaultInputMethod(), plan.replace,
+                                   plan.methods, plan.default_method, available);
+    if (!normalization.rewrite) {
+      // Already this feature's shape (or nothing to normalize): the user's methods and the
+      // method in use are what was written last time, so nothing is touched and the profile
+      // is not rewritten on every start.
       log_group(instance, profile_present, false);
       return;
     }
-    // A group that predates the marker is migrated without reinterpreting it: its Items are
-    // the user's methods in their order, and its first item is the method those builds were
-    // typing with (`Instance::inputMethod` while inactive). A first-run plan names the
-    // method to use explicitly.
-    std::vector<std::string> methods;
-    std::string active;
-    if (plan.replace) {
-      methods = plan.methods;
-      active = methods.empty() ? plan.default_method : methods.front();
-    } else {
-      for (const auto &item : stored)
-        methods.push_back(item.name);
-      active = selection::legacy_in_use_method(stored, plan.default_method);
-    }
-    if (active.empty()) {
-      log_group(instance, profile_present, plan.replace);
-      return;
-    }
-    write_group(group, selection::group_items_with_off_slot(methods, active, available), active);
+    write_group(group, normalization.items, normalization.default_method);
     manager.setGroup(std::move(group));
     log_group(instance, profile_present, plan.replace);
   }
@@ -1437,7 +1430,8 @@ private:
                                     ? (names.empty() ? std::string() : names.front())
                                     : options_.fixture_default_method;
             write_group(group,
-                        selection::group_items_with_off_slot(names, active, fixture_available),
+                        selection::group_items_with_off_slot(
+                            selection::items_from_names(names), active, fixture_available),
                         active);
             instance.inputMethodManager().setGroup(std::move(group));
             log_group(instance, true, false);

@@ -50,18 +50,21 @@ void test_selection() {
   require(binding_input_method("", "").empty(), "no group means no input method to select");
 
   // The marked slot: Items/0 is an entry this product owns, marked in its layout field so
-  // that a pre-feature profile — which can look identical in names and DefaultIM — is
-  // never mistaken for one. `group_items_with_off_slot` writes it, `group_enabled_items`
-  // reads the user's list back out, and the marker alone decides which is which.
+  // that a pre-feature profile — which can look identical in names and DefaultIM — is never
+  // mistaken for one. Everything below runs the product's own decision (`normalize_group`)
+  // twice, so "idempotent" is measured, not asserted by comparing an expression to itself.
   using fusion::selection::GroupItem;
   using fusion::selection::group_enabled_items;
   using fusion::selection::group_has_off_slot;
   using fusion::selection::group_items_with_off_slot;
+  using fusion::selection::items_from_names;
   using fusion::selection::kOffSlotLayout;
   using fusion::selection::legacy_in_use_method;
+  using fusion::selection::normalize_group;
 
-  const auto marked = group_items_with_off_slot({"shuangpin"}, "shuangpin",
-                                                {"pinyin", "shuangpin"});
+  const std::vector<std::string> both{"pinyin", "shuangpin"};
+  const auto marked =
+      group_items_with_off_slot(items_from_names({"shuangpin"}), "shuangpin", both);
   require(same(names(marked), {"pinyin", "shuangpin"}), "a single method gains the other slot");
   require(marked.front().layout == kOffSlotLayout, "the slot carries the format marker");
   require(marked.back().layout.empty(), "the user's entry carries no marker");
@@ -69,58 +72,81 @@ void test_selection() {
   require(same(names(group_enabled_items(marked)), {"shuangpin"}),
           "the enabled list is what follows the slot");
 
-  // Both orders, both methods in use: the slot is never the method in use, so Fcitx sees
-  // an input-method change when the state flips.
-  const auto pair_pinyin = group_items_with_off_slot({"pinyin", "shuangpin"}, "pinyin",
-                                                     {"pinyin", "shuangpin"});
-  require(same(names(pair_pinyin), {"shuangpin", "pinyin", "shuangpin"}),
-          "a two-method list keeps its order after the slot");
-  require(names(group_enabled_items(pair_pinyin)) == std::vector<std::string>({"pinyin", "shuangpin"}),
-          "a two-method list reads back unchanged");
-  const auto pair_shuangpin = group_items_with_off_slot({"shuangpin", "pinyin"}, "shuangpin",
-                                                        {"pinyin", "shuangpin"});
-  require(same(names(pair_shuangpin), {"pinyin", "shuangpin", "pinyin"}),
-          "the other order gets the other slot");
-  require(names(group_enabled_items(pair_shuangpin)) ==
-              std::vector<std::string>({"shuangpin", "pinyin"}),
-          "the other order reads back unchanged");
+  // A user entry keeps the fields it had — the layout is theirs, and the previous rebuild
+  // from names dropped it. `[shuangpin, pinyin]` with a layout on the second entry is the
+  // shape a real profile can have.
+  const std::vector<GroupItem> legacy_pair{{"shuangpin", ""}, {"pinyin", "us"}};
+  const auto first = normalize_group(legacy_pair, "pinyin", false, {}, {}, both);
+  require(first.rewrite, "a pre-feature group is normalized");
+  require(first.default_method == "shuangpin", "the migration keeps the method in use");
+  require(same(names(first.items), {"pinyin", "shuangpin", "pinyin"}),
+          "the migration keeps the user's members and their order");
+  require(first.items.front().layout == kOffSlotLayout, "the migration writes one marked slot");
+  require(first.items[2].layout == "us", "the user's own layout survives the migration");
 
-  // A pre-feature group has no marker, whatever its shape. Reading it by shape would take
-  // `[shuangpin, pinyin]` with DefaultIM=pinyin — a user typing Shuangpin — for a marked
-  // group and move them to Pinyin while hiding Shuangpin.
-  const std::vector<GroupItem> legacy_single{{"shuangpin", ""}};
-  const std::vector<GroupItem> legacy_pair{{"shuangpin", ""}, {"pinyin", ""}};
-  require(!group_has_off_slot(legacy_single), "a single-entry legacy group is unmarked");
-  require(!group_has_off_slot(legacy_pair), "a two-entry legacy group is unmarked");
-  require(legacy_in_use_method(legacy_pair, "pinyin") == "shuangpin",
-          "a legacy group's method in use is its first item, not DefaultIM");
-  require(legacy_in_use_method(legacy_single, "shuangpin") == "shuangpin",
-          "a single-entry legacy group keeps its method");
-  require(same(names(group_enabled_items(legacy_pair)), {"shuangpin", "pinyin"}),
-          "a legacy group's members are all of its items");
+  // Running the same decision on its own result changes nothing: the marker is the whole
+  // test, so a second start cannot add a slot, drop a method or move the method in use.
+  const auto second =
+      normalize_group(first.items, first.default_method, false, {}, {}, both);
+  require(!second.rewrite, "a normalized group is not rewritten again");
+  require(same(names(group_enabled_items(first.items)), {"shuangpin", "pinyin"}),
+          "the user's list reads back in its order");
 
-  // Migrating either shape preserves the method in use and the members in order.
-  const auto migrated_pair = group_items_with_off_slot(
-      names(legacy_pair), legacy_in_use_method(legacy_pair, "pinyin"), {"pinyin", "shuangpin"});
-  require(same(names(migrated_pair), {"pinyin", "shuangpin", "pinyin"}),
-          "the migrated pair keeps its order and its scheme");
-  require(same(names(group_enabled_items(migrated_pair)), {"shuangpin", "pinyin"}),
-          "the migrated pair reads back as the user's list");
-  const auto migrated_single = group_items_with_off_slot(
-      names(legacy_single), legacy_in_use_method(legacy_single, "shuangpin"),
-      {"pinyin", "shuangpin"});
-  require(same(names(migrated_single), {"pinyin", "shuangpin"}),
-          "the migrated single keeps its scheme");
+  // The same, with the other order and the other method in use.
+  const std::vector<GroupItem> legacy_reversed{{"pinyin", ""}, {"shuangpin", ""}};
+  const auto reversed = normalize_group(legacy_reversed, "shuangpin", false, {}, {}, both);
+  require(reversed.default_method == "pinyin", "the other order keeps its own method");
+  require(same(names(reversed.items), {"shuangpin", "pinyin", "shuangpin"}),
+          "the other order keeps its members");
+  require(!normalize_group(reversed.items, reversed.default_method, false, {}, {}, both).rewrite,
+          "the other order is idempotent too");
 
-  // Idempotence: migrating a marked group changes nothing, so a restart or a save cannot
-  // grow the slot or drop a method.
-  require(group_has_off_slot(migrated_pair), "the migrated group is marked");
-  require(same(names(group_enabled_items(migrated_pair)),
-               names(group_enabled_items(migrated_pair))),
-          "reading the migrated group twice yields the same list");
+  // A single pre-feature method: the slot is added, the method and its layout are not lost.
+  const std::vector<GroupItem> legacy_single{{"shuangpin", "us"}};
+  const auto single = normalize_group(legacy_single, "shuangpin", false, {}, {}, both);
+  require(same(names(single.items), {"pinyin", "shuangpin"}), "a single method gains one slot");
+  require(single.items.back().layout == "us", "the single method keeps its layout");
+  require(!normalize_group(single.items, single.default_method, false, {}, {}, both).rewrite,
+          "the single method is idempotent");
 
-  // A marked group with one user method still has the second entry Fcitx's switch needs.
-  require(names(marked).size() > 1, "a single-method user still gets two group entries");
+  // The collision the shape-based recovery could not survive: the slot and a user method
+  // share a name, so `layoutFor("shuangpin")` returns the slot's marker. Reading the user's
+  // entries directly — and stripping the marker — keeps it off their entry.
+  const auto collision = normalize_group({{"pinyin", ""}, {"shuangpin", ""}}, "pinyin", false,
+                                         {}, {}, both);
+  require(same(names(collision.items), {"shuangpin", "pinyin", "shuangpin"}),
+          "the slot may share a name with a user method");
+  const auto enabled = group_enabled_items(collision.items);
+  require(same(names(enabled), {"pinyin", "shuangpin"}), "the collision keeps both methods");
+  require(enabled[0].layout.empty() && enabled[1].layout.empty(),
+          "the marker never reaches a user entry");
+
+  // A profile written by the leaking build: the marker sits on a user entry as well. The
+  // normalization clears it, so the slot stays the only one.
+  const std::vector<GroupItem> leaked{{"shuangpin", kOffSlotLayout},
+                                      {"pinyin", ""},
+                                      {"shuangpin", kOffSlotLayout}};
+  require(group_has_off_slot(leaked), "the leaked group is still recognized by its slot");
+  const auto cleaned = group_enabled_items(leaked);
+  require(cleaned[0].layout.empty() && cleaned[1].layout.empty(),
+          "a leaked marker is cleared from the user's entries");
+  require(names(cleaned) == std::vector<std::string>({"pinyin", "shuangpin"}),
+          "clearing the marker does not drop a method");
+
+  // Editing the enabled list keeps the retained entries' fields: the new list is built from
+  // the user's entries, never from a name lookup that could hit the slot.
+  const auto edited = group_items_with_off_slot(enabled, "shuangpin", both);
+  require(same(names(edited), {"pinyin", "pinyin", "shuangpin"}),
+          "the edited list keeps its order");
+  require(edited.front().layout == kOffSlotLayout, "the edited list writes one slot");
+  require(edited[1].layout.empty() && edited[2].layout.empty(),
+          "editing does not copy the marker onto a retained entry");
+  require(!normalize_group(edited, "shuangpin", false, {}, {}, both).rewrite,
+          "the edited list is already normalized");
+
+  // Reading, not just writing: a marked group's enabled list never includes the slot.
+  require(names(group_enabled_items(marked)) == std::vector<std::string>({"shuangpin"}),
+          "the slot is not reported as one of the user's methods");
 
   const auto kept =
       plan_startup_group(true, "shuangpin", {"pinyin", "shuangpin"}, {"pinyin", "shuangpin"});
