@@ -649,6 +649,98 @@ int main() {
     }
   }
 
+  // 21. place_fulltext_tip is a pure geometric decision: the box it returns is always on
+  //     screen and never on top of the panel, and when the text wanted more than any gap can
+  //     hold, the box shrinks to the largest non-overlapping band instead of spilling over
+  //     the candidates. A tall 400px popup beside a panel that already fills a short work
+  //     area is the exact case the old inline fallback (y = work.top) put on top of the list.
+  {
+    using fusion::tsf::LayoutRect;
+    const LayoutRect work{0, 0, 1200, 300};
+    const LayoutRect panel{300, 40, 900, 260}; // only ~40px of free vertical room at the top
+    const LayoutRect big = fusion::tsf::place_fulltext_tip(panel, work, 400, 400, 2);
+    CHECK(big.left >= work.left && big.right <= work.right);
+    CHECK(big.top >= work.top && big.bottom <= work.bottom);
+    // Disjoint from the panel on at least one axis.
+    CHECK(big.right <= panel.left || big.left >= panel.right || big.bottom <= panel.top ||
+          big.top >= panel.bottom);
+    CHECK(!big.empty());
+
+    // When a band fits the whole text, the requested size is kept and it opens below first.
+    const LayoutRect roomy{0, 0, 1000, 1000};
+    const LayoutRect small_panel{100, 100, 300, 200};
+    const LayoutRect below = fusion::tsf::place_fulltext_tip(small_panel, roomy, 150, 100, 4);
+    CHECK(below.right - below.left == 150 && below.bottom - below.top == 100);
+    CHECK(below.top == small_panel.bottom + 4);
+    CHECK(!(below.left < small_panel.right && below.right > small_panel.left &&
+            below.top < small_panel.bottom && below.bottom > small_panel.top));
+  }
+
+  // 21b. The same rule proven on real windows: a candidate so long its full text scrolls,
+  //      hovered over, must not leave the box covering the panel it describes. This is the
+  //      case that failed on the old placement — the fallback pinned the tall box at the top
+  //      of the work area, right across the candidate list.
+  {
+    auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
+    page.entries[3].text.clear();
+    for (int i = 0; i < 2400; ++i)
+      page.entries[3].text += "很长的候选内容";
+    show_and_measure(view, page);
+    const auto &slot = view.layout().slots[3];
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    CHECK(view.tip_scrollable());
+    if (view.tip_window() != nullptr) {
+      RECT panel_rect{};
+      RECT tip_rect{};
+      GetWindowRect(view.window(), &panel_rect);
+      GetWindowRect(view.tip_window(), &tip_rect);
+      const bool overlaps = tip_rect.left < panel_rect.right && tip_rect.right > panel_rect.left &&
+                            tip_rect.top < panel_rect.bottom && tip_rect.bottom > panel_rect.top;
+      CHECK(!overlaps);
+      // The scroll extent is measured against the box that was actually placed: the visible
+      // height is at most the window minus its padding, and the maximum scroll is exactly the
+      // text that does not fit in that visible height. A stale pre-placement extent would let
+      // the end fall past the real box.
+      CHECK(height_of(tip_rect) >= view.tip_view_height());
+      CHECK(view.tip_scroll_max() == view.tip_content_height() - view.tip_view_height());
+    }
+  }
+
+  // 22. The full-text box survives the pointer moving from the clipped slot *into* the box
+  //     so it can be wheeled, and hides only once the pointer has left the box too. The old
+  //     code tore the box down on the panel's leave, which made a long candidate impossible
+  //     to read.
+  {
+    auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
+    page.entries[3].text.clear();
+    for (int i = 0; i < 2400; ++i)
+      page.entries[3].text += "很长的候选内容";
+    show_and_measure(view, page);
+    const auto &slot = view.layout().slots[3];
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    CHECK(view.tip_scrollable());
+
+    if (view.tip_window() != nullptr) {
+      RECT tip{};
+      GetWindowRect(view.tip_window(), &tip);
+      const POINT inside{tip.left + (tip.right - tip.left) / 2, tip.top + (tip.bottom - tip.top) / 2};
+      SetCursorPos(inside.x, inside.y);
+      // The panel reports the pointer leaving it while the pointer is inside the box: keep it.
+      SendMessageW(view.window(), WM_MOUSELEAVE, 0, 0);
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+
+      // The pointer leaves the box itself: only now does the box go away.
+      SendMessageW(view.tip_window(), WM_MOUSEMOVE, 0, 0);
+      SetCursorPos(tip.left - scaled_for_test(400), tip.top);
+      SendMessageW(view.tip_window(), WM_MOUSELEAVE, 0, 0);
+      CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+    }
+  }
+
   view.destroy();
   CHECK(view.window() == nullptr);
 

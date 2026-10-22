@@ -146,6 +146,9 @@ private:
   int tip_padding_ = 0;
   int tip_line_height_ = 0;
   bool tracking_leave_ = false;
+  // The full-text box, once it takes the pointer (a scrollable text), tracks its own leave so
+  // it can hide when the pointer finally leaves it — not merely when it leaves the panel.
+  bool tip_tracking_leave_ = false;
   // WM_DPICHANGED runs a full re-measure that calls SetWindowPos, which can raise another
   // one; the guard keeps a single re-layout from recursing into itself.
   bool in_dpi_change_ = false;

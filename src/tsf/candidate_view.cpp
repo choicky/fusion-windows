@@ -376,6 +376,7 @@ void CandidateView::update_tip(std::int32_t index) {
     if (tip_hwnd_ != nullptr && IsWindowVisible(tip_hwnd_))
       ShowWindow(tip_hwnd_, SW_HIDE);
     tip_index_ = -1;
+    tip_tracking_leave_ = false;
     return;
   }
   if (tip_hwnd_ == nullptr) {
@@ -436,7 +437,27 @@ void CandidateView::update_tip(std::int32_t index) {
 
   tip_padding_ = padding;
   tip_content_height_ = content_height;
-  tip_view_height_ = height - 2 * padding;
+
+  // Place the popup first, against the panel's real rectangle: place_fulltext_tip keeps it
+  // inside the work area *and* off the candidate list. The measured `height` may be more
+  // than any non-overlapping band can hold, in which case the box is bound down to the
+  // largest such band — the same shrinking that used to be done against the whole work
+  // area, now done against the space that does not cover the candidates.
+  RECT panel_rect{};
+  GetWindowRect(hwnd_, &panel_rect);
+  const LayoutRect panel{static_cast<int>(panel_rect.left), static_cast<int>(panel_rect.top),
+                         static_cast<int>(panel_rect.right), static_cast<int>(panel_rect.bottom)};
+  const LayoutRect bounds =
+      place_fulltext_tip(panel, LayoutRect{static_cast<int>(work.left), static_cast<int>(work.top),
+                                           static_cast<int>(work.right),
+                                           static_cast<int>(work.bottom)},
+                         width, height, scaled(2, dpi_));
+  const int placed_width = bounds.right - bounds.left;
+  const int placed_height = bounds.bottom - bounds.top;
+
+  // The scroll extent is a property of the box the reader actually gets, so it is measured
+  // against the placed height, not the pre-placement one.
+  tip_view_height_ = (std::max)(0, placed_height - 2 * padding);
   tip_scroll_max_ = (std::max)(0, content_height - tip_view_height_);
   tip_scroll_ = (std::min)(tip_scroll_, tip_scroll_max_);
 
@@ -451,21 +472,8 @@ void CandidateView::update_tip(std::int32_t index) {
     style |= WS_EX_TRANSPARENT;
   SetWindowLongPtrW(tip_hwnd_, GWL_EXSTYLE, style);
 
-  // Beside the panel, never on top of it: a tooltip that covered the candidates would eat
-  // the click the user was aiming at.
-  RECT panel{};
-  GetWindowRect(hwnd_, &panel);
-  int x = panel.left;
-  int y = panel.bottom + scaled(2, dpi_);
-  if (y + height > work.bottom)
-    y = panel.top - height - scaled(2, dpi_);
-  if (y < work.top || y + height > work.bottom)
-    y = static_cast<int>(work.top);
-  if (x + width > work.right)
-    x = (std::max)(static_cast<int>(work.left), static_cast<int>(work.right) - width);
-  if (x < work.left)
-    x = work.left;
-  SetWindowPos(tip_hwnd_, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  SetWindowPos(tip_hwnd_, HWND_TOP, bounds.left, bounds.top, placed_width, placed_height,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
   InvalidateRect(tip_hwnd_, nullptr, TRUE);
 }
 
@@ -478,6 +486,7 @@ void CandidateView::destroy_tip() {
   }
   tip_index_ = -1;
   tip_text_.clear();
+  tip_tracking_leave_ = false;
 }
 
 LRESULT CALLBACK CandidateView::tip_window_proc(HWND hwnd, UINT message, WPARAM wparam,
@@ -528,6 +537,26 @@ LRESULT CandidateView::on_tip_message(HWND hwnd, UINT message, WPARAM wparam, LP
   }
   case WM_ERASEBKGND:
     return 1;
+  case WM_MOUSEMOVE: {
+    // The box took the pointer, so it is now responsible for noticing when the pointer
+    // leaves it. Arm a single leave notification; without this the box would linger after the
+    // pointer has gone somewhere else entirely.
+    if (!tip_tracking_leave_) {
+      TRACKMOUSEEVENT track{};
+      track.cbSize = sizeof(track);
+      track.dwFlags = TME_LEAVE;
+      track.hwndTrack = hwnd;
+      tip_tracking_leave_ = TrackMouseEvent(&track) != 0;
+    }
+    return 0;
+  }
+  case WM_MOUSELEAVE:
+    // The pointer has now left both the candidate panel and this box: hide it. Only a
+    // scrollable box receives its own leave, because a fitting one is click-through and the
+    // panel keeps handling the pointer over it.
+    tip_tracking_leave_ = false;
+    update_tip(-1);
+    return 0;
   case WM_MOUSEWHEEL: {
     if (tip_scroll_max_ > 0) {
       const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
@@ -608,6 +637,19 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
   }
   case WM_MOUSELEAVE:
     tracking_leave_ = false;
+    // Leaving the panel is not the same as leaving the reading surface. A scrollable
+    // full-text box is meant to be moved into and wheeled over; if the pointer crossed from
+    // the candidate slot into that box, the panel's own leave must not tear the box down.
+    // The box now tracks its own leave (see on_tip_message), and only a pointer that ends up
+    // in neither hides it.
+    if (tip_hwnd_ != nullptr && IsWindowVisible(tip_hwnd_)) {
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      RECT tip_rect{};
+      GetWindowRect(tip_hwnd_, &tip_rect);
+      if (PtInRect(&tip_rect, cursor))
+        return 0;
+    }
     update_tip(page_.cursor_index);
     return 0;
   case WM_LBUTTONUP: {

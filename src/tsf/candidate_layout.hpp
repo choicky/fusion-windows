@@ -302,4 +302,77 @@ inline std::optional<PanelHit> hit_test_candidate_panel(const CandidatePanelLayo
   return std::nullopt;
 }
 
+// Where the full-text popup goes, in screen coordinates. Two invariants, both absolute:
+// the returned rect stays inside `work`, and it never overlaps `panel`. A popup that sat on
+// the candidate list would eat the click the user aimed at a candidate, and once the text
+// is long enough to scroll the popup also takes the pointer (it can no longer be
+// click-through), so an overlap would trap it over the very list it is describing.
+//
+// `width`/`height` are the size the text wanted; `gap` separates the popup from the panel.
+// Preference order is the reader's: directly below, then directly above, then beside on the
+// side that has room. When none of those bands can hold the *full* height, the popup is
+// bound to the largest non-overlapping band — the leftover text scrolls, exactly as when it
+// was bounded by the whole work area, rather than spilling over the panel or off the screen.
+// The returned rect is empty only when the work area itself is degenerate.
+inline LayoutRect place_fulltext_tip(const LayoutRect &panel, const LayoutRect &work, int width,
+                                     int height, int gap) {
+  const int l = (std::max)(0, width);
+  const int h = (std::max)(0, height);
+  const int g = (std::max)(0, gap);
+  if (work.right <= work.left || work.bottom <= work.top)
+    return LayoutRect{};
+
+  // The four regions the panel leaves free, already clipped to the work area. Each is by
+  // construction disjoint from the panel (they start or end a `gap` clear of it).
+  const LayoutRect below{work.left, (std::min)(work.bottom, panel.bottom + g), work.right, work.bottom};
+  const LayoutRect above{work.left, work.top, work.right, (std::max)(work.top, panel.top - g)};
+  const LayoutRect right{
+      (std::min)(work.right, panel.right + g), work.top, work.right, work.bottom};
+  const LayoutRect left_band{work.left, work.top, (std::max)(work.left, panel.left - g), work.bottom};
+
+  // A band holds the popup whole only if it is at least as large in both dimensions.
+  const auto holds = [&](const LayoutRect &band) {
+    return !band.empty() && band.right - band.left >= l && band.bottom - band.top >= h;
+  };
+  // x chosen so [x, x+l] stays inside work, preferring to start under the panel's left edge.
+  const auto clamp_x = [&](int preferred) {
+    return (std::clamp)(preferred, work.left, (std::max)(work.left, work.right - l));
+  };
+  // y chosen so [y, y+h] stays inside work, preferring to hug the panel.
+  const auto clamp_y = [&](int preferred) {
+    return (std::clamp)(preferred, work.top, (std::max)(work.top, work.bottom - h));
+  };
+  const auto rect = [&](int x, int y) { return LayoutRect{x, y, x + l, y + h}; };
+
+  if (holds(below))
+    return rect(clamp_x(panel.left), below.top);
+  if (holds(above))
+    return rect(clamp_x(panel.left), above.bottom - h);
+  if (holds(right))
+    return rect(right.left, clamp_y(panel.top));
+  if (holds(left_band))
+    return rect(left_band.right - l, clamp_y(panel.top));
+
+  // Nothing fits the full text: bind the popup to the largest non-overlapping band and let
+  // the rest scroll. Its size is capped to the band, so it cannot reach past the work area
+  // or back over the panel.
+  auto widest = [](const LayoutRect &b) { return (b.right - b.left) * (b.bottom - b.top); };
+  const LayoutRect *best = &below;
+  for (const LayoutRect *band : {&below, &above, &right, &left_band})
+    if (!band->empty() && widest(*band) > widest(*best))
+      best = band;
+  if (best->empty()) {
+    // Even the bands are zero (the panel fills the work area): clamp the popup to the work
+    // area so at least its top-left corner is reachable.
+    const int ew = (std::min)(l, work.right - work.left);
+    const int eh = (std::min)(h, work.bottom - work.top);
+    return LayoutRect{work.left, work.top, work.left + ew, work.top + eh};
+  }
+  const int ew = (std::min)(l, best->right - best->left);
+  const int eh = (std::min)(h, best->bottom - best->top);
+  const int x = (std::clamp)(panel.left, best->left, (std::max)(best->left, best->right - ew));
+  const int y = (std::clamp)(panel.top, best->top, (std::max)(best->top, best->bottom - eh));
+  return LayoutRect{x, y, x + ew, y + eh};
+}
+
 } // namespace fusion::tsf
