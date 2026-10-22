@@ -1208,6 +1208,52 @@ int main() {
     CHECK(layout.visible_rows < 5);
   }
 
+  // 28b. The capacity the popup reports is the number of rows it can really draw: the host
+  //      groups scroll pages by it, so a disagreement here is the "sliding window" defect —
+  //      a page of five rows drawn as three, whose last visible row is not the page's last.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 12;
+    };
+    for (const int budget : {152, 190, 266, 342, 1000}) {
+      fusion::tsf::LayoutLimits limits;
+      limits.max_width = 900;
+      limits.max_height = budget;
+      const auto page = make_scroll_page(5, 5, 0);
+      const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+      CHECK(layout.row_capacity >= 1 && layout.row_capacity <= 5);
+      // What it says it can hold is what it did hold: with a five-row page and a capacity of
+      // n, exactly n rows are on screen and no row is silently dropped.
+      CHECK(layout.visible_rows == layout.row_capacity);
+      CHECK(layout.height <= budget);
+      // The capacity is a ceiling on rows, not a squeeze on their size: every visible row is
+      // still a whole row of the metrics above.
+      std::vector<int> row_tops;
+      for (const auto &slot : layout.slots) {
+        if (slot.empty())
+          continue;
+        if (std::find(row_tops.begin(), row_tops.end(), slot.top) == row_tops.end())
+          row_tops.push_back(slot.top);
+        CHECK(slot.bottom - slot.top >= metrics.line_height);
+      }
+      CHECK(static_cast<int>(row_tops.size()) == layout.row_capacity);
+    }
+    // A bigger font buys fewer rows, never smaller text.
+    const auto large = fusion::tsf::layout_metrics_for(60, 96);
+    fusion::tsf::LayoutLimits short_area;
+    short_area.max_width = 900;
+    short_area.max_height = 260;
+    const auto big = fusion::tsf::layout_candidate_panel(make_scroll_page(5, 5, 0), measure,
+                                                         large, short_area);
+    CHECK(big.row_capacity < 5);
+    CHECK(big.visible_rows == big.row_capacity);
+    for (const auto &slot : big.slots) {
+      if (!slot.empty())
+        CHECK(slot.bottom - slot.top >= large.line_height);
+    }
+  }
+
   // 29. A long candidate in a scroll cell is ellipsized like any other, and its full text is
   //     still reachable from the same detail popup — one mechanism, not a second one.
   {

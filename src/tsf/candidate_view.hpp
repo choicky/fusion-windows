@@ -88,6 +88,9 @@ public:
   bool tip_scrollable() const { return tip_scroll_max_ > 0; }
   // The full text's wrapped height and the visible height, so a check can state "the end is
   // inside the box at maximum scroll" instead of asserting that a window merely exists.
+  // How many complete candidate rows the panel can currently draw: what the Host needs to
+  // group scroll pages the way this window draws them. 0 before the first layout.
+  int row_capacity() const { return layout_.row_capacity; }
   int tip_content_height() const { return tip_content_height_; }
   int tip_view_height() const { return tip_view_height_; }
 

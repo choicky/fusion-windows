@@ -84,6 +84,11 @@ struct CandidatePanelLayout {
   int first_row = 0;
   int visible_rows = 0;
   int total_rows = 0;
+  // How many complete rows of this arrangement the work area can hold at the font and DPI the
+  // panel was laid out with (at most five). The host groups scroll pages by this number, so
+  // what the paging keys call a page and what the popup shows are the same thing; 0 means the
+  // layout had no ceiling to apply (an unbounded test layout).
+  int row_capacity = 0;
   bool rows_hidden_above() const { return first_row > 0; }
   bool rows_hidden_below() const { return first_row + visible_rows < total_rows; }
 };
@@ -229,13 +234,17 @@ layout_candidate_panel(const CandidatePage &page,
     // Five rows is the window's own size; a work area that cannot hold them shows fewer,
     // anchored so the row the paging keys are on stays visible. The font is never shrunk to
     // make more fit, and a row outside the window keeps its index with an empty rect.
-    int visible = rows;
-    if (bounded_height && rows > 1) {
+    // The capacity is what the panel can hold, measured with the same numbers it places rows
+    // with — the text rows above it and the pager band included, so a host that groups by
+    // this number never asks for a row that would not fit.
+    constexpr int max_scroll_rows = 5;
+    int capacity = max_scroll_rows;
+    if (bounded_height) {
       const int available = limits.max_height - top - band - side_margin;
-      const int fits = available / row_height;
-      if (fits < rows)
-        visible = (std::max)(1, fits);
+      capacity = (std::clamp)(available / (std::max)(1, row_height), 1, max_scroll_rows);
     }
+    out.row_capacity = capacity;
+    int visible = (std::min)(rows, capacity);
     int first = 0;
     if (visible < rows) {
       const int anchor = (std::min)(page.current_row(), rows - 1);

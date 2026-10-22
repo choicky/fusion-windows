@@ -74,6 +74,17 @@ struct BackendStimulus {
   std::uint32_t modifiers = 0;
   // Page-local candidate index for SelectCandidate; -1 for every other type.
   std::int32_t candidate_index = -1;
+  // How many complete candidate rows the presentation can show right now, sent with every
+  // key because the answer changes with the work area, the display's DPI and the user's font
+  // size — none of which the Host can measure. 0 means "no opinion": the Host then uses the
+  // maximum (five). Only the automatic scrolling arrangement reads it; every other
+  // arrangement ignores it, and the engine never sees it.
+  //
+  // It is a *capacity*, not a request: the Host groups rows into scroll pages of this size,
+  // so the row the paging keys are on and the rows on screen stay the same thing. A short
+  // screen that shows three rows therefore turns pages of three, instead of turning pages of
+  // five and hiding two of them.
+  std::int32_t window_rows = 0;
 };
 
 // Mirror of the Fcitx page contract (fcitx::CandidateLayoutHint, candidatelist.h)

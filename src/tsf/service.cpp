@@ -1916,6 +1916,9 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     diagf("CANDIDATE_VIEW", "hidden reason=no-anchor cid=%" PRIu64, entry.semantic.context_id());
     entry.candidates->hide(); // never show a page we cannot place near its text
   }
+  // The window has just measured itself, so it now knows how many rows fit. The next key
+  // carries that number to the Host, which groups scroll pages by it.
+  entry.semantic.set_window_rows(entry.candidates->row_capacity());
 }
 
 void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,

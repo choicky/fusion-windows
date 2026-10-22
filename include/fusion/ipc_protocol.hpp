@@ -48,6 +48,12 @@
 // engine's own global index instead of by a page-local one that does not exist. Both are
 // payload shapes inside the same messages; an old/new pairing fails the handshake.
 //
+// Automatic scrolling's second pass raised it 6 -> 7: BackendStimulus carries the number of
+// complete candidate rows the presentation can show, because that number is decided by the
+// window's work area, DPI and font and the Host cannot see any of them. The Host groups the
+// scroll window by it, so a row step and a page turn stay the same thing on a short screen.
+// Same message, same framing; the stimulus payload grew by one field.
+//
 // The settings messages below stay additive on top of this version for the reason
 // they always were: FusionSettings.exe uses its own connection and its own
 // settings_api_version. The numbers below remain engineering constants: D072 keeps
@@ -65,7 +71,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 6;
+inline constexpr std::uint32_t protocol_version = 7;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -76,6 +82,12 @@ inline constexpr std::size_t max_vector_length = 64;
 // The largest global candidate index a stimulus may name: a bound, not a page size. The
 // engine's own total decides what is selectable; this only keeps the payload sane.
 inline constexpr std::size_t max_candidate_index = 100000;
+// Upper bounds for the paging facts, checked before they are used in any multiplication.
+inline constexpr std::uint32_t max_page_size = 100;
+inline constexpr std::uint32_t max_page_count = 100000;
+// The most candidate rows a presentation may claim it can show. Five is the confirmed
+// maximum, so anything above it is a payload this Host does not implement.
+inline constexpr std::uint32_t max_candidate_rows = 5;
 inline constexpr std::size_t header_size = 5;
 
 enum class MessageType : std::uint8_t {
@@ -223,6 +235,7 @@ inline void serialize(std::vector<std::uint8_t> &buf, const BackendStimulus &s) 
   detail::write_u32(buf, s.keysym);
   detail::write_u32(buf, s.modifiers);
   detail::write_u32(buf, static_cast<std::uint32_t>(s.candidate_index));
+  detail::write_u32(buf, static_cast<std::uint32_t>(s.window_rows));
 }
 
 inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *data,
@@ -235,8 +248,13 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
   auto keysym = r.read_u32();
   auto modifiers = r.read_u32();
   auto index_bits = r.read_u32();
+  auto window_rows = r.read_u32();
   if (!binding || !stimulus_id || !type_byte || !character || !keysym || !modifiers ||
-      !index_bits || !r.at_end())
+      !index_bits || !window_rows || !r.at_end())
+    return std::nullopt;
+  // A capacity is a count of rows, not a command: bound it the way a page size is bounded,
+  // and treat 0 as "no opinion".
+  if (*window_rows > max_candidate_rows)
     return std::nullopt;
   // The known range, not merely the first types: a value outside it is a payload this
   // Host does not implement and is rejected rather than guessed at. KeyRelease is the
@@ -266,6 +284,7 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
   s.keysym = *keysym;
   s.modifiers = *modifiers;
   s.candidate_index = index;
+  s.window_rows = static_cast<std::int32_t>(*window_rows);
   return s;
 }
 
@@ -375,27 +394,39 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
     return std::nullopt;
   if (*arrangement > static_cast<std::uint8_t>(CandidateArrangement::Scroll))
     return std::nullopt;
-  // The paging facts have to describe *this* entry list: a window whose entries cannot be
-  // addressed by (first page + index / page size) is a payload this Host does not
-  // implement, not something to trim or guess at.
-  if (*current_page > *total_pages || *window_first_page > *current_page)
+  // Bounds first, arithmetic second, relations last — the arithmetic below multiplies, and a
+  // value is only allowed to take part in it once it is inside its own range.
+  if (*page_size > max_page_size || *total_pages > max_page_count)
     return std::nullopt;
-  if (*page_size > 0) {
-    const auto window_pages = *total_pages - *window_first_page;
-    const std::uint64_t addressable =
-        static_cast<std::uint64_t>(window_pages) * static_cast<std::uint64_t>(*page_size);
-    if (addressable < page.entries.size())
+
+  const auto scroll = static_cast<std::uint8_t>(CandidateArrangement::Scroll);
+  if (*arrangement == scroll) {
+    // A window has to describe *this* entry list, and the one thing it may never lose is the
+    // page the engine is on: the numbers the keys act on come from it. So the current page
+    // must exist, must lie inside the pages the entries actually cover, and the entries may
+    // not reach past the list's own last page.
+    if (*page_size < 1 || *total_pages < 1)
       return std::nullopt;
-    if (*arrangement == static_cast<std::uint8_t>(CandidateArrangement::Scroll) &&
-        (*window_first_page >= *total_pages || page.entries.empty()))
+    if (*current_page >= *total_pages)
       return std::nullopt;
-  } else if (*arrangement == static_cast<std::uint8_t>(CandidateArrangement::Scroll)) {
-    return std::nullopt; // a scroll window without a page size has no rows to draw
-  } else if (*current_page != 0 || *window_first_page != 0 || *total_pages != 0) {
-    return std::nullopt;
+    if (*window_first_page > *current_page)
+      return std::nullopt;
+    const std::uint64_t window_start =
+        static_cast<std::uint64_t>(*window_first_page) * *page_size;
+    const std::uint64_t window_end = window_start + page.entries.size();
+    const std::uint64_t current_start = static_cast<std::uint64_t>(*current_page) * *page_size;
+    const std::uint64_t list_end = static_cast<std::uint64_t>(*total_pages) * *page_size;
+    if (current_start < window_start || current_start >= window_end)
+      return std::nullopt; // the highlighted page is not in the payload
+    if (window_end > list_end)
+      return std::nullopt; // entries past the last page cannot be addressed
+  } else {
+    // The ordinary page shape carries none of the scrolling fields: a page that claims some
+    // would be a payload from a build this one does not implement, and guessing which half
+    // to believe is worse than refusing it.
+    if (*page_size != 0 || *current_page != 0 || *window_first_page != 0 || *total_pages != 0)
+      return std::nullopt;
   }
-  if (*page_size > 100 || *total_pages > 100000)
-    return std::nullopt;
   page.arrangement = static_cast<CandidateArrangement>(*arrangement);
   page.page_size = static_cast<std::int32_t>(*page_size);
   page.current_page = static_cast<std::int32_t>(*current_page);

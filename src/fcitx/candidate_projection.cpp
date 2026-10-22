@@ -100,7 +100,6 @@ project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
   // about the preference, and no stored value can be silently overwritten by a hint.
   const auto hint = static_cast<CandidateLayout>(static_cast<std::uint8_t>(list->layoutHint()));
   page.layout = resolve_candidate_layout(hint, options.layout);
-  const bool paging_known = list->toPageable() != nullptr;
   if (auto *pager = list->toPageable()) {
     page.has_prev = pager->hasPrev();
     page.has_next = pager->hasNext();
@@ -112,18 +111,24 @@ project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
   CandidateScrollWindow window;
   if (options.auto_scroll && hint == CandidateLayout::NotSet) {
     if (auto *common = dynamic_cast<fcitx::CommonCandidateList *>(list.get())) {
+      // The rows a scroll page holds are what the window can actually show, not a constant:
+      // a short screen that shows three rows turns pages of three, so stepping off the last
+      // visible row really is the next scroll page's first row.
+      const int rows = options.max_scroll_rows > 0 ? options.max_scroll_rows : 1;
       window = plan_scroll_window(common->pageSize(), common->currentPage(),
-                                  common->totalPages(), common->usedNextBefore(),
-                                  options.max_scroll_rows, static_cast<int>((std::min)(
-                                                                entry_bound, byte_bound)));
+                                  common->totalPages(), common->usedNextBefore(), rows,
+                                  static_cast<int>(entry_bound));
+      if (window.active) {
+        // Pinyin resets its cursor to the page's first column on every page turn, which is
+        // the classic UI's convention and not this one: the confirmed behaviour for the
+        // scrolling arrangement is to keep the column and clamp on a short row. The engine
+        // still owns the cursor — this only tells it which of its own policies to apply, and
+        // `SameAsLast` is exactly "same index, or the last candidate when the page is
+        // shorter" (candidatelist.cpp, fixCursorAfterPaging). A list that is not paged has no
+        // column to keep, and every other arrangement keeps the engine's own choice.
+        common->setCursorPositionAfterPaging(fcitx::CursorPositionAfterPaging::SameAsLast);
+      }
     }
-  }
-  if (window.active && paging_known) {
-    page.arrangement = CandidateArrangement::Scroll;
-    page.page_size = window.page_size;
-    page.current_page = window.current_page;
-    page.window_first_page = window.first_page;
-    page.total_pages = window.total_pages;
   }
 
   std::size_t used = 0;
@@ -163,27 +168,59 @@ project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
   };
 
   if (window.active) {
+    // A window is published only when it is complete enough to be *the* page: contiguous from
+    // its first page, and containing every candidate of the engine's own page. Half a window
+    // is worse than no window — the numbers on the engine's row would select candidates the
+    // user cannot see — so a window that cannot be built inside the transport's bounds is
+    // abandoned and the ordinary page projection takes over.
+    auto *bulk = list->toBulk();
+    const int total = bulk != nullptr ? bulk->totalSize() : -1;
     const int page_start = window.current_page * window.page_size;
     const int last_page = (std::min)(window.total_pages - 1, window.first_page + window.rows - 1);
-    const int window_end = (last_page + 1) * window.page_size;
+    int window_end = (last_page + 1) * window.page_size;
+    if (total >= 0)
+      window_end = (std::min)(window_end, total); // a short last page is not a failure
+    const int current_end = page_start + (std::min)(list->size(), window.page_size);
+
+    int built_end = window.first_page * window.page_size;
+    bool failed = false;
     for (int global = window.first_page * window.page_size; global < window_end; ++global) {
       if (page.entries.size() >= entry_bound) {
-        page.truncated = true;
+        failed = true;
         break;
       }
       const auto *word = window_candidate(list, global, page_start);
       if (word == nullptr) {
-        page.truncated = true;
+        failed = true;
         break;
       }
       const int local = global - page_start;
-      if (!stop_if_bounded(append(*word, local >= 0 && local < list->size() ? local : -1))) {
-        if (page.truncated)
-          break;
+      const auto result = append(*word, local >= 0 && local < list->size() ? local : -1);
+      if (result == Appended::Invalid)
         return std::nullopt;
+      if (result != Appended::Ok) {
+        failed = true; // a byte budget that cannot even hold the current page
+        break;
       }
+      built_end = global + 1;
     }
-  } else {
+    if (failed || built_end < current_end || built_end <= window.first_page * window.page_size) {
+      // Not a usable window. Fall through to the page shape this product has always sent,
+      // which has its own (and older) truncation semantics.
+      page.entries.clear();
+      page.truncated = false;
+      used = 0; // the page projection starts its own budget, not a spent one
+      window = CandidateScrollWindow{};
+      page.cursor_index = list->cursorIndex();
+    } else {
+      page.arrangement = CandidateArrangement::Scroll;
+      page.page_size = window.page_size;
+      page.current_page = window.current_page;
+      page.window_first_page = window.first_page;
+      page.total_pages = window.total_pages;
+    }
+  }
+  if (!window.active) {
     const int visible = list->size();
     for (int index = 0; index < visible; ++index) {
       if (page.entries.size() >= entry_bound) {
@@ -198,7 +235,7 @@ project_candidate_page(fcitx::Instance &instance, fcitx::InputContext *context,
     }
   }
   // The engine cursor is page-local; in a window it moves to where that page's slot is.
-  if (window.active && page.cursor_index >= 0) {
+  if (page.arrangement == CandidateArrangement::Scroll && page.cursor_index >= 0) {
     const long long moved = static_cast<long long>(window.current_page - window.first_page) *
                                 window.page_size +
                             page.cursor_index;

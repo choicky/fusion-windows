@@ -275,6 +275,7 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     return decision;
   }
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   switch (action.type) {
   case KeyAction::Type::AppendChar:
     stimulus.type = BackendStimulus::Type::Character;
@@ -386,6 +387,7 @@ SemanticDecision SemanticController::release_key(const KeyAction &action) {
   shift_forwarded_.reset();
   shift_pressed_keysym_ = 0;
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   stimulus.type = BackendStimulus::Type::KeyRelease;
   stimulus.keysym = action.keysym;
   stimulus.modifiers = action.modifiers;
@@ -447,6 +449,7 @@ SemanticDecision SemanticController::begin_candidate_action(CandidateAction acti
     return decision;
   }
   BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.window_rows = window_rows_;
   switch (action) {
   case CandidateAction::Select:
     // A cell of a scroll window can belong to an engine page the engine is not on, where a

@@ -132,11 +132,15 @@ fixture_preference(const std::string &name, CandidateLayoutPreference stored) {
 }
 
 CandidateProjectionOptions
-candidate_projection_options_for(CandidateLayoutPreference preference) {
+candidate_projection_options_for(CandidateLayoutPreference preference, std::int32_t window_rows) {
   CandidateProjectionOptions options;
   options.layout = candidate_layout_for(preference);
   options.auto_scroll = preference == CandidateLayoutPreference::AutoScroll;
-  options.max_scroll_rows = max_scroll_rows;
+  // The presentation's capacity when it named one, the maximum otherwise. It is a capacity
+  // of *complete* rows, so a scroll page never contains a row the popup cannot draw.
+  options.max_scroll_rows = window_rows > 0 ? (std::min)(static_cast<int>(window_rows),
+                                                         max_scroll_rows)
+                                            : max_scroll_rows;
   return options;
 }
 
@@ -514,8 +518,8 @@ public:
     if (auto list = inputPanel().candidateList()) {
       auto projected = project_candidate_page(
           *instance_, this, list,
-          candidate_projection_options_for(
-              layout_preference_.load(std::memory_order_relaxed)),
+          candidate_projection_options_for(layout_preference_.load(std::memory_order_relaxed),
+                                           window_rows),
           candidate_page_entries, candidate_page_bytes, payload_bound);
       if (!projected) {
         invalid = true;
@@ -625,6 +629,9 @@ public:
   BackendBatch *batch = nullptr;
   bool lifecycle = true;
   bool invalid = false;
+  // The rows the presentation said it can show with this dispatch (BackendStimulus::
+  // window_rows); 0 = it did not say, and the projection uses the maximum.
+  std::int32_t window_rows = 0;
   // Set once the engine has been seen active for this context (see
   // inactive_passthrough): a brand-new context's first key must reach the engine, because
   // reaching it is what activates the context.
@@ -704,6 +711,9 @@ public:
             return false;
           context->last_stimulus = stimulus.stimulus_id;
           context->batch = output.get();
+          // The presentation's own row capacity travels with the key that caused this
+          // dispatch, so the window this projection plans is the window the popup can draw.
+          context->window_rows = stimulus.window_rows;
           try {
             if (is_candidate_action(stimulus.type)) {
               // A non-key stimulus carries no key identity, so it is never a

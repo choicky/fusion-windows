@@ -41,6 +41,8 @@ struct Driver {
   Binding binding{8101, 1, 1};
   std::uint64_t next = 1;
   CandidatePage page;
+  // What the popup would report it can show. 0 = "no opinion" (the Host maximum).
+  std::int32_t rows = 0;
 
   explicit Driver(FcitxBackendOptions options) : backend(make_fcitx_backend(std::move(options))) {
     if (!backend->healthy() || !backend->bind(binding))
@@ -50,6 +52,7 @@ struct Driver {
   BackendBatch send(BackendStimulus stimulus) {
     stimulus.binding = binding;
     stimulus.stimulus_id = next++;
+    stimulus.window_rows = rows;
     auto batch = backend->send(stimulus);
     for (const auto &operation : batch.operations)
       if (operation.type == BackendOperation::Type::CandidateSnapshot && operation.page)
@@ -67,6 +70,12 @@ struct Driver {
   }
   BackendBatch key(BackendStimulus::Type type) {
     return send(BackendStimulus{binding, 0, type, 0});
+  }
+  // A key identified by keysym, the way the TSF sends a navigation key.
+  BackendBatch keysym(std::uint32_t symbol) {
+    BackendStimulus stimulus{binding, 0, BackendStimulus::Type::Character, 0};
+    stimulus.keysym = symbol;
+    return send(stimulus);
   }
   // The last projected preedit text of a batch, "" when it carried none: what is still
   // composing after a partial selection.
@@ -238,6 +247,109 @@ void run_scroll_session(const char *label, const char *method, const char *expec
   (void)expected_scheme;
 }
 
+// A: a row step keeps the column. The engine's own candidate-navigation key (Tab by default)
+// puts the cursor on a later column; the first next-page then has to leave it there, and a
+// short page has to clamp it to its last candidate rather than reset it to the first.
+std::int32_t cursor_column(const CandidatePage &page) {
+  if (page.cursor_index < 0 || page.page_size <= 0)
+    return -1;
+  return page.cursor_index % page.page_size;
+}
+
+void run_column_keep(const char *label, const char *method) {
+  constexpr std::uint32_t kTab = 0xff09;
+  constexpr std::uint32_t kEqual = 0x3d;
+  for (const int column : {3, 1}) {
+    Driver d(scrolling(method));
+    d.type("nihao");
+    for (int step = 0; step < column; ++step)
+      d.keysym(kTab);
+    require(d.page.current_page == 0, "moving the cursor left the first page");
+    require(cursor_column(d.page) == column,
+            "the engine's candidate key did not put the cursor on a later column");
+
+    d.keysym(kEqual);
+    require(d.page.current_page == 1, "the page key did not turn the page");
+    std::printf("[%s] column %d: page 0 col %d -> page 1 col %d\n", label, column, column,
+                cursor_column(d.page));
+    require(cursor_column(d.page) == column,
+            "the row step did not keep the column the user was on");
+
+    // And the number key acts on that column, so the kept cursor is the one the keys use.
+    const std::size_t row = static_cast<std::size_t>(d.page.current_row());
+    const std::size_t page_size = static_cast<std::size_t>(page_size_of(d.page));
+    const std::string expected =
+        entry_text(d.page, row * page_size + static_cast<std::size_t>(column));
+    const auto typed = d.type(std::to_string(column + 1));
+    require(d.committed(typed) == expected || d.preedit(typed).find(expected) == 0,
+            "the kept column is not the candidate the number key selected");
+  }
+
+  // The short last page: the cursor cannot stay on a column that does not exist there.
+  Driver d(scrolling(method));
+  d.type("nihao");
+  for (int step = 0; step < 3; ++step)
+    d.keysym(kTab);
+  int turns = 0;
+  while (d.page.has_next && turns < 64) {
+    d.keysym(kEqual);
+    ++turns;
+  }
+  require(!d.page.has_next, "the fixture never reached the last page");
+  const std::size_t row = static_cast<std::size_t>(d.page.current_row());
+  const std::size_t last_page_count =
+      d.page.entries.size() - row * static_cast<std::size_t>(page_size_of(d.page));
+  const std::int32_t column = cursor_column(d.page);
+  std::printf("[%s] last page: %zu candidates, cursor column %d\n", label, last_page_count, column);
+  require(column >= 0 && static_cast<std::size_t>(column) < last_page_count,
+          "the cursor points past the candidates of the short last page");
+  // The column the user was on, or the last candidate when this page is shorter than that —
+  // a page that happens to be full keeps the column.
+  require(static_cast<std::size_t>(column) ==
+              (std::min)(std::size_t{3}, last_page_count - 1),
+          "the cursor was neither kept nor clamped to the last candidate of the page");
+}
+
+// B: the rows a scroll page holds are the rows the popup can show. With a capacity of three
+// (a short screen) the first expansion is three rows, and the last of them is followed by the
+// next scroll page rather than by a fourth row of the same one.
+void run_capacity(const char *label, const char *method, std::int32_t capacity) {
+  Driver d(scrolling(method));
+  d.rows = capacity;
+  d.type("nihao");
+  require(d.page.entries.size() == static_cast<std::size_t>(page_size_of(d.page)),
+          "the first projection is still one row");
+
+  d.key(BackendStimulus::Type::PageNext);
+  const std::size_t page_size = static_cast<std::size_t>(page_size_of(d.page));
+  require(d.page.entries.size() == page_size * static_cast<std::size_t>(capacity),
+          "the window is not the capacity the popup reported");
+  require(d.page.current_row() == 0, "the first row of the scroll page is not the current one");
+
+  // Row by row to the last row of this scroll page, then one more step.
+  for (std::int32_t row = 1; row < capacity; ++row) {
+    d.key(BackendStimulus::Type::PageNext);
+    require(d.page.current_row() == row, "a row step did not move down one row");
+    require(d.page.window_first_page == 1, "the window moved before its last row");
+  }
+  const int first_of_page = d.page.window_first_page;
+  d.key(BackendStimulus::Type::PageNext);
+  std::printf("[%s] capacity %d: rows %d..%d -> next page rows from %d (row %d)\n", label,
+              capacity, first_of_page, first_of_page + capacity - 1, d.page.window_first_page,
+              d.page.current_row());
+  require(d.page.current_row() == 0,
+          "stepping off the last visible row did not start the next scroll page");
+  require(d.page.window_first_page == first_of_page + capacity,
+          "the next scroll page did not start one capacity further on");
+
+  // Back: symmetric, into the last row of the previous scroll page.
+  d.key(BackendStimulus::Type::PagePrev);
+  require(d.page.current_row() == capacity - 1,
+          "going back did not land on the previous scroll page's last row");
+  require(d.page.window_first_page == first_of_page,
+          "going back did not restore the previous scroll page");
+}
+
 // The number keys are the engine's own: they select a candidate of the page the engine is
 // on, which is the row the window highlights. Two facts make showing numbers on that row and
 // nowhere else honest, and both are measured rather than asserted:
@@ -322,6 +434,10 @@ int main() {
     run_scroll_session("shuangpin", "shuangpin", "ni ha o");
     run_number_keys(nullptr);
     run_page_shapes();
+    run_column_keep("pinyin", nullptr);
+    run_column_keep("shuangpin", "shuangpin");
+    run_capacity("pinyin", nullptr, 3);
+    run_capacity("shuangpin", "shuangpin", 2);
     std::printf("PASS automatic scrolling: window, row steps, scroll pages and global selects\n");
     return 0;
   } catch (const std::exception &error) {
