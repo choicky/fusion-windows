@@ -83,6 +83,17 @@ struct CandidateEntry {
   bool placeholder = false;
 };
 
+// The font the Windows candidate popup draws with. It is presentation, not input
+// semantics: the value comes from the candidate-presentation configuration the Host
+// owns, and travels with the page instead of being cached per connection so a changed
+// setting takes effect on the next projected page rather than at the next reconnect.
+// Zero/empty means "this page carries no preference" — the case for Mock and test pages —
+// and the popup then uses its own default, which is the same value the schema defaults to.
+struct CandidateFont {
+  std::string family;
+  int size_pt = 0; // logical points, not device pixels: the popup scales it by monitor DPI
+};
+
 // STATE for one InputPanel update as the popup presentation shows it: the visible
 // candidate page plus the panel text rows a mature Fcitx panel renders around it
 // (classic-ui: upper row = auxUp + panel preedit, lower row = auxDown). The
@@ -93,6 +104,7 @@ struct CandidatePage {
   std::vector<CandidateEntry> entries;
   std::int32_t cursor_index = -1; // page-local highlight, -1 = nothing highlighted
   CandidateLayout layout = CandidateLayout::NotSet;
+  CandidateFont font; // presentation only; never a candidate identity or a selection
   bool has_prev = false; // canonical pager truth (PageableCandidateList)
   bool has_next = false;
   bool truncated = false; // transport bound hit, not a semantic decision

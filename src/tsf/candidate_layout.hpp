@@ -11,6 +11,11 @@
 // its spaceBetweenComment default). Every slot rect stays aligned with
 // CandidatePage::entries[i] == CandidateList::candidate(i); a placeholder keeps
 // its index with an empty, non-hit rect.
+//
+// Everything here is a device-pixel decision: the caller derives the metrics from the
+// popup font's real text height at the target monitor's DPI (layout_metrics_for), so a
+// slot is always at least as tall as the text it contains and the two layout directions
+// differ only in how slots are arranged, never in whether text fits.
 
 #include "fusion/backend.hpp"
 
@@ -61,30 +66,76 @@ struct CandidatePanelLayout {
   LayoutRect upper;              // empty when there is no upper-row text
   LayoutRect lower;              // empty when there is no auxDown
   std::vector<LayoutRect> slots; // aligned with page.entries
+  // Aligned with page.entries: 1 when the slot's text does not fit its rect and is drawn
+  // with an ellipsis. The popup offers the full text for such a slot; the candidate
+  // itself is never shortened — what is committed is always the engine's own string.
+  std::vector<std::uint8_t> clipped;
   LayoutRect prev;               // pager arrows, empty when the engine has no prev/next
   LayoutRect next;
   int width = 0;
   int height = 0;
+  bool slot_clipped(std::size_t index) const {
+    return index < clipped.size() && clipped[index] != 0;
+  }
 };
 
-namespace layout_metrics {
-inline constexpr int row_height = 24;
-inline constexpr int side_margin = 6;
-inline constexpr int item_gap = 12;
-inline constexpr int pager_width = 20;
-inline constexpr int min_vertical_width = 180;
-inline constexpr int min_width = 40;
-} // namespace layout_metrics
+// Device-pixel metrics. The values that are not typographic (margins, gaps, arrows) keep
+// the proportions they had at 96 dpi, scaled by the target DPI in one place instead of
+// being multiplied a second time somewhere else.
+struct LayoutMetrics {
+  int line_height = 20; // measured text height of the popup font, device pixels
+  int item_padding = 3; // vertical padding inside a slot, above and below the text
+  int row_height = 0;   // line_height + 2 * item_padding; computed when left 0
+  int side_margin = 6;
+  int item_gap = 12;
+  int pager_width = 20;
+  int min_vertical_width = 180;
+  int min_width = 40;
+  int min_slot_width = 24; // a slot never shrinks below this, even on a narrow work area
+};
+
+// Metrics for a font whose drawn text height is `line_height` device pixels on a display
+// at `dpi`. 96 dpi reproduces the proportions the popup shipped with.
+inline LayoutMetrics layout_metrics_for(int line_height, int dpi) {
+  const auto scaled = [dpi](int value) { return value * dpi / 96; };
+  LayoutMetrics metrics;
+  metrics.line_height = (std::max)(1, line_height);
+  metrics.item_padding = (std::max)(2, scaled(3));
+  metrics.row_height = metrics.line_height + 2 * metrics.item_padding;
+  metrics.side_margin = (std::max)(3, scaled(6));
+  metrics.item_gap = (std::max)(4, scaled(12));
+  metrics.pager_width = (std::max)(12, scaled(20));
+  metrics.min_vertical_width = (std::max)(60, scaled(180));
+  metrics.min_width = (std::max)(24, scaled(40));
+  metrics.min_slot_width = (std::max)(16, scaled(24));
+  return metrics;
+}
+
+// Bounds the popup must respect. Both are device pixels and 0 means "unbounded", so a
+// caller with no screen to fit into (a geometry test) gets the plain intrinsic layout.
+struct LayoutLimits {
+  int max_width = 0;      // the target monitor's work area width
+  int max_slot_width = 0; // an upper bound for one slot, independent of the row
+};
 
 // `measure` returns the drawn pixel width of a UTF-8 string.
 inline CandidatePanelLayout
 layout_candidate_panel(const CandidatePage &page,
-                       const std::function<int(const std::string &)> &measure) {
-  using namespace layout_metrics;
+                       const std::function<int(const std::string &)> &measure,
+                       const LayoutMetrics &metrics = {}, const LayoutLimits &limits = {}) {
   CandidatePanelLayout out;
   out.slots.assign(page.entries.size(), LayoutRect{});
+  out.clipped.assign(page.entries.size(), 0);
+  const int line_height = (std::max)(1, metrics.line_height);
+  const int padding = (std::max)(0, metrics.item_padding);
+  const int row_height =
+      metrics.row_height > 0 ? metrics.row_height : line_height + 2 * padding;
+  const int side_margin = (std::max)(0, metrics.side_margin);
+  const int item_gap = (std::max)(0, metrics.item_gap);
+  const int pager_width = (std::max)(0, metrics.pager_width);
+
   int top = 0;
-  int width = min_width;
+  int width = (std::max)(1, metrics.min_width);
   const std::string upper = panel_upper_text(page);
   if (!upper.empty()) {
     const int w = measure(upper) + 2 * side_margin;
@@ -108,36 +159,70 @@ layout_candidate_panel(const CandidatePage &page,
     return out;
   }
   if (page.layout == CandidateLayout::Horizontal) {
+    // One row, in page order. Each slot is as wide as its own text until something has to
+    // give: a single very long candidate must not stretch the panel past the screen, so a
+    // slot is capped by the work area's per-slot share (and by an explicit cap when the
+    // caller has one). A capped slot is drawn with an ellipsis and offered in full; the
+    // candidate it stands for is unchanged.
+    std::size_t count = 0;
+    for (const auto &entry : page.entries)
+      if (!entry.placeholder)
+        ++count;
+    int chrome = 2 * side_margin;
+    if (count > 1)
+      chrome += static_cast<int>(count - 1) * item_gap;
+    if (page.has_prev)
+      chrome += pager_width + item_gap;
+    if (page.has_next)
+      chrome += pager_width;
+    int cap = limits.max_slot_width;
+    if (limits.max_width > 0 && count > 0) {
+      const int share = (limits.max_width - chrome) / static_cast<int>(count);
+      cap = cap > 0 ? (std::min)(cap, share) : share;
+    }
+    if (cap > 0)
+      cap = (std::max)(cap, metrics.min_slot_width);
+
     int x = side_margin;
     if (page.has_prev) {
-      out.prev = LayoutRect{x, top + side_margin, x + pager_width, top + row_height - side_margin};
+      out.prev = LayoutRect{x, top, x + pager_width, top + row_height};
       x += pager_width + item_gap;
     }
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue; // index kept, no displayed slot
-      const int w = measure(slot_full_text(page.entries[index]));
-      out.slots[index] = LayoutRect{x, top + side_margin, x + w, top + row_height - side_margin};
+      const int available = measure(slot_full_text(page.entries[index]));
+      const int w = cap > 0 ? (std::min)(available, cap) : available;
+      out.slots[index] = LayoutRect{x, top, x + w, top + row_height};
+      out.clipped[index] = available > w ? 1 : 0;
       x += w + item_gap;
     }
     if (page.has_next) {
-      out.next = LayoutRect{x, top + side_margin, x + pager_width, top + row_height - side_margin};
+      out.next = LayoutRect{x, top, x + pager_width, top + row_height};
       x += pager_width;
     }
     width = (std::max)(width, x + side_margin);
     top += row_height;
   } else {
     const int band = pager ? row_height : 0;
-    int w = min_vertical_width;
+    int w = (std::max)(1, metrics.min_vertical_width);
     for (const auto &entry : page.entries)
       if (!entry.placeholder)
         w = (std::max)(w, measure(slot_full_text(entry)) + 2 * side_margin + pager_width);
+    if (limits.max_width > 0) {
+      w = (std::min)(w, (std::max)(limits.max_width, metrics.min_width));
+    }
     width = (std::max)(width, w);
+    const int slot_left = side_margin;
+    const int slot_right = (std::max)(slot_left + 1, width - side_margin);
     int y = top + band;
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue;
-      out.slots[index] = LayoutRect{side_margin, y, width - side_margin, y + row_height};
+      out.slots[index] = LayoutRect{slot_left, y, slot_right, y + row_height};
+      out.clipped[index] = measure(slot_full_text(page.entries[index])) > slot_right - slot_left
+                               ? 1
+                               : 0;
       y += row_height;
     }
     if (page.has_prev)

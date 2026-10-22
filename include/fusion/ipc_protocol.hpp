@@ -34,8 +34,16 @@
 // fcitx::Text contract (segment byte lengths + TextFormatFlag bits + byte
 // cursor), and CandidatePage carries the panel rows (auxUp, panel preedit,
 // auxDown). Same framing and fencing; only the payload shapes grew.
-// The numbers below remain engineering constants: D072 keeps wire format and
-// numerical thresholds UNFROZEN.
+//
+// Candidate presentation raised it 4 -> 5: CandidatePage carries the font the
+// Windows popup draws with (family + point size), so the user's font choice takes
+// effect on the next page instead of needing its own request/reply channel or a
+// reconnect. The page is a payload inside SendResponse, so this is again a shape
+// change rather than a new message, and an old/new pairing must fail the handshake.
+// The settings messages below stay additive on top of this version for the reason
+// they always were: FusionSettings.exe uses its own connection and its own
+// settings_api_version. The numbers below remain engineering constants: D072 keeps
+// wire format and numerical thresholds UNFROZEN.
 
 #include "fusion/backend.hpp"
 #include "fusion/core.hpp"
@@ -49,7 +57,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 4;
+inline constexpr std::uint32_t protocol_version = 5;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -280,6 +288,10 @@ inline void serialize(std::vector<std::uint8_t> &buf, const CandidatePage &page)
   detail::write_string(buf, page.aux_up);
   detail::write_string(buf, page.panel_preedit);
   detail::write_string(buf, page.aux_down);
+  // Presentation, after the page's own fields so the shape reads in the same order as
+  // CandidatePage. Bounded by the same string limit every other field uses.
+  detail::write_string(buf, page.font.family);
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.font.size_pt));
 }
 
 inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
@@ -302,8 +314,10 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
   auto aux_up = r.read_string();
   auto panel_preedit = r.read_string();
   auto aux_down = r.read_string();
+  auto font_family = r.read_string();
+  auto font_size = r.read_u32();
   if (!cursor_bits || !layout || !has_prev || !has_next || !truncated || !aux_up ||
-      !panel_preedit || !aux_down)
+      !panel_preedit || !aux_down || !font_family || !font_size)
     return std::nullopt;
   if (*layout > static_cast<std::uint8_t>(CandidateLayout::Horizontal))
     return std::nullopt;
@@ -322,6 +336,13 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
   page.aux_up = std::move(*aux_up);
   page.panel_preedit = std::move(*panel_preedit);
   page.aux_down = std::move(*aux_down);
+  // Fail closed on a font size outside any usable range: the popup multiplies it by the
+  // monitor DPI, and an implausible value would be a payload this Host does not implement
+  // rather than something to clamp silently.
+  if (*font_size > 400)
+    return std::nullopt;
+  page.font.family = std::move(*font_family);
+  page.font.size_pt = static_cast<int>(*font_size);
   return page;
 }
 

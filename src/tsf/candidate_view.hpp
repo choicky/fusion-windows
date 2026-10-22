@@ -9,6 +9,12 @@
 // page it displays is display text handed to it; a click reports a page-local
 // index (or a pager request) and nothing more.
 //
+// The font it draws with comes from the page (CandidateFont), which the Host projects
+// from the one candidate-presentation configuration; this object keeps no copy of the
+// setting and reads no configuration of its own. Everything geometric is recomputed per
+// show from the target monitor's DPI, so moving between displays relayouts rather than
+// scaling an old result.
+//
 // D072 §16 stays UNFROZEN on placement. This specialized in-process surface is
 // the first seam only because it needs no anchor-over-IPC and keeps the Host
 // headless; it is not a freeze of that boundary.
@@ -19,7 +25,8 @@
 #include <windows.h>
 
 #include <cstdint>
-#include <vector>
+#include <memory>
+#include <string>
 
 namespace fusion::tsf {
 
@@ -54,13 +61,38 @@ public:
   // path uses it.
   HWND window() const { return hwnd_; }
 
+  // The measured text height the current font produces at the current DPI, and the
+  // geometry that was laid out from it. Read by the geometry checks for the same reason
+  // window() is: a test that re-measured with its own font would be checking itself.
+  int line_height() const { return line_height_; }
+  int dpi() const { return dpi_; }
+  const CandidatePanelLayout &layout() const { return layout_; }
+
+  // The full-text popup's window handle, null while no clipped slot is being shown.
+  // Exposed for the same reason `window()` is; the product path never touches it.
+  HWND tip_window() const { return tip_hwnd_; }
+
 private:
   static bool register_window_class();
+  static bool register_tip_class();
   static LRESULT CALLBACK window_proc(HWND, UINT, WPARAM, LPARAM);
+  static LRESULT CALLBACK tip_window_proc(HWND, UINT, WPARAM, LPARAM);
   LRESULT on_message(UINT message, WPARAM wparam, LPARAM lparam);
+  LRESULT on_tip_message(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
   void relayout_and_paint();
   void draw(HDC dc);
-  HFONT font();
+  // The handle for `requested` at `dpi`, recreated when the request differs from what the
+  // current handle was made for. Falls back to the default GUI font if creation fails.
+  HFONT font_for(const CandidateFont &requested, int dpi);
+  // The monitor the popup is placed on: its work area and DPI.
+  void resolve_target(POINT anchor);
+  // Place the window at the anchor, inside the work area (above it when there is no room
+  // below), and paint.
+  void place_and_paint();
+  // Show (or hide) the full text of a clipped slot. `index` is a page-local slot index or
+  // -1 for "nothing to show".
+  void update_tip(std::int32_t index);
+  void destroy_tip();
 
   // Map a client point to a page-local entry index (select), or a pager request.
   // Returns the action through the out parameters; false means no actionable hit.
@@ -68,6 +100,16 @@ private:
 
   HWND hwnd_ = nullptr;
   HFONT font_ = nullptr;
+  bool font_owned_ = false; // a stock font must not be deleted
+  // What the current handle was created for. A page whose font or DPI differs recreates
+  // it instead of reusing a handle that no longer matches the setting.
+  std::string font_family_;
+  int font_size_pt_ = 0;
+  int font_dpi_ = 0;
+  int line_height_ = 20;
+  int dpi_ = 96;
+  RECT work_area_{};
+  POINT anchor_{};
   TextService *service_ = nullptr;
   void *entry_ = nullptr; // ContextEntry identity; validated by the service
   std::uint64_t generation_ = 0;
@@ -77,6 +119,12 @@ private:
   // select() is never shifted off the engine's own list index), pager arrows and
   // the panel text rows.
   CandidatePanelLayout layout_;
+  // The non-activating sibling that shows a clipped candidate's full text. Created on
+  // first need; it never takes focus, never selects, and is click-through.
+  HWND tip_hwnd_ = nullptr;
+  std::int32_t tip_index_ = -1;
+  std::wstring tip_text_;
+  bool tracking_leave_ = false;
 };
 
 } // namespace fusion::tsf

@@ -1,10 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
 using Fusion.Settings.App.Services;
 using Fusion.Settings.Model;
+using Fusion.Settings.Workspace;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 
 namespace Fusion.Settings.App.Views;
 
@@ -26,6 +30,7 @@ public sealed class CandidatesPage : SettingsPageBase
         // drawn, before anything about which candidates are produced.
         AddGroupedSections(body, PresentationRows(Workspace, PresentationMap.PageCandidates),
             PresentationMap.CandidateSections);
+        AddCandidatePreview(body);
 
         AddGroupedSections(body, PinyinRows(Workspace, PresentationMap.PageCandidates),
             PresentationMap.CandidateSections);
@@ -37,6 +42,96 @@ public sealed class CandidatesPage : SettingsPageBase
         AddExternalTools(body);
 
         return page;
+    }
+
+    /// <summary>
+    /// A preview of the candidate window's own typography, plus the one action that belongs
+    /// to it: put the font back to the Host schema's defaults.
+    ///
+    /// The preview reads the draft, so it shows what Apply would store, and it changes when
+    /// a font row changes. It is sample text, not a candidate: it never touches the engine,
+    /// the candidate list or the selection, and the defaults it restores are the schema's
+    /// own DefaultValue rather than a number copied into this file.
+    /// </summary>
+    private void AddCandidatePreview(StackPanel body)
+    {
+        var snapshot = Workspace.SnapshotFor(SettingsTarget.Presentation);
+        var draft = Workspace.DraftFor(SettingsTarget.Presentation);
+        if (snapshot is null || draft is null || snapshot.Types.Count == 0)
+        {
+            return;
+        }
+
+        var sample = new TextBlock
+        {
+            Text = "1. 你好  2. 尼  3. 泥  4. 拟  —  nǐ hǎo",
+            TextWrapping = TextWrapping.NoWrap,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        var panel = new Border
+        {
+            Padding = new Thickness(12, 8, 12, 8),
+            CornerRadius = new CornerRadius(4),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Background = (Brush)Application.Current.Resources["CardBackgroundFillColorDefaultBrush"],
+            BorderBrush = (Brush)Application.Current.Resources["CardStrokeColorDefaultBrush"],
+            BorderThickness = new Thickness(1),
+            Child = sample,
+        };
+
+        void Render()
+        {
+            var family = draft.Effective("FontFamily").Scalar;
+            var sizeText = draft.Effective("FontSize").Scalar;
+            if (!string.IsNullOrWhiteSpace(family))
+            {
+                sample.FontFamily = new FontFamily(family);
+            }
+
+            // The stored value is points; WinUI measures in DIPs. Converting here keeps the
+            // preview the same physical size as the popup, which scales points by the
+            // monitor DPI for the same reason.
+            if (double.TryParse(sizeText, NumberStyles.Float, CultureInfo.InvariantCulture, out var points))
+            {
+                sample.FontSize = Math.Clamp(points * 96.0 / 72.0, 6.0, 96.0);
+            }
+        }
+
+        Render();
+
+        var reset = new Button { Content = "恢复默认字体" };
+        reset.Click += (_, _) =>
+        {
+            foreach (var name in new[] { "FontFamily", "FontSize" })
+            {
+                var option = snapshot.Types[0].Options.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Name, name, StringComparison.Ordinal));
+                if (option is not null)
+                {
+                    Workspace.TrySet(SettingsTarget.Presentation, name, option.DefaultValue);
+                }
+            }
+
+            Render();
+        };
+
+        void OnWorkspace(object? sender, PropertyChangedEventArgs args)
+        {
+            if (string.Equals(args.PropertyName, nameof(SettingsWorkspace.HasChanges), StringComparison.Ordinal))
+            {
+                Render();
+            }
+        }
+
+        // Follow the draft while this page is on screen, and stop when it is replaced: the
+        // workspace outlives every page, so a handler left behind would keep the page alive.
+        Workspace.PropertyChanged += OnWorkspace;
+        panel.Unloaded += (_, _) => Workspace.PropertyChanged -= OnWorkspace;
+
+        var rows = new List<FrameworkElement> { panel, reset };
+        PageChrome.AddSection(body, "候选窗口预览",
+            "这里显示候选窗口实际使用的字体和字号；改动候选字体或字号后即时生效，点击保存后应用到候选窗口。",
+            rows);
     }
 
     /// <summary>

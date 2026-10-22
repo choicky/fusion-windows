@@ -4,7 +4,14 @@ using System.Collections.Generic;
 namespace Fusion.Settings.App.Services;
 
 /// <summary>Where one option appears, and how it is described.</summary>
-public sealed record Placement(string Page, string Section, int Order, string Label, string? Help = null);
+/// <param name="EnumLabels">
+/// Chinese display text for an enum's stored values, keyed by the stored value. The stored
+/// value itself is never translated: it is what the configuration file contains and what
+/// the Host reads back, so a saved profile never depends on the display language. A value
+/// with no entry keeps whatever the Host supplied.
+/// </param>
+public sealed record Placement(string Page, string Section, int Order, string Label, string? Help = null,
+                               IReadOnlyDictionary<string, string>? EnumLabels = null);
 
 /// <summary>
 /// The one table that decides where each official option lives in the accepted
@@ -148,8 +155,19 @@ public static class PresentationMap
         new Dictionary<string, Placement>(StringComparer.Ordinal)
         {
             ["CandidateLayout"] = new(PageCandidates, "候选窗口", 10, "候选排列方向",
-                "横向排成一行，纵向排成一列。若输入法为某个候选列表指定了排列方向（例如快捷短语、"
-                + "Unicode 等模式），输入法的指定优先于这里的设置。"),
+                "竖排每个候选占一行，横排把这一页的候选排在同一行。若输入法为某个候选列表指定了"
+                + "排列方向（例如快捷短语、Unicode 等模式），输入法的指定优先于这里的设置。",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["Vertical"] = "竖排",
+                    ["Horizontal"] = "横排",
+                }),
+            ["FontFamily"] = new(PageCandidates, "候选窗口", 20, "候选字体",
+                "候选窗口中候选文字使用的字体。字体不存在时由 Windows 自动替换为相近字体，"
+                + "缺少的字由系统字体链接补齐。"),
+            ["FontSize"] = new(PageCandidates, "候选窗口", 30, "字号（磅）",
+                "候选文字的字号，以磅为单位，所以在不同缩放比例的屏幕上保持相同的物理大小。"
+                + "不是按屏幕缩小字号来迁就越界。"),
         };
 
     /// <summary>Section order within a page; anything unknown sorts last.</summary>
