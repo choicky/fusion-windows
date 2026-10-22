@@ -91,7 +91,6 @@ struct LayoutMetrics {
   int pager_width = 20;
   int min_vertical_width = 180;
   int min_width = 40;
-  int min_slot_width = 24; // a slot never shrinks below this, even on a narrow work area
 };
 
 // Metrics for a font whose drawn text height is `line_height` device pixels on a display
@@ -107,14 +106,18 @@ inline LayoutMetrics layout_metrics_for(int line_height, int dpi) {
   metrics.pager_width = (std::max)(12, scaled(20));
   metrics.min_vertical_width = (std::max)(60, scaled(180));
   metrics.min_width = (std::max)(24, scaled(40));
-  metrics.min_slot_width = (std::max)(16, scaled(24));
   return metrics;
 }
 
-// Bounds the popup must respect. Both are device pixels and 0 means "unbounded", so a
+// Bounds the popup must respect. All are device pixels and 0 means "unbounded", so a
 // caller with no screen to fit into (a geometry test) gets the plain intrinsic layout.
+//
+// They are budgets, not hints: the layout below divides the available space before it
+// places anything, so the panel's own width and height come out inside these numbers
+// rather than being clamped afterwards (clamping a window never made its contents fit).
 struct LayoutLimits {
   int max_width = 0;      // the target monitor's work area width
+  int max_height = 0;     // and its height
   int max_slot_width = 0; // an upper bound for one slot, independent of the row
 };
 
@@ -133,22 +136,29 @@ layout_candidate_panel(const CandidatePage &page,
   const int side_margin = (std::max)(0, metrics.side_margin);
   const int item_gap = (std::max)(0, metrics.item_gap);
   const int pager_width = (std::max)(0, metrics.pager_width);
+  const bool bounded_width = limits.max_width > 0;
+  const bool bounded_height = limits.max_height > 0;
 
+  // One content column: the panel never draws wider than the budget, and an auxiliary row
+  // is ellipsized inside it like a slot is. Nothing here can be wider than the screen, so
+  // there is no state in which a long preedit or prompt pushes the panel off the display.
   int top = 0;
   int width = (std::max)(1, metrics.min_width);
+  const auto place_text_row = [&](const std::string &text, LayoutRect &rect) {
+    const int natural = measure(text) + side_margin;
+    int right = side_margin + natural;
+    if (bounded_width)
+      right = (std::min)(right, (std::max)(side_margin + 1, limits.max_width - side_margin));
+    rect = LayoutRect{side_margin, top, right, top + row_height};
+    width = (std::max)(width, right + side_margin);
+    top += row_height;
+  };
   const std::string upper = panel_upper_text(page);
-  if (!upper.empty()) {
-    const int w = measure(upper) + 2 * side_margin;
-    out.upper = LayoutRect{side_margin, top, w - side_margin, top + row_height};
-    width = (std::max)(width, w);
-    top += row_height;
-  }
-  if (!page.aux_down.empty()) {
-    const int w = measure(page.aux_down) + 2 * side_margin;
-    out.lower = LayoutRect{side_margin, top, w - side_margin, top + row_height};
-    width = (std::max)(width, w);
-    top += row_height;
-  }
+  if (!upper.empty())
+    place_text_row(upper, out.upper);
+  if (!page.aux_down.empty())
+    place_text_row(page.aux_down, out.lower);
+
   bool any_slot = false;
   for (const auto &entry : page.entries)
     any_slot = any_slot || !entry.placeholder;
@@ -158,79 +168,116 @@ layout_candidate_panel(const CandidatePage &page,
     out.height = top;
     return out;
   }
+
+  std::size_t count = 0;
+  for (const auto &entry : page.entries)
+    if (!entry.placeholder)
+      ++count;
+
   if (page.layout == CandidateLayout::Horizontal) {
-    // One row, in page order. Each slot is as wide as its own text until something has to
-    // give: a single very long candidate must not stretch the panel past the screen, so a
-    // slot is capped by the work area's per-slot share (and by an explicit cap when the
-    // caller has one). A capped slot is drawn with an ellipsis and offered in full; the
-    // candidate it stands for is unchanged.
-    std::size_t count = 0;
-    for (const auto &entry : page.entries)
-      if (!entry.placeholder)
-        ++count;
-    int chrome = 2 * side_margin;
-    if (count > 1)
-      chrome += static_cast<int>(count - 1) * item_gap;
+    // One row, in page order. The row has a fixed budget: margins, gaps, the pager arrows
+    // and every cell come out of the same width, so K cells can never add up to more than
+    // the screen even when every one of them is long. A cell that has to give is drawn
+    // with an ellipsis and offered in full; the candidate it stands for is unchanged, and
+    // it keeps its rect (so it keeps a click target).
+    int reserve = 0;
     if (page.has_prev)
-      chrome += pager_width + item_gap;
+      reserve += pager_width + item_gap;
+    // The next arrow also sits after a gap, so its gap is part of what it costs.
     if (page.has_next)
-      chrome += pager_width;
+      reserve += pager_width + item_gap;
+    const int gaps = count > 1 ? static_cast<int>(count - 1) * item_gap : 0;
     int cap = limits.max_slot_width;
-    if (limits.max_width > 0 && count > 0) {
-      const int share = (limits.max_width - chrome) / static_cast<int>(count);
-      cap = cap > 0 ? (std::min)(cap, share) : share;
+    if (bounded_width && count > 0) {
+      const int content = limits.max_width - 2 * side_margin - reserve - gaps;
+      const int per = content > 0 ? content / static_cast<int>(count) : 1;
+      cap = cap > 0 ? (std::min)(cap, per) : per;
+      cap = (std::max)(cap, 1);
     }
-    if (cap > 0)
-      cap = (std::max)(cap, metrics.min_slot_width);
 
     int x = side_margin;
     if (page.has_prev) {
       out.prev = LayoutRect{x, top, x + pager_width, top + row_height};
       x += pager_width + item_gap;
     }
+    int remaining = static_cast<int>(count);
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue; // index kept, no displayed slot
-      const int available = measure(slot_full_text(page.entries[index]));
-      const int w = cap > 0 ? (std::min)(available, cap) : available;
+      const int natural = measure(slot_full_text(page.entries[index]));
+      const int w = cap > 0 ? (std::min)(natural, cap) : natural;
       out.slots[index] = LayoutRect{x, top, x + w, top + row_height};
-      out.clipped[index] = available > w ? 1 : 0;
-      x += w + item_gap;
+      out.clipped[index] = natural > w ? 1 : 0;
+      // A gap belongs *between* things: one after the last cell would be charged to the
+      // budget and then left empty, which is how a reserved arrow ends up outside the panel.
+      --remaining;
+      x += w;
+      if (remaining > 0 || page.has_next)
+        x += item_gap;
     }
     if (page.has_next) {
       out.next = LayoutRect{x, top, x + pager_width, top + row_height};
       x += pager_width;
     }
     width = (std::max)(width, x + side_margin);
+    if (bounded_width)
+      width = (std::min)(width, (std::max)(limits.max_width, metrics.min_width));
     top += row_height;
   } else {
+    // One column, in page order — until the column would not fit the screen at the size
+    // the user chose. Then the same page continues in a second column rather than being
+    // cut off or shrunk: every candidate keeps a visible, clickable rect, and the order is
+    // still the engine's (down one column, then the next). A single column is the normal
+    // case and the only one for a page that fits.
     const int band = pager ? row_height : 0;
-    int w = (std::max)(1, metrics.min_vertical_width);
+    const int rows_available =
+        bounded_height ? (limits.max_height - top - band - side_margin) / row_height : 0;
+    const int max_rows = bounded_height ? (std::max)(1, rows_available) : 0;
+    int columns = 1;
+    if (max_rows > 0 && static_cast<int>(count) > max_rows) {
+      columns = (static_cast<int>(count) + max_rows - 1) / max_rows;
+    }
+    const int rows_per_column =
+        columns > 0 ? (static_cast<int>(count) + columns - 1) / columns : static_cast<int>(count);
+
+    int column_width = (std::max)(1, metrics.min_vertical_width);
     for (const auto &entry : page.entries)
       if (!entry.placeholder)
-        w = (std::max)(w, measure(slot_full_text(entry)) + 2 * side_margin + pager_width);
-    if (limits.max_width > 0) {
-      w = (std::min)(w, (std::max)(limits.max_width, metrics.min_width));
+        column_width = (std::max)(column_width, measure(slot_full_text(entry)) + 2 * side_margin +
+                                                      pager_width);
+    if (bounded_width) {
+      const int share = (std::max)(1, limits.max_width / columns);
+      column_width = (std::min)(column_width, (std::max)(share, metrics.min_width));
     }
-    width = (std::max)(width, w);
-    const int slot_left = side_margin;
-    const int slot_right = (std::max)(slot_left + 1, width - side_margin);
-    int y = top + band;
+    width = (std::max)(width, column_width * columns);
+    if (bounded_width)
+      width = (std::min)(width, (std::max)(limits.max_width, metrics.min_width));
+
+    int column = 0;
+    int row = 0;
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue;
-      out.slots[index] = LayoutRect{slot_left, y, slot_right, y + row_height};
-      out.clipped[index] = measure(slot_full_text(page.entries[index])) > slot_right - slot_left
+      if (row >= rows_per_column) {
+        ++column;
+        row = 0;
+      }
+      const int left = column * column_width + side_margin;
+      const int right = (column + 1) * column_width - side_margin;
+      const int y = top + band + row * row_height;
+      out.slots[index] = LayoutRect{left, y, (std::max)(left + 1, right), y + row_height};
+      out.clipped[index] = measure(slot_full_text(page.entries[index])) >
+                                   (std::max)(left + 1, right) - left
                                ? 1
                                : 0;
-      y += row_height;
+      ++row;
     }
     if (page.has_prev)
       out.prev = LayoutRect{side_margin, top, side_margin + pager_width, top + band};
     if (page.has_next)
       out.next =
           LayoutRect{width - side_margin - pager_width, top, width - side_margin, top + band};
-    top = y + side_margin;
+    top = top + band + rows_per_column * row_height + side_margin;
   }
   out.width = width;
   out.height = top;

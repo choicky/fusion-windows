@@ -357,12 +357,12 @@ internal static class WireTests
         Harness.Check(!SettingsCodec.TryDecodeImList(truncatedReader, out _),
             "a truncated IM list is refused");
 
-        var hello = Bytes.Concat(Bytes.U32(4), Bytes.U64(42), Bytes.U32(3), Bytes.U8(0),
-                                 Bytes.Str(string.Empty));
+        var hello = Bytes.Concat(Bytes.U32(WireLimits.ProtocolVersion), Bytes.U64(42), Bytes.U32(3),
+                                 Bytes.U8(0), Bytes.Str(string.Empty));
         Harness.Check(SettingsCodec.TryDecodeHello(new ProtoReader(hello), out var protocol,
                 out var session, out var api, out var status, out _),
             "a hello reply decodes");
-        Harness.CheckEqual(4u, protocol, "the IPC protocol version");
+        Harness.CheckEqual(WireLimits.ProtocolVersion, protocol, "the IPC protocol version");
         Harness.CheckEqual(42ul, session, "the backend session id");
         Harness.CheckEqual(3u, api, "a newer Host's API version is readable, not rejected here");
         Harness.CheckEqual(SettingsStatus.Ok, status, "the status");

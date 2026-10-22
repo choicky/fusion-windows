@@ -8,6 +8,7 @@
 #include "startup_group.hpp"
 #include "im_list.hpp"
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <fcitx-utils/environ.h>
@@ -1036,6 +1037,36 @@ private:
     // path startup already uses, and it validates the raw tree exactly once, before any I/O.
     CandidatePresentationConfig candidate;
     candidate.load(raw, /*partial=*/true);
+    // `Configuration::load` returns void and leaves an option whose value fails its own
+    // constraint (a font size outside 6..48, say) at the default. Writing that would report
+    // success for a number that was never stored, so the submitted size is compared with the
+    // one the schema actually accepted, and a value that did not survive is refused before
+    // anything is written. The bounds themselves stay in the schema, not here.
+    // The merged tree is keyed by option name; the schema types may add a level, so the
+    // leaf is looked for at both depths rather than assumed to sit at one of them.
+    const auto size_leaf = [](const SettingsValue &value) -> const SettingsValue * {
+      if (!value.is_map)
+        return nullptr;
+      const auto leaf = value.entries.find("FontSize");
+      return leaf != value.entries.end() ? &leaf->second : nullptr;
+    };
+    const SettingsValue *requested_size = size_leaf(merged);
+    for (const auto &child : merged.entries) {
+      if (requested_size != nullptr)
+        break;
+      requested_size = size_leaf(child.second);
+    }
+    if (requested_size != nullptr) {
+      int size = 0;
+      const auto &text = requested_size->scalar;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), size);
+      if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() ||
+          candidate.font_size.value() != size) {
+        error = "The candidate font size is outside the range this configuration accepts; "
+                "nothing was changed.";
+        return SettingsStatus::Invalid;
+      }
+    }
     if (!fcitx::safeSaveAsIni(candidate, candidate_presentation_config_path)) {
       error = "Fcitx could not save the candidate-presentation configuration; nothing was "
               "changed, so the same change can be retried.";

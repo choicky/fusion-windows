@@ -71,6 +71,16 @@ public:
   // The full-text popup's window handle, null while no clipped slot is being shown.
   // Exposed for the same reason `window()` is; the product path never touches it.
   HWND tip_window() const { return tip_hwnd_; }
+  // How far the full-text popup is scrolled, and how far it can go. A test can therefore
+  // check that the end of a long text is actually reachable instead of only that a window
+  // exists; the product path reads neither.
+  int tip_scroll() const { return tip_scroll_; }
+  int tip_scroll_max() const { return tip_scroll_max_; }
+  bool tip_scrollable() const { return tip_scroll_max_ > 0; }
+  // The full text's wrapped height and the visible height, so a check can state "the end is
+  // inside the box at maximum scroll" instead of asserting that a window merely exists.
+  int tip_content_height() const { return tip_content_height_; }
+  int tip_view_height() const { return tip_view_height_; }
 
 private:
   static bool register_window_class();
@@ -80,6 +90,9 @@ private:
   LRESULT on_message(UINT message, WPARAM wparam, LPARAM lparam);
   LRESULT on_tip_message(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
   void relayout_and_paint();
+  // Measure the page with the current font and DPI and lay the panel out against the work
+  // area. Separate from show() because a DPI correction has to redo exactly this.
+  void reflow();
   void draw(HDC dc);
   // The handle for `requested` at `dpi`, recreated when the request differs from what the
   // current handle was made for. Falls back to the default GUI font if creation fails.
@@ -124,7 +137,18 @@ private:
   HWND tip_hwnd_ = nullptr;
   std::int32_t tip_index_ = -1;
   std::wstring tip_text_;
+  // The full-text popup is bounded by the work area; a text longer than that is scrolled
+  // rather than ellipsized, so its end is reachable instead of merely declared present.
+  int tip_scroll_ = 0;
+  int tip_scroll_max_ = 0;
+  int tip_content_height_ = 0;
+  int tip_view_height_ = 0;
+  int tip_padding_ = 0;
+  int tip_line_height_ = 0;
   bool tracking_leave_ = false;
+  // WM_DPICHANGED runs a full re-measure that calls SetWindowPos, which can raise another
+  // one; the guard keeps a single re-layout from recursing into itself.
+  bool in_dpi_change_ = false;
 };
 
 } // namespace fusion::tsf

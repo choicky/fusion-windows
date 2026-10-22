@@ -93,6 +93,28 @@ fusion::CandidatePage make_long_page(fusion::CandidateLayout layout, int entries
   return page;
 }
 
+// A page where *every* candidate is long: the case a single long candidate does not cover,
+// because the budget has to divide between competitors rather than absorb one outlier.
+fusion::CandidatePage make_all_long_page(fusion::CandidateLayout layout, int entries, int repeat) {
+  fusion::CandidatePage page = make_page(layout, entries);
+  page.cursor_index = -1;
+  for (auto &entry : page.entries) {
+    std::string text;
+    for (int i = 0; i < repeat; ++i)
+      text += "超长候选文本";
+    entry.text = std::move(text);
+    entry.comment = "same-comment-for-every-entry";
+  }
+  return page;
+}
+
+// The test places the popup in the coordinates the process actually uses, so the inset is
+// scaled by the DPI the window reports rather than assumed to be pixels.
+int scaled_for_test(int value) {
+  const UINT dpi = GetDpiForSystem();
+  return static_cast<int>(value * (dpi == 0 ? 96 : dpi) / 96);
+}
+
 int width_of(const RECT &rect) { return static_cast<int>(rect.right - rect.left); }
 
 int height_of(const RECT &rect) { return static_cast<int>(rect.bottom - rect.top); }
@@ -109,6 +131,8 @@ RECT show_and_measure(fusion::tsf::CandidateView &view, const fusion::CandidateP
 // Every displayed slot has to be at least as tall as the text the popup measured: this is
 // the invariant that was broken in the horizontal direction.
 bool slots_hold_the_text(const fusion::tsf::CandidateView &view) {
+  // Named for the caller above as well: one implementation, two spellings would drift.
+
   const auto &layout = view.layout();
   for (const auto &slot : layout.slots) {
     if (slot.empty())
@@ -304,6 +328,324 @@ int main() {
         CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
               hit->index == static_cast<std::int32_t>(index));
       }
+    }
+  }
+
+  // 13. Every candidate long at once: the budget is divided, not absorbed by one outlier,
+  //     so the panel still fits and *every* slot keeps a rect that can be clicked.
+  {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{120, 120}, MONITOR_DEFAULTTONEAREST), &info))
+      work = info.rcWork;
+    const int work_width = width_of(work);
+    const int work_height = height_of(work);
+
+    for (const auto kind :
+         {fusion::CandidateLayout::Horizontal, fusion::CandidateLayout::Vertical}) {
+      const auto page = make_all_long_page(kind, entries, 24);
+      const RECT rect = show_and_measure(view, page);
+      CHECK(view.visible());
+      CHECK(width_of(rect) <= work_width);
+      CHECK(height_of(rect) <= work_height);
+      const auto &layout = view.layout();
+      for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+        // Present, on screen, flagged as shortened, and still the target of its own click.
+        CHECK(!layout.slots[index].empty());
+        // Horizontal has to divide one row between competitors, so every cell is
+        // shortened; vertical is allowed to be as wide as the text (it is bounded by the
+        // work area), so clipping there is a consequence, not a requirement.
+        if (kind == fusion::CandidateLayout::Horizontal)
+          CHECK(layout.slot_clipped(index));
+        CHECK(layout.slots[index].left >= 0 && layout.slots[index].right <= width_of(rect));
+        CHECK(layout.slots[index].top >= 0 && layout.slots[index].bottom <= height_of(rect));
+        const auto hit = fusion::tsf::hit_test_candidate_panel(
+            layout, layout.slots[index].left + 1,
+            (layout.slots[index].top + layout.slots[index].bottom) / 2);
+        CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+              hit->index == static_cast<std::int32_t>(index));
+      }
+      CHECK(slots_hold_the_text(view));
+    }
+  }
+
+  // 14. The largest size the schema allows, with a full page of candidates: the vertical
+  //     column cannot fit the work area at 48 pt, and the answer is still bounded — every
+  //     candidate present and clickable, and the user's size untouched.
+  {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{120, 120}, MONITOR_DEFAULTTONEAREST), &info))
+      work = info.rcWork;
+    const int work_width = width_of(work);
+    const int work_height = height_of(work);
+
+    auto page = make_page(fusion::CandidateLayout::Vertical, 10);
+    page.font.family = "Microsoft YaHei UI";
+    page.font.size_pt = 48;
+    const RECT rect = show_and_measure(view, page);
+    CHECK(view.visible());
+    CHECK(width_of(rect) <= work_width);
+    CHECK(height_of(rect) <= work_height);
+    const int line = view.line_height();
+    CHECK(line > 0);
+    const auto &layout = view.layout();
+    CHECK(layout.slots.size() == 10);
+    int placed = 0;
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      if (layout.slots[index].empty())
+        continue;
+      ++placed;
+      CHECK(layout.slots[index].bottom - layout.slots[index].top >= line);
+      const auto hit = fusion::tsf::hit_test_candidate_panel(
+          layout, layout.slots[index].left + 1,
+          (layout.slots[index].top + layout.slots[index].bottom) / 2);
+      CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+            hit->index == static_cast<std::int32_t>(index));
+    }
+    CHECK(placed == 10);
+  }
+
+  // 15. A narrow work area with a pager and an auxiliary row: the budget is shared by every
+  //     part of the panel, so nothing sticks out to the right of the screen.
+  {
+    const auto page = make_all_long_page(fusion::CandidateLayout::Horizontal, entries, 12);
+    fusion::CandidatePage bounded = page;
+    bounded.aux_up = "笔画筛选：横 竖 撇 点 折 以及一段很长的提示文字";
+    bounded.has_next = true;
+    bounded.has_prev = true;
+
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 12;
+    };
+    for (const int budget : {320, 640, 1024}) {
+      fusion::tsf::LayoutLimits limits;
+      limits.max_width = budget;
+      limits.max_height = 600;
+      const auto layout = fusion::tsf::layout_candidate_panel(bounded, measure, metrics, limits);
+      CHECK(layout.width <= budget);
+      CHECK(layout.height <= 600);
+      CHECK(!layout.upper.empty() && layout.upper.right <= budget);
+      CHECK(!layout.prev.empty() && !layout.next.empty());
+      CHECK(layout.next.right <= budget);
+      int placed = 0;
+      for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+        const auto &slot = layout.slots[index];
+        if (slot.empty())
+          continue;
+        ++placed;
+        CHECK(slot.left >= 0 && slot.right <= budget);
+        const auto hit = fusion::tsf::hit_test_candidate_panel(
+            layout, slot.left + 1, (slot.top + slot.bottom) / 2);
+        CHECK(hit && hit->index == static_cast<std::int32_t>(index));
+      }
+      CHECK(placed == entries);
+      CHECK(layout.prev.left >= 0);
+    }
+  }
+
+  // 16. The last page has no next arrow: the reserve it needed is gone and the cells may use
+  //     it, but nothing overflows and nothing is lost.
+  {
+    const auto all_long = make_all_long_page(fusion::CandidateLayout::Horizontal, entries, 24);
+    fusion::CandidatePage page = all_long;
+    page.has_next = true; // a middle page, with the arrow that has to be paid for
+    page.has_prev = false;
+    fusion::CandidatePage last = all_long; // the last page: no next arrow to reserve
+    last.has_next = false;
+    last.has_prev = true;
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 12;
+    };
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = 800;
+    limits.max_height = 400;
+    const auto with_next =
+        fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+    const auto without_next = fusion::tsf::layout_candidate_panel(last, measure, metrics, limits);
+    CHECK(with_next.width <= 800 && without_next.width <= 800);
+    CHECK(without_next.next.empty() && !without_next.prev.empty());
+    CHECK(without_next.slots[0].right - without_next.slots[0].left >=
+          with_next.slots[0].right - with_next.slots[0].left);
+  }
+
+  // 17. A very long candidate's full text is readable to the end: the box is bounded, and
+  //     the pointer's wheel moves the text inside it until the last line is in view.
+  {
+    auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
+    page.cursor_index = -1;
+    page.entries[3].text.clear();
+    for (int i = 0; i < 2400; ++i)
+      page.entries[3].text += "很长的候选内容";
+    show_and_measure(view, page);
+    const auto &slot = view.layout().slots[3];
+    CHECK(!slot.empty());
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    // The text really is taller than the box, so there is something to reach.
+    CHECK(view.tip_scrollable());
+    CHECK(view.tip_content_height() > view.tip_view_height());
+    CHECK(view.tip_scroll() == 0);
+
+    // One wheel notch moves it, and repeated notches reach the end; the clamp is exact, so
+    // the end of the text lands inside the visible box rather than past it.
+    SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+    CHECK(view.tip_scroll() > 0);
+    for (int i = 0; i < 500 && view.tip_scroll() < view.tip_scroll_max(); ++i)
+      SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+    CHECK(view.tip_scroll() == view.tip_scroll_max());
+    CHECK(view.tip_scroll() + view.tip_view_height() >= view.tip_content_height());
+
+    // And it scrolls back, so nothing is one-way.
+    SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+    CHECK(view.tip_scroll() < view.tip_scroll_max());
+
+    // A text that fits is not scrollable and stays fully click-through, so it can never
+    // intercept a pointer aimed at the candidates.
+    auto short_page = make_page(fusion::CandidateLayout::Horizontal, entries);
+    short_page.entries[0].text += std::string(120, 'x');
+    show_and_measure(view, short_page);
+    const auto &short_slot = view.layout().slots[0];
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((short_slot.left + short_slot.right) / 2,
+                            (short_slot.top + short_slot.bottom) / 2));
+    if (view.tip_window() != nullptr && IsWindowVisible(view.tip_window())) {
+      CHECK(!view.tip_scrollable());
+      const LONG_PTR style = GetWindowLongPtrW(view.tip_window(), GWL_EXSTYLE);
+      CHECK((style & WS_EX_TRANSPARENT) != 0);
+    }
+  }
+
+  // 18. The same page on a work area that cannot hold a single column: a small laptop
+  //     screen at 125 %, ten candidates at the largest size the schema allows. The column
+  //     has to continue sideways — all ten present, inside the screen, still clickable —
+  //     instead of running off the bottom where nobody can reach it.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(75, 96); // 48 pt text at 100 %
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 14;
+    };
+    auto page = make_page(fusion::CandidateLayout::Vertical, 10);
+    page.font.size_pt = 48;
+
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = 800;
+    limits.max_height = 600;
+    const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+
+    CHECK(layout.height <= 600);
+    CHECK(layout.width <= 800);
+    int placed = 0;
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      const auto &slot = layout.slots[index];
+      if (slot.empty())
+        continue;
+      ++placed;
+      CHECK(slot.top >= 0 && slot.bottom <= 600);
+      CHECK(slot.left >= 0 && slot.right <= 800);
+      CHECK(slot.bottom - slot.top >= metrics.line_height);
+      const auto hit = fusion::tsf::hit_test_candidate_panel(layout, slot.left + 1,
+                                                             (slot.top + slot.bottom) / 2);
+      CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+            hit->index == static_cast<std::int32_t>(index));
+    }
+    CHECK(placed == 10);
+    // More than one column: two candidates share a row, which can only happen when the
+    // single column would not have fitted. Without that, this page could not be on screen.
+    bool shared_row = false;
+    for (std::size_t a = 0; a < layout.slots.size(); ++a)
+      for (std::size_t b = a + 1; b < layout.slots.size(); ++b)
+        if (!layout.slots[a].empty() && !layout.slots[b].empty() &&
+            layout.slots[a].top == layout.slots[b].top &&
+            layout.slots[a].left != layout.slots[b].left)
+          shared_row = true;
+    CHECK(shared_row);
+  }
+
+  // 19. The popup's own DPI is the one it measured with, and its own rectangle obeys the
+  //     work area: a caret near the bottom-right corner produces a window that is above the
+  //     caret and inside the screen, not one hanging off the edge.
+  {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{120, 120}, MONITOR_DEFAULTTONEAREST), &info))
+      work = info.rcWork;
+
+    const int awareness = static_cast<int>(GetAwarenessFromDpiAwarenessContext(
+        GetThreadDpiAwarenessContext()));
+    std::printf("dpi awareness of this process: %d (0 unaware, 1 system, 2 per-monitor)\n",
+                awareness);
+
+    auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    const POINT corner{work.right - scaled_for_test(40), work.bottom - scaled_for_test(40)};
+    view.show(page, corner);
+    CHECK(view.visible());
+    // Measurement, window and font agree on one DPI.
+    using GetDpiForWindowFn = UINT(WINAPI *)(HWND);
+    const auto get_dpi =
+        reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                           "GetDpiForWindow"));
+    if (get_dpi != nullptr) {
+      const int window_dpi = static_cast<int>(get_dpi(view.window()));
+      CHECK(window_dpi == view.dpi());
+    }
+    RECT rect{};
+    GetWindowRect(view.window(), &rect);
+    CHECK(rect.left >= work.left && rect.right <= work.right);
+    CHECK(rect.top >= work.top && rect.bottom <= work.bottom);
+    // No room below the caret at the bottom of the screen, so it opened above it.
+    CHECK(rect.bottom <= corner.y);
+  }
+
+  // 20. The same popup created from a per-monitor-aware context — the awareness a modern
+  //     host application gives the TIP. The window and the measurement have to agree on the
+  //     DPI in that mode too, and a point size has to come out as that many points at the
+  //     DPI the window reports (not at the 96 the unaware path above is pinned to).
+  {
+    const DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (previous == nullptr) {
+      std::printf("per-monitor context: not available on this system\n");
+    } else {
+      fusion::tsf::CandidateView aware;
+      CHECK(aware.ensure_created(nullptr, nullptr, 0));
+      auto page = make_page(fusion::CandidateLayout::Vertical, 5);
+      page.font.family = "Microsoft YaHei UI";
+      page.font.size_pt = 11;
+      aware.show(page, POINT{200, 200});
+      CHECK(aware.visible());
+
+      using GetDpiForWindowFn = UINT(WINAPI *)(HWND);
+      const auto get_dpi = reinterpret_cast<GetDpiForWindowFn>(
+          GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+      const int window_dpi =
+          get_dpi != nullptr ? static_cast<int>(get_dpi(aware.window())) : 96;
+      std::printf("per-monitor context: window dpi=%d, measured dpi=%d, line=%d\n", window_dpi,
+                  aware.dpi(), aware.line_height());
+      CHECK(window_dpi == aware.dpi());
+      // 11 pt is 11/72 inch: the drawn line has to be at least that many device pixels, at
+      // whatever DPI this display actually reports.
+      CHECK(aware.line_height() >= 11 * window_dpi / 72);
+      // And the panel is still placed inside its monitor's work area at that scale.
+      MONITORINFO info{};
+      info.cbSize = sizeof(info);
+      RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+      if (GetMonitorInfoW(MonitorFromWindow(aware.window(), MONITOR_DEFAULTTONEAREST), &info))
+        work = info.rcWork;
+      RECT rect{};
+      GetWindowRect(aware.window(), &rect);
+      CHECK(rect.left >= work.left && rect.right <= work.right);
+      CHECK(rect.top >= work.top && rect.bottom <= work.bottom);
+      CHECK(slots_hold_the_text(aware));
+      aware.destroy();
+      CHECK(aware.window() == nullptr);
+      SetThreadDpiAwarenessContext(previous);
     }
   }
 
