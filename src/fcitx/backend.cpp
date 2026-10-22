@@ -335,6 +335,16 @@ inline bool is_candidate_action(BackendStimulus::Type type) {
   return type == BackendStimulus::Type::SelectCandidate ||
          type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev;
 }
+// Whether a stimulus carries a character, i.e. is something an input method would compose
+// from. Everything else — function keys, bare modifiers, navigation and editing keys — is a
+// candidate for the engine's own global hotkeys and stays the engine's business even while
+// the context is inactive.
+inline bool stimulus_carries_character(const BackendStimulus &stimulus) {
+  if (stimulus.type == BackendStimulus::Type::Character ||
+      stimulus.type == BackendStimulus::Type::Space)
+    return true;
+  return (stimulus.keysym >= 0x20 && stimulus.keysym < 0x7f) || stimulus.keysym >= 0x01000000u;
+}
 
 class InputContext final : public fcitx::InputContext {
 public:
@@ -348,6 +358,64 @@ public:
   }
   ~InputContext() override { destroy(); }
   const char *frontend() const override { return "fusion-stage3b"; }
+  // Fcitx hands "an inactive context forwards keys to the application" to the keyboard
+  // input method, and this runtime compiles none. The frontend half of that rule lives
+  // here: once the engine has been active for this context and reports it inactive again,
+  // a key that carries a character is the application's and must not reach an input method
+  // (which would start composing again).
+  //
+  // "English" is not "Fcitx stops seeing keys". The engine's own global keys —
+  // `Hotkey/TriggerKeys`, `ActivateKeys`, the layout hots — are handled before any input
+  // method and deliberately do not require an active context; that is exactly how a
+  // configured key turns the input method back on. So character-less keys are still
+  // dispatched and the engine decides: a bound key consumes them, anything else comes back
+  // as Forward with nothing composed. No second matcher, no hard-coded key.
+  bool inactive_passthrough(const BackendStimulus &stimulus) {
+    if (!instance_ || !ever_active_)
+      return false;
+    // Fcitx keeps the on/off state per input context (InputState is an IC property; the
+    // AltTriggerKeys binding calls Instance::toggle(ic) for the event's own context, and
+    // Instance::inputMethod(ic) at instance.cpp:1794 reads that context's own InputState
+    // before falling back to mostRecentInputContext()). An active context resolves to its
+    // local selection or DefaultIM; an inactive one resolves to `Items/0` — Fusion's
+    // synthetic off slot. So the per-context answer is: this context is inactive iff
+    // inputMethod(this) equals the group's Items/0 name.
+    //
+    // The comparison relies on two invariants this runtime owns:
+    //   (a) Items/0 is the marked off slot (`fusion-off` in Layout, see startup_group.hpp),
+    //       never the method in use; the group migration always picks the *other* Pinyin
+    //       scheme so active and inactive resolve to different names (group_off_slot_method).
+    //   (b) IM switching is not reachable in this runtime (WP3 B6): a bound context keeps
+    //       the scheme the group's DefaultIM resolves to; the only way to leave it is the
+    //       inactive path, which lands on Items/0.
+    // A disabled or password context resolves to `keyboard-<layout>` from
+    // Instance::inputMethod(ic), which never equals a pinyin/shuangpin Items/0; those
+    // cases are answered before this predicate by the Windows hard policy, so the
+    // comparison cannot misclassify them.
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    if (group.inputMethodList().empty())
+      return false;
+    const auto off_slot = group.inputMethodList()[0].name();
+    if (off_slot.empty() || instance_->inputMethod(this) != off_slot)
+      return false;
+    return stimulus_carries_character(stimulus);
+  }
+  // Record that the engine has been active here. Called after every dispatch, so the
+  // transition is observed rather than predicted. Uses the same per-context query as
+  // inactive_passthrough: an active context resolves to a name other than Items/0.
+  void note_engine_state() {
+    if (!instance_)
+      return;
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    if (group.inputMethodList().empty())
+      return;
+    const auto off_slot = group.inputMethodList()[0].name();
+    if (off_slot.empty())
+      return;
+    const auto im = instance_->inputMethod(this);
+    if (!im.empty() && im != off_slot)
+      ever_active_ = true;
+  }
   void commitStringImpl(const std::string &text) override {
     observe({BackendOperation::Type::CommitText, text, {}});
   }
@@ -457,6 +525,10 @@ public:
   BackendBatch *batch = nullptr;
   bool lifecycle = true;
   bool invalid = false;
+  // Set once the engine has been seen active for this context (see
+  // inactive_passthrough): a brand-new context's first key must reach the engine, because
+  // reaching it is what activates the context.
+  bool ever_active_ = false;
 };
 
 class FcitxBackend final : public Backend {
@@ -488,6 +560,13 @@ public:
           names.empty() ? std::string() : names.front(), group.defaultInputMethod());
       if (!method.empty())
         instance_->setCurrentInputMethod(context.get(), method, true);
+      // Fusion's "Chinese is on" is Fcitx's own active state, and a context that was never
+      // activated has none of the modifier-only bindings available (Hotkey/AltTriggerKeys
+      // toggles from active to inactive and back; it does not start from nothing). Declare
+      // it through the frontend entry point — the same one fcitx5-remote uses — instead of
+      // keeping an active flag of our own. The context was just focused above, so the
+      // no-argument form addresses this one.
+      instance_->activate();
       context->lifecycle = false;
       contexts_.emplace(binding.context, std::move(context));
       return true;
@@ -535,18 +614,28 @@ public:
               }
               output->disposition = BackendBatch::Disposition::Consumed;
             } else {
-              const auto name = key_name(stimulus);
-              const auto key = stimulus.keysym
-                                   ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
-                                                fcitx::KeyStates(stimulus.modifiers))
-                                   : fcitx::Key(name);
-              context->dispatched_key = key;
-              fcitx::KeyEvent event(context, key, false);
-              const bool consumed = context->keyEvent(event);
-              output->disposition = consumed ? BackendBatch::Disposition::Consumed
-                                             : BackendBatch::Disposition::Forward;
+              // A stimulus that carries a keysym is identified by it; the symbolic name is
+              // only the fallback for the semantic key classes.
+              const auto key =
+                  stimulus.keysym
+                      ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
+                                   fcitx::KeyStates(stimulus.modifiers))
+                      : fcitx::Key(key_name(stimulus));
+              if (!context->inactive_passthrough(stimulus)) {
+                context->dispatched_key = key;
+                fcitx::KeyEvent event(context, key,
+                                      stimulus.type == BackendStimulus::Type::KeyRelease);
+                const bool consumed = context->keyEvent(event);
+                output->disposition = consumed ? BackendBatch::Disposition::Consumed
+                                               : BackendBatch::Disposition::Forward;
+              } else {
+                // The engine is inactive for this context, so the key is the
+                // application's: nothing was composed, nothing is forwarded twice.
+                output->disposition = BackendBatch::Disposition::Forward;
+              }
             }
             context->observe_candidate_page();
+            context->note_engine_state();
           } catch (...) {
             context->batch = nullptr;
             context->invalid = true;
@@ -1029,10 +1118,12 @@ private:
         selection.available.emplace_back(name);
       }
     }
-    if (!group.inputMethodList().empty()) {
-      const auto &first = group.inputMethodList().front().name();
-      if (first == "pinyin" || first == "shuangpin") {
-        selection.selected = first; // Items/0 is the selected method; DefaultIM is fallback.
+    if (!group.defaultInputMethod().empty()) {
+      const auto &selected = group.defaultInputMethod();
+      if (selected == "pinyin" || selected == "shuangpin") {
+        // DefaultIM is the method a bound context resolves to; Items/0 is the
+        // group's other slot (see group_items_with_off_slot).
+        selection.selected = selected;
       }
     }
     if (selection.available.empty()) {
@@ -1058,7 +1149,8 @@ private:
   }
 
   // Reads the current group's ordered membership using official semantics:
-  // enabled = the group's defined Items, active = Items/0, fallback = DefaultIM,
+  // enabled = the group's Items after the off slot at Items/0, active = DefaultIM
+  // (the method a bound context resolves to), fallback = DefaultIM,
   // available = the methods this runtime defines.
   SettingsStatus im_list_on_loop(ImList &list, std::string &error) {
     const auto &group = instance_->inputMethodManager().currentGroup();
@@ -1068,11 +1160,10 @@ private:
       error = "This Host has no Pinyin or Shuangpin input method available.";
       return SettingsStatus::Unsupported;
     }
-    for (const auto &item : group.inputMethodList()) {
-      const auto &name = item.name();
-      if (std::find(list.available.begin(), list.available.end(), name) !=
+    for (const auto &item : selection::group_enabled_items(group_items(group))) {
+      if (std::find(list.available.begin(), list.available.end(), item.name) !=
           list.available.end()) {
-        list.enabled.push_back(name);
+        list.enabled.push_back(item.name);
       }
     }
     if (!list.enabled.empty()) {
@@ -1103,44 +1194,70 @@ private:
               "entry must be available.";
       return SettingsStatus::Invalid;
     }
-    // No-change short-circuit: same defined membership and order and the same
-    // requested fallback leaves the group identical, so persist nothing.
+    // No-change short-circuit: the same enabled list, in the same order, still
+    // leaving Items/0 as the group's other slot, persists nothing.
     const auto current_enabled = [&] {
       std::vector<std::string> names;
-      for (const auto &item : current_group.inputMethodList()) {
-        const auto &name = item.name();
-        if (std::find(available.begin(), available.end(), name) != available.end()) {
-          names.push_back(name);
+      for (const auto &item : selection::group_enabled_items(group_items(current_group))) {
+        if (std::find(available.begin(), available.end(), item.name) != available.end()) {
+          names.push_back(item.name);
         }
       }
       return names;
     }();
     if (current_enabled == plan->methods &&
-        current_group.defaultInputMethod() == plan->requested_fallback) {
+        current_group.defaultInputMethod() == plan->methods.front()) {
       return im_list_on_loop(out, error);
     }
     if (has_active_composition_on_loop()) {
       error = "Finish the current composition, then retry the input-method list change.";
       return SettingsStatus::Busy;
     }
+    // The first enabled method is the one in use, so it is also Items/0's content and
+    // DefaultIM; the rest follow in the user's order (see group_items_with_off_slot).
     auto group = current_group;
-    std::vector<fcitx::InputMethodGroupItem> rebuilt;
-    rebuilt.reserve(plan->methods.size());
+    // A retained entry keeps the fields it had, taken from the user's own entries. The
+    // official `layoutFor(name)` cannot be used here: it returns the *first* item with that
+    // name, which is the slot when a user method and the slot share one, and the marker
+    // would be written onto a real entry.
+    const auto current_items = selection::group_enabled_items(group_items(current_group));
+    std::vector<selection::GroupItem> methods;
+    methods.reserve(plan->methods.size());
     for (const auto &name : plan->methods) {
-      fcitx::InputMethodGroupItem item(name);
-      const auto &layout = current_group.layoutFor(name);
-      if (!layout.empty()) {
-        item.setLayout(layout);
-      }
-      rebuilt.push_back(std::move(item));
+      const auto kept = std::find_if(current_items.begin(), current_items.end(),
+                                     [&](const selection::GroupItem &item) {
+                                       return item.name == name;
+                                     });
+      methods.push_back(kept == current_items.end() ? selection::GroupItem{name, {}}
+                                                    : *kept);
     }
-    group.inputMethodList() = std::move(rebuilt);
-    group.setDefaultInputMethod(plan->requested_fallback);
+    auto items = selection::group_items_with_off_slot(methods, plan->methods.front(), available);
+    write_group(group, items, plan->methods.front());
     manager.setGroup(std::move(group));
     manager.save();
     return im_list_on_loop(out, error);
   }
 
+  static std::vector<selection::GroupItem> group_items(const fcitx::InputMethodGroup &group) {
+    std::vector<selection::GroupItem> items;
+    items.reserve(group.inputMethodList().size());
+    for (const auto &item : group.inputMethodList()) {
+      items.push_back({item.name(), item.layout()});
+    }
+    return items;
+  }
+  static void write_group(fcitx::InputMethodGroup &group,
+                          const std::vector<selection::GroupItem> &items,
+                          const std::string &default_method) {
+    group.inputMethodList().clear();
+    for (const auto &item : items) {
+      fcitx::InputMethodGroupItem entry(item.name);
+      if (!item.layout.empty())
+        entry.setLayout(item.layout);
+      group.inputMethodList().push_back(std::move(entry));
+    }
+    group.setDefaultInputMethod(default_method);
+  }
   static std::vector<std::string> method_names(const fcitx::InputMethodGroup &group) {
     std::vector<std::string> names;
     names.reserve(group.inputMethodList().size());
@@ -1154,6 +1271,13 @@ private:
   // no profile at all this is a first run, and the first-run default is built
   // explicitly (Pinyin default) instead of accepting Fcitx's built-in fallback,
   // which depends on load order and layout availability.
+  //
+  // Whatever the source, the group is then given the shape Fcitx's switch needs:
+  // Items/0 carries the method in use as well (see group_items_with_off_slot), so
+  // the group has the second entry `canTrigger()` requires and `DefaultIM` names the
+  // method in use instead of being rewritten to Items/1. The method in use is the
+  // one the group resolved to before this change — Items/0 — so a saved list and
+  // its scheme are preserved exactly, and Items/1.. are the user's list unchanged.
   static void ensure_usable_group(fcitx::Instance &instance) {
     auto &manager = instance.inputMethodManager();
     std::vector<std::string> available;
@@ -1165,21 +1289,22 @@ private:
     const bool profile_present = !fcitx::StandardPaths::global()
                                       .locate(fcitx::StandardPathsType::PkgConfig, "profile")
                                       .empty();
-    const auto &current = manager.currentGroup();
-    const auto plan = selection::plan_startup_group(profile_present, current.defaultInputMethod(),
-                                                    method_names(current), available);
-    if (!plan.replace) {
+    auto group = manager.currentGroup();
+    const auto plan = selection::plan_startup_group(
+        profile_present, group.defaultInputMethod(), method_names(group), available);
+    const auto normalization =
+        selection::normalize_group(group_items(group), group.defaultInputMethod(), plan.replace,
+                                   plan.methods, plan.default_method, available);
+    if (!normalization.rewrite) {
+      // Already this feature's shape (or nothing to normalize): the user's methods and the
+      // method in use are what was written last time, so nothing is touched and the profile
+      // is not rewritten on every start.
       log_group(instance, profile_present, false);
       return;
     }
-    auto group = current;
-    group.inputMethodList().clear();
-    for (const auto &name : plan.methods) {
-      group.inputMethodList().emplace_back(name);
-    }
-    group.setDefaultInputMethod(plan.default_method);
+    write_group(group, normalization.items, normalization.default_method);
     manager.setGroup(std::move(group));
-    log_group(instance, profile_present, true);
+    log_group(instance, profile_present, plan.replace);
   }
   // Development observable for the WP3 verification: which input method a bound
   // context will start in, and where the group came from. Selection itself stays
@@ -1210,6 +1335,9 @@ private:
       return "Escape";
     case BackendStimulus::Type::Return:
       return "Return";
+    case BackendStimulus::Type::KeyRelease:
+      // A release always carries its keysym, so the name is never used for identity.
+      break;
     case BackendStimulus::Type::SelectCandidate:
     case BackendStimulus::Type::PageNext:
     case BackendStimulus::Type::PagePrev:
@@ -1302,16 +1430,49 @@ private:
           fcitx::readAsIni(presentation_config_, candidate_presentation_config_path);
           candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
           ensure_usable_group(instance);
-          if (!options_.fixture_global_hotkey.empty()) {
-            // Fixture-only global key. Fcitx exposes no setter for its global hotkeys, and
+          if (!options_.fixture_input_methods.empty()) {
+            // Fixture-only: apply a saved profile's list through the same
+            // normalization the product uses at startup, so a test can measure e.g. a
+            // single-Shuangpin list without touching the user's profile.
+            auto group = instance.inputMethodManager().currentGroup();
+            std::vector<std::string> names;
+            std::vector<std::string> fixture_available;
+            for (const auto *name : {"pinyin", "shuangpin"}) {
+              if (instance.inputMethodManager().entry(name))
+                fixture_available.emplace_back(name);
+            }
+            for (const auto &name : options_.fixture_input_methods) {
+              if (instance.inputMethodManager().entry(name))
+                names.emplace_back(name);
+            }
+            const auto active = options_.fixture_default_method.empty() || names.empty()
+                                    ? (names.empty() ? std::string() : names.front())
+                                    : options_.fixture_default_method;
+            write_group(group,
+                        selection::group_items_with_off_slot(
+                            selection::items_from_names(names), active, fixture_available),
+                        active);
+            instance.inputMethodManager().setGroup(std::move(group));
+            log_group(instance, true, false);
+          }
+          if (!options_.fixture_global_hotkey.empty() || !options_.fixture_alt_trigger_key.empty()) {
+            // Fixture-only global keys. Fcitx exposes no setter for its global hotkeys, and
             // their configuration layer is only reachable through this instance, so the
-            // value is loaded the same way the product loads its presentation option. The
+            // values are loaded the same way the product loads its presentation option. The
             // partial load leaves every other hotkey at its own value.
             // A Fcitx key list is stored as indexed children of the option node, and the
             // list unmarshaller clears the value first: writing a scalar here would leave
             // the list empty instead of replacing it.
             fcitx::RawConfig hotkeys;
-            hotkeys["Hotkey"]["TriggerKeys"]["0"] = options_.fixture_global_hotkey;
+            if (!options_.fixture_global_hotkey.empty()) {
+              hotkeys["Hotkey"]["TriggerKeys"]["0"] = options_.fixture_global_hotkey;
+            }
+            // The modifier-only "temporarily switch input method" key: the product reads
+            // this from the user's own configuration and never overrides it, so a test
+            // that wants a different key rebinds it through the same partial load.
+            if (!options_.fixture_alt_trigger_key.empty()) {
+              hotkeys["Hotkey"]["AltTriggerKeys"]["0"] = options_.fixture_alt_trigger_key;
+            }
             instance.globalConfig().load(hotkeys, true);
           }
           // Development observable for the WP3 verification: where Fcitx resolves its

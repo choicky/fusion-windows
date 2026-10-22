@@ -32,6 +32,8 @@ SemanticController::SemanticController(std::uint64_t context_id, std::size_t cap
       core_(Binding{context_id, 1, 1}, capacity), host_(core_), backend_(&backend) {}
 
 SemanticDecision SemanticController::begin_key(const KeyAction &action, bool policy_allows) {
+  if (action.release)
+    return release_key(action); // a release is never a key-down
   if (real_backend_)
     return begin_real_key(action, policy_allows);
   SemanticDecision decision;
@@ -178,6 +180,9 @@ void SemanticController::fence_previous_incarnation() {
   state_dependency_ = 0;
   // A deferred reset intent belonged to the connection that is gone.
   backend_reset_pending_ = false;
+  // A press the previous connection received is not one this one may settle.
+  shift_forwarded_.reset();
+  shift_pressed_keysym_ = 0;
   // The previous incarnation's candidate page is not the new one's projection;
   // it must not be displayed or acted on after the link moved.
   clear_displayed_page();
@@ -245,6 +250,7 @@ bool SemanticController::routes_key(const KeyAction &action) const {
 
 SemanticDecision SemanticController::begin_real_key(const KeyAction &action, bool policy_allows) {
   SemanticDecision decision;
+  observe_key_down(action);
   if (!policy_allows) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
@@ -300,6 +306,90 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     return decision;
   }
   decision.symbolic = "fcitx:" + std::to_string(stimulus.keysym);
+  dispatch_real(stimulus, decision);
+  if ((action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR) &&
+      decision.route != SemanticDecision::Route::CancelledRecovery &&
+      decision.backend_session_id != 0) {
+    // The engine really received this press, on this binding and this link: that, and only
+    // that, is what a later release may settle.
+    shift_forwarded_ = ShiftPress{action.keysym, core_.binding().context, bound_incarnation_,
+                                  bound_connection_};
+  }
+  return decision;
+}
+
+bool SemanticController::routes_release(const KeyAction &action) const {
+  // Only the two Shift keys are relayed. They are the modifier-only keys the pinned
+  // engine can interpret, and the ones its own Hotkey/AltTriggerKeys is configured with;
+  // which keys actually toggle stays Fcitx's decision, taken from its configuration.
+  if (!real_backend_)
+    return false; // the Mock fixture has no engine state to toggle
+  if (action.keysym != kKeysymShiftL && action.keysym != kKeysymShiftR)
+    return false;
+  // The release belongs to a press the engine actually received — not to a press this
+  // shell merely observed — and only if nothing else was pressed in between: Fcitx
+  // settles a modifier-only binding on the release of a press that was not followed by
+  // another key, and the one fact it cannot observe here is a press it never received (a
+  // Shift+letter combination is the application's own text). Delivering the release of
+  // such a press would present a combination as a lone modifier and toggle on it.
+  if (shift_forwarded_.keysym == 0 || shift_forwarded_.keysym != action.keysym)
+    return false;
+  // A binding belongs to one context, incarnation and connection (D072 §13). A release
+  // that arrives after the link moved must not settle anything in the new instance, and
+  // must never be the reason a context is re-bound: `release_key` deliberately does not
+  // reconnect.
+  if (shift_forwarded_.context != core_.binding().context || !backend_ready_)
+    return false;
+  const LinkStatus link = real_backend_->link_status();
+  if (link.state != LinkState::Established || link.host_incarnation != shift_forwarded_.incarnation ||
+      link.connection_generation != shift_forwarded_.generation)
+    return false;
+  return real_backend_->healthy();
+}
+
+void SemanticController::observe_key_down(const KeyAction &action) {
+  if (!real_backend_)
+    return;
+  // The physical fact only: this key-down either starts the press a modifier-only release
+  // may settle, or ends every earlier press by making it a combination. It is NOT proof
+  // that the engine received the press — that is recorded after a successful dispatch
+  // (`shift_forwarded_`), so a T-only delivery, a policy refusal or a failed send cannot
+  // manufacture one.
+  if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR) {
+    shift_pressed_keysym_ = action.keysym;
+    return; // a repeat of the same press leaves the forwarded fact alone
+  }
+  shift_pressed_keysym_ = 0;
+  shift_forwarded_.reset();
+}
+
+bool SemanticController::release_admissible(const KeyAction &action) const {
+  if (!routes_release(action))
+    return false;
+  // The release's reply is document work and it settles through the one ordered path, so it
+  // needs the same two resources a key-down does: room in the bounded ledger, and a pass
+  // barrier that is clear. A release that arrives while the barrier is up is dropped rather
+  // than settled out of order — the engine's own ModifierOnlyKeyTimeout expires the press.
+  constexpr std::size_t callback_bound = frontend_operation_bound;
+  return core_.records().size() + callback_bound + recovery_reserve_ <= core_.capacity() &&
+         core_.probe_pass() != Pass::RecoveryRequired && pass_probe() == Pass::Clear;
+}
+
+SemanticDecision SemanticController::release_key(const KeyAction &action) {
+  SemanticDecision decision;
+  // Defence in depth: the callers ask `release_admissible` first, and this guard keeps the
+  // ledger and the link safe even if a future caller forgets to.
+  if (!release_admissible(action))
+    return decision;
+  // One release settles one press: retire the fact first, so a repeated or duplicated
+  // key-up cannot make the engine settle the same binding twice.
+  shift_forwarded_.reset();
+  shift_pressed_keysym_ = 0;
+  BackendStimulus stimulus{core_.binding(), next_stimulus_++};
+  stimulus.type = BackendStimulus::Type::KeyRelease;
+  stimulus.keysym = action.keysym;
+  stimulus.modifiers = action.modifiers;
+  decision.symbolic = "release:" + std::to_string(stimulus.keysym);
   dispatch_real(stimulus, decision);
   return decision;
 }
@@ -535,6 +625,14 @@ bool SemanticController::engine_has_composition_work() const {
 }
 
 bool SemanticController::engine_has_work_for(const KeyAction &action) const {
+  // A lone Shift may be one of the engine's own modifier-only bindings
+  // (Hotkey/AltTriggerKeys), which it settles from the press/release pair with nothing
+  // composing. Admitting it here is what lets the press reach the engine at all: an
+  // application that consults T skips K after a FALSE, so the engine would never record
+  // the press the release then settles. Whether the press actually toggles stays
+  // Fcitx's decision, taken from its configuration; this shell keeps no state for it.
+  if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR)
+    return true;
   // Every key this shell admitted before R37 keeps its admission; only the keys whose
   // Fcitx handling needs a live composition are gated on the composition state.
   if (!editing_key_needs_composition(action))

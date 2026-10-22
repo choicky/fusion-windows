@@ -49,7 +49,11 @@ struct BackendStimulus {
     Return,
     SelectCandidate,
     PageNext,
-    PagePrev
+    PagePrev,
+    // The key-up half of a modifier-only key. It carries the same keysym identity as the
+    // down that preceded it and asks Fcitx one question it alone can answer: did this
+    // press complete a configured modifier-only binding (`Hotkey/AltTriggerKeys`)?
+    KeyRelease
   };
   Binding binding{};
   std::uint64_t stimulus_id = 0;
@@ -256,6 +260,17 @@ struct FcitxBackendOptions {
   // configured global hotkey is handled with nothing composing. Empty keeps Fcitx's
   // configured key list. The product Host never sets it.
   std::string fixture_global_hotkey;
+  // Fixture-only: replace the loaded group's input methods with this exact list and this
+  // DefaultIM, so a test can reproduce a user's saved profile (for example a single
+  // Shuangpin method) in its own instance. Empty keeps what the profile/first-run plan
+  // decided. The product Host never sets it.
+  std::vector<std::string> fixture_input_methods;
+  std::string fixture_default_method;
+  // Fixture-only: set Fcitx's own modifier-only "temporarily switch input method"
+  // binding (Hotkey/AltTriggerKeys) to this key, for example "Shift_R", so a test can
+  // prove that the configured key decides and not the shell. Empty keeps Fcitx's
+  // configured value (Shift_L).
+  std::string fixture_alt_trigger_key;
 };
 FUSION_FCITX_API std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options = {});
 } // namespace fusion

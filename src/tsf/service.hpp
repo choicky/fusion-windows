@@ -139,6 +139,11 @@ public:
   std::shared_ptr<ContextEntry> hold_entry(ContextEntry *entry);
   ContextEntry *find_entry_alive(void *entry, std::uint64_t generation);
   bool hard_policy_allows(ContextEntry &entry);
+
+  // The one answer both key-up callbacks use: may this release be relayed at all, and does
+  // this context have the resources to settle it. T claims a key-up only when this is true,
+  // so a release the application never sees cannot be caused by T and K disagreeing.
+  bool release_admissible(ContextEntry &entry, const KeyAction &action);
   // U6: declares this thread's keyboard open/close compartment open, once per
   // activation and once per document manager that has not been seen yet (a new
   // application window). It is never called from a key path, so a Ctrl+Space close

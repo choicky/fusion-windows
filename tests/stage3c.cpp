@@ -1,14 +1,44 @@
 #include "fusion/backend.hpp"
 #include "tsf/semantic.hpp"
 #include <crtdbg.h>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 using namespace fusion;
 using namespace fusion::tsf;
 void require(bool ok, const char *message) {
   if (!ok)
     throw std::runtime_error(message);
 }
+namespace {
+// Every section that completes prints exactly one `PASS` line through this function, and
+// the count is checked on the way out. A section that never runs is therefore a failure
+// rather than a shorter log: an earlier round of this file silently returned after five of
+// its sections and still exited 0, which made "88/88 and unchanged oracles" look like
+// coverage it did not have.
+constexpr int kExpectedSections = 21;
+int sections_completed = 0;
+bool failure_reported = false;
+
+void section(std::string line) {
+  ++sections_completed;
+  std::cout << line << '\n';
+}
+
+// A destructor runs on every exit path, including an early `return` from main; a check at the
+// end of main does not.
+struct SectionCoverage {
+  ~SectionCoverage() {
+    if (failure_reported || sections_completed == kExpectedSections)
+      return;
+    std::cout.flush();
+    std::cerr << "FAIL stage3c completed " << sections_completed << " of " << kExpectedSections
+              << " sections; a scheduled section did not run\n";
+    std::_Exit(1);
+  }
+};
+} // namespace
 struct Document {
   std::string committed, preedit;
   void apply(SemanticController &controller, const SemanticDecision &decision) {
@@ -118,7 +148,7 @@ void fallback() {
   require(unsupported.route == SemanticDecision::Route::CancelledRecovery && unsupported.eaten,
           "non-original forward silently replayed");
   forward.destroy();
-  std::cout << "PASS callback fallback, watermark, uncertainty and original Forward contract\n";
+  section("PASS callback fallback, watermark, uncertainty and original Forward contract");
 }
 int main() {
   _set_error_mode(_OUT_TO_STDERR);
@@ -127,6 +157,7 @@ int main() {
   _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
+  SectionCoverage coverage;
   try {
     fallback();
     auto backend = make_fcitx_backend();
@@ -149,7 +180,7 @@ int main() {
     require(!controller.open_effect(result.frontend[2].key), "later commit overtook first");
     doc.apply(controller, result);
     require(doc.committed == "你好，" && doc.preedit.empty(), "comma final text");
-    std::cout << "PASS real nihao, -> 你好，; callback order and duplicate fencing\n";
+    section("PASS real nihao, -> 你好，; callback order and duplicate fencing");
     // A genuine physical Tab is returned naturally only after all prior effects.
     auto tab = translate_key(9, false, false, false);
     require(controller.routes_key(tab), "Tab excluded before real dispatch");
@@ -158,7 +189,7 @@ int main() {
             "Fcitx did not determine genuine Tab Forward");
     doc.apply(controller, forward);
     require(controller.finish_pass(), "Forward did not settle prior effects");
-    std::cout << "PASS genuine Tab Forward; no owned key or replay\n";
+    section("PASS genuine Tab Forward; no owned key or replay");
     for (const char c : std::string("/@.:")) {
       controller.note_composition_terminated();
       auto action = physical(c, c == '@' || c == ':');
@@ -267,7 +298,7 @@ int main() {
     auto denied = controller.begin_key(physical(','), false);
     require(!denied.backend_session_id && !denied.eaten, "hard policy dispatched");
     controller.destroy();
-    std::cout << "PASS real Backspace/Return and hard-policy gate\n";
+    section("PASS real Backspace/Return and hard-policy gate");
     // R37 control, the other half of the same rule: a configured Fcitx global hotkey is
     // engine work with **nothing** composing, so the shell must keep claiming it. F6 is
     // installed as this isolated instance's own "toggle input method" hotkey
@@ -300,11 +331,353 @@ int main() {
       require(global.eaten && !global.forward && global.frontend.empty(),
               "the engine did not handle the configured global hotkey");
       require(hotkey.finish_pass(), "global hotkey barrier");
+      // F6 turned the input method off. The same key has to turn it back on: a global key is
+      // handled before any input method and does not need an active context, so the inactive
+      // state must still dispatch character-less keys and let the engine decide.
+      auto english = hotkey.begin_key(physical('n'), true);
+      require(english.forward && english.frontend.empty(),
+              "the inactive state still composed instead of passing the key through");
+      const auto reactivate = hotkey.begin_key(f6, true);
+      std::cout << "inactive F6 eaten=" << (reactivate.eaten ? 1 : 0)
+                << " forward=" << (reactivate.forward ? 1 : 0)
+                << " route=" << static_cast<int>(reactivate.route) << '\n';
+      require(reactivate.eaten && !reactivate.forward,
+              "the configured hotkey did not reach the engine while inactive");
+      auto resumed = hotkey.begin_key(physical('n'), true);
+      require(!resumed.frontend.empty(), "the hotkey did not turn the input method back on");
       hotkey.destroy();
-      std::cout << "PASS configured global hotkey reached the engine with nothing composing\n";
+      section("PASS configured global hotkey reached the engine with nothing composing");
+      section("PASS the same global hotkey turns the input method back on");
+    }
+
+    // R39: a lone left Shift is the engine's own "temporarily switch input method"
+    // binding (Hotkey/AltTriggerKeys, Shift_L by default). The shell relays the press and
+    // its release with the key's own identity and keeps no state; what is asserted here is
+    // the engine's answer, not a re-expression of the implementation.
+    {
+      const auto left_shift = translate_key(kVkLShift, false, false, false);
+      require(left_shift.keysym == kKeysymShiftL && !left_shift.modified, "left Shift identity");
+      require(translate_key(0x10, false, false, false, 0, false, false, kScanShiftRight).keysym ==
+                  kKeysymShiftR,
+              "the generic VK_SHIFT is told apart by its scan code");
+      require(!translate_key(0x11 /*VK_CONTROL*/, false, false, false).keysym,
+              "an unrelated modifier keeps no keysym");
+      // A bare Shift is admitted by T, because an application that consults T skips K after
+      // a FALSE, and K is where the press reaches the engine.
+      require(SemanticController(901, 64, *make_fcitx_backend(FcitxBackendOptions{}))
+                  .engine_has_work_for(left_shift),
+              "the shell would not deliver a Shift press to the engine");
+
+      const auto compose = [](SemanticController &c, Document &d) {
+        for (const char *ch = "nihao"; *ch; ++ch)
+          d.apply(c, c.begin_key(physical(*ch), true));
+        return d.preedit;
+      };
+      const auto press_shift = [](SemanticController &c, std::uint32_t vk, std::uint32_t scan) {
+        auto action = translate_key(vk, false, false, false, 0, false, false, scan);
+        const auto down = c.begin_key(action, true);
+        require(down.forward && down.frontend.empty(),
+                "the engine did not hand the Shift press back to the application");
+        action.release = true;
+        return action;
+      };
+
+      const auto run_shape = [&](const char *label, std::vector<std::string> methods,
+                                 const char *def, const char *scheme, std::uint64_t context) {
+        FcitxBackendOptions options;
+        options.fixture_input_methods = std::move(methods);
+        options.fixture_default_method = def;
+        auto shift_backend = make_fcitx_backend(options);
+        SemanticController c(context, 64, *shift_backend);
+        Document d;
+        require(compose(c, d) == scheme, label);
+        section(std::string(label) + " chinese=[" + d.preedit + "]");
+
+        // One lone press: the engine settles its own binding on the release, which ends
+        // the composition, and the next key is the application's with nothing composed.
+        auto release = press_shift(c, kVkLShift, kScanShiftLeft);
+        require(c.routes_release(release), "a lone Shift release is relayed");
+        const auto toggled = c.release_key(release);
+        section(std::string(label) + " toggle ops=" + std::to_string(toggled.frontend.size()) +
+                " eaten=" + std::to_string(toggled.eaten ? 1 : 0));
+        d.apply(c, toggled);
+        require(d.preedit.empty(), "the engine did not end the composition on the toggle");
+        auto english = c.begin_key(physical('n'), true);
+        section(std::string(label) + " english route=" +
+                std::to_string(static_cast<int>(english.route)) +
+                " forward=" + std::to_string(english.forward ? 1 : 0) +
+                " ops=" + std::to_string(english.frontend.size()));
+        require(english.forward && english.frontend.empty(),
+                "English still fed the engine instead of passing the key through");
+        // While inactive the context resolves Items/0 — the other Pinyin scheme — and a
+        // character-less key is still dispatched, because that is how a configured global
+        // hotkey turns the input method back on. With nothing composing the off slot hands
+        // the key back unchanged, so it composes nothing.
+        const auto arrow = c.begin_key(translate_key(0x25 /*VK_LEFT*/, false, false, false), true);
+        require(arrow.forward && arrow.frontend.empty(),
+                "an inactive character-less key was composed through the off slot");
+        require(!c.routes_release(release), "a release with no relayed press is not ours");
+
+        // And back: the same press returns to the same input method, so the same keys
+        // compose to the same scheme.
+        auto release_back = press_shift(c, kVkLShift, kScanShiftLeft);
+        require(c.routes_release(release_back), "the returning Shift release is relayed");
+        d.apply(c, c.release_key(release_back));
+        require(compose(c, d) == scheme, "the toggle did not return to the same scheme");
+        section(std::string(label) + " back=[" + d.preedit + "]");
+        c.destroy();
+      };
+
+      // The first-run shape (Pinyin in use) and a saved single-method profile (Shuangpin
+      // only), which is the shape the owner's own profile has.
+      run_shape("PASS lone Shift: pinyin", {}, "", "ni hao", 960);
+      run_shape("PASS lone Shift: shuangpin only", {"shuangpin"}, "shuangpin", "ni ha o", 961);
+
+      // Shift+letter is a combination, not a lone press: the letter is the application's
+      // own key (a modified key is never routed), and it ends the press, so the release
+      // must not settle a modifier-only binding.
+      {
+        auto shift_backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(962, 64, *shift_backend);
+        Document d;
+        compose(c, d);
+        c.begin_key(left_shift, true);
+        // Shift+letter is ordinary text input: the letter is engine text, and its
+        // key-down is the fact that ends the lone-press window.
+        const auto letter = translate_key('a', false, false, false, 'A', true, false);
+        require(c.routes_key(letter), "Shift+letter is engine text");
+        c.begin_key(letter, true);
+        auto release = left_shift;
+        release.release = true;
+        require(!c.routes_release(release), "a Shift used with another key is not a lone press");
+        require(c.release_key(release).frontend.empty(), "the combination produced callbacks");
+        auto next = c.begin_key(physical('n'), true);
+        require(!next.frontend.empty(), "the combination toggled instead of typing");
+        section("PASS Shift+letter does not toggle");
+        c.destroy();
+      }
+
+      // The right Shift is a different key and AltTriggerKeys names Shift_L: it must not
+      // toggle, and it must never be presented as the left one.
+      {
+        auto shift_backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(963, 64, *shift_backend);
+        Document d;
+        compose(c, d);
+        auto release = press_shift(c, kVkRShift, kScanShiftRight);
+        require(release.keysym == kKeysymShiftR, "right Shift identity");
+        require(c.routes_release(release), "the right Shift release is relayed");
+        d.apply(c, c.release_key(release));
+        require(!compose(c, d).empty(), "the right Shift toggled a binding it does not name");
+        section("PASS right Shift leaves the binding alone");
+        c.destroy();
+      }
+
+      // A held Shift repeats key-downs; that is still one press.
+      {
+        auto shift_backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(964, 64, *shift_backend);
+        Document d;
+        compose(c, d);
+        for (int i = 0; i < 3; ++i)
+          c.begin_key(left_shift, true);
+        auto release = left_shift;
+        release.release = true;
+        require(c.routes_release(release), "a repeated press still settles");
+        d.apply(c, c.release_key(release));
+        require(!c.routes_release(release), "a repeated release is not relayed twice");
+        auto english = c.begin_key(physical('n'), true);
+        require(english.forward && english.frontend.empty(),
+                "repeated Shift presses toggled more than once");
+        section("PASS repeated Shift press toggles once");
+        c.destroy();
+      }
+
+      // A release settles only a press the engine actually received. A T-only observation
+      // (the application consulted T and never delivered K), a press the hard policy
+      // refused, and a second release of the same press must all leave the binding alone.
+      {
+        auto shift_backend = make_fcitx_backend(FcitxBackendOptions{});
+        SemanticController c(970, 64, *shift_backend);
+        Document d;
+        compose(c, d);
+        auto release = left_shift;
+        release.release = true;
+        c.observe_key_down(left_shift); // observed, never forwarded
+        require(!c.routes_release(release), "an observed-only press armed a release");
+        require(c.release_key(release).frontend.empty(), "an observed-only press settled");
+
+        const auto refused = c.begin_key(left_shift, false); // hard policy says no
+        require(refused.route == SemanticDecision::Route::FailOpen, "a refused press dispatched");
+        require(!c.routes_release(release), "a policy-refused press armed a release");
+
+        require(c.begin_key(left_shift, true).forward, "the admitted press is not the engine's");
+        require(c.routes_release(release), "an admitted press did not arm its release");
+        require(c.release_admissible(release), "an admitted release was refused admission");
+        const auto first = c.release_key(release);
+        require(!first.frontend.empty(), "the admitted press did not settle");
+        require(!c.routes_release(release), "one press produced two releases");
+        require(c.release_key(release).frontend.empty(), "a repeated release settled again");
+
+        // The same release refused by the *admission* path rather than by routing: a pass
+        // barrier is still up, so the reply could not be settled in order. `routes_release`
+        // is true and `release_admissible` is false — the exact disagreement T and K used to
+        // have, where T claimed a key-up K then dropped and the application never saw its own
+        // modifier release. `release_admissible` is what OnTestKeyUp returns, so this is T's
+        // answer, and `release_key` agrees with it.
+        {
+          auto barrier_backend = make_fcitx_backend(FcitxBackendOptions{});
+          SemanticController gated(971, 64, *barrier_backend);
+          Document gated_doc;
+          compose(gated, gated_doc);
+          // An unsettled EFFECT is what puts the pass barrier up (Core::probe_pass answers
+          // DrainRequired while one is pending), and it is a state a release really arrives
+          // in: the engine's commit is still being written when the key-up comes.
+          const auto gated_commit =
+              gated.begin_key(translate_key(kVkSpace, false, false, false), true);
+          require(!gated_commit.frontend.empty(), "the gated commit produced no work");
+          require(gated.pass_probe() != Pass::Clear, "the gated commit left no barrier");
+          require(gated.begin_key(left_shift, true).forward, "the gated press was not forwarded");
+          auto held = left_shift;
+          held.release = true;
+          require(gated.routes_release(held), "the gated press did not arm a release");
+          require(!gated.release_admissible(held),
+                  "a release was admitted while the pass barrier was up");
+          require(gated.release_key(held).frontend.empty(), "a deferred release still settled");
+          // The same release once that work is settled is admitted, so the check above turns
+          // on the barrier and not on something else.
+          gated_doc.apply(gated, gated_commit);
+          require(gated.pass_probe() == Pass::Clear, "the barrier did not clear");
+          require(gated.release_admissible(held), "a release was refused with a clear barrier");
+          gated.destroy();
+        }
+        section("PASS only a forwarded press arms its release");
+      }
+
+
+      // The configured key decides: with AltTriggerKeys moved to Shift_R the left Shift
+      // does nothing and the right one toggles.
+      {
+        FcitxBackendOptions options;
+        options.fixture_alt_trigger_key = "Shift_R";
+        auto shift_backend = make_fcitx_backend(options);
+        SemanticController c(965, 64, *shift_backend);
+        Document d;
+        compose(c, d);
+        auto left_release = press_shift(c, kVkLShift, kScanShiftLeft);
+        d.apply(c, c.release_key(left_release));
+        require(!compose(c, d).empty(), "the shell ignored the configured binding");
+        auto right_release = press_shift(c, kVkRShift, kScanShiftRight);
+        d.apply(c, c.release_key(right_release));
+        auto english = c.begin_key(physical('n'), true);
+        require(english.forward && english.frontend.empty(),
+                "the configured Shift_R binding did not toggle");
+        section("PASS the configured modifier-only key decides");
+        c.destroy();
+      }
+    }
+
+    // R38 correction: the inactive passthrough must be decided per context, not from
+    // Instance::state() / mostRecentInputContext(). Two bound contexts on one backend: A
+    // toggles to English, then B is bound and typed into (bind() calls Instance::activate()
+    // which flips the whole instance's state and makes B the mostRecent). A's character
+    // key must still be forwarded because A's own per-context InputState is still inactive
+    // and Fcitx's per-context Instance::inputMethod(A) still resolves to Items/0. On the
+    // pre-fix code the predicate saw mostRecent != A and returned false, so A's key
+    // reached keyEvent and composed with Items/0 — this require is the discriminator.
+    // Every earlier section here used a single context, which is how this escaped.
+    {
+      auto two_backend = make_fcitx_backend(FcitxBackendOptions{});
+      require(two_backend != nullptr, "two-context backend");
+      SemanticController a(980, 64, *two_backend);
+      Document da;
+      type(a, da, "nihao");
+      require(!da.preedit.empty(), "A did not compose in Chinese before the toggle");
+      const auto a_release = [&] {
+        auto action = translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        (void)a.begin_key(action, true);
+        action.release = true;
+        return action;
+      }();
+      require(a.routes_release(a_release), "A's Shift release is relayed");
+      da.apply(a, a.release_key(a_release));
+      require(da.preedit.empty(), "the toggle did not end A's composition");
+      const auto a_english = a.begin_key(physical('n'), true);
+      require(a_english.forward && a_english.frontend.empty(),
+              "A did not pass through into English before B was bound");
+      // Bind B and type into it. Its InputState is active; the instance's mostRecent is B.
+      SemanticController b(981, 64, *two_backend);
+      Document db;
+      type(b, db, "nihao");
+      require(!db.preedit.empty(), "B never composed after being bound over an inactive A");
+      // Discriminating case: back to A. MostRecent is B, but A must still be English.
+      const auto a_again = a.begin_key(physical('n'), true);
+      require(a_again.forward && a_again.frontend.empty(),
+              "A's character key composed after B became most recent — the predicate must "
+              "read the dispatching context's own state, not mostRecentInputContext()");
+      // B is unaffected throughout: it stays on its own scheme.
+      const auto b_again = b.begin_key(physical('i'), true);
+      require(!b_again.frontend.empty(), "B lost its active composition when A was typed into");
+      // A's own Shift press returns it to its original scheme; the toggle is still per-context.
+      const auto a_back_release = [&] {
+        auto action = translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        (void)a.begin_key(action, true);
+        action.release = true;
+        return action;
+      }();
+      require(a.routes_release(a_back_release), "A's returning Shift release is relayed");
+      da.apply(a, a.release_key(a_back_release));
+      const auto a_reactivated = a.begin_key(physical('n'), true);
+      require(!a_reactivated.frontend.empty(), "the returning Shift did not reactivate A");
+      b.destroy();
+      a.destroy();
+      section("PASS the inactive passthrough follows the dispatching context, not mostRecent");
+    }
+    // The same discriminator with a configured Hotkey/TriggerKeys (F6) fixture: A toggled
+    // off through F6, B bound and used, then F6 on A returns A to active. Proves the fix
+    // does not affect the global-hotkey path.
+    {
+      FcitxBackendOptions options;
+      options.fixture_global_hotkey = "F6";
+      auto f6_backend = make_fcitx_backend(std::move(options));
+      require(f6_backend != nullptr, "F6 two-context backend");
+      SemanticController a(990, 64, *f6_backend);
+      Document da;
+      type(a, da, "nihao");
+      // Commit first, so F6 arrives with nothing composing, exactly as the single-context
+      // global-hotkey section proves the engine handles it.
+      auto f6_commit = a.begin_key(translate_key(kVkSpace, false, false, false), true);
+      require(f6_commit.eaten && !f6_commit.frontend.empty(), "F6 fixture commit");
+      da.apply(a, f6_commit);
+      require(a.finish_pass(), "F6 fixture commit barrier");
+      const auto f6 = translate_key(0x75, false, false, false); // VK_F6 -> 0xffc3
+      const auto off = a.begin_key(f6, true);
+      require(off.eaten && !off.forward && off.frontend.empty(), "the F6 fixture did not turn A off");
+      require(a.finish_pass(), "global hotkey barrier");
+      const auto a_english = a.begin_key(physical('n'), true);
+      require(a_english.forward && a_english.frontend.empty(),
+              "A stayed composing instead of passing through after F6");
+      SemanticController b(991, 64, *f6_backend);
+      Document db;
+      type(b, db, "nihao");
+      // Discriminator: back to A, a character key must still be forwarded. On the pre-fix
+      // code this composed because mostRecent was B and state() reflected B's active state.
+      const auto a_again = a.begin_key(physical('n'), true);
+      require(a_again.forward && a_again.frontend.empty(),
+              "after B was bound A's character key reached the engine on the F6 fixture");
+      // F6 still re-activates A with B having been typed into.
+      const auto a_reactivate = a.begin_key(f6, true);
+      require(a_reactivate.eaten && !a_reactivate.forward,
+              "the configured global hotkey did not reach the engine while A was inactive");
+      const auto a_resumed = a.begin_key(physical('n'), true);
+      require(!a_resumed.frontend.empty(), "the F6 fixture did not turn A back on after B was used");
+      b.destroy();
+      a.destroy();
+      section("PASS the configured global hotkey reactivates A after B became most recent");
     }
     return 0;
   } catch (const std::exception &e) {
+    failure_reported = true;
     std::cerr << "FAIL " << e.what() << '\n';
     return 1;
   }
