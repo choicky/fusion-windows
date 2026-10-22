@@ -48,6 +48,9 @@ internal static class Program
         // The candidate-presentation save needs the same writable profile, for the same reason.
         await PresentationSaveSectionAsync().ConfigureAwait(false);
 
+        // And what the save bar says when one page is stored and another is refused.
+        await PartialSaveSectionAsync().ConfigureAwait(false);
+
         // The real-Host checks run only when an isolated endpoint is supplied; they never
         // fall back to the installed product's pipe.
         var includeIntegration = args.Length == 0 || Array.IndexOf(args, "--no-integration") < 0;
@@ -97,6 +100,24 @@ internal static class Program
 
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
         await PresentationSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
+    }
+
+    private static async Task PartialSaveSectionAsync()
+    {
+        var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            Harness.Section("partial save: SKIPPED (FUSION_SETTINGS_GLOBAL_PROFILE is not set)");
+            return;
+        }
+
+        if (!TryIsolatedEndpoint(out var endpoint))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await PartialSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
     }
 
     private static async Task<int> VerifyPersistedAsync(string? expectation, string? presentationExpectation)

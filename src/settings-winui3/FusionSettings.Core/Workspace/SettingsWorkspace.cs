@@ -644,7 +644,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
             case SettingsStatus.Busy:
                 Log($"save {uri}: busy");
-                return $"{name}：当前正在输入或组合中，未保存。请完成输入后重试。";
+                return $"{name}：{BusyRefusal(target)}";
 
             default:
                 Log($"save {uri}: {result.Status} {result.Error}");
@@ -707,7 +707,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return "输入方式列表：写入结果不确定，但重新读取显示已生效。";
 
             case SettingsStatus.Busy:
-                return "输入方式列表：当前正在输入或组合中，未保存。";
+                return "输入方式列表：正在组合中，未保存——切换输入方式会结束正在进行的组合。修改已保留，完成输入后可再次保存。";
 
             default:
                 Log($"save im-list: {result.Status} {result.Error}");
@@ -732,11 +732,36 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         Methods.RefreshBaseline(fresh);
     }
 
+    /// <summary>
+    /// What a <c>Busy</c> refusal means for this page, in the page's own terms.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>Busy</c> has two causes and the user can only act on one of them, so the sentence has
+    /// to name the right one. A page whose value is read only by the next projection — the
+    /// candidate window and the global configuration — is refused by nothing but a second
+    /// request already in flight, so it must not tell the user to stop typing.
+    /// </para>
+    /// <para>
+    /// The Pinyin/Shuangpin page is the opposite: the only official way to store it is the
+    /// engine's own setter, and that setter publishes immediately, which clears every composing
+    /// context. Nothing is written in that case, so the sentence says so and the edit is kept
+    /// rather than being called saved.
+    /// </para>
+    /// </remarks>
+    public static string BusyRefusal(SettingsTarget target) => target switch
+    {
+        SettingsTarget.Pinyin or SettingsTarget.Shuangpin =>
+            "正在组合中，未保存——拼音/双拼配置只能由输入法自己的设置入口写入，而它会清空正在进行的组合。"
+            + "修改已保留，完成当前输入后可再次保存。",
+        _ => "Host 正在处理另一次设置请求，未保存。修改已保留，请稍后再次保存。",
+    };
+
     /// <summary>A short, user-facing sentence for a status.</summary>
     public static string Describe(SettingsStatus status, string error) => status switch
     {
         SettingsStatus.Ok => "正常。",
-        SettingsStatus.Busy => "Host 正在处理输入，暂时无法写入。",
+        SettingsStatus.Busy => "Host 暂时没有接受这次请求：正在组合中，或另一次请求正在进行。",
         SettingsStatus.Unsupported => string.IsNullOrEmpty(error) ? "Host 不支持该操作。" : error,
         SettingsStatus.Invalid => string.IsNullOrEmpty(error) ? "请求无效。" : error,
         SettingsStatus.Timeout => "Host 没有在限定时间内响应。",

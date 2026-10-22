@@ -184,6 +184,21 @@ if(BUILD_TESTING)
     target_link_libraries(candidate_auto_scroll PRIVATE FusionFcitxHost)
     add_test(NAME candidate_auto_scroll COMMAND candidate_auto_scroll)
 
+    # Settings saves taken while a composition is live, and a write the filesystem refuses,
+    # against the real pinned engine and Fcitx's own files. It needs a writable per-user
+    # configuration directory, so it runs only when the launcher names a throwaway profile
+    # (FUSION_TEST_SETTINGS_PROFILE, with APPDATA inside it); otherwise it prints SKIP and
+    # connects to nothing. The product's profile is never read or written.
+    add_executable(settings_save_while_composing tests/settings_save_while_composing.cpp)
+    target_include_directories(settings_save_while_composing PRIVATE src include)
+    target_compile_features(settings_save_while_composing PRIVATE cxx_std_20)
+    target_compile_definitions(settings_save_while_composing PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(settings_save_while_composing PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(settings_save_while_composing PRIVATE FusionFcitxHost)
+    add_test(NAME settings_save_while_composing COMMAND settings_save_while_composing)
+    set_tests_properties(settings_save_while_composing PROPERTIES
+      SKIP_REGULAR_EXPRESSION "SKIP settings_save_while_composing")
+
     # The candidate/preedit/panel outputFilter contract against the real pinned
     # Fcitx5 core: same projection source FusionHost.exe compiles, built with the
     # Host's own compiler settings, driven with engine-side OutputFilter consumers.

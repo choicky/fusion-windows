@@ -886,7 +886,12 @@ public:
             return selection_on_loop(*result, taskError);
           }
           if (has_active_composition_on_loop()) {
-            taskError = "Finish the current composition, then retry the input-method switch.";
+            // Same reason as the list below: the switch is `setGroup`, which deactivates the
+            // engine of every composing context.
+            taskError =
+                "Switching the input method ends the composition of every context that is "
+                "still composing, and the switch is stored by that same official call. Finish "
+                "the composition, then retry.";
             return SettingsStatus::Busy;
           }
           auto group = liveGroup;
@@ -1042,12 +1047,34 @@ private:
     return SettingsStatus::Ok;
   }
 
-  // The official D-Bus controller apply sequence for fcitx://config/global
-  // (dbusmodule.cpp:425-432): partial load onto the live GlobalConfig, safeSave, and
-  // reloadConfig only if the save succeeded. The submitted tree is merged onto the
-  // current values first (same delta/no-change path as an input-method page), so a
-  // partial load never resets an unexposed option to its default, and a no-change
-  // Apply calls neither load nor safeSave nor reloadConfig and touches no file.
+  // The official D-Bus controller apply step for fcitx://config/global
+  // (dbusmodule.cpp:425-432) is a partial load onto the live GlobalConfig, safeSave, and
+  // reloadConfig only if the save succeeded. That order has a state the product must not
+  // have: a refused write leaves the live object holding a value the file does not have, so
+  // GetConfig reports it, the derived state (hotkeys, preedit default, property policy) is
+  // never refreshed, and resubmitting the same change matches the "nothing changed" branch
+  // and reports success without writing. Here the write therefore happens against a
+  // throwaway GlobalConfig first, and the live object is touched only once the file is on
+  // disk, exactly as the candidate-presentation apply does it.
+  //
+  // A fresh object is used rather than a copy: `GlobalConfig` owns sub-configurations whose
+  // options carry their owner pointer, and this change has no reason to ask what copying one
+  // means. `load` into a default-constructed instance is the path startup uses, and
+  // `safeSave` on it is the same call the official sequence makes on the live one — same
+  // serialization, same filtered output (an option left at its default is simply absent, so
+  // a cleared value stays cleared), same file and same atomic replace.
+  //
+  // The submitted tree is merged onto the current values first (same delta/no-change path as
+  // an input-method page), so a partial load never resets an unexposed option to its default,
+  // and a no-change Apply calls neither load nor safeSave nor reloadConfig and touches no
+  // file.
+  //
+  // No composition gate: reloadConfig does not reset an input context — it re-reads the file,
+  // re-applies ShareInputState and the preedit default, re-arms the autosave period and posts
+  // GlobalConfigReloadedEvent — and the Pinyin engine is not one of that event's listeners
+  // (chinese-addons `pinyin.cpp` has no GlobalConfigReloaded handler), so a composition that
+  // is live in another context keeps its buffer and its candidates. A page whose apply would
+  // end a composition is refused, not this one.
   SettingsStatus apply_global_settings_on_loop(const SettingsValue &submitted,
                                                SettingsSnapshot &snapshot, std::string &error) {
     SettingsSnapshot current;
@@ -1068,28 +1095,31 @@ private:
       snapshot = std::move(current);
       return SettingsStatus::Ok;
     }
-    if (has_active_composition_on_loop()) {
-      error = "Finish the current composition, then retry applying the global settings.";
-      return SettingsStatus::Busy;
-    }
     fcitx::RawConfig raw;
     if (!settings_value_fill_raw_config(merged, raw)) {
       error = "The global settings value tree is malformed.";
       return SettingsStatus::Invalid;
     }
-    instance_->globalConfig().load(raw, /*partial=*/true);
-    if (!instance_->globalConfig().safeSave()) {
-      error = "Fcitx could not save the global configuration; reload before retrying.";
+    fcitx::GlobalConfig candidate;
+    candidate.load(raw, /*partial=*/true);
+    if (!candidate.safeSave()) {
+      error = "Fcitx could not save the global configuration; nothing was changed, so the "
+              "same change can be retried.";
       return SettingsStatus::Error;
     }
+    // Persisted. Publish the same tree to the object the Host reads from, then let Fcitx
+    // derive everything that depends on it, so the file, what GetConfig reports and what the
+    // hotkeys and preedit default actually do cannot disagree — including when the write
+    // failed, where none of the three moves.
+    instance_->globalConfig().load(raw, /*partial=*/true);
     instance_->reloadConfig();
     return read_global_settings_on_loop(snapshot, error);
   }
 
-  // The candidate-presentation configuration follows the same sequence as the global one,
-  // minus reloadConfig: no addon caches this value, so the save plus the in-memory update
-  // below is the whole apply. Nothing here touches the engine, and the merge/no-change
-  // path is shared, so an Apply with nothing changed writes no file.
+  // The candidate-presentation configuration is the same write-then-publish sequence as the
+  // global one, minus reloadConfig: no addon caches this value, so the save plus the
+  // in-memory update below is the whole apply. Nothing here touches the engine, and the
+  // merge/no-change path is shared, so an Apply with nothing changed writes no file.
   SettingsStatus read_presentation_settings_on_loop(SettingsSnapshot &snapshot,
                                                     std::string &error) {
     fcitx::RawConfig values;
@@ -1121,13 +1151,6 @@ private:
       snapshot = std::move(current);
       return SettingsStatus::Ok;
     }
-    // Refused while a composition is live for the same reason the other pages are: the
-    // candidate window is already on screen, and moving it mid-composition would relocate
-    // the panel under the user's pointer.
-    if (has_active_composition_on_loop()) {
-      error = "Finish the current composition, then retry applying the candidate layout.";
-      return SettingsStatus::Busy;
-    }
     fcitx::RawConfig raw;
     if (!settings_value_fill_raw_config(merged, raw)) {
       error = "The candidate-presentation settings value tree is malformed.";
@@ -1145,6 +1168,16 @@ private:
     // exist, but copying an object whose options carry an owner pointer is a question this
     // change has no reason to ask. `load` into a default-constructed instance is the same
     // path startup already uses, and it validates the raw tree exactly once, before any I/O.
+    //
+    // No composition gate either. Unlike the two engine pages below, nothing stored here is
+    // read by a running composition: the layout and the font are read once per projected
+    // page, so a panel already on screen keeps its geometry and its contents until the next
+    // projection — which is the first moment a new value could be drawn at all. A click
+    // already in flight therefore still names the candidate the user saw: the action is
+    // fenced to the displayed page and bounded by its entry count (semantic.cpp,
+    // begin_candidate_action), and this path changes neither the engine's list nor that page.
+    // Refusing the save instead would only ask the user to finish a word they had already
+    // typed.
     CandidatePresentationConfig candidate;
     candidate.load(raw, /*partial=*/true);
     // `Configuration::load` returns void and leaves an option whose value fails its own
@@ -1234,8 +1267,22 @@ private:
       snapshot = std::move(current);
       return SettingsStatus::Ok;
     }
+    // This is the one page that cannot be written without being applied, and cannot be
+    // applied while a composition is live. `setConfigForInputMethod` is the engine's own
+    // setter: PinyinEngine::setConfig loads the tree, saves conf/pinyin.conf and calls
+    // populateConfig, and populateConfig always installs a freshly constructed
+    // `ShuangpinProfile` (chinese-addons `pinyin.h`/`pinyin.cpp`). libime's PinyinIME
+    // compares that shared_ptr and emits `optionChanged`, and PinyinContext connects that
+    // signal to `clear()` (`libime/pinyin/pinyincontext.cpp:432`), so every composing
+    // context in the Host loses the buffer the user was typing. There is no official call
+    // that persists this configuration without publishing it, and holding the submitted tree
+    // in Host memory instead would be neither the official store nor a save. So the request
+    // is refused while a composition is live, with the reason named rather than "busy".
     if (has_active_composition_on_loop()) {
-      error = "Finish the current composition, then retry applying settings.";
+      error = "This Pinyin/Shuangpin setting can only be applied by the engine's own setter, "
+              "which clears every composing context, and there is no official way to store it "
+              "without applying it. Finish the composition, then save again; nothing was "
+              "changed, so the same change can be retried.";
       return SettingsStatus::Busy;
     }
     const auto *entry = instance_->inputMethodManager().entry(method);
@@ -1352,8 +1399,17 @@ private:
         current_group.defaultInputMethod() == plan->methods.front()) {
       return im_list_on_loop(out, error);
     }
+    // Refused while a composition is live, and for a reason that is the engine's, not a
+    // policy: `setGroup` on the current group emits CurrentGroupChanged, every context
+    // re-resolves its input method, and the engine that was composing is deactivated — which
+    // for Pinyin is `reset`. The group and the profile are written by that same call
+    // (`setGroup` then `save`), so there is no order in which the list is stored without the
+    // switch happening.
     if (has_active_composition_on_loop()) {
-      error = "Finish the current composition, then retry the input-method list change.";
+      error = "Changing the input-method list switches the method a composing context uses, "
+              "which ends its composition, and the list is stored by that same official call. "
+              "Finish the composition, then save again; nothing was changed, so the same "
+              "change can be retried.";
       return SettingsStatus::Busy;
     }
     // The first enabled method is the one in use, so it is also Items/0's content and
