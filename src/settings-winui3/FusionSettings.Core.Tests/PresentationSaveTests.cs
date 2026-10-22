@@ -69,9 +69,12 @@ internal static class PresentationSaveTests
             return;
         }
 
-        Harness.CheckEqual("Enum", option.Type, "the layout is a two-valued option");
-        Harness.CheckEqual("Horizontal|Vertical", string.Join("|", option.EnumLabels),
-            "with exactly the two layouts and no third stored state");
+        Harness.CheckEqual("Enum", option.Type, "the layout is an enumeration");
+        // Three arrangements now (R40 added automatic scrolling), and still no "not chosen"
+        // value: an absent choice is the default, not a fourth stored state that would be
+        // indistinguishable from a key the user never wrote.
+        Harness.CheckEqual("Horizontal|Vertical|AutoScroll", string.Join("|", option.EnumLabels),
+            "with the three arrangements and no additional stored state");
         Harness.CheckEqual("Vertical", option.DefaultValue.Scalar,
             "and a default that preserves the presentation shipped before the option existed");
 
@@ -164,6 +167,45 @@ internal static class PresentationSaveTests
         Harness.CheckEqual("Vertical", await ReadStoredAsync(endpoint, cancellationToken)
                 .ConfigureAwait(false),
             "the Host stores the vertical layout");
+
+        // 6b. The third arrangement is a stored value like the other two: the schema offers
+        //     it, the Host accepts it, and it comes back. This is the only one the settings
+        //     window can offer that changes the *shape* of the window rather than its
+        //     direction, so it is worth proving on the same path rather than by inspection.
+        var layoutOption = type.Options.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, Option, StringComparison.Ordinal));
+        Harness.Check(layoutOption is not null, "the layout option is in the schema");
+        if (layoutOption is not null)
+        {
+            Harness.CheckEqual(3, layoutOption.EnumLabels.Count,
+                "the schema offers exactly three arrangements");
+            Harness.Check(layoutOption.EnumLabels.Contains("AutoScroll", StringComparer.Ordinal),
+                "and the automatic scrolling arrangement is one of them");
+            Harness.CheckEqual("Horizontal|Vertical",
+                string.Join("|", layoutOption.EnumLabels.Take(2)),
+                "the two arrangements that shipped first kept their names and order");
+            // The default is still vertical, so a profile that never chose keeps the window it
+            // has always had rather than silently becoming a scrolling one.
+            Harness.CheckEqual("Vertical", layoutOption.DefaultValue.Scalar,
+                "and the default is still the vertical list");
+        }
+
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, Option,
+                SettingsValue.Text("AutoScroll")),
+            "the automatic scrolling arrangement is selected");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Harness.Check(!workspace.PresentationDraft!.HasChanges, "the save leaves nothing pending");
+        Harness.CheckEqual("AutoScroll", await ReadStoredAsync(endpoint, cancellationToken)
+                .ConfigureAwait(false),
+            "the Host stores the automatic scrolling arrangement");
+        // Back to the value step 7 needs, through the same path.
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, Option,
+                SettingsValue.Text("Vertical")),
+            "and back to vertical for the next step");
+        await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
+        Harness.CheckEqual("Vertical", await ReadStoredAsync(endpoint, cancellationToken)
+                .ConfigureAwait(false),
+            "which the Host also stores");
 
         // 7. A write that the operating system genuinely refuses must not publish anything.
         //
@@ -333,18 +375,26 @@ internal static class PresentationSaveTests
         Harness.CheckEqual("11", ReadIniValue(File.ReadAllText(fontFile!), "FontSize"),
             "and the file agrees");
 
-        // 12. Leave a non-default font behind, so the post-restart run proves persistence of a
-        //     choice rather than of a default that would read the same either way.
+        // 12. Leave two non-default choices behind, so the post-restart run proves
+        //     persistence of the choices rather than of defaults that would read the same
+        //     either way: the automatic scrolling arrangement and a 16 pt font.
         Harness.Check(workspace.TrySet(SettingsTarget.Presentation, "FontSize",
                 SettingsValue.Text("16")),
             "a non-default size is set again for the restart check");
+        Harness.Check(workspace.TrySet(SettingsTarget.Presentation, Option,
+                SettingsValue.Text("AutoScroll")),
+            "and the automatic scrolling arrangement");
         await workspace.SaveAsync(cancellationToken).ConfigureAwait(false);
         Harness.CheckEqual("16",
             await ReadPresentationValueAsync(endpoint, "FontSize", cancellationToken)
                 .ConfigureAwait(false),
-            "and stored");
+            "the size is stored");
+        Harness.CheckEqual("AutoScroll",
+            await ReadPresentationValueAsync(endpoint, Option, cancellationToken)
+                .ConfigureAwait(false),
+            "and so is the arrangement");
 
-        Console.WriteLine($"   PRESENTATION_EXPECT={Option}=Horizontal;FontSize=16");
+        Console.WriteLine($"   PRESENTATION_EXPECT={Option}=AutoScroll;FontSize=16");
     }
 
     /// <summary>

@@ -40,6 +40,14 @@
 // effect on the next page instead of needing its own request/reply channel or a
 // reconnect. The page is a payload inside SendResponse, so this is again a shape
 // change rather than a new message, and an old/new pairing must fail the handshake.
+//
+// Automatic scrolling raised it 5 -> 6: CandidatePage carries the engine's paging
+// facts (arrangement, page size, current/first/total page), so one page can describe a
+// bounded window of several engine pages, and BackendStimulus gained
+// SelectCandidateGlobal so a candidate in another row of that window is selected by the
+// engine's own global index instead of by a page-local one that does not exist. Both are
+// payload shapes inside the same messages; an old/new pairing fails the handshake.
+//
 // The settings messages below stay additive on top of this version for the reason
 // they always were: FusionSettings.exe uses its own connection and its own
 // settings_api_version. The numbers below remain engineering constants: D072 keeps
@@ -57,7 +65,7 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 5;
+inline constexpr std::uint32_t protocol_version = 6;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -65,6 +73,9 @@ inline constexpr std::size_t response_envelope_size = 8;
 inline constexpr std::size_t max_message_payload = 65536;
 inline constexpr std::size_t max_string_length = 8192;
 inline constexpr std::size_t max_vector_length = 64;
+// The largest global candidate index a stimulus may name: a bound, not a page size. The
+// engine's own total decides what is selectable; this only keeps the payload sane.
+inline constexpr std::size_t max_candidate_index = 100000;
 inline constexpr std::size_t header_size = 5;
 
 enum class MessageType : std::uint8_t {
@@ -235,10 +246,14 @@ inline std::optional<BackendStimulus> deserialize_stimulus(const std::uint8_t *d
     return std::nullopt;
   const auto type = static_cast<BackendStimulus::Type>(*type_byte);
   const auto index = static_cast<std::int32_t>(*index_bits);
-  // Fail closed on an index that cannot address a page slot, and on a key
-  // stimulus that claims one.
+  // Fail closed on an index that cannot address a slot, and on a key stimulus that claims
+  // one. A page-local index is bounded by a page; a global one by the whole list, so its
+  // ceiling is larger — the Host re-checks both against the engine's own numbers.
   if (type == BackendStimulus::Type::SelectCandidate) {
     if (index < 0 || static_cast<std::size_t>(index) >= max_vector_length)
+      return std::nullopt;
+  } else if (type == BackendStimulus::Type::SelectCandidateGlobal) {
+    if (index < 0 || static_cast<std::size_t>(index) >= max_candidate_index)
       return std::nullopt;
   } else if (index != -1) {
     return std::nullopt;
@@ -292,6 +307,13 @@ inline void serialize(std::vector<std::uint8_t> &buf, const CandidatePage &page)
   // CandidatePage. Bounded by the same string limit every other field uses.
   detail::write_string(buf, page.font.family);
   detail::write_u32(buf, static_cast<std::uint32_t>(page.font.size_pt));
+  // The window, after the font for the same reason: appended fields keep the reader's
+  // order the same as CandidatePage's own.
+  detail::write_u8(buf, static_cast<std::uint8_t>(page.arrangement));
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.page_size));
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.current_page));
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.window_first_page));
+  detail::write_u32(buf, static_cast<std::uint32_t>(page.total_pages));
 }
 
 inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
@@ -343,6 +365,42 @@ inline std::optional<CandidatePage> deserialize_page(detail::Reader &r) {
     return std::nullopt;
   page.font.family = std::move(*font_family);
   page.font.size_pt = static_cast<int>(*font_size);
+
+  auto arrangement = r.read_u8();
+  auto page_size = r.read_u32();
+  auto current_page = r.read_u32();
+  auto window_first_page = r.read_u32();
+  auto total_pages = r.read_u32();
+  if (!arrangement || !page_size || !current_page || !window_first_page || !total_pages)
+    return std::nullopt;
+  if (*arrangement > static_cast<std::uint8_t>(CandidateArrangement::Scroll))
+    return std::nullopt;
+  // The paging facts have to describe *this* entry list: a window whose entries cannot be
+  // addressed by (first page + index / page size) is a payload this Host does not
+  // implement, not something to trim or guess at.
+  if (*current_page > *total_pages || *window_first_page > *current_page)
+    return std::nullopt;
+  if (*page_size > 0) {
+    const auto window_pages = *total_pages - *window_first_page;
+    const std::uint64_t addressable =
+        static_cast<std::uint64_t>(window_pages) * static_cast<std::uint64_t>(*page_size);
+    if (addressable < page.entries.size())
+      return std::nullopt;
+    if (*arrangement == static_cast<std::uint8_t>(CandidateArrangement::Scroll) &&
+        (*window_first_page >= *total_pages || page.entries.empty()))
+      return std::nullopt;
+  } else if (*arrangement == static_cast<std::uint8_t>(CandidateArrangement::Scroll)) {
+    return std::nullopt; // a scroll window without a page size has no rows to draw
+  } else if (*current_page != 0 || *window_first_page != 0 || *total_pages != 0) {
+    return std::nullopt;
+  }
+  if (*page_size > 100 || *total_pages > 100000)
+    return std::nullopt;
+  page.arrangement = static_cast<CandidateArrangement>(*arrangement);
+  page.page_size = static_cast<std::int32_t>(*page_size);
+  page.current_page = static_cast<std::int32_t>(*current_page);
+  page.window_first_page = static_cast<std::int32_t>(*window_first_page);
+  page.total_pages = static_cast<std::int32_t>(*total_pages);
   return page;
 }
 

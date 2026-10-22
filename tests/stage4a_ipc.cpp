@@ -60,6 +60,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -811,11 +812,15 @@ void test_protocol() {
 
     std::vector<std::uint8_t> broken;
     serialize(broken, page);
-    // Rewrite the trailing size field (the last four bytes) to an implausible value.
+    // Rewrite the size field. It is not the last field on the wire any more, so the offset
+    // is derived from the fields that follow it (arrangement + four page numbers) instead of
+    // being "the last four bytes" — which would now corrupt a page number and quietly stop
+    // testing the size at all.
+    const std::size_t trailing = 1 + 4 * sizeof(std::uint32_t);
+    const std::size_t size_offset = broken.size() - trailing - sizeof(std::uint32_t);
     const std::uint32_t absurd = 401;
-    for (int i = 0; i < 4; ++i)
-      broken[broken.size() - 4 + static_cast<std::size_t>(i)] =
-          static_cast<std::uint8_t>(absurd >> (i * 8));
+    for (std::size_t i = 0; i < 4; ++i)
+      broken[size_offset + i] = static_cast<std::uint8_t>(absurd >> (i * 8));
     detail::Reader bad{broken.data(), broken.size()};
     require(!deserialize_page(bad), "an implausible font size fails closed");
 
@@ -830,6 +835,97 @@ void test_protocol() {
     require(plain_decoded && plain_decoded->font.family.empty() &&
                 plain_decoded->font.size_pt == 0,
             "a page without a font keeps the empty projection");
+  }
+
+  // A scroll window carries the engine's paging facts, and the reader refuses a window that
+  // does not describe its own entries: a mis-addressed page would select a candidate the
+  // user never saw.
+  {
+    CandidatePage page;
+    page.layout = CandidateLayout::Horizontal;
+    page.arrangement = CandidateArrangement::Scroll;
+    page.page_size = 5;
+    page.window_first_page = 1;
+    page.current_page = 2;
+    page.total_pages = 9;
+    page.has_prev = true;
+    page.has_next = true;
+    for (int index = 0; index < 15; ++index)
+      page.entries.push_back(
+          CandidateEntry{std::to_string(index + 1), "\u4f60", "", false});
+    std::vector<std::uint8_t> payload;
+    serialize(payload, page);
+    detail::Reader reader{payload.data(), payload.size()};
+    const auto decoded = deserialize_page(reader);
+    require(decoded && reader.at_end(), "the scroll window parses back");
+    require(decoded->arrangement == CandidateArrangement::Scroll &&
+                decoded->page_size == 5 && decoded->current_page == 2 &&
+                decoded->window_first_page == 1 && decoded->total_pages == 9,
+            "the paging facts survive the wire unchanged");
+    require(decoded->global_index_of(0) == 5 && decoded->current_row() == 1,
+            "the window addresses its entries by the engine's global index");
+
+    const auto rejected = [&](const std::function<void(CandidatePage &)> &mutate,
+                              const char *reason) {
+      CandidatePage copy = page;
+      mutate(copy);
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, copy);
+      detail::Reader r{bytes.data(), bytes.size()};
+      require(!deserialize_page(r), reason);
+    };
+    rejected([](CandidatePage &p) { p.page_size = 0; },
+             "a scroll window without a page size is rejected");
+    rejected([](CandidatePage &p) { p.current_page = 40; },
+             "a current page past the last page is rejected");
+    rejected([](CandidatePage &p) { p.window_first_page = 5; },
+             "a window that starts after the current page is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          p.window_first_page = 7; // two pages left, so ten entries at most
+          p.current_page = 8;
+          p.entries.resize(15);
+        },
+        "a window with more entries than its pages can address is rejected");
+    rejected(
+        [](CandidatePage &p) {
+          p.arrangement = CandidateArrangement::Page;
+          p.total_pages = 3;
+        },
+        "a plain page that carries paging facts is rejected");
+  }
+
+  // The global selection stimulus: it is a candidate action like any other on the wire,
+  // and its index is bounded as a list index rather than a page slot.
+  {
+    BackendStimulus stimulus;
+    stimulus.binding = Binding{7, 8, 9};
+    stimulus.stimulus_id = 12;
+    stimulus.type = BackendStimulus::Type::SelectCandidateGlobal;
+    stimulus.candidate_index = 137;
+    std::vector<std::uint8_t> payload;
+    serialize(payload, stimulus);
+    const auto decoded = deserialize_stimulus(payload.data(), payload.size());
+    require(decoded && decoded->type == BackendStimulus::Type::SelectCandidateGlobal &&
+                decoded->candidate_index == 137,
+            "a global selection round-trips");
+
+    for (const std::int32_t bad : {-1, 100001}) {
+      auto broken = stimulus;
+      broken.candidate_index = bad;
+      std::vector<std::uint8_t> bytes;
+      serialize(bytes, broken);
+      require(!deserialize_stimulus(bytes.data(), bytes.size()),
+              "an out-of-range global index is rejected");
+    }
+    // A key stimulus still carries no index at all.
+    auto key = stimulus;
+    key.type = BackendStimulus::Type::Character;
+    key.candidate_index = 5;
+    std::vector<std::uint8_t> bytes;
+    serialize(bytes, key);
+    require(!deserialize_stimulus(bytes.data(), bytes.size()),
+            "a character stimulus that names a candidate is rejected");
   }
 
   std::cout << "PASS protocol serialization, bounds, trailing bytes, and malformed input\n";

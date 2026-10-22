@@ -35,7 +35,7 @@ public static class WireLimits
     // Must match `fusion::ipc::protocol_version`. Both ends check it exactly and refuse a
     // mismatch with a version error, so this is a compatibility constant, not a hint: a
     // client that guessed would be served nothing at all.
-    public const uint ProtocolVersion = 5;
+    public const uint ProtocolVersion = 6;
     public const uint SettingsApiVersion = 2;
     public const uint SettingsApiMinVersion = 1;
 

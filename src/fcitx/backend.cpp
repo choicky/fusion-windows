@@ -56,8 +56,12 @@ constexpr std::size_t context_bound = 64;
 // page width belongs to the engine (pinyin configures 7, constrained 3-10).
 // D072 keeps numerical thresholds OPEN, so these are engineering constants and
 // exceeding them is recorded by CandidatePage::truncated rather than hidden.
-constexpr std::size_t candidate_page_entries = 10;
-constexpr std::size_t candidate_page_bytes = 4096;
+// One engine page is at most ten candidates, and a scroll window holds up to five rows of
+// them, so the transport bound is the window's, not a page's. It stays a bound: a list with
+// a wider page or a longer window is truncated (and reported as such) rather than sized to
+// whatever the engine happens to produce.
+constexpr std::size_t candidate_page_entries = 64;
+constexpr std::size_t candidate_page_bytes = 16384;
 // Segment bound for one displayed preedit (after Text::normalize()); an
 // engineering transport bound like the others, not a semantic limit.
 constexpr std::size_t preedit_segment_bound = 16;
@@ -94,12 +98,46 @@ bool is_candidate_presentation_uri(const std::string &uri) {
 }
 
 // The stored preference and the transport enum are two vocabularies for one decision: the
-// configuration persists Horizontal/Vertical, while CandidatePage::layout mirrors
-// fcitx::CandidateLayoutHint. Converting in one place keeps the stored value from ever
-// becoming a second layout model.
+// configuration persists Horizontal/Vertical/AutoScroll, while CandidatePage::layout
+// mirrors fcitx::CandidateLayoutHint. Converting in one place keeps the stored value from
+// ever becoming a second layout model.
+//
+// AutoScroll is a row-per-page *arrangement* whose rows are horizontal, so it maps to
+// Horizontal here and is carried separately as a presentation flag (see
+// candidate_projection_options_for). The page's layout field therefore keeps meaning
+// exactly what the engine's hint vocabulary means.
 CandidateLayout candidate_layout_for(CandidateLayoutPreference preference) {
-  return preference == CandidateLayoutPreference::Horizontal ? CandidateLayout::Horizontal
-                                                             : CandidateLayout::Vertical;
+  if (preference == CandidateLayoutPreference::Horizontal ||
+      preference == CandidateLayoutPreference::AutoScroll)
+    return CandidateLayout::Horizontal;
+  return CandidateLayout::Vertical;
+}
+
+// The tallest window the automatic scrolling arrangement may show, in engine pages (one
+// page = one row). The owner's confirmed maximum; the renderer shows fewer when the work
+// area cannot hold them.
+constexpr int max_scroll_rows = 5;
+
+// A test's own starting preference, named the way the configuration stores it. Empty (the
+// product path) keeps the stored value.
+CandidateLayoutPreference
+fixture_preference(const std::string &name, CandidateLayoutPreference stored) {
+  if (name == "Horizontal")
+    return CandidateLayoutPreference::Horizontal;
+  if (name == "Vertical")
+    return CandidateLayoutPreference::Vertical;
+  if (name == "AutoScroll")
+    return CandidateLayoutPreference::AutoScroll;
+  return stored;
+}
+
+CandidateProjectionOptions
+candidate_projection_options_for(CandidateLayoutPreference preference) {
+  CandidateProjectionOptions options;
+  options.layout = candidate_layout_for(preference);
+  options.auto_scroll = preference == CandidateLayoutPreference::AutoScroll;
+  options.max_scroll_rows = max_scroll_rows;
+  return options;
 }
 
 // The font the popup draws with, taken from the same stored configuration. Kept as one
@@ -344,6 +382,7 @@ std::vector<SettingsConfigType> dump_settings_description(const fcitx::Configura
 
 inline bool is_candidate_action(BackendStimulus::Type type) {
   return type == BackendStimulus::Type::SelectCandidate ||
+         type == BackendStimulus::Type::SelectCandidateGlobal ||
          type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev;
 }
 // Whether a stimulus carries a character, i.e. is something an input method would compose
@@ -360,7 +399,7 @@ inline bool stimulus_carries_character(const BackendStimulus &stimulus) {
 class InputContext final : public fcitx::InputContext {
 public:
   InputContext(fcitx::Instance &instance, Binding value,
-               const std::atomic<CandidateLayout> &layout_preference,
+               const std::atomic<CandidateLayoutPreference> &layout_preference,
                const std::atomic<std::shared_ptr<const CandidateFont>> &font)
       : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value),
         layout_preference_(layout_preference), font_(font) {
@@ -474,7 +513,9 @@ public:
     CandidatePage page;
     if (auto list = inputPanel().candidateList()) {
       auto projected = project_candidate_page(
-          *instance_, this, list, layout_preference_.load(std::memory_order_relaxed),
+          *instance_, this, list,
+          candidate_projection_options_for(
+              layout_preference_.load(std::memory_order_relaxed)),
           candidate_page_entries, candidate_page_bytes, payload_bound);
       if (!projected) {
         invalid = true;
@@ -509,6 +550,46 @@ public:
         return false;
       list->candidate(stimulus.candidate_index).select(this);
       return true;
+    case BackendStimulus::Type::SelectCandidateGlobal: {
+      // A cell of the scroll window that belongs to another engine page. The word is
+      // resolved through the list's own bulk view — the same CandidateWord the engine
+      // would hand out for that page — and selected through the same select() every other
+      // selection uses, so what commits is still decided only by the engine. No paging is
+      // performed to reach it, so the engine's page and its "next was used" state are left
+      // exactly as the user left them.
+      const int global = stimulus.candidate_index;
+      if (global < 0)
+        return false;
+      auto *common = dynamic_cast<fcitx::CommonCandidateList *>(list.get());
+      if (common != nullptr) {
+        const int page_size = common->pageSize();
+        const int total_pages = common->totalPages();
+        if (page_size <= 0 || total_pages <= 0 || global / page_size >= total_pages)
+          return false;
+      }
+      // -1 when the list does not publish pages: then the index is only meaningful as a
+      // global one, and the bulk lookup below is the only honest reading of it. Treating it
+      // as page-local there would select whatever happened to sit at that position.
+      const int local = common != nullptr && common->pageSize() > 0
+                            ? global - common->currentPage() * common->pageSize()
+                            : -1;
+      if (local >= 0 && local < list->size()) {
+        list->candidate(local).select(this);
+        return true;
+      }
+      auto *bulk = list->toBulk();
+      if (bulk == nullptr)
+        return false;
+      const int total = bulk->totalSize();
+      if (total >= 0 && global >= total)
+        return false;
+      try {
+        bulk->candidateFromAll(global).select(this);
+      } catch (const std::exception &) {
+        return false; // an index the list cannot produce is not a selection
+      }
+      return true;
+    }
     case BackendStimulus::Type::PageNext: {
       auto *pager = list->toPageable();
       if (!pager || !pager->hasNext())
@@ -536,7 +617,7 @@ public:
   // The Host's one stored presentation preference, read at projection time. It lives in
   // the backend and outlives every context, so a save is visible to the next projection
   // of every context without any per-context copy that could drift.
-  const std::atomic<CandidateLayout> &layout_preference_;
+  const std::atomic<CandidateLayoutPreference> &layout_preference_;
   // The font the same configuration carries, for the popup's drawing. Read once per
   // projected page; the backend publishes a new immutable value on a save.
   const std::atomic<std::shared_ptr<const CandidateFont>> &font_;
@@ -569,7 +650,7 @@ public:
       if (contexts_.contains(binding.context) || contexts_.size() >= context_bound)
         return false;
       auto context =
-          std::make_unique<InputContext>(*instance_, binding, candidate_layout_, candidate_font_);
+          std::make_unique<InputContext>(*instance_, binding, candidate_preference_, candidate_font_);
       context->focusIn();
       // The profile decides the input method (U1): the bound context starts in the
       // group's current input method (Items/0) as Fcitx resolves it, never in a
@@ -1096,7 +1177,8 @@ private:
     // projected page uses cannot disagree — including when the write failed, where none of
     // the three moves.
     presentation_config_.load(raw, /*partial=*/true);
-    candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
+    candidate_preference_.store(
+        presentation_config_.layout.value());
     candidate_font_.store(candidate_font_for(presentation_config_));
     return read_presentation_settings_on_loop(snapshot, error);
   }
@@ -1479,7 +1561,8 @@ private:
           // product shipped before the option existed, so an upgrade changes nothing for a
           // user who never opens the setting.
           fcitx::readAsIni(presentation_config_, candidate_presentation_config_path);
-          candidate_layout_.store(candidate_layout_for(presentation_config_.layout.value()));
+          candidate_preference_.store(fixture_preference(options_.fixture_candidate_layout,
+                                                          presentation_config_.layout.value()));
           candidate_font_.store(candidate_font_for(presentation_config_));
           ensure_usable_group(instance);
           if (!options_.fixture_input_methods.empty()) {
@@ -1610,10 +1693,14 @@ private:
   std::map<std::uint64_t, std::unique_ptr<InputContext>> contexts_;
   // The Windows candidate-presentation configuration is the Host's single authoritative
   // store for presentation, read from Fcitx's per-user directory at startup and written
-  // only through the settings path below. candidate_layout_ mirrors its layout value for
-  // the projection, so no code reads the file or the schema on a keystroke.
+  // only through the settings path below. candidate_preference_ mirrors its layout value
+  // for the projection, so no code reads the file or the schema on a keystroke.
   CandidatePresentationConfig presentation_config_;
-  std::atomic<CandidateLayout> candidate_layout_{CandidateLayout::Vertical};
+  // The stored preference itself, not a derived layout: AutoScroll and Horizontal both
+  // resolve to a horizontal row, and the difference between them is the arrangement, so
+  // keeping the preference is what stops the two from being confused after a load.
+  std::atomic<CandidateLayoutPreference> candidate_preference_{
+      CandidateLayoutPreference::Vertical};
   std::atomic<std::shared_ptr<const CandidateFont>> candidate_font_{
       std::make_shared<const CandidateFont>(CandidateFont{"Microsoft YaHei UI", 11})};
 };

@@ -174,6 +174,16 @@ if(BUILD_TESTING)
     target_link_libraries(stage5_real_projection PRIVATE FusionFcitxHost)
     add_test(NAME stage5_real_projection COMMAND stage5_real_projection)
 
+    # R40 automatic scrolling against the same real pinned engine: the window of several
+    # engine pages, the row step that follows the engine's own paging, the scroll-page step,
+    # and a global-index selection out of that window.
+    add_executable(candidate_auto_scroll tests/candidate_auto_scroll.cpp)
+    target_include_directories(candidate_auto_scroll PRIVATE src include)
+    target_compile_features(candidate_auto_scroll PRIVATE cxx_std_20)
+    target_compile_options(candidate_auto_scroll PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(candidate_auto_scroll PRIVATE FusionFcitxHost)
+    add_test(NAME candidate_auto_scroll COMMAND candidate_auto_scroll)
+
     # The candidate/preedit/panel outputFilter contract against the real pinned
     # Fcitx5 core: same projection source FusionHost.exe compiles, built with the
     # Host's own compiler settings, driven with engine-side OutputFilter consumers.

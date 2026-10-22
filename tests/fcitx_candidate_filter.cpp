@@ -109,9 +109,8 @@ int main() {
     // stored preference is what the page carries — and the default preference is vertical,
     // which is why the presentation is unchanged for a user who never configures it.
     CHECK(list->layoutHint() == fcitx::CandidateLayoutHint::NotSet);
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 10, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 10, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "你好");
@@ -147,7 +146,8 @@ int main() {
     };
     for (const auto &one : cases) {
       list->setLayoutHint(one.hint);
-      const auto page = fusion::project_candidate_page(instance, &frontend, list, one.preference,
+      const auto page = fusion::project_candidate_page(
+          instance, &frontend, list, fusion::CandidateProjectionOptions{one.preference},
                                                        10, 4096, 4096);
       CHECK(page.has_value());
       CHECK(page->layout == one.expected);
@@ -173,9 +173,8 @@ int main() {
             orig = text("F:" + orig.toString());
           }));
   {
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 10, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 10, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->entries.size() == 3);
     CHECK(page->entries[0].text == "F:你好");
@@ -200,9 +199,8 @@ int main() {
   // page records truncation and normalizes a dropped cursor to no-highlight.
   {
     list->setCursorIndex(2);
-    const auto page = fusion::project_candidate_page(instance, &frontend, list,
-                                                     fusion::CandidateLayout::Vertical, 1, 4096,
-                                                     4096);
+    const auto page = fusion::project_candidate_page(
+        instance, &frontend, list, fusion::CandidateProjectionOptions{}, 1, 4096, 4096);
     CHECK(page.has_value());
     CHECK(page->truncated);
     CHECK(page->entries.size() == 1);

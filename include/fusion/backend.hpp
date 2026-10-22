@@ -1,6 +1,7 @@
 #pragma once
 #include "fusion/core.hpp"
 #include "fusion/settings.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,14 @@ struct BackendStimulus {
     Escape,
     Return,
     SelectCandidate,
+    // SelectCandidate with `candidate_index` read as the engine's **global** index across
+    // the whole candidate list instead of the current page. Only a window that carries
+    // more than one engine page needs it: in such a window a clicked cell may belong to a
+    // page the engine is not on, and its page-local number does not exist. The selection
+    // itself is the same call on the same engine word — `CandidateWord::select`, which
+    // commits whatever the engine meant to commit — resolved through
+    // `BulkCandidateList::candidateFromAll`. Nothing is paged or re-ordered to reach it.
+    SelectCandidateGlobal,
     PageNext,
     PagePrev,
     // The key-up half of a modifier-only key. It carries the same keysym identity as the
@@ -70,6 +79,19 @@ struct BackendStimulus {
 // Mirror of the Fcitx page contract (fcitx::CandidateLayoutHint, candidatelist.h)
 // in declaration order. Windows projects it; it is not a second layout model.
 enum class CandidateLayout : std::uint8_t { NotSet = 0, Vertical = 1, Horizontal = 2 };
+
+// How the Windows window arranges what the page carries. This is *presentation*, and it is
+// deliberately not a fourth CandidateLayout: that enum mirrors the engine's own hint
+// vocabulary (fcitx::CandidateLayoutHint), and the engine has no "scroll" hint to mirror.
+//
+// Page   — what the engine gave, arranged the way CandidateLayout says: one row
+//          (Horizontal) or one column (Vertical). Every page sent before this existed is
+//          this, and it is also the fallback when the list cannot be read beyond its page.
+// Scroll — the page carries a bounded window of several engine pages (see the page fields
+//          below), arranged as a grid whose columns are the engine's own PageSize. Each
+//          row of the grid is one engine page, so the row the paging keys act on and the
+//          numbers the engine would accept stay the engine's.
+enum class CandidateArrangement : std::uint8_t { Page = 0, Scroll = 1 };
 
 // One list slot of the visible page. entries[i] always corresponds to
 // CandidateList::candidate(i): a placeholder keeps its index (it is never
@@ -104,7 +126,24 @@ struct CandidatePage {
   std::vector<CandidateEntry> entries;
   std::int32_t cursor_index = -1; // page-local highlight, -1 = nothing highlighted
   CandidateLayout layout = CandidateLayout::NotSet;
+  CandidateArrangement arrangement = CandidateArrangement::Page;
   CandidateFont font; // presentation only; never a candidate identity or a selection
+  // The engine's own paging facts, carried so the window can be arranged without a second
+  // notion of "page". All zero when the page does not come from a paging-aware list (Mock,
+  // a list without PageableCandidateList, or a window that could not be read):
+  //
+  //   page_size          fcitx::CommonCandidateList::pageSize() — the columns of one row
+  //   current_page       the engine's page right now — the row the paging keys act on
+  //   window_first_page  the engine page entries[0] belongs to
+  //   total_pages        how many pages the list has
+  //
+  // Scroll pages are the only ones that carry a non-zero window, and entries[] is then
+  // (window_last_page - window_first_page + 1) * page_size long, in engine order. For a
+  // Page arrangement entries[] is exactly the engine page and window_first_page is 0.
+  std::int32_t page_size = 0;
+  std::int32_t current_page = 0;
+  std::int32_t window_first_page = 0;
+  std::int32_t total_pages = 0;
   bool has_prev = false; // canonical pager truth (PageableCandidateList)
   bool has_next = false;
   bool truncated = false; // transport bound hit, not a semantic decision
@@ -134,6 +173,20 @@ struct CandidatePage {
   void normalize_cursor_to_retained_prefix() {
     if (cursor_index >= static_cast<std::int32_t>(entries.size()))
       cursor_index = -1;
+  }
+  // The engine's global index of a displayed entry, and the row the engine's current page
+  // occupies inside the window. Both are pure arithmetic over the paging facts above, so
+  // the window never invents an ordering: entries[] is already the engine's.
+  bool paging_known() const { return page_size > 0; }
+  std::int32_t global_index_of(std::size_t entry_index) const {
+    if (!paging_known() || entry_index > static_cast<std::size_t>(INT32_MAX))
+      return -1;
+    return window_first_page * page_size + static_cast<std::int32_t>(entry_index);
+  }
+  std::int32_t current_row() const {
+    if (!paging_known())
+      return 0;
+    return (std::max)(0, current_page - window_first_page);
   }
 };
 
@@ -283,6 +336,11 @@ struct FcitxBackendOptions {
   // prove that the configured key decides and not the shell. Empty keeps Fcitx's
   // configured value (Shift_L).
   std::string fixture_alt_trigger_key;
+  // Fixture-only: start with this candidate-presentation preference ("Vertical",
+  // "Horizontal" or "AutoScroll") instead of the schema's default, so a test can drive the
+  // scrolling arrangement without writing a configuration file. Empty keeps the default.
+  // The product Host never sets it: its value comes from the user's own configuration.
+  std::string fixture_candidate_layout;
 };
 FUSION_FCITX_API std::unique_ptr<Backend> make_fcitx_backend(FcitxBackendOptions options = {});
 } // namespace fusion

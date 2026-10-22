@@ -28,20 +28,27 @@
 
 namespace fusion {
 
-// The stored user preference. Two values only: "no choice" is the schema default rather
-// than a third stored state, because a stored NotSet would be indistinguishable from an
-// absent key, and "the user chose the default" and "the user never chose" would then be
-// the same bytes describing different facts.
+// The stored user preference. "No choice" is the schema default rather than a stored
+// state, because a stored NotSet would be indistinguishable from an absent key, and "the
+// user chose the default" and "the user never chose" would then be the same bytes
+// describing different facts.
 //
 // The stored names are ASCII and stable; the Chinese labels the settings window shows are
 // supplied by the settings client, so a stored value never depends on the display
 // language. CandidateLayout::NotSet stays reserved for "the engine's own list hint", and
 // this enum has no such value: the projection resolves the preference before the page is
 // sent (see candidate_layout_for).
-enum class CandidateLayoutPreference { Horizontal, Vertical };
+//
+// AutoScroll is a third *preference*, and deliberately not a third CandidateLayout: the
+// layout enum mirrors fcitx::CandidateLayoutHint, which has no scrolling value. AutoScroll
+// means "one row per engine page, up to five of them at once, following the paging keys" —
+// the arrangement is presentation (CandidateArrangement::Scroll) and each row is still
+// laid out as a row. An engine hint still wins over this, exactly as it wins over the
+// other two (resolve_candidate_layout), so a list that asks for a column gets a column.
+enum class CandidateLayoutPreference { Horizontal, Vertical, AutoScroll };
 
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(CandidateLayoutPreference, N_("Horizontal"),
-                                 N_("Vertical"))
+                                 N_("Vertical"), N_("AutoScroll"))
 
 // Default Vertical: a user who never opens the setting keeps the presentation this
 // product shipped before the option existed, which is the requirement that outranks
