@@ -30,6 +30,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -118,6 +119,73 @@ int scaled_for_test(int value) {
 int width_of(const RECT &rect) { return static_cast<int>(rect.right - rect.left); }
 
 int height_of(const RECT &rect) { return static_cast<int>(rect.bottom - rect.top); }
+
+RECT window_rect(HWND hwnd) {
+  RECT rect{};
+  if (hwnd != nullptr)
+    GetWindowRect(hwnd, &rect);
+  return rect;
+}
+
+bool overlaps(const RECT &a, const RECT &b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+bool in_rect(const RECT &rect, POINT point) {
+  return point.x >= rect.left && point.x < rect.right && point.y >= rect.top &&
+         point.y < rect.bottom;
+}
+
+// A point in the space between the two windows: it belongs to neither, which is exactly
+// where the pointer is while it travels from a candidate to the full text.
+POINT point_between(const RECT &panel, const RECT &tip) {
+  if (tip.top >= panel.bottom)
+    return POINT{(std::max)(panel.left, tip.left) + 2, (panel.bottom + tip.top) / 2};
+  if (tip.bottom <= panel.top)
+    return POINT{(std::max)(panel.left, tip.left) + 2, (tip.bottom + panel.top) / 2};
+  if (tip.left >= panel.right)
+    return POINT{(panel.right + tip.left) / 2, panel.top + 2};
+  return POINT{(tip.right + panel.left) / 2, panel.top + 2};
+}
+
+std::wstring to_wide(const std::string &text) {
+  if (text.empty())
+    return {};
+  const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                        static_cast<int>(text.size()), nullptr, 0);
+  if (count <= 0)
+    return {};
+  std::wstring result(static_cast<std::size_t>(count), L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()),
+                      result.data(), count);
+  return result;
+}
+
+// An independent height for a wrapped text: the test's own font handle, its own GDI
+// measurement and the width the popup says it wrapped at. Nothing here reuses the popup's
+// arithmetic, which is the point — comparing its counters with each other would prove only
+// that they agree.
+int wrapped_height_with(const fusion::CandidatePage &page, int dpi, const std::wstring &text,
+                        int width) {
+  HDC dc = GetDC(nullptr);
+  if (dc == nullptr)
+    return 0;
+  const std::string family = page.font.family.empty() ? "Microsoft YaHei UI" : page.font.family;
+  const int size_pt = page.font.size_pt > 0 ? page.font.size_pt : 11;
+  HFONT font = CreateFontW(-MulDiv(size_pt, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           CLEARTYPE_QUALITY, FF_DONTCARE, to_wide(family).c_str());
+  HGDIOBJ previous = font != nullptr ? SelectObject(dc, font) : nullptr;
+  RECT cell{0, 0, (std::max)(1, width), 0};
+  DrawTextW(dc, text.c_str(), -1, &cell, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+  const int height = cell.bottom - cell.top;
+  if (previous != nullptr)
+    SelectObject(dc, previous);
+  if (font != nullptr)
+    DeleteObject(font);
+  ReleaseDC(nullptr, dc);
+  return height;
+}
 
 RECT show_and_measure(fusion::tsf::CandidateView &view, const fusion::CandidatePage &page) {
   view.show(page, POINT{120, 120});
@@ -243,8 +311,13 @@ int main() {
       CHECK(tip.left >= work.left && tip.right <= work.right);
       CHECK(tip.top >= work.top && tip.bottom <= work.bottom);
     }
-    // Leaving the slot hides it again rather than leaving a stale tooltip on screen.
+    // Leaving the slot does not hide it on the spot: the pointer may be on its way into the
+    // box across the gap, so the close is deferred and the cursor's position at the end of
+    // the delay decides. With the pointer away from both windows it goes.
     SendMessageW(view.window(), WM_MOUSELEAVE, 0, 0);
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    SetCursorPos(work.left + 4, work.top + 4);
+    SendMessageW(view.window(), WM_TIMER, fusion::tsf::CandidateView::tip_close_timer_id, 0);
     CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
 
     // A page with nothing clipped hides the tip as well.
@@ -370,9 +443,11 @@ int main() {
     }
   }
 
-  // 14. The largest size the schema allows, with a full page of candidates: the vertical
-  //     column cannot fit the work area at 48 pt, and the answer is still bounded — every
-  //     candidate present and clickable, and the user's size untouched.
+  // 14. The largest size the schema allows, with a full page of candidates. On this display
+  //     the column may or may not fit, so the invariants here are the ones that hold either
+  //     way: one column, inside the screen, every drawn candidate clickable, and the
+  //     highlighted candidate always drawn. The overflow case itself is proven below with a
+  //     budget that cannot hold the page, which does not depend on the screen size.
   {
     MONITORINFO info{};
     info.cbSize = sizeof(info);
@@ -393,19 +468,82 @@ int main() {
     CHECK(line > 0);
     const auto &layout = view.layout();
     CHECK(layout.slots.size() == 10);
+    CHECK(layout.total_rows == 10);
+    // One column only: no two visible slots share a row, and every visible slot starts at
+    // the same left edge.
+    int left_edge = -1;
+    for (std::size_t a = 0; a < layout.slots.size(); ++a) {
+      if (layout.slots[a].empty())
+        continue;
+      if (left_edge < 0)
+        left_edge = layout.slots[a].left;
+      CHECK(layout.slots[a].left == left_edge);
+      for (std::size_t b = a + 1; b < layout.slots.size(); ++b)
+        CHECK(layout.slots[b].empty() || layout.slots[b].top != layout.slots[a].top);
+    }
     int placed = 0;
     for (std::size_t index = 0; index < layout.slots.size(); ++index) {
       if (layout.slots[index].empty())
         continue;
       ++placed;
       CHECK(layout.slots[index].bottom - layout.slots[index].top >= line);
+      CHECK(layout.slots[index].top >= 0);
+      CHECK(layout.slots[index].bottom <= height_of(rect));
       const auto hit = fusion::tsf::hit_test_candidate_panel(
           layout, layout.slots[index].left + 1,
           (layout.slots[index].top + layout.slots[index].bottom) / 2);
       CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
             hit->index == static_cast<std::int32_t>(index));
     }
-    CHECK(placed == 10);
+    CHECK(placed == layout.visible_rows);
+    CHECK(placed > 0);
+    // Nothing outside the window takes a click: a row that is not drawn has no rect.
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      if (!layout.slots[index].empty())
+        continue;
+      const auto hit = fusion::tsf::hit_test_candidate_panel(layout, 1, layout.height - 1);
+      CHECK(!hit || hit->kind != fusion::tsf::PanelHit::Kind::Select ||
+            hit->index != static_cast<std::int32_t>(index));
+    }
+    // The highlighted candidate is always inside the window: that is what makes the rows
+    // outside it reachable at all (the keyboard moves the window).
+    for (std::int32_t cursor = 0; cursor < 10; ++cursor) {
+      page.cursor_index = cursor;
+      show_and_measure(view, page);
+      const auto &current = view.layout();
+      CHECK(!current.slots[static_cast<std::size_t>(cursor)].empty());
+      CHECK(current.slots[static_cast<std::size_t>(cursor)].top >= 0);
+      CHECK(current.slots[static_cast<std::size_t>(cursor)].bottom <= current.height);
+    }
+  }
+
+  // 14b. The same page against a budget that cannot hold it (a short work area): the panel
+  //      becomes a viewport over one column instead of continuing into a second column, and
+  //      the window follows the highlighted row.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(64, 96); // 48 pt at 100 %
+    const auto measure = [](const std::string &text) {
+      return static_cast<int>(text.size()) * 30;
+    };
+    auto page = make_page(fusion::CandidateLayout::Vertical, 10);
+    page.font.size_pt = 48;
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = 900;
+    limits.max_height = 420;
+    page.cursor_index = 0;
+    const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+    CHECK(layout.total_rows == 10);
+    CHECK(layout.visible_rows > 0 && layout.visible_rows < layout.total_rows);
+    CHECK(layout.first_row == 0);
+    CHECK(layout.rows_hidden_below());
+    CHECK(!layout.rows_hidden_above());
+    CHECK(layout.height <= 420);
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      if (layout.slots[index].empty())
+        continue;
+      CHECK(layout.slots[index].bottom <= 420);
+      CHECK(layout.slots[index].top >= 0);
+    }
   }
 
   // 15. A narrow work area with a pager and an auxiliary row: the budget is shared by every
@@ -521,10 +659,12 @@ int main() {
     }
   }
 
-  // 18. The same page on a work area that cannot hold a single column: a small laptop
+  // 18. The same page on a work area that cannot hold the whole column: a small laptop
   //     screen at 125 %, ten candidates at the largest size the schema allows. The column
-  //     has to continue sideways — all ten present, inside the screen, still clickable —
-  //     instead of running off the bottom where nobody can reach it.
+  //     stays a single column and the panel becomes a bounded viewport over it: the rows
+  //     that fit are drawn and clickable, the rest are reached by moving the highlight, and
+  //     no second column appears — the engine's page order and PageSize are not rewritten by
+  //     the presentation.
   {
     const auto metrics = fusion::tsf::layout_metrics_for(75, 96); // 48 pt text at 100 %
     const auto measure = [](const std::string &text) {
@@ -540,7 +680,10 @@ int main() {
 
     CHECK(layout.height <= 600);
     CHECK(layout.width <= 800);
+    CHECK(layout.total_rows == 10);
+    CHECK(layout.visible_rows < 10);
     int placed = 0;
+    int column_left = -1;
     for (std::size_t index = 0; index < layout.slots.size(); ++index) {
       const auto &slot = layout.slots[index];
       if (slot.empty())
@@ -549,22 +692,42 @@ int main() {
       CHECK(slot.top >= 0 && slot.bottom <= 600);
       CHECK(slot.left >= 0 && slot.right <= 800);
       CHECK(slot.bottom - slot.top >= metrics.line_height);
+      if (column_left < 0)
+        column_left = slot.left;
+      CHECK(slot.left == column_left); // one column, one left edge
       const auto hit = fusion::tsf::hit_test_candidate_panel(layout, slot.left + 1,
                                                              (slot.top + slot.bottom) / 2);
       CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
             hit->index == static_cast<std::int32_t>(index));
     }
-    CHECK(placed == 10);
-    // More than one column: two candidates share a row, which can only happen when the
-    // single column would not have fitted. Without that, this page could not be on screen.
-    bool shared_row = false;
+    CHECK(placed == layout.visible_rows);
+    CHECK(placed > 0);
+    // No two visible candidates share a row: the second-column layout this replaced put
+    // them side by side, which is exactly what no longer happens.
     for (std::size_t a = 0; a < layout.slots.size(); ++a)
       for (std::size_t b = a + 1; b < layout.slots.size(); ++b)
-        if (!layout.slots[a].empty() && !layout.slots[b].empty() &&
-            layout.slots[a].top == layout.slots[b].top &&
-            layout.slots[a].left != layout.slots[b].left)
-          shared_row = true;
-    CHECK(shared_row);
+        CHECK(layout.slots[a].empty() || layout.slots[b].empty() ||
+              layout.slots[a].top != layout.slots[b].top);
+    // Walking the highlight from the first candidate to the last walks the window over the
+    // whole column: every candidate is visible for exactly the cursor position that names
+    // it, and always inside the panel.
+    for (std::int32_t cursor = 0; cursor < 10; ++cursor) {
+      page.cursor_index = cursor;
+      const auto scrolled = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+      CHECK(scrolled.first_row + scrolled.visible_rows <= scrolled.total_rows);
+      CHECK(!scrolled.slots[static_cast<std::size_t>(cursor)].empty());
+      CHECK(scrolled.slots[static_cast<std::size_t>(cursor)].bottom <= scrolled.height);
+    }
+    // The window starts at the first row with nothing highlighted and moves down with the
+    // cursor, so the first and last candidates are reachable by the same mechanism.
+    page.cursor_index = -1;
+    const auto top = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+    CHECK(top.first_row == 0 && !top.rows_hidden_above());
+    page.cursor_index = 9;
+    const auto bottom = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+    CHECK(bottom.rows_hidden_below() == false);
+    CHECK(bottom.first_row == bottom.total_rows - bottom.visible_rows);
+    CHECK(bottom.rows_hidden_above());
   }
 
   // 19. The popup's own DPI is the one it measured with, and its own rectangle obeys the
@@ -708,10 +871,11 @@ int main() {
     }
   }
 
-  // 22. The full-text box survives the pointer moving from the clipped slot *into* the box
-  //     so it can be wheeled, and hides only once the pointer has left the box too. The old
-  //     code tore the box down on the panel's leave, which made a long candidate impossible
-  //     to read.
+  // 22. The reading path as the pointer actually makes it: candidate → the gap between the
+  //     two windows → the full text → wheel → back to the candidates → away from both. Each
+  //     step is a real position and a real message, not a jump into the box followed by a
+  //     wheel: the gap is the part that used to destroy the box, because it belongs to
+  //     neither window and the panel leaves it on its way in.
   {
     auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
     page.entries[3].text.clear();
@@ -719,26 +883,180 @@ int main() {
       page.entries[3].text += "很长的候选内容";
     show_and_measure(view, page);
     const auto &slot = view.layout().slots[3];
+    CHECK(!slot.empty());
     SendMessageW(view.window(), WM_MOUSEMOVE, 0,
                  MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
     CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
     CHECK(view.tip_scrollable());
 
     if (view.tip_window() != nullptr) {
-      RECT tip{};
-      GetWindowRect(view.tip_window(), &tip);
-      const POINT inside{tip.left + (tip.right - tip.left) / 2, tip.top + (tip.bottom - tip.top) / 2};
-      SetCursorPos(inside.x, inside.y);
-      // The panel reports the pointer leaving it while the pointer is inside the box: keep it.
+      const RECT panel = window_rect(view.window());
+      const RECT tip = window_rect(view.tip_window());
+      // The two windows really are apart: without a gap this path would not exist.
+      CHECK(!overlaps(panel, tip));
+      const POINT gap = point_between(panel, tip);
+      CHECK(!in_rect(panel, gap) && !in_rect(tip, gap));
+
+      // 1. The pointer leaves the candidate into the gap. The panel reports the leave; the
+      //    box must still be there, and must still be there after the delay expires while
+      //    the pointer is in the gap.
+      SetCursorPos(gap.x, gap.y);
       SendMessageW(view.window(), WM_MOUSELEAVE, 0, 0);
       CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      SendMessageW(view.window(), WM_TIMER, fusion::tsf::CandidateView::tip_close_timer_id, 0);
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
 
-      // The pointer leaves the box itself: only now does the box go away.
+      // 2. The pointer arrives in the box and wheels it. The panel's pending close is
+      //    cancelled by the box's own move, and the wheel works from this position.
+      const POINT inside{tip.left + width_of(tip) / 2, tip.top + height_of(tip) / 2};
+      SetCursorPos(inside.x, inside.y);
       SendMessageW(view.tip_window(), WM_MOUSEMOVE, 0, 0);
-      SetCursorPos(tip.left - scaled_for_test(400), tip.top);
-      SendMessageW(view.tip_window(), WM_MOUSELEAVE, 0, 0);
+      SendMessageW(view.window(), WM_TIMER, fusion::tsf::CandidateView::tip_close_timer_id, 0);
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      CHECK(view.tip_scroll() == 0);
+      SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+      CHECK(view.tip_scroll() > 0);
+
+      // 3. Back over the candidates: the wheel position is kept only while the same slot is
+      //    described, and a different slot replaces the text (it is not stale).
+      const auto &other = view.layout().slots[4];
+      CHECK(!other.empty());
+      SetCursorPos(panel.left + (other.left + other.right) / 2,
+                   panel.top + (other.top + other.bottom) / 2);
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                   MAKELPARAM((other.left + other.right) / 2, (other.top + other.bottom) / 2));
+      // Slot 4 is short, so nothing is clipped there: the box goes away rather than describe
+      // the candidate the pointer left.
       CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+
+      // 4. Hover the long slot again, then leave both windows entirely: after the delay the
+      //    box is gone, so nothing stale is left behind.
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                   MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      SetCursorPos(panel.left - scaled_for_test(600), panel.top - scaled_for_test(600));
+      SendMessageW(view.window(), WM_MOUSELEAVE, 0, 0);
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      SendMessageW(view.window(), WM_TIMER, fusion::tsf::CandidateView::tip_close_timer_id, 0);
+      CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+
+      // 5. From the box back to the candidates the other way: the box is showing, the panel
+      //    takes the pointer, and the panel's own move cancels the close and re-decides.
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                   MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      const RECT tip_again = window_rect(view.tip_window());
+      SetCursorPos(tip_again.left + 4, tip_again.top + 4);
+      SendMessageW(view.tip_window(), WM_MOUSEMOVE, 0, 0);
+      SetCursorPos(panel.left + (slot.left + slot.right) / 2,
+                   panel.top + (slot.top + slot.bottom) / 2);
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                   MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      SendMessageW(view.window(), WM_TIMER, fusion::tsf::CandidateView::tip_close_timer_id, 0);
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
     }
+
+    // 6. A refreshed page and a hidden panel both clear the box: a detail must not outlive
+    //    the page it describes.
+    SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                 MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    show_and_measure(view, make_page(fusion::CandidateLayout::Horizontal, entries));
+    CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+    view.hide();
+    CHECK(!view.visible());
+  }
+
+  // 23. The text is measured at the width it is drawn at, and its end is reachable. The check
+  //     re-measures the same string with its own font handle at the width the popup reports,
+  //     so the numbers are compared with an independent measurement of the real window rather
+  //     than with the popup's own.
+  {
+    auto page = make_long_page(fusion::CandidateLayout::Horizontal, entries, 3);
+    page.cursor_index = 3; // the keyboard case: no pointer involved
+    page.entries[3].text.clear();
+    for (int i = 0; i < 600; ++i)
+      page.entries[3].text += "很长的候选内容";
+    show_and_measure(view, page);
+    CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+    if (view.tip_window() != nullptr) {
+      RECT client{};
+      GetClientRect(view.tip_window(), &client);
+      const int wrap = view.tip_wrap_width();
+      CHECK(wrap > 0);
+      CHECK(wrap < width_of(client)); // the padding is outside the measured width
+      const std::wstring text = to_wide(fusion::tsf::slot_full_text(page.entries[3]));
+      const int independent = wrapped_height_with(page, view.dpi(), text, wrap);
+      CHECK(independent > 0);
+      // The height the popup counted is the height this width really produces.
+      CHECK(independent == view.tip_content_height());
+      CHECK(view.tip_scrollable());
+
+      // At maximum scroll the whole text is inside the window: the last line is not past
+      // the bottom edge.
+      for (int i = 0; i < 4000 && view.tip_scroll() < view.tip_scroll_max(); ++i)
+        SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+      CHECK(view.tip_scroll() == view.tip_scroll_max());
+      CHECK(view.tip_scroll() + view.tip_view_height() >= independent);
+      CHECK(independent - view.tip_scroll() <= height_of(client));
+      // One notch back moves it, so the end is not a one-way trap.
+      SendMessageW(view.tip_window(), WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+      CHECK(view.tip_scroll() < view.tip_scroll_max());
+    }
+  }
+
+  // 24. Placement never covers the candidates, not even when there is nowhere to go: a panel
+  //     that fills the work area leaves no band, and the honest answer is an empty rect (the
+  //     caller shows nothing) rather than a box dropped on top of the list. The three sizes
+  //     below are the cases around that boundary.
+  {
+    using fusion::tsf::LayoutRect;
+    const LayoutRect work{0, 0, 1000, 800};
+    const LayoutRect full{0, 0, 1000, 800}; // the panel is the work area
+    CHECK(fusion::tsf::place_fulltext_tip(full, work, 300, 200, 4).empty());
+
+    // A panel narrower than the work area on a nearly-full screen: the only band left is the
+    // narrow one beside it, so the box is narrowed to that band — still disjoint, still on
+    // screen, and no wider than what the band can hold.
+    const LayoutRect tall{100, 0, 900, 800};
+    const LayoutRect inband = fusion::tsf::place_fulltext_tip(tall, work, 600, 780, 4);
+    CHECK(!inband.empty());
+    CHECK(!overlaps(RECT{inband.left, inband.top, inband.right, inband.bottom},
+                    RECT{tall.left, tall.top, tall.right, tall.bottom}));
+    CHECK(inband.right - inband.left <= 600);
+    CHECK(inband.left >= work.left && inband.right <= work.right);
+
+    // A degenerate work area has no honest answer either.
+    CHECK(fusion::tsf::place_fulltext_tip(tall, LayoutRect{}, 300, 200, 4).empty());
+  }
+
+  // 25. Why the measure has to run twice, measured on the text itself: placement can narrow
+  //     the box (only a side band is free), and the same text needs more lines in a narrower
+  //     box. Both heights are measured here with this check's own font and GDI, so the gap
+  //     between them is a property of the text and the two widths, not of the popup.
+  {
+    using fusion::tsf::LayoutRect;
+    const LayoutRect work{0, 0, 1000, 800};
+    const LayoutRect tall_panel{100, 0, 900, 800}; // full height: only a side band is free
+    const LayoutRect placed = fusion::tsf::place_fulltext_tip(tall_panel, work, 600, 780, 4);
+    CHECK(!placed.empty());
+    const int placed_width = placed.right - placed.left;
+    CHECK(placed_width < 600); // narrowed by the band
+    CHECK(!overlaps(RECT{placed.left, placed.top, placed.right, placed.bottom},
+                    RECT{tall_panel.left, tall_panel.top, tall_panel.right, tall_panel.bottom}));
+
+    fusion::CandidatePage page; // default font, as a page without one is drawn
+    std::string text;
+    for (int i = 0; i < 120; ++i)
+      text += "很长很长的候选内容";
+    const std::wstring wide = to_wide(text);
+    const int requested_height = wrapped_height_with(page, 96, wide, 600 - 12);
+    const int placed_height = wrapped_height_with(page, 96, wide, placed_width - 12);
+    CHECK(requested_height > 0);
+    // A single-pass measure would set the scroll extent from the first number and stop
+    // short of the real end, which is exactly the defect.
+    CHECK(placed_height > requested_height);
   }
 
   view.destroy();

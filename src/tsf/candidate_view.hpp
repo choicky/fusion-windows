@@ -71,6 +71,15 @@ public:
   // The full-text popup's window handle, null while no clipped slot is being shown.
   // Exposed for the same reason `window()` is; the product path never touches it.
   HWND tip_window() const { return tip_hwnd_; }
+  // The timer identity used for the delayed close. A check that has no message pump drives
+  // the delay by posting that WM_TIMER itself instead of waiting for it; the product path
+  // only ever receives the real timer.
+  static constexpr UINT_PTR tip_close_timer_id = 1;
+  // The width the full text was wrapped and measured at, which is also the width it is drawn
+  // at (client width minus padding). A check re-measures the same text with its own GDI
+  // measurement at this width, so "the end is reachable" is not proven by comparing the
+  // popup's own counters with each other.
+  int tip_wrap_width() const { return tip_wrap_width_; }
   // How far the full-text popup is scrolled, and how far it can go. A test can therefore
   // check that the end of a long text is actually reachable instead of only that a window
   // exists; the product path reads neither.
@@ -106,6 +115,12 @@ private:
   // -1 for "nothing to show".
   void update_tip(std::int32_t index);
   void destroy_tip();
+  // The pointer leaving one of the two windows does not close the full text at once: it can
+  // be on its way to the other one across the gap the placement leaves between them. A short
+  // timer is armed instead, and the cursor's position decides what happens when it fires.
+  void arm_tip_close();
+  void cancel_tip_close();
+  void on_tip_close_timer();
 
   // Map a client point to a page-local entry index (select), or a pager request.
   // Returns the action through the out parameters; false means no actionable hit.
@@ -145,6 +160,12 @@ private:
   int tip_view_height_ = 0;
   int tip_padding_ = 0;
   int tip_line_height_ = 0;
+  int tip_wrap_width_ = 0;
+  // The delayed close: whether a WM_TIMER is outstanding, and how many times it has been
+  // re-armed while the pointer stayed in the gap between the two windows. The re-arm count is
+  // bounded so a pointer parked between them cannot keep a stale box on screen.
+  bool tip_close_pending_ = false;
+  int tip_close_rearms_ = 0;
   bool tracking_leave_ = false;
   // The full-text box, once it takes the pointer (a scrollable text), tracks its own leave so
   // it can hide when the pointer finally leaves it — not merely when it leaves the panel.

@@ -77,6 +77,15 @@ struct CandidatePanelLayout {
   bool slot_clipped(std::size_t index) const {
     return index < clipped.size() && clipped[index] != 0;
   }
+  // Vertical only: how many candidate rows this page has, how many of them the popup shows,
+  // and which one is the first shown. A column that fits leaves first_row 0 and
+  // visible_rows == total_rows. The rows outside the window keep their index and get an
+  // empty rect (no draw, no hit), so what the pointer can hit is exactly what is on screen.
+  int first_row = 0;
+  int visible_rows = 0;
+  int total_rows = 0;
+  bool rows_hidden_above() const { return first_row > 0; }
+  bool rows_hidden_below() const { return first_row + visible_rows < total_rows; }
 };
 
 // Device-pixel metrics. The values that are not typographic (margins, gaps, arrows) keep
@@ -224,52 +233,67 @@ layout_candidate_panel(const CandidatePage &page,
       width = (std::min)(width, (std::max)(limits.max_width, metrics.min_width));
     top += row_height;
   } else {
-    // One column, in page order — until the column would not fit the screen at the size
-    // the user chose. Then the same page continues in a second column rather than being
-    // cut off or shrunk: every candidate keeps a visible, clickable rect, and the order is
-    // still the engine's (down one column, then the next). A single column is the normal
-    // case and the only one for a page that fits.
+    // One column, in page order — always one column. A column taller than the space it is
+    // given is shown through a bounded viewport that keeps the highlighted candidate in
+    // view, rather than continuing sideways: a second column would change the reading order
+    // the engine's own PageSize defines (down the list, one page at a time), and the
+    // product does not redefine that. The user's font is never shrunk and no candidate is
+    // dropped; a row outside the window keeps its index with an empty rect.
     const int band = pager ? row_height : 0;
-    const int rows_available =
-        bounded_height ? (limits.max_height - top - band - side_margin) / row_height : 0;
-    const int max_rows = bounded_height ? (std::max)(1, rows_available) : 0;
-    int columns = 1;
-    if (max_rows > 0 && static_cast<int>(count) > max_rows) {
-      columns = (static_cast<int>(count) + max_rows - 1) / max_rows;
-    }
-    const int rows_per_column =
-        columns > 0 ? (static_cast<int>(count) + columns - 1) / columns : static_cast<int>(count);
-
     int column_width = (std::max)(1, metrics.min_vertical_width);
     for (const auto &entry : page.entries)
       if (!entry.placeholder)
         column_width = (std::max)(column_width, measure(slot_full_text(entry)) + 2 * side_margin +
                                                       pager_width);
-    if (bounded_width) {
-      const int share = (std::max)(1, limits.max_width / columns);
-      column_width = (std::min)(column_width, (std::max)(share, metrics.min_width));
-    }
-    width = (std::max)(width, column_width * columns);
+    if (bounded_width)
+      column_width = (std::min)(column_width, (std::max)(limits.max_width, metrics.min_width));
+    width = (std::max)(width, column_width);
     if (bounded_width)
       width = (std::min)(width, (std::max)(limits.max_width, metrics.min_width));
 
-    int column = 0;
+    const int rows = static_cast<int>(count);
+    out.total_rows = rows;
+    // How many whole rows the budget can show. At least one: a window that cannot show a
+    // single candidate would have nothing to scroll and no way to reach any of them.
+    int visible = rows;
+    if (bounded_height && rows > 1) {
+      const int available = limits.max_height - top - band - side_margin;
+      const int fits = available / row_height;
+      if (fits < rows)
+        visible = (std::max)(1, fits);
+    }
+    // The window keeps the highlighted row visible, and it keeps the rows that precede it
+    // as context: the highlighted row sits at the bottom of the window once the list is
+    // longer than the window, which is the arrangement the paging keys move one row at a
+    // time. With nothing highlighted the window starts at the first row.
+    int first = 0;
+    if (visible < rows) {
+      int anchor = 0;
+      for (std::size_t index = 0;
+           index < page.entries.size() && static_cast<std::int32_t>(index) < page.cursor_index;
+           ++index)
+        if (!page.entries[index].placeholder)
+          ++anchor;
+      first = (std::clamp)(anchor - (visible - 1), 0, rows - visible);
+    }
+    out.first_row = first;
+    out.visible_rows = visible;
+
     int row = 0;
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue;
-      if (row >= rows_per_column) {
-        ++column;
-        row = 0;
+      const int shown = row - first;
+      if (shown >= 0 && shown < visible) {
+        const int left = side_margin;
+        const int right = width - side_margin;
+        const int y = top + band + shown * row_height;
+        out.slots[index] = LayoutRect{left, y, (std::max)(left + 1, right), y + row_height};
+        out.clipped[index] = measure(slot_full_text(page.entries[index])) >
+                                     (std::max)(left + 1, right) - left
+                                 ? 1
+                                 : 0;
       }
-      const int left = column * column_width + side_margin;
-      const int right = (column + 1) * column_width - side_margin;
-      const int y = top + band + row * row_height;
-      out.slots[index] = LayoutRect{left, y, (std::max)(left + 1, right), y + row_height};
-      out.clipped[index] = measure(slot_full_text(page.entries[index])) >
-                                   (std::max)(left + 1, right) - left
-                               ? 1
-                               : 0;
       ++row;
     }
     if (page.has_prev)
@@ -277,7 +301,7 @@ layout_candidate_panel(const CandidatePage &page,
     if (page.has_next)
       out.next =
           LayoutRect{width - side_margin - pager_width, top, width - side_margin, top + band};
-    top = top + band + rows_per_column * row_height + side_margin;
+    top = top + band + visible * row_height + side_margin;
   }
   out.width = width;
   out.height = top;
@@ -313,7 +337,8 @@ inline std::optional<PanelHit> hit_test_candidate_panel(const CandidatePanelLayo
 // side that has room. When none of those bands can hold the *full* height, the popup is
 // bound to the largest non-overlapping band — the leftover text scrolls, exactly as when it
 // was bounded by the whole work area, rather than spilling over the panel or off the screen.
-// The returned rect is empty only when the work area itself is degenerate.
+// The returned rect is empty when the work area is degenerate or when the panel leaves no
+// free band at all; an empty result means "show nothing", never "show it over the panel".
 inline LayoutRect place_fulltext_tip(const LayoutRect &panel, const LayoutRect &work, int width,
                                      int height, int gap) {
   const int l = (std::max)(0, width);
@@ -324,11 +349,13 @@ inline LayoutRect place_fulltext_tip(const LayoutRect &panel, const LayoutRect &
 
   // The four regions the panel leaves free, already clipped to the work area. Each is by
   // construction disjoint from the panel (they start or end a `gap` clear of it).
-  const LayoutRect below{work.left, (std::min)(work.bottom, panel.bottom + g), work.right, work.bottom};
+  const LayoutRect below{work.left, (std::min)(work.bottom, panel.bottom + g), work.right,
+                         work.bottom};
   const LayoutRect above{work.left, work.top, work.right, (std::max)(work.top, panel.top - g)};
   const LayoutRect right{
       (std::min)(work.right, panel.right + g), work.top, work.right, work.bottom};
-  const LayoutRect left_band{work.left, work.top, (std::max)(work.left, panel.left - g), work.bottom};
+  const LayoutRect left_band{work.left, work.top, (std::max)(work.left, panel.left - g),
+                             work.bottom};
 
   // A band holds the popup whole only if it is at least as large in both dimensions.
   const auto holds = [&](const LayoutRect &band) {
@@ -362,11 +389,11 @@ inline LayoutRect place_fulltext_tip(const LayoutRect &panel, const LayoutRect &
     if (!band->empty() && widest(*band) > widest(*best))
       best = band;
   if (best->empty()) {
-    // Even the bands are zero (the panel fills the work area): clamp the popup to the work
-    // area so at least its top-left corner is reachable.
-    const int ew = (std::min)(l, work.right - work.left);
-    const int eh = (std::min)(h, work.bottom - work.top);
-    return LayoutRect{work.left, work.top, work.left + ew, work.top + eh};
+    // The panel leaves no region at all (it fills the work area). There is then no honest
+    // place for the text: an empty rect means "do not show it", which the caller turns into
+    // a hidden box. Covering the candidates instead would swallow the click aimed at one of
+    // them, which is exactly what this function exists to prevent.
+    return LayoutRect{};
   }
   const int ew = (std::min)(l, best->right - best->left);
   const int eh = (std::min)(h, best->bottom - best->top);

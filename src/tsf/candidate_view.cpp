@@ -27,6 +27,14 @@ constexpr int kDefaultSizePt = 11;
 constexpr int kMinSizePt = 6;
 constexpr int kMaxSizePt = 48;
 
+// How long the full-text box survives the pointer leaving one of the two windows. Long
+// enough to cross the gap between them at any ordinary pointer speed, short enough that a
+// pointer that really went elsewhere does not leave a stale box behind.
+constexpr UINT kTipCloseDelayMs = 150;
+// While the pointer stays *between* the two windows the delay is re-armed at most this many
+// times, so the box can be crossed slowly but cannot be parked on screen forever.
+constexpr int kTipCloseMaxRearms = 6;
+
 std::wstring to_wide(const std::string &text) {
   if (text.empty())
     return {};
@@ -42,6 +50,15 @@ std::wstring to_wide(const std::string &text) {
 }
 
 RECT to_rect(const LayoutRect &rect) { return RECT{rect.left, rect.top, rect.right, rect.bottom}; }
+
+// The width the entry text is wrapped and measured at, with the same call the painting code
+// makes: one width, one wrapping rule, one font. `DT_CALCRECT` with `DT_WORDBREAK` returns
+// exactly the height `DrawTextW` would occupy for the same string in the same width.
+int wrapped_height(HDC dc, const std::wstring &text, int width) {
+  RECT cell{0, 0, (std::max)(1, width), 0};
+  DrawTextW(dc, text.c_str(), -1, &cell, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+  return cell.bottom - cell.top;
+}
 
 int scaled(int value, int dpi) { return MulDiv(value, dpi, 96); }
 
@@ -202,6 +219,7 @@ void CandidateView::show(const CandidatePage &page, POINT anchor) {
   }
   if (hwnd_ == nullptr)
     return;
+  cancel_tip_close();
   page_ = page;
   anchor_ = anchor;
   // Geometry follows the display the caret is on, every time: a page that reopens on
@@ -266,12 +284,14 @@ void CandidateView::reflow() {
 }
 
 void CandidateView::hide() {
+  cancel_tip_close();
   if (hwnd_ != nullptr && IsWindowVisible(hwnd_))
     ShowWindow(hwnd_, SW_HIDE);
   update_tip(-1);
 }
 
 void CandidateView::destroy() {
+  cancel_tip_close();
   destroy_tip();
   if (hwnd_ != nullptr) {
     const HWND hwnd = hwnd_;
@@ -360,11 +380,43 @@ void CandidateView::draw(HDC dc) {
       }
     }
   }
+  // A vertical column longer than the space it was given shows a window of its rows. A thin
+  // bar inside the candidate area's own edge padding says which way the rest of the page
+  // continues, so a hidden row is visibly hidden rather than silently missing; the bar is
+  // decoration only and takes no pointer.
+  if (layout_.total_rows > layout_.visible_rows) {
+    const int bar = (std::max)(1, scaled(2, dpi_));
+    const LayoutRect *first = nullptr;
+    const LayoutRect *last = nullptr;
+    for (const auto &slot : layout_.slots) {
+      if (slot.empty())
+        continue;
+      if (first == nullptr || slot.top < first->top)
+        first = &slot;
+      if (last == nullptr || slot.bottom > last->bottom)
+        last = &slot;
+    }
+    if (first != nullptr && last != nullptr) {
+      const HBRUSH shade = GetSysColorBrush(COLOR_BTNSHADOW);
+      if (layout_.rows_hidden_above()) {
+        RECT more{first->left, first->top, first->right, first->top + bar};
+        if (more.bottom > more.top)
+          FillRect(dc, &more, shade);
+      }
+      if (layout_.rows_hidden_below()) {
+        RECT more{last->left, last->bottom - bar, last->right, last->bottom};
+        if (more.bottom > more.top)
+          FillRect(dc, &more, shade);
+      }
+    }
+  }
+
   if (previous_font != nullptr)
     SelectObject(dc, previous_font);
 }
 
 void CandidateView::update_tip(std::int32_t index) {
+  cancel_tip_close();
   const bool wanted = index >= 0 && static_cast<std::size_t>(index) < page_.entries.size() &&
                       layout_.slot_clipped(static_cast<std::size_t>(index)) && hwnd_ != nullptr &&
                       IsWindowVisible(hwnd_);
@@ -377,6 +429,10 @@ void CandidateView::update_tip(std::int32_t index) {
       ShowWindow(tip_hwnd_, SW_HIDE);
     tip_index_ = -1;
     tip_tracking_leave_ = false;
+    tip_content_height_ = 0;
+    tip_view_height_ = 0;
+    tip_scroll_max_ = 0;
+    tip_wrap_width_ = 0;
     return;
   }
   if (tip_hwnd_ == nullptr) {
@@ -424,39 +480,63 @@ void CandidateView::update_tip(std::int32_t index) {
   GetTextExtentPoint32W(dc, tip_text_.c_str(), static_cast<int>(tip_text_.size()), &natural);
   int width = (std::min)(static_cast<int>(natural.cx) + 2 * padding, max_width);
   width = (std::max)(width, scaled(60, dpi_));
-  const int wrap_width = (std::max)(1, width - 2 * padding);
-
-  // Then the height that wrapped text needs, against what the work area will give it.
-  RECT measure{0, 0, wrap_width, 0};
-  DrawTextW(dc, tip_text_.c_str(), -1, &measure, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-  const int content_height = measure.bottom - measure.top;
   const int max_height = (std::max)(tip_line_height_, work_height - 2 * margin);
-  const int height = (std::min)(content_height + 2 * padding, max_height);
-  SelectObject(dc, previous_font);
-  ReleaseDC(tip_hwnd_, dc);
 
-  tip_padding_ = padding;
-  tip_content_height_ = content_height;
-
-  // Place the popup first, against the panel's real rectangle: place_fulltext_tip keeps it
-  // inside the work area *and* off the candidate list. The measured `height` may be more
-  // than any non-overlapping band can hold, in which case the box is bound down to the
-  // largest such band — the same shrinking that used to be done against the whole work
-  // area, now done against the space that does not cover the candidates.
   RECT panel_rect{};
   GetWindowRect(hwnd_, &panel_rect);
   const LayoutRect panel{static_cast<int>(panel_rect.left), static_cast<int>(panel_rect.top),
                          static_cast<int>(panel_rect.right), static_cast<int>(panel_rect.bottom)};
-  const LayoutRect bounds =
-      place_fulltext_tip(panel, LayoutRect{static_cast<int>(work.left), static_cast<int>(work.top),
-                                           static_cast<int>(work.right),
-                                           static_cast<int>(work.bottom)},
-                         width, height, scaled(2, dpi_));
+  const LayoutRect work_rect{static_cast<int>(work.left), static_cast<int>(work.top),
+                             static_cast<int>(work.right), static_cast<int>(work.bottom)};
+
+  // Place, then measure again at the width that was *actually* placed. Placement can narrow
+  // the box (the free band beside the panel is narrower than the text wanted), and a
+  // narrower box wraps into more lines: measuring the height against the pre-placement width
+  // would set a scroll limit that stops short of the real end. The loop is bounded because
+  // placement only ever narrows: the second pass measures the width that will be drawn.
+  LayoutRect bounds;
+  int content_height = 0;
+  int requested_width = width;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const int wrap_width = (std::max)(1, requested_width - 2 * padding);
+    content_height = wrapped_height(dc, tip_text_, wrap_width);
+    const int wanted_height = (std::min)(content_height + 2 * padding, max_height);
+    bounds = place_fulltext_tip(panel, work_rect, requested_width, wanted_height, scaled(2, dpi_));
+    if (bounds.empty())
+      break; // no free band: the caller hides the box rather than covering the candidates
+    const int placed = bounds.right - bounds.left;
+    if (placed >= requested_width)
+      break; // converged: the measurement above used the width it will be drawn at
+    requested_width = placed;
+  }
+  SelectObject(dc, previous_font);
+  ReleaseDC(tip_hwnd_, dc);
+
+  if (bounds.empty() || bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
+    // The panel leaves no room for the text anywhere on this work area. Showing it over the
+    // candidates would take their clicks, so it is not shown at all.
+    if (IsWindowVisible(tip_hwnd_))
+      ShowWindow(tip_hwnd_, SW_HIDE);
+    tip_index_ = -1;
+    tip_tracking_leave_ = false;
+    tip_content_height_ = 0;
+    tip_view_height_ = 0;
+    tip_scroll_max_ = 0;
+    tip_wrap_width_ = 0;
+    return;
+  }
+
   const int placed_width = bounds.right - bounds.left;
   const int placed_height = bounds.bottom - bounds.top;
+  tip_padding_ = padding;
+  tip_content_height_ = content_height;
+  // Both the measurement and the painting use this one width (client width minus padding),
+  // so a line is wrapped where it was counted.
+  tip_wrap_width_ = (std::max)(1, placed_width - 2 * padding);
 
-  // The scroll extent is a property of the box the reader actually gets, so it is measured
-  // against the placed height, not the pre-placement one.
+  // The scroll extent is a property of the box the reader actually gets: the visible height
+  // comes from the placed height, and the maximum scroll is exactly the text that does not
+  // fit inside it.
   tip_view_height_ = (std::max)(0, placed_height - 2 * padding);
   tip_scroll_max_ = (std::max)(0, content_height - tip_view_height_);
   tip_scroll_ = (std::min)(tip_scroll_, tip_scroll_max_);
@@ -475,6 +555,65 @@ void CandidateView::update_tip(std::int32_t index) {
   SetWindowPos(tip_hwnd_, HWND_TOP, bounds.left, bounds.top, placed_width, placed_height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   InvalidateRect(tip_hwnd_, nullptr, TRUE);
+}
+
+void CandidateView::arm_tip_close() {
+  if (hwnd_ == nullptr)
+    return;
+  tip_close_pending_ = true;
+  SetTimer(hwnd_, tip_close_timer_id, kTipCloseDelayMs, nullptr);
+}
+
+void CandidateView::cancel_tip_close() {
+  if (hwnd_ != nullptr && tip_close_pending_)
+    KillTimer(hwnd_, tip_close_timer_id);
+  tip_close_pending_ = false;
+  tip_close_rearms_ = 0;
+}
+
+void CandidateView::on_tip_close_timer() {
+  if (hwnd_ != nullptr)
+    KillTimer(hwnd_, tip_close_timer_id);
+  tip_close_pending_ = false;
+  const bool tip_shown = tip_hwnd_ != nullptr && IsWindowVisible(tip_hwnd_);
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  RECT panel{};
+  if (hwnd_ != nullptr)
+    GetWindowRect(hwnd_, &panel);
+  RECT tip{};
+  if (tip_shown)
+    GetWindowRect(tip_hwnd_, &tip);
+
+  if (tip_shown && PtInRect(&tip, cursor)) {
+    // The pointer reached the box: it owns the pointer now and will report its own leave.
+    tip_close_rearms_ = 0;
+    return;
+  }
+  if (PtInRect(&panel, cursor)) {
+    // Back on the candidates. The panel's own WM_MOUSEMOVE has already decided what belongs
+    // there, so the delay simply stops; re-deciding from the keyboard highlight here would
+    // undo a hover that is still in progress.
+    tip_close_rearms_ = 0;
+    return;
+  }
+  if (tip_shown) {
+    // Between the two windows, on its way from one to the other. Keep the box across the
+    // gap, but only for a bounded number of delays: a pointer that stops there must not
+    // leave a stale box on screen indefinitely.
+    RECT span{};
+    span.left = (std::min)(panel.left, tip.left);
+    span.top = (std::min)(panel.top, tip.top);
+    span.right = (std::max)(panel.right, tip.right);
+    span.bottom = (std::max)(panel.bottom, tip.bottom);
+    if (PtInRect(&span, cursor) && tip_close_rearms_ < kTipCloseMaxRearms) {
+      ++tip_close_rearms_;
+      arm_tip_close();
+      return;
+    }
+  }
+  tip_close_rearms_ = 0;
+  update_tip(-1);
 }
 
 void CandidateView::destroy_tip() {
@@ -541,6 +680,7 @@ LRESULT CandidateView::on_tip_message(HWND hwnd, UINT message, WPARAM wparam, LP
     // The box took the pointer, so it is now responsible for noticing when the pointer
     // leaves it. Arm a single leave notification; without this the box would linger after the
     // pointer has gone somewhere else entirely.
+    cancel_tip_close();
     if (!tip_tracking_leave_) {
       TRACKMOUSEEVENT track{};
       track.cbSize = sizeof(track);
@@ -551,11 +691,11 @@ LRESULT CandidateView::on_tip_message(HWND hwnd, UINT message, WPARAM wparam, LP
     return 0;
   }
   case WM_MOUSELEAVE:
-    // The pointer has now left both the candidate panel and this box: hide it. Only a
-    // scrollable box receives its own leave, because a fitting one is click-through and the
-    // panel keeps handling the pointer over it.
+    // The pointer left this box, but it may be on its way back over the candidates (or into
+    // the gap between them). The delayed close decides from where it actually is; the panel
+    // cancels the delay the moment the pointer lands on it.
     tip_tracking_leave_ = false;
-    update_tip(-1);
+    arm_tip_close();
     return 0;
   case WM_MOUSEWHEEL: {
     if (tip_scroll_max_ > 0) {
@@ -625,6 +765,9 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
     std::int32_t index = -1;
     const bool over_slot = hit_test(point, action, index) &&
                            static_cast<CandidateAction>(action) == CandidateAction::Select;
+    // The pointer is on the candidates again: any pending close is moot, and the slot under
+    // it decides what is shown.
+    cancel_tip_close();
     update_tip(over_slot ? index : -1);
     if (!tracking_leave_) {
       TRACKMOUSEEVENT track{};
@@ -637,21 +780,23 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
   }
   case WM_MOUSELEAVE:
     tracking_leave_ = false;
-    // Leaving the panel is not the same as leaving the reading surface. A scrollable
-    // full-text box is meant to be moved into and wheeled over; if the pointer crossed from
-    // the candidate slot into that box, the panel's own leave must not tear the box down.
-    // The box now tracks its own leave (see on_tip_message), and only a pointer that ends up
-    // in neither hides it.
+    // Leaving the panel is not the same as leaving the reading surface. A full-text box is
+    // normally placed in the free band beside the panel, with a gap, so the pointer that
+    // goes to read it has to cross space that belongs to neither window. Closing here would
+    // take the box away exactly when the pointer was on its way into it, which is why the
+    // close is deferred: the cursor's position at the end of the delay decides.
     if (tip_hwnd_ != nullptr && IsWindowVisible(tip_hwnd_)) {
-      POINT cursor{};
-      GetCursorPos(&cursor);
-      RECT tip_rect{};
-      GetWindowRect(tip_hwnd_, &tip_rect);
-      if (PtInRect(&tip_rect, cursor))
-        return 0;
+      arm_tip_close();
+      return 0;
     }
     update_tip(page_.cursor_index);
     return 0;
+  case WM_TIMER:
+    if (wparam == tip_close_timer_id) {
+      on_tip_close_timer();
+      return 0;
+    }
+    return DefWindowProcW(hwnd_, message, wparam, lparam);
   case WM_LBUTTONUP: {
     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     int action = 0;
