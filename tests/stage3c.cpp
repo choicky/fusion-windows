@@ -17,7 +17,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 19;
+constexpr int kExpectedSections = 21;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -575,6 +575,105 @@ int main() {
         section("PASS the configured modifier-only key decides");
         c.destroy();
       }
+    }
+
+    // R38 correction: the inactive passthrough must be decided per context, not from
+    // Instance::state() / mostRecentInputContext(). Two bound contexts on one backend: A
+    // toggles to English, then B is bound and typed into (bind() calls Instance::activate()
+    // which flips the whole instance's state and makes B the mostRecent). A's character
+    // key must still be forwarded because A's own per-context InputState is still inactive
+    // and Fcitx's per-context Instance::inputMethod(A) still resolves to Items/0. On the
+    // pre-fix code the predicate saw mostRecent != A and returned false, so A's key
+    // reached keyEvent and composed with Items/0 — this require is the discriminator.
+    // Every earlier section here used a single context, which is how this escaped.
+    {
+      auto two_backend = make_fcitx_backend(FcitxBackendOptions{});
+      require(two_backend != nullptr, "two-context backend");
+      SemanticController a(980, 64, *two_backend);
+      Document da;
+      type(a, da, "nihao");
+      require(!da.preedit.empty(), "A did not compose in Chinese before the toggle");
+      const auto a_release = [&] {
+        auto action = translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        (void)a.begin_key(action, true);
+        action.release = true;
+        return action;
+      }();
+      require(a.routes_release(a_release), "A's Shift release is relayed");
+      da.apply(a, a.release_key(a_release));
+      require(da.preedit.empty(), "the toggle did not end A's composition");
+      const auto a_english = a.begin_key(physical('n'), true);
+      require(a_english.forward && a_english.frontend.empty(),
+              "A did not pass through into English before B was bound");
+      // Bind B and type into it. Its InputState is active; the instance's mostRecent is B.
+      SemanticController b(981, 64, *two_backend);
+      Document db;
+      type(b, db, "nihao");
+      require(!db.preedit.empty(), "B never composed after being bound over an inactive A");
+      // Discriminating case: back to A. MostRecent is B, but A must still be English.
+      const auto a_again = a.begin_key(physical('n'), true);
+      require(a_again.forward && a_again.frontend.empty(),
+              "A's character key composed after B became most recent — the predicate must "
+              "read the dispatching context's own state, not mostRecentInputContext()");
+      // B is unaffected throughout: it stays on its own scheme.
+      const auto b_again = b.begin_key(physical('i'), true);
+      require(!b_again.frontend.empty(), "B lost its active composition when A was typed into");
+      // A's own Shift press returns it to its original scheme; the toggle is still per-context.
+      const auto a_back_release = [&] {
+        auto action = translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        (void)a.begin_key(action, true);
+        action.release = true;
+        return action;
+      }();
+      require(a.routes_release(a_back_release), "A's returning Shift release is relayed");
+      da.apply(a, a.release_key(a_back_release));
+      const auto a_reactivated = a.begin_key(physical('n'), true);
+      require(!a_reactivated.frontend.empty(), "the returning Shift did not reactivate A");
+      b.destroy();
+      a.destroy();
+      section("PASS the inactive passthrough follows the dispatching context, not mostRecent");
+    }
+    // The same discriminator with a configured Hotkey/TriggerKeys (F6) fixture: A toggled
+    // off through F6, B bound and used, then F6 on A returns A to active. Proves the fix
+    // does not affect the global-hotkey path.
+    {
+      FcitxBackendOptions options;
+      options.fixture_global_hotkey = "F6";
+      auto f6_backend = make_fcitx_backend(std::move(options));
+      require(f6_backend != nullptr, "F6 two-context backend");
+      SemanticController a(990, 64, *f6_backend);
+      Document da;
+      type(a, da, "nihao");
+      // Commit first, so F6 arrives with nothing composing, exactly as the single-context
+      // global-hotkey section proves the engine handles it.
+      auto f6_commit = a.begin_key(translate_key(kVkSpace, false, false, false), true);
+      require(f6_commit.eaten && !f6_commit.frontend.empty(), "F6 fixture commit");
+      da.apply(a, f6_commit);
+      require(a.finish_pass(), "F6 fixture commit barrier");
+      const auto f6 = translate_key(0x75, false, false, false); // VK_F6 -> 0xffc3
+      const auto off = a.begin_key(f6, true);
+      require(off.eaten && !off.forward && off.frontend.empty(), "the F6 fixture did not turn A off");
+      require(a.finish_pass(), "global hotkey barrier");
+      const auto a_english = a.begin_key(physical('n'), true);
+      require(a_english.forward && a_english.frontend.empty(),
+              "A stayed composing instead of passing through after F6");
+      SemanticController b(991, 64, *f6_backend);
+      Document db;
+      type(b, db, "nihao");
+      // Discriminator: back to A, a character key must still be forwarded. On the pre-fix
+      // code this composed because mostRecent was B and state() reflected B's active state.
+      const auto a_again = a.begin_key(physical('n'), true);
+      require(a_again.forward && a_again.frontend.empty(),
+              "after B was bound A's character key reached the engine on the F6 fixture");
+      // F6 still re-activates A with B having been typed into.
+      const auto a_reactivate = a.begin_key(f6, true);
+      require(a_reactivate.eaten && !a_reactivate.forward,
+              "the configured global hotkey did not reach the engine while A was inactive");
+      const auto a_resumed = a.begin_key(physical('n'), true);
+      require(!a_resumed.frontend.empty(), "the F6 fixture did not turn A back on after B was used");
+      b.destroy();
+      a.destroy();
+      section("PASS the configured global hotkey reactivates A after B became most recent");
     }
     return 0;
   } catch (const std::exception &e) {

@@ -358,14 +358,6 @@ public:
   }
   ~InputContext() override { destroy(); }
   const char *frontend() const override { return "fusion-stage3b"; }
-  // Fcitx hands "an inactive context forwards keys to the application" to the inactive
-  // keyboard input method, and this runtime compiles none. The frontend half of that same
-  // rule lives here: once the engine has been active for this context and reports it
-  // inactive again, an ordinary key is the application's, and only the modifier-only keys
-  // stay in the engine because a release of one is what can toggle the context back
-  // (`Hotkey/AltTriggerKeys`). No state is invented: the answer is Fcitx's own, read per
-  // dispatch, and `ever_active_` only keeps a brand-new context's first key going to the
-  // engine, which is what activates it.
   // Fcitx hands "an inactive context forwards keys to the application" to the keyboard
   // input method, and this runtime compiles none. The frontend half of that rule lives
   // here: once the engine has been active for this context and reports it inactive again,
@@ -381,20 +373,47 @@ public:
   bool inactive_passthrough(const BackendStimulus &stimulus) {
     if (!instance_ || !ever_active_)
       return false;
-    // Instance::state() describes the most recent input context. Read it only when that
-    // is this context, so a background context never inherits another one's state.
-    if (instance_->inputContextManager().mostRecentInputContext() != this)
+    // Fcitx keeps the on/off state per input context (InputState is an IC property; the
+    // AltTriggerKeys binding calls Instance::toggle(ic) for the event's own context, and
+    // Instance::inputMethod(ic) at instance.cpp:1794 reads that context's own InputState
+    // before falling back to mostRecentInputContext()). An active context resolves to its
+    // local selection or DefaultIM; an inactive one resolves to `Items/0` — Fusion's
+    // synthetic off slot. So the per-context answer is: this context is inactive iff
+    // inputMethod(this) equals the group's Items/0 name.
+    //
+    // The comparison relies on two invariants this runtime owns:
+    //   (a) Items/0 is the marked off slot (`fusion-off` in Layout, see startup_group.hpp),
+    //       never the method in use; the group migration always picks the *other* Pinyin
+    //       scheme so active and inactive resolve to different names (group_off_slot_method).
+    //   (b) IM switching is not reachable in this runtime (WP3 B6): a bound context keeps
+    //       the scheme the group's DefaultIM resolves to; the only way to leave it is the
+    //       inactive path, which lands on Items/0.
+    // A disabled or password context resolves to `keyboard-<layout>` from
+    // Instance::inputMethod(ic), which never equals a pinyin/shuangpin Items/0; those
+    // cases are answered before this predicate by the Windows hard policy, so the
+    // comparison cannot misclassify them.
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    if (group.inputMethodList().empty())
       return false;
-    if (instance_->state() != 1) // 2 = active, 1 = inactive, 0 = no context at all
+    const auto off_slot = group.inputMethodList()[0].name();
+    if (off_slot.empty() || instance_->inputMethod(this) != off_slot)
       return false;
     return stimulus_carries_character(stimulus);
   }
   // Record that the engine has been active here. Called after every dispatch, so the
-  // transition is observed rather than predicted.
+  // transition is observed rather than predicted. Uses the same per-context query as
+  // inactive_passthrough: an active context resolves to a name other than Items/0.
   void note_engine_state() {
-    if (!instance_ || instance_->inputContextManager().mostRecentInputContext() != this)
+    if (!instance_)
       return;
-    if (instance_->state() == 2)
+    const auto &group = instance_->inputMethodManager().currentGroup();
+    if (group.inputMethodList().empty())
+      return;
+    const auto off_slot = group.inputMethodList()[0].name();
+    if (off_slot.empty())
+      return;
+    const auto im = instance_->inputMethod(this);
+    if (!im.empty() && im != off_slot)
       ever_active_ = true;
   }
   void commitStringImpl(const std::string &text) override {
