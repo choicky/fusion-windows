@@ -50,16 +50,20 @@ These are the properties the presentation may rely on, each covered by a check:
 - **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
   replaced with an empty one, and empty entries keep their positions through a copy or a
   replacement.
-- **A save the Host cannot apply yet is submitted, not refused, and never called saved.** The
-  Pinyin/Shuangpin configuration and the input-method list are applied by an official setter that
-  ends a running composition, so the Host stages the request and applies it when the input
-  finishes; the reply is `Pending`, not `Ok`. The client keeps those values as *awaiting*: still
-  what the window shows, no longer counted as an unsaved edit, and dropped only when a fresh read
-  shows the Host applied them — otherwise they go back to being unsaved.
-- **A refusal carries the Host's reason.** Every settings reply has a `detail` byte
-  (`RequestInProgress`, `CompositionInProgress`, `UnsettledWork`), so a request that lost a race
-  with another request is never reported as "you are still typing", which is what a per-page guess
-  did before.
+- **A refusal says which page it is about, and never reports it as saved.** The save bar
+  reports each configuration separately, so one page can say `已保存` while another says `未保存`
+  in the same click. Which pages can be refused at all is decided by the Host from what its own
+  apply step does, not by the client: the candidate-window and global pages are stored while a
+  composition is live, and only the Pinyin/Shuangpin configuration and the input-method list are
+  refused, because their official apply step ends the composition that is running. The edit is
+  kept in every refusal.
+- **One click does the waiting.** `Busy` is the one answer the Host gives without having written
+  anything, so a save that receives it keeps the edit, says it is not saved yet, and resubmits
+  what is still dirty every 400 ms until the Host is free — serially, off the UI thread, and
+  cancellable through 停止等待. Nothing else is retried: a timeout, a lost connection, a
+  cancellation, an `Indeterminate` outcome or an `Invalid` rejection ends the save exactly as it
+  did before. A page that already succeeded is not sent again, and a different Host incarnation
+  ends the wait rather than receiving an intent formed against another instance.
 - **A newer Host is accepted and an older one refused**, per the additive settings-API
   contract; the IPC protocol version is still matched exactly.
 

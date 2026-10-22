@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Linq;
 using Fusion.Settings.Model;
 
@@ -12,7 +11,6 @@ internal static class ModelTests
         Identity();
         Draft();
         DraftLifecycle();
-        AwaitingApply();
         SharedViews();
         SchemaHelpers();
         StringLists();
@@ -219,55 +217,6 @@ internal static class ModelTests
         Harness.CheckEqual(1, shared.PendingPaths.Count, "the unapplied edit stays pending");
         Harness.Check(shared.PendingPaths.Contains("ShuangpinProfile"),
             "and it is the shuangpin-specific one");
-    }
-
-    /// <summary>
-    /// A change the Host accepted and is holding is neither unsaved nor saved: it stays the
-    /// value the user sees, it stops being counted as an unsaved edit, and a fresh read that
-    /// does not show it puts it back as unsaved instead of leaving it believed-applied.
-    /// </summary>
-    private static void AwaitingApply()
-    {
-        Harness.Section("draft: a submitted change waits for the Host to apply it");
-
-        var identity = ConfigIdentity.ForUri("fcitx://config/inputmethod/pinyin");
-        var view = TestSchema.PinyinView();
-        var draft = SettingsDraft.FromSnapshot(identity, view);
-        Harness.Check(draft.TrySet(view, "PageSize", SettingsValue.Text("9")),
-            "an edit is made");
-        Harness.Check(draft.HasChanges && !draft.HasAwaitingApply,
-            "and is an unsaved change to begin with");
-
-        draft.MarkAwaiting(new HashSet<string>(StringComparer.Ordinal) { "PageSize" });
-        Harness.Check(!draft.HasChanges, "a submitted change is no longer an unsaved edit");
-        Harness.Check(draft.HasAwaitingApply, "it is waiting instead");
-        Harness.Check(draft.HasUnsettledChanges, "and the window still knows something is open");
-        Harness.CheckEqual("9", draft.Effective("PageSize").Scalar,
-            "the value on screen is still the user's, not the Host's stored one");
-
-        // A fresh read that shows the old value means it was not applied: back to unsaved.
-        draft.SettleAwaiting(TestSchema.PinyinView());
-        Harness.Check(!draft.HasAwaitingApply, "a read that does not show it ends the wait");
-        Harness.Check(draft.HasChanges, "and the edit is unsaved again, so it can be resubmitted");
-
-        // And a read that shows it means it landed: the draft is clean.
-        draft.MarkAwaiting(new HashSet<string>(StringComparer.Ordinal) { "PageSize" });
-        // A read that shows the submitted value is what "the Host applied it" looks like.
-        draft.SettleAwaiting(new SettingsSnapshot(
-            view.Values.WithPath(new[] { "PageSize" }, SettingsValue.Text("9")), view.Types));
-        Harness.Check(!draft.HasAwaitingApply && !draft.HasChanges,
-            "a read that shows it clears the change entirely");
-
-        var list = new ImListDraft(new ImList("pinyin", "pinyin",
-            new[] { "pinyin", "shuangpin" }, new[] { "pinyin", "shuangpin" }));
-        Harness.Check(list.Move(0, 1), "the list order is changed");
-        Harness.Check(list.HasChanges, "which is an unsaved change");
-        list.MarkAwaiting();
-        Harness.Check(!list.HasChanges && list.HasAwaitingApply,
-            "a submitted order waits instead of counting as unsaved");
-        list.RefreshBaseline(new ImList("pinyin", "pinyin",
-            new[] { "pinyin", "shuangpin" }, new[] { "pinyin", "shuangpin" }));
-        Harness.Check(list.HasChanges, "a read that does not show it makes it unsaved again");
     }
 
     private static void SchemaHelpers()

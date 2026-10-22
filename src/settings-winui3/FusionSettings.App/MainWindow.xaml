@@ -114,6 +114,15 @@
                     Style="{StaticResource AccentButtonStyle}"
                     IsEnabled="False"
                     Click="OnSaveClick" />
+
+                <!-- A save that is waiting for the Host to be free: the only way out of the wait
+                     besides the Host answering, and it leaves the edit unsaved rather than lost. -->
+                <Button
+                    x:Name="StopWaitButton"
+                    Grid.Column="4"
+                    Content="停止等待"
+                    Visibility="Collapsed"
+                    Click="OnStopWaitClick" />
             </Grid>
         </Border>
     </Grid>

@@ -16,7 +16,7 @@ namespace fusion::ipc {
 // client in [min, current] — a v1 client simply never sends the newer types — and
 // a client requires a Host at least as new as itself, while a newer Host stays
 // usable because it must keep the older messages intact.
-inline constexpr std::uint32_t settings_api_version = 3;
+inline constexpr std::uint32_t settings_api_version = 2;
 inline constexpr std::uint32_t settings_api_min_version = 1;
 inline constexpr std::size_t max_settings_payload = 60 * 1024;
 inline constexpr std::size_t max_settings_nodes = 4096;
@@ -32,10 +32,6 @@ struct SettingsHello {
 
 struct SettingsReplyPrefix {
   SettingsStatus status = SettingsStatus::Error;
-  // Why a Busy or Pending reply means what it means. Sent by every settings reply, so a
-  // client never has to guess the reason from the page it asked for, and never parses the
-  // error sentence.
-  SettingsDetail detail = SettingsDetail::None;
   std::string error;
 };
 
@@ -370,12 +366,9 @@ inline bool deserialize_settings_set_im_list_request(const std::uint8_t *data, s
 }
 
 inline std::vector<std::uint8_t> serialize_settings_status(SettingsStatus status,
-                                                           std::string error,
-                                                           SettingsDetail detail =
-                                                               SettingsDetail::None) {
+                                                           const std::string &error) {
   std::vector<std::uint8_t> payload;
   detail::write_u8(payload, static_cast<std::uint8_t>(status));
-  detail::write_u8(payload, static_cast<std::uint8_t>(detail));
   (void)settings_detail::write_string(payload, error);
   return payload;
 }
@@ -383,14 +376,11 @@ inline std::vector<std::uint8_t> serialize_settings_status(SettingsStatus status
 inline std::optional<SettingsReplyPrefix>
 deserialize_settings_status(detail::Reader &reader) {
   auto status = reader.read_u8();
-  auto detail = reader.read_u8();
   auto error = reader.read_string();
-  if (!status || *status > static_cast<std::uint8_t>(SettingsStatus::Pending) || !detail ||
-      *detail > static_cast<std::uint8_t>(SettingsDetail::UnsettledWork) || !error) {
+  if (!status || *status > static_cast<std::uint8_t>(SettingsStatus::VersionMismatch) || !error) {
     return std::nullopt;
   }
-  return SettingsReplyPrefix{static_cast<SettingsStatus>(*status),
-                             static_cast<SettingsDetail>(*detail), std::move(*error)};
+  return SettingsReplyPrefix{static_cast<SettingsStatus>(*status), std::move(*error)};
 }
 
 } // namespace fusion::ipc

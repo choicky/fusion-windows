@@ -36,12 +36,6 @@ public sealed class SettingsDraft
 {
     private readonly Dictionary<string, SettingsValue> _pending = new(StringComparer.Ordinal);
 
-    // Submitted and accepted by the Host, which is holding the change until the user's input
-    // finishes. Not a second store of the configuration and not a cache of a write: it is the
-    // user's intent, kept visible and kept distinguishable from both "unsaved" and "saved",
-    // because the Host has written nothing yet.
-    private readonly Dictionary<string, SettingsValue> _awaiting = new(StringComparer.Ordinal);
-
     public SettingsDraft(ConfigIdentity identity, SettingsValue baselineValues)
     {
         Identity = identity ?? throw new ArgumentNullException(nameof(identity));
@@ -71,33 +65,15 @@ public sealed class SettingsDraft
     public bool HasChanges => _pending.Count > 0;
 
     /// <summary>
-    /// Edits the Host has accepted and is holding until the current input finishes. They are
-    /// not saved — nothing is on disk — and they are not unsaved either: the Host will apply
-    /// them without the user doing anything. A window that treated them as either would lie.
-    /// </summary>
-    public IReadOnlyCollection<string> AwaitingPaths => _awaiting.Keys;
-
-    public bool HasAwaitingApply => _awaiting.Count > 0;
-
-    /// <summary>Anything the user has meant but the Host has not written.</summary>
-    public bool HasUnsettledChanges => _pending.Count > 0 || _awaiting.Count > 0;
-
-    /// <summary>
-    /// The value a view should show: the pending edit when there is one, then a submitted
-    /// value the Host is still holding, otherwise the confirmed value. A missing value reads
-    /// as an empty scalar, which is not the same thing as the option's default and is never
-    /// treated as one.
+    /// The value a view should show: the pending edit when there is one, otherwise the
+    /// confirmed value. A missing value reads as an empty scalar, which is not the same
+    /// thing as the option's default and is never treated as one.
     /// </summary>
     public SettingsValue Effective(string optionName)
     {
         if (_pending.TryGetValue(optionName, out var pending))
         {
             return pending;
-        }
-
-        if (_awaiting.TryGetValue(optionName, out var awaiting))
-        {
-            return awaiting;
         }
 
         return BaselineValues.TryGet(optionName, out var confirmed)
@@ -122,7 +98,6 @@ public sealed class SettingsDraft
         // Compare against the confirmed baseline, not the effective value: setting an
         // edited option back to what the Host already has is not a change, even though
         // it differs from the pending edit it replaces.
-        _awaiting.Remove(optionName);
         if (value.Equals(Confirmed(optionName)))
         {
             _pending.Remove(optionName);
@@ -193,11 +168,7 @@ public sealed class SettingsDraft
 
     public void Revert(string optionName) => _pending.Remove(optionName);
 
-    public void RevertAll()
-    {
-        _pending.Clear();
-        _awaiting.Clear();
-    }
+    public void RevertAll() => _pending.Clear();
 
     /// <summary>
     /// The tree a save submits: only the pending edits, with their nesting preserved.
@@ -271,50 +242,6 @@ public sealed class SettingsDraft
             {
                 _pending.Remove(path);
             }
-        }
-
-        Revision++;
-    }
-
-    /// <summary>
-    /// Records that the Host accepted these paths and is holding them until the current input
-    /// finishes. They leave the "unsaved" set and become "waiting": nothing is on disk, so the
-    /// window must not call them saved, and the Host will apply them without the user doing
-    /// anything, so they are not lost either.
-    /// </summary>
-    public void MarkAwaiting(IReadOnlySet<string> paths)
-    {
-        ArgumentNullException.ThrowIfNull(paths);
-        foreach (var path in paths.ToArray())
-        {
-            if (_pending.Remove(path, out var value))
-            {
-                _awaiting[path] = value;
-            }
-        }
-
-        Revision++;
-    }
-
-    /// <summary>
-    /// Reconciles waiting values against a fresh read of the Host. A path the Host now shows is
-    /// applied and forgotten; a path it does not show is not applied — it goes back to being
-    /// unsaved, so the user can submit it again rather than believing it landed. This is the
-    /// only way a waiting value leaves the draft without a new edit.
-    /// </summary>
-    public void SettleAwaiting(SettingsSnapshot confirmed)
-    {
-        ArgumentNullException.ThrowIfNull(confirmed);
-        foreach (var path in _awaiting.Keys.ToArray())
-        {
-            var value = _awaiting[path];
-            _awaiting.Remove(path);
-            if (ValueAt(confirmed.Values, path) is { } stored && SameStoredValue(stored, value))
-            {
-                continue;
-            }
-
-            _pending[path] = value;
         }
 
         Revision++;

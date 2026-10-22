@@ -68,7 +68,7 @@ internal static class Bytes
     /// <summary>A complete snapshot payload: status, error, values, then the schema types.</summary>
     public static byte[] SnapshotPayload(byte[] values, params (string Name, byte[][] Options)[] types)
     {
-        var parts = new List<byte[]> { U8(0), U8(0), Str(string.Empty), values, U32((uint)types.Length) };
+        var parts = new List<byte[]> { U8(0), Str(string.Empty), values, U32((uint)types.Length) };
         foreach (var (name, options) in types)
         {
             parts.Add(Str(name));
@@ -118,7 +118,7 @@ internal static class WireTests
     private static bool TryDecodeSnapshot(byte[] payload, out SettingsSnapshot snapshot)
     {
         var reader = new ProtoReader(payload);
-        if (!SettingsCodec.TryDecodeStatus(reader, out _, out _, out _))
+        if (!SettingsCodec.TryDecodeStatus(reader, out _, out _))
         {
             snapshot = SettingsSnapshot.Empty;
             return false;
@@ -182,7 +182,7 @@ internal static class WireTests
         var payload = Bytes.SnapshotPayload(values, ("PinyinEngineConfig", new[] { option }));
 
         var reader = new ProtoReader(payload);
-        Harness.Check(SettingsCodec.TryDecodeStatus(reader, out var status, out var detail, out var error),
+        Harness.Check(SettingsCodec.TryDecodeStatus(reader, out var status, out var error),
             "status prefix decodes");
         Harness.CheckEqual(SettingsStatus.Ok, status, "status is Ok");
         Harness.CheckEqual(string.Empty, error, "error text is empty");
@@ -274,13 +274,13 @@ internal static class WireTests
             "an over-long string is refused");
 
         var badStatus = Bytes.Concat(Bytes.U8(99), Bytes.Str(string.Empty), Bytes.Map(), Bytes.U32(0));
-        Harness.Check(!SettingsCodec.TryDecodeStatus(new ProtoReader(badStatus), out _, out _, out _),
+        Harness.Check(!SettingsCodec.TryDecodeStatus(new ProtoReader(badStatus), out _, out _),
             "an out-of-range status is refused");
 
         var noTypes = Bytes.SnapshotPayload(Bytes.Map());
         Harness.Check(TryDecodeSnapshot(noTypes, out _),
             "a snapshot with no types decodes");
-        var overTypes = Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Map(),
+        var overTypes = Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Map(),
                                      Bytes.U32(WireLimits.MaxSettingsTypes + 1));
         Harness.Check(!TryDecodeSnapshot(overTypes, out _),
             "a snapshot over the type bound is refused");
@@ -330,35 +330,35 @@ internal static class WireTests
     {
         Harness.Section("codec: selection, input-method list and hello replies");
 
-        var selection = Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"),
+        var selection = Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"),
                                      Bytes.U32(2), Bytes.Str("pinyin"), Bytes.Str("shuangpin"));
         var selectionReader = new ProtoReader(selection);
-        Harness.Check(SettingsCodec.TryDecodeStatus(selectionReader, out _, out _, out _), "selection status");
+        Harness.Check(SettingsCodec.TryDecodeStatus(selectionReader, out _, out _), "selection status");
         Harness.Check(SettingsCodec.TryDecodeSelection(selectionReader, out var decodedSelection),
             "selection decodes");
         Harness.CheckEqual("pinyin", decodedSelection.Selected, "the selected method");
         Harness.CheckEqual(2, decodedSelection.Available.Count, "the available methods");
 
-        var imList = Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty),
+        var imList = Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty),
                                   Bytes.Str("pinyin"), Bytes.Str("pinyin"),
                                   Bytes.U32(2), Bytes.Str("pinyin"), Bytes.Str("shuangpin"),
                                   Bytes.U32(2), Bytes.Str("pinyin"), Bytes.Str("shuangpin"));
         var imReader = new ProtoReader(imList);
-        Harness.Check(SettingsCodec.TryDecodeStatus(imReader, out _, out _, out _), "IM list status");
+        Harness.Check(SettingsCodec.TryDecodeStatus(imReader, out _, out _), "IM list status");
         Harness.Check(SettingsCodec.TryDecodeImList(imReader, out var decodedList), "IM list decodes");
         Harness.CheckEqual("pinyin", decodedList.Active, "Items/0 is the active method");
         Harness.CheckEqual("pinyin", decodedList.Fallback, "the fallback is carried separately");
         Harness.CheckEqual(2, decodedList.Enabled.Count, "the ordered list");
         Harness.CheckEqual(2, decodedList.Available.Count, "the available set");
 
-        var truncatedList = Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"));
+        var truncatedList = Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"));
         var truncatedReader = new ProtoReader(truncatedList);
-        SettingsCodec.TryDecodeStatus(truncatedReader, out _, out _, out _);
+        SettingsCodec.TryDecodeStatus(truncatedReader, out _, out _);
         Harness.Check(!SettingsCodec.TryDecodeImList(truncatedReader, out _),
             "a truncated IM list is refused");
 
         var hello = Bytes.Concat(Bytes.U32(WireLimits.ProtocolVersion), Bytes.U64(42), Bytes.U32(3),
-                                 Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty));
+                                 Bytes.U8(0), Bytes.Str(string.Empty));
         Harness.Check(SettingsCodec.TryDecodeHello(new ProtoReader(hello), out var protocol,
                 out var session, out var api, out var status, out _),
             "a hello reply decodes");

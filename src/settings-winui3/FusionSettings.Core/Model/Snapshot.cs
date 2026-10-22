@@ -17,13 +17,6 @@ public enum SettingsStatus
     VersionMismatch = 7,
 
     /// <summary>
-    /// Accepted and staged by the Host, not written: it applies the change through the official
-    /// setter at the first moment no composition is live. Deliberately not <see cref="Ok"/> —
-    /// nothing is on disk yet, so the window must not say "saved".
-    /// </summary>
-    Pending = 8,
-
-    /// <summary>
     /// Client-only: the Host could not be reached, or the connection failed before a
     /// reply. It is never sent by the Host and it never means "the write happened".
     /// </summary>
@@ -325,24 +318,10 @@ public sealed class ImList
 }
 
 /// <summary>The Host's answer, with the incarnation that produced it.</summary>
-/// <summary>
-/// Why the Host answered the way it did. It is the Host's own fact, not the page's: a request
-/// that lost a race with another request is not "you are still typing", and only the Host can
-/// tell the two apart.
-/// </summary>
-public enum SettingsDetail
-{
-    None = 0,
-    RequestInProgress = 1,
-    CompositionInProgress = 2,
-    UnsettledWork = 3,
-}
-
 public sealed class SettingsResult<T>
 {
     public SettingsResult(SettingsStatus status, string error, T? value, ulong incarnation,
-                          bool mutationMayHaveBeenApplied = false, bool cancelled = false,
-                          SettingsDetail detail = SettingsDetail.None)
+                          bool mutationMayHaveBeenApplied = false, bool cancelled = false)
     {
         Status = status;
         Error = error;
@@ -350,13 +329,9 @@ public sealed class SettingsResult<T>
         HostIncarnation = incarnation;
         MutationMayHaveBeenApplied = mutationMayHaveBeenApplied;
         Cancelled = cancelled;
-        Detail = detail;
     }
 
     public SettingsStatus Status { get; }
-
-    /// <summary>The Host's reason for a <see cref="SettingsStatus.Busy"/> or a refusal.</summary>
-    public SettingsDetail Detail { get; }
 
     public string Error { get; }
 
@@ -397,17 +372,6 @@ public static class SettingsResult
     public static SettingsResult<T> Failure<T>(SettingsStatus status, string error,
                                                ulong incarnation = 0,
                                                bool mutationMayHaveBeenApplied = false,
-                                               bool cancelled = false,
-                                               SettingsDetail detail = SettingsDetail.None) =>
-        new(status, error, default, incarnation, mutationMayHaveBeenApplied, cancelled, detail);
-
-    /// <summary>
-    /// The Host staged the change and will apply it when the composition ends. The value is
-    /// what the Host still holds, which is the old one — the caller keeps the user's intent
-    /// separately instead of mistaking this for a confirmed write.
-    /// </summary>
-    public static SettingsResult<T> Pending<T>(T value, ulong incarnation,
-                                               SettingsDetail detail = SettingsDetail.None,
-                                               string error = "") =>
-        new(SettingsStatus.Pending, error, value, incarnation, false, false, detail);
+                                               bool cancelled = false) =>
+        new(status, error, default, incarnation, mutationMayHaveBeenApplied, cancelled);
 }

@@ -80,24 +80,6 @@ enum class SettingsStatus : std::uint8_t {
   Timeout = 5,
   Indeterminate = 6,
   VersionMismatch = 7,
-  // Accepted and staged, not written: the Host keeps the requested change and applies it
-  // through the official setter at the first moment no composition is live. It is
-  // deliberately not `Ok` — nothing has been persisted yet, and a client that showed
-  // "saved" here would be describing a file that does not contain the change.
-  Pending = 8,
-};
-
-// Why a settings request was refused or staged. The reason is decided by the Host, which is
-// the only side that can see the event loop; a client that inferred it from the page it was
-// on would report "you are typing" for a request that lost a race with another request.
-enum class SettingsDetail : std::uint8_t {
-  None = 0,
-  // Another settings request was already in flight on the Host.
-  RequestInProgress = 1,
-  // A composition is live: a preedit or candidate list the user is still building.
-  CompositionInProgress = 2,
-  // Work this Host owes the frontend has not settled yet (an ordered pass barrier).
-  UnsettledWork = 3,
 };
 
 } // namespace fusion

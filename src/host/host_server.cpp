@@ -585,10 +585,8 @@ void HostServer::Connection::handle_settings_get_config(
   }
   SettingsSnapshot snapshot;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status = backend.settings_get_config(*uri, snapshot, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
+  const auto status = backend.settings_get_config(*uri, snapshot, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
   if (status == SettingsStatus::Ok &&
       !settings_detail::write_snapshot(response_payload, snapshot)) {
     response_payload = serialize_settings_status(
@@ -612,13 +610,9 @@ void HostServer::Connection::handle_settings_set_config(
   }
   SettingsSnapshot snapshot;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status = backend.settings_set_config(uri, values, snapshot, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
-  // A staged (Pending) change carries the configuration as the Host still holds it, which is
-  // what the client needs in order to show the stored value next to the intent it keeps.
-  if ((status == SettingsStatus::Ok || status == SettingsStatus::Pending) &&
+  const auto status = backend.settings_set_config(uri, values, snapshot, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
       !settings_detail::write_snapshot(response_payload, snapshot)) {
     response_payload = serialize_settings_status(
         SettingsStatus::Indeterminate,
@@ -636,10 +630,8 @@ void HostServer::Connection::handle_settings_get_selection(
   }
   SettingsSelection selection;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status = backend.settings_get_selection(selection, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
+  const auto status = backend.settings_get_selection(selection, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
   if (status == SettingsStatus::Ok &&
       !settings_detail::write_selection(response_payload, selection)) {
     response_payload = serialize_settings_status(
@@ -663,11 +655,8 @@ void HostServer::Connection::handle_settings_select_input_method(
   }
   SettingsSelection selection;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status =
-      backend.settings_select_input_method(*method, selection, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
+  const auto status = backend.settings_select_input_method(*method, selection, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
   if (status == SettingsStatus::Ok &&
       !settings_detail::write_selection(response_payload, selection)) {
     response_payload = serialize_settings_status(
@@ -686,10 +675,8 @@ void HostServer::Connection::handle_settings_get_im_list(
   }
   ImList list;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status = backend.settings_get_im_list(list, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
+  const auto status = backend.settings_get_im_list(list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
   if (status == SettingsStatus::Ok && !settings_detail::write_im_list(response_payload, list)) {
     response_payload = serialize_settings_status(
         SettingsStatus::Error, "The input-method list exceeds the supported response bound.");
@@ -711,11 +698,9 @@ void HostServer::Connection::handle_settings_set_im_list(
   }
   ImList list;
   std::string error;
-  SettingsDetail detail = SettingsDetail::None;
-  const auto status = backend.settings_set_im_list(enabled, list, error, &detail);
-  std::vector<std::uint8_t> response_payload =
-      serialize_settings_status(status, error, detail);
-  if ((status == SettingsStatus::Ok || status == SettingsStatus::Pending) && !settings_detail::write_im_list(response_payload, list)) {
+  const auto status = backend.settings_set_im_list(enabled, list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok && !settings_detail::write_im_list(response_payload, list)) {
     response_payload = serialize_settings_status(
         SettingsStatus::Indeterminate,
         "The input-method list may have changed, but the Host could not confirm the result. Reload "

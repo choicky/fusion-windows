@@ -143,21 +143,18 @@ public sealed class SettingsClient
             }
 
             var reader = new ProtoReader(payload);
-            if (!SettingsCodec.TryDecodeStatus(reader, out var status, out var detail,
-                                               out var error))
+            if (!SettingsCodec.TryDecodeStatus(reader, out var status, out var error))
             {
                 return Failed<T>(phase, isMutation, transmission, timedOut: false, incarnation,
                     "The Host reply could not be decoded.");
             }
 
-            if (status != SettingsStatus.Ok && status != SettingsStatus.Pending)
+            if (status != SettingsStatus.Ok)
             {
                 // An authoritative refusal. A Host that answers Indeterminate has already
-                // said the outcome is unknown; keep that rather than downgrading it. The
-                // reason travels with it, so the caller never has to infer one from the page.
+                // said the outcome is unknown; keep that rather than downgrading it.
                 return SettingsResult.Failure<T>(status, error, incarnation,
-                    mutationMayHaveBeenApplied: status == SettingsStatus.Indeterminate,
-                    detail: detail);
+                    mutationMayHaveBeenApplied: status == SettingsStatus.Indeterminate);
             }
 
             if (!decode(reader, out var value))
@@ -169,9 +166,7 @@ public sealed class SettingsClient
                     authoritativeOk: true);
             }
 
-            return status == SettingsStatus.Pending
-                ? SettingsResult.Pending(value, incarnation, detail, error)
-                : SettingsResult.Ok(value, incarnation);
+            return SettingsResult.Ok(value, incarnation);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

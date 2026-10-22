@@ -39,6 +39,10 @@ internal static class Program
         // a scripted peer: both are sequences of replies, not single-response cases.
         await RecoveryTests.RunAsync().ConfigureAwait(false);
 
+        // One save, and a Host that is busy because a buffer is live: the window waits and
+        // resubmits, and only that answer is ever retried.
+        await BusyWaitTests.RunAsync().ConfigureAwait(false);
+
         // The workspace path needs a real Host; it skips without one.
         await WorkspaceTests.RunAsync().ConfigureAwait(false);
 
