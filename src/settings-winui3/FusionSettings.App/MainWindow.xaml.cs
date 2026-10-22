@@ -147,9 +147,14 @@ public sealed partial class MainWindow : Window
         ReloadButton.Visibility = _workspace.IsLoaded ? Visibility.Visible : Visibility.Collapsed;
         ReloadButton.IsEnabled = idle;
 
-        if (_workspace.HasChanges && idle)
+        if (_workspace.HasUnsettledChanges && idle)
         {
-            StatusLine.Text = _workspace.StatusText + " 有未保存的修改。";
+            // "Waiting" is not "unsaved" and not "saved": the Host has accepted the change
+            // and will apply it when the input finishes, and only then is anything on disk.
+            StatusLine.Text = _workspace.StatusText +
+                              (_workspace.HasAwaitingApply
+                                  ? " 有已提交、待输入结束后自动应用的修改。"
+                                  : " 有未保存的修改。");
         }
     }
 
@@ -188,7 +193,7 @@ public sealed partial class MainWindow : Window
         // discarded without ever being counted.
         CommitPendingInput();
 
-        if (_workspace.HasChanges)
+        if (_workspace.HasUnsettledChanges)
         {
             var dialog = new ContentDialog
             {
@@ -284,7 +289,7 @@ public sealed partial class MainWindow : Window
         // committed. Ask before deciding whether the window is dirty.
         CommitPendingInput();
 
-        if (!_workspace.HasChanges)
+        if (!_workspace.HasUnsettledChanges)
         {
             return;
         }
@@ -318,7 +323,7 @@ public sealed partial class MainWindow : Window
                 // uncommitted edit that the save would otherwise miss.
                 CommitPendingInput();
                 await _workspace.SaveAsync().ConfigureAwait(true);
-                if (_workspace.HasChanges)
+                if (_workspace.HasUnsettledChanges)
                 {
                     // The save did not take; keep the window open rather than lose the edits.
                     UpdateStatus();

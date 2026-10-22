@@ -1524,7 +1524,7 @@ public:
   }
 
   SettingsStatus settings_get_config(const std::string &uri, SettingsSnapshot &snapshot,
-                                    std::string &error) override {
+                                    std::string &error, SettingsDetail *) override {
     if (uri != "fcitx://config/inputmethod/pinyin" &&
         uri != "fcitx://config/inputmethod/shuangpin") {
       error = "unsupported URI";
@@ -1536,7 +1536,8 @@ public:
   }
 
   SettingsStatus settings_set_config(const std::string &uri, const SettingsValue &values,
-                                     SettingsSnapshot &snapshot, std::string &error) override {
+                                     SettingsSnapshot &snapshot, std::string &error,
+                                     SettingsDetail *) override {
     if (uri != "fcitx://config/inputmethod/pinyin" &&
         uri != "fcitx://config/inputmethod/shuangpin") {
       error = "unsupported URI";
@@ -1555,8 +1556,8 @@ public:
     return SettingsStatus::Ok;
   }
 
-  SettingsStatus settings_get_selection(SettingsSelection &selection,
-                                        std::string &) override {
+  SettingsStatus settings_get_selection(SettingsSelection &selection, std::string &,
+                                        SettingsDetail *) override {
     std::lock_guard lock(settings_mutex_);
     selection = selection_state;
     return SettingsStatus::Ok;
@@ -1564,7 +1565,7 @@ public:
 
   SettingsStatus settings_select_input_method(const std::string &method,
                                               SettingsSelection &selection,
-                                              std::string &error) override {
+                                              std::string &error, SettingsDetail *) override {
     if (composition_active.load()) {
       error = "finish composition first";
       return SettingsStatus::Busy;

@@ -38,7 +38,7 @@ public static class SettingsCodec
             return false;
         }
 
-        if (!TryDecodeStatus(reader, out status, out error))
+        if (!TryDecodeStatus(reader, out status, out _, out error))
         {
             return false;
         }
@@ -46,16 +46,24 @@ public static class SettingsCodec
         return reader.AtEnd;
     }
 
-    public static bool TryDecodeStatus(ProtoReader reader, out SettingsStatus status, out string error)
+    public static bool TryDecodeStatus(ProtoReader reader, out SettingsStatus status,
+                                       out SettingsDetail detail, out string error)
     {
         status = SettingsStatus.Error;
+        detail = SettingsDetail.None;
         error = string.Empty;
-        if (!reader.TryU8(out var raw) || raw > (byte)SettingsStatus.VersionMismatch)
+        if (!reader.TryU8(out var raw) || raw > (byte)SettingsStatus.Pending)
+        {
+            return false;
+        }
+
+        if (!reader.TryU8(out var rawDetail) || rawDetail > (byte)SettingsDetail.UnsettledWork)
         {
             return false;
         }
 
         status = (SettingsStatus)raw;
+        detail = (SettingsDetail)rawDetail;
         return reader.TryString(out error);
     }
 

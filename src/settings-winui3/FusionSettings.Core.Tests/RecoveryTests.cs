@@ -409,10 +409,10 @@ internal static class RecoveryTests
             }));
 
     private static byte[] StatusBody(SettingsStatus status, string error) =>
-        Bytes.Concat(Bytes.U8((byte)status), Bytes.Str(error));
+        Bytes.Concat(Bytes.U8((byte)status), Bytes.U8(0), Bytes.Str(error));
 
     private static byte[] ImListBody(string[] enabled, string[] available) =>
-        Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty),
+        Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty),
                      Bytes.Str(enabled.Length == 0 ? string.Empty : enabled[0]),
                      Bytes.Str("pinyin"),
                      Bytes.U32((uint)enabled.Length),

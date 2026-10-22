@@ -155,7 +155,8 @@ internal sealed class FakeHost : IAsyncDisposable
 
         await WriteFrameAsync(server, MessageType.SettingsHelloResponse,
             Bytes.Concat(Bytes.U32(_protocol), Bytes.U64(7), Bytes.U32(_api),
-                         Bytes.U8((byte)_helloStatus), Bytes.Str(string.Empty))).ConfigureAwait(false);
+                         Bytes.U8((byte)_helloStatus), Bytes.U8(0), Bytes.Str(string.Empty)))
+            .ConfigureAwait(false);
 
         if (_behaviour == FakeBehaviour.CloseAfterHello)
         {
@@ -194,11 +195,12 @@ internal sealed class FakeHost : IAsyncDisposable
                     MessageType.SettingsSetImListRequest => MessageType.SettingsSetImListResponse,
                     MessageType.SettingsGetSelectionRequest => MessageType.SettingsGetSelectionResponse,
                     _ => MessageType.SettingsSelectInputMethodResponse,
-                }, Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty), Bytes.U8(9))).ConfigureAwait(false);
+                }, Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty), Bytes.U8(9))).ConfigureAwait(false);
                 return;
             case FakeBehaviour.ReplyStatus:
                 await WriteReplyAsync(server, request.Value.Type,
-                    Bytes.Concat(Bytes.U8((byte)_replyStatus), Bytes.Str("the Host refused"))).ConfigureAwait(false);
+                    Bytes.Concat(Bytes.U8((byte)_replyStatus), Bytes.U8(0),
+                                 Bytes.Str("the Host refused"))).ConfigureAwait(false);
                 return;
             case FakeBehaviour.Scripted:
                 var scripted = _script!(request.Value.Type, request.Value.Payload);
@@ -222,11 +224,11 @@ internal sealed class FakeHost : IAsyncDisposable
         MessageType.SettingsGetConfigRequest or MessageType.SettingsSetConfigRequest =>
             Bytes.SnapshotPayload(Bytes.Map(("PageSize", Bytes.Scalar("9")))),
         MessageType.SettingsGetImListRequest or MessageType.SettingsSetImListRequest =>
-            Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty),
+            Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty),
                          Bytes.Str("pinyin"), Bytes.Str("pinyin"),
                          Bytes.U32(1), Bytes.Str("pinyin"),
                          Bytes.U32(1), Bytes.Str("pinyin")),
-        _ => Bytes.Concat(Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"),
+        _ => Bytes.Concat(Bytes.U8(0), Bytes.U8(0), Bytes.Str(string.Empty), Bytes.Str("pinyin"),
                           Bytes.U32(1), Bytes.Str("pinyin")),
     };
 

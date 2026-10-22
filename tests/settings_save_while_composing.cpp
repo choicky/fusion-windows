@@ -232,10 +232,10 @@ void section_global_during_composition(Driver &driver) {
           "the option is put back, so the sections below start from the profile's value");
 }
 
-// 3. The Pinyin configuration cannot be written without being applied, and its apply step
-//    clears every composing context. It is refused with that reason and nothing changes.
+// 3. The Pinyin configuration is accepted while a composition is live, kept as a staged
+//    request, and applied by the Host itself once the composition ends — the user saves once.
 void section_engine_page_during_composition(Driver &driver) {
-  std::printf("[pinyin] the engine page is refused while a composition is live\n");
+  std::printf("[pinyin] one save during a composition, applied by the Host afterwards\n");
   SettingsSnapshot current;
   std::string error;
   require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", current,
@@ -248,29 +248,94 @@ void section_engine_page_during_composition(Driver &driver) {
   driver.type("nihao");
   require(!driver.page.entries.empty(), "the engine produced no candidates");
 
-  SettingsSnapshot refused;
+  SettingsSnapshot accepted;
   const auto status = driver.backend->settings_set_config(
-      "fcitx://config/inputmethod/pinyin", value_tree("PageSize", wanted), refused, error);
+      "fcitx://config/inputmethod/pinyin", value_tree("PageSize", wanted), accepted, error);
   std::printf("   saving it with a live composition returned %d\n   reason: %s\n",
               static_cast<int>(status), error.c_str());
-  require(status == SettingsStatus::Busy,
-          "the engine page is refused while a composition is live, not applied");
-  require(error.find("composition") != std::string::npos,
-          "the refusal names the composition as the reason");
+  require(status == SettingsStatus::Pending,
+          "the Host accepts a request it cannot apply yet, instead of refusing it");
+  require(stored_scalar(accepted, "PageSize") == before,
+          "and reports the value it still holds, so nothing claims the change is stored");
 
-  SettingsSnapshot after;
-  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", after,
+  // Still composing: the buffer is intact and nothing was applied behind the user's back.
+  SettingsSnapshot while_waiting;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", while_waiting,
                                               error) == SettingsStatus::Ok,
-          "the Pinyin configuration can still be read");
-  require(stored_scalar(after, "PageSize") == before,
-          "the refused change was not stored, so the same change can really be retried");
+          "the configuration can still be read");
+  require(stored_scalar(while_waiting, "PageSize") == before,
+          "a staged change is not on disk while the composition is live");
+
+  // The word is finished by selecting the candidate that was on screen. That is the safe
+  // point, and the Host applies the staged change there without a second save.
   require_composition_survives(driver, "pinyin");
+
+  SettingsSnapshot applied;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", applied,
+                                              error) == SettingsStatus::Ok,
+          "the configuration can be read after the composition ended");
+  const std::string after = stored_scalar(applied, "PageSize");
+  std::printf("   after the composition ended the Host holds PageSize=%s (was %s)\n",
+              after.c_str(), before.c_str());
+  require(after == wanted,
+          "the staged change was applied when the composition ended, with no second save");
 }
 
-// 4. The input-method list is refused for the same class of reason: the group change ends the
-//    composition of every context that is composing, and the list is stored by that same call.
+// 3b. A second submission while the first is still waiting replaces the intent instead of
+//     queueing behind it, and the applied value is the newer one.
+void section_replaces_while_waiting(Driver &driver) {
+  std::printf("[pinyin] a newer submission while one is waiting wins\n");
+  SettingsSnapshot current;
+  std::string error;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", current,
+                                              error) == SettingsStatus::Ok,
+          "the configuration can be read");
+  const std::string base = stored_scalar(current, "PageSize");
+  // Two values distinct from the stored one and from each other, from the option's own range.
+  std::vector<std::string> pool;
+  for (const char *candidate : {"7", "8", "9"})
+    if (base != candidate)
+      pool.emplace_back(candidate);
+  require(pool.size() >= 2, "the page-size range leaves two values to try");
+  const std::string first = pool[0];
+  const std::string second = pool[1];
+
+  driver.type("hao");
+  require(!driver.page.entries.empty(), "the engine produced no candidates");
+  SettingsSnapshot one;
+  require(driver.backend->settings_set_config("fcitx://config/inputmethod/pinyin",
+                                              value_tree("PageSize", first), one, error) ==
+              SettingsStatus::Pending,
+          "the first submission is accepted and waits");
+  SettingsSnapshot two;
+  require(driver.backend->settings_set_config("fcitx://config/inputmethod/pinyin",
+                                              value_tree("PageSize", second), two, error) ==
+              SettingsStatus::Pending,
+          "the second submission is accepted and waits too");
+
+  require_composition_survives(driver, "pinyin replacement");
+  SettingsSnapshot applied;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", applied,
+                                              error) == SettingsStatus::Ok,
+          "the configuration can be read afterwards");
+  std::printf("   the applied value is PageSize=%s (first asked %s, then %s)\n",
+              stored_scalar(applied, "PageSize").c_str(), first.c_str(), second.c_str());
+  require(stored_scalar(applied, "PageSize") == second,
+          "the newest intent is the one that took effect, not the first one");
+
+  // Put the schema value back so the sections below start from the profile's own state.
+  SettingsSnapshot restored;
+  require(driver.backend->settings_set_config("fcitx://config/inputmethod/pinyin",
+                                              value_tree("PageSize", base), restored, error) ==
+              SettingsStatus::Ok,
+          "the original value is restored once nothing is composing");
+}
+
+// 4. The input-method list takes the same path: accepted while composing, applied by the
+//    Host when the input ends. The switch really happens then, which is why it could not be
+//    applied immediately.
 void section_im_list_during_composition(Driver &driver) {
-  std::printf("[im list] the list is refused while a composition is live\n");
+  std::printf("[im list] one save during a composition, applied by the Host afterwards\n");
   ImList current;
   std::string error;
   require(driver.backend->settings_get_im_list(current, error) == SettingsStatus::Ok,
@@ -284,17 +349,76 @@ void section_im_list_during_composition(Driver &driver) {
   driver.type("nihao");
   require(!driver.page.entries.empty(), "the engine produced no candidates");
 
-  ImList refused;
-  const auto status = driver.backend->settings_set_im_list(reordered, refused, error);
+  ImList accepted;
+  const auto status = driver.backend->settings_set_im_list(reordered, accepted, error);
   std::printf("   saving the list with a live composition returned %d\n   reason: %s\n",
               static_cast<int>(status), error.c_str());
-  require(status == SettingsStatus::Busy, "the list is refused while a composition is live");
+  require(status == SettingsStatus::Pending,
+          "the list is accepted while a composition is live, not refused");
 
-  ImList stored;
-  require(driver.backend->settings_get_im_list(stored, error) == SettingsStatus::Ok,
+  ImList still_old;
+  require(driver.backend->settings_get_im_list(still_old, error) == SettingsStatus::Ok,
           "the list can still be read");
-  require(stored.enabled == current.enabled, "the refused order was not stored");
+  require(still_old.enabled == current.enabled,
+          "nothing is stored while the composition is live");
+
   require_composition_survives(driver, "im list");
+
+  ImList applied;
+  require(driver.backend->settings_get_im_list(applied, error) == SettingsStatus::Ok,
+          "the list can be read after the composition ended");
+  std::printf("   after the composition ended the order is [%s] (asked for [%s])\n",
+              applied.enabled.empty() ? "" : applied.enabled.front().c_str(),
+              reordered.empty() ? "" : reordered.front().c_str());
+  require(applied.enabled == reordered,
+          "the staged order was applied when the composition ended, with no second save");
+
+  // Put the original order back for the sections that follow.
+  ImList restored;
+  require(driver.backend->settings_set_im_list(current.enabled, restored, error) ==
+              SettingsStatus::Ok,
+          "the original order is restored once nothing is composing");
+}
+
+// 4b. The reason a request is refused is the Host's own, and it says which of the two it is:
+//     a live composition here, not a request race. The client shows that reason verbatim
+//     instead of inferring one from the page it happened to be on.
+void section_refusal_names_the_host_reason(Driver &driver) {
+  std::printf("[busy] a refusal carries the Host's reason, not the page's guess\n");
+  driver.type("nihao");
+  require(!driver.page.entries.empty(), "the engine produced no candidates");
+
+  // The method it is *not* already on: switching to the current one is a no-op that never
+  // reaches the composition guard.
+  // Both entry points are tried: one of them is the method the group already resolves to, and
+  // that switch is a no-op which never reaches the guard. The other one must be refused, and
+  // the reason must be the composition — reported as a detail, not spelled out in a string the
+  // client would have to parse.
+  int refused = 0;
+  int noops = 0;
+  for (const char *name : {"pinyin", "shuangpin"}) {
+    SettingsSelection selection;
+    SettingsDetail detail = SettingsDetail::None;
+    std::string error;
+    const auto status =
+        driver.backend->settings_select_input_method(name, selection, error, &detail);
+    std::printf("   switching to %s returned %d detail=%d\n", name, static_cast<int>(status),
+                static_cast<int>(detail));
+    if (status == SettingsStatus::Ok) {
+      ++noops;
+      continue;
+    }
+
+    require(status == SettingsStatus::Busy, "a real method switch is refused while composing");
+    require(detail == SettingsDetail::CompositionInProgress,
+            "and the reason is the composition, reported as a detail rather than a sentence");
+    ++refused;
+  }
+
+  require(refused >= 1, "the method the group does not already use is refused, not applied");
+  require(noops <= 1, "at most one of the two switches is the no-op for the current method");
+
+  require_composition_survives(driver, "select");
 }
 
 // 5. A global write the filesystem refuses. The value the Host reports and the file on disk
@@ -373,7 +497,7 @@ void section_refused_global_write(Driver &driver, const std::filesystem::path &c
 
 // The five sections above must all run: a guard that skipped one silently would leave the
 // promise it covers unmeasured while the process still exited 0.
-constexpr int expected_sections = 5;
+constexpr int expected_sections = 7;
 
 // The configuration file the Host's global apply writes, found under the throwaway profile
 // rather than assembled from the layout Fcitx happens to use: `config/fcitx5/config` is
@@ -402,7 +526,11 @@ void run() {
   ++sections;
   section_engine_page_during_composition(driver);
   ++sections;
+  section_replaces_while_waiting(driver);
+  ++sections;
   section_im_list_during_composition(driver);
+  ++sections;
+  section_refusal_names_the_host_reason(driver);
   ++sections;
 
   // The two global saves above are what created this file, so it is looked for after them:

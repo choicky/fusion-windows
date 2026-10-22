@@ -709,6 +709,10 @@ public:
           auto *context = find(stimulus.binding);
           if (!context || context->invalid || stimulus.stimulus_id <= context->last_stimulus)
             return false;
+          // A staged settings change whose safe point has come is applied before this key, so
+          // the key that follows the end of a composition already runs under the setting the
+          // user submitted while typing.
+          apply_staged_settings_on_loop();
           context->last_stimulus = stimulus.stimulus_id;
           context->batch = output.get();
           // The presentation's own row capacity travels with the key that caused this
@@ -753,6 +757,10 @@ public:
             throw;
           }
           context->batch = nullptr;
+          // And once after it: the stimulus that ended a composition is exactly the safe point
+          // a staged change was waiting for, so it is applied here rather than at the next
+          // arbitrary keystroke.
+          apply_staged_settings_on_loop();
           return !context->invalid;
         }))
       return result;
@@ -760,14 +768,15 @@ public:
   }
 
   SettingsStatus settings_get_config(const std::string &uri, SettingsSnapshot &snapshot,
-                                     std::string &error) override {
+                                     std::string &error,
+                                      SettingsDetail *detail = nullptr) override {
     if (is_global_config_uri(uri)) {
       auto result = std::make_shared<SettingsSnapshot>();
       const auto status =
           invoke_settings([this, result](std::string &taskError) {
                           return read_global_settings_on_loop(*result, taskError);
                         },
-                        error, SettingsStatus::Timeout);
+                        error, SettingsStatus::Timeout, detail);
       if (status == SettingsStatus::Ok) {
         snapshot = std::move(*result);
       }
@@ -779,7 +788,7 @@ public:
           invoke_settings([this, result](std::string &taskError) {
                           return read_presentation_settings_on_loop(*result, taskError);
                         },
-                        error, SettingsStatus::Timeout);
+                        error, SettingsStatus::Timeout, detail);
       if (status == SettingsStatus::Ok) {
         snapshot = std::move(*result);
       }
@@ -793,18 +802,21 @@ public:
     }
     auto result = std::make_shared<SettingsSnapshot>();
     const auto status = invoke_settings(
-        [this, method, result](std::string &taskError) {
+        [this, method, result, detail](std::string &taskError) {
           return read_settings_on_loop(method, *result, taskError);
         },
-        error, SettingsStatus::Timeout);
-    if (status == SettingsStatus::Ok) {
+        error, SettingsStatus::Timeout, detail);
+    // A staged (Pending) reply carries the values the Host still holds, so the caller can show
+    // what is stored next to the intent it is waiting to apply.
+    if (status == SettingsStatus::Ok || status == SettingsStatus::Pending) {
       snapshot = std::move(*result);
     }
     return status;
   }
 
   SettingsStatus settings_set_config(const std::string &uri, const SettingsValue &submitted,
-                                     SettingsSnapshot &snapshot, std::string &error) override {
+                                     SettingsSnapshot &snapshot, std::string &error,
+                                     SettingsDetail *detail = nullptr) override {
     if (!submitted.is_map) {
       error = "The settings request is invalid.";
       return SettingsStatus::Invalid;
@@ -815,7 +827,7 @@ public:
           invoke_settings([this, submitted, result](std::string &taskError) {
                             return apply_global_settings_on_loop(submitted, *result, taskError);
                           },
-                          error, SettingsStatus::Indeterminate);
+                          error, SettingsStatus::Indeterminate, detail);
       if (status == SettingsStatus::Ok) {
         snapshot = std::move(*result);
       }
@@ -828,7 +840,7 @@ public:
                             return apply_presentation_settings_on_loop(submitted, *result,
                                                                       taskError);
                           },
-                          error, SettingsStatus::Indeterminate);
+                          error, SettingsStatus::Indeterminate, detail);
       if (status == SettingsStatus::Ok) {
         snapshot = std::move(*result);
       }
@@ -844,19 +856,22 @@ public:
         [this, method, submitted, result](std::string &taskError) {
           return apply_settings_on_loop(method, submitted, *result, taskError);
         },
-        error, SettingsStatus::Indeterminate);
-    if (status == SettingsStatus::Ok) {
+        error, SettingsStatus::Indeterminate, detail);
+    // A staged (Pending) reply carries the values the Host still holds, so the caller can show
+    // what is stored next to the intent it is waiting to apply.
+    if (status == SettingsStatus::Ok || status == SettingsStatus::Pending) {
       snapshot = std::move(*result);
     }
     return status;
   }
 
   SettingsStatus settings_get_selection(SettingsSelection &selection,
-                                        std::string &error) override {
+                                        std::string &error,
+                                        SettingsDetail *detail = nullptr) override {
     auto result = std::make_shared<SettingsSelection>();
     const auto status = invoke_settings(
         [this, result](std::string &taskError) { return selection_on_loop(*result, taskError); },
-        error, SettingsStatus::Timeout);
+        error, SettingsStatus::Timeout, detail);
     if (status == SettingsStatus::Ok) {
       selection = std::move(*result);
     }
@@ -865,14 +880,15 @@ public:
 
   SettingsStatus settings_select_input_method(const std::string &method,
                                               SettingsSelection &selection,
-                                              std::string &error) override {
+                                              std::string &error,
+                                              SettingsDetail *detail = nullptr) override {
     if (method != "pinyin" && method != "shuangpin") {
       error = "Only Pinyin and Shuangpin can be selected.";
       return SettingsStatus::Invalid;
     }
     auto result = std::make_shared<SettingsSelection>();
     const auto status = invoke_settings(
-        [this, method, result](std::string &taskError) {
+        [this, method, result, detail](std::string &taskError) {
           auto &manager = instance_->inputMethodManager();
           if (!manager.entry(method)) {
             taskError = "The requested input method is not available in this Host.";
@@ -885,9 +901,14 @@ public:
           if (liveCurrent == method) {
             return selection_on_loop(*result, taskError);
           }
-          if (has_active_composition_on_loop()) {
-            // Same reason as the list below: the switch is `setGroup`, which deactivates the
-            // engine of every composing context.
+          // Same reason as the list: the switch is `setGroup`, which deactivates the engine
+          // of every composing context. This entry point is not the one the client uses (it
+          // reports the selected method, which a staged switch could not confirm), so it
+          // refuses and names the Host's own reason instead of letting the client guess.
+          if (const auto blocker = composition_blocker_on_loop();
+              blocker != SettingsDetail::None) {
+            if (detail != nullptr)
+              *detail = blocker;
             taskError =
                 "Switching the input method ends the composition of every context that is "
                 "still composing, and the switch is stored by that same official call. Finish "
@@ -917,33 +938,35 @@ public:
           manager.save();
           return selection_on_loop(*result, taskError);
         },
-        error, SettingsStatus::Indeterminate);
+        error, SettingsStatus::Indeterminate, detail);
     if (status == SettingsStatus::Ok) {
       selection = std::move(*result);
     }
     return status;
   }
 
-  SettingsStatus settings_get_im_list(ImList &list, std::string &error) override {
+  SettingsStatus settings_get_im_list(ImList &list, std::string &error,
+                                      SettingsDetail *detail = nullptr) override {
     auto result = std::make_shared<ImList>();
     const auto status = invoke_settings(
         [this, result](std::string &taskError) { return im_list_on_loop(*result, taskError); },
-        error, SettingsStatus::Timeout);
-    if (status == SettingsStatus::Ok) {
+        error, SettingsStatus::Timeout, detail);
+    if (status == SettingsStatus::Ok || status == SettingsStatus::Pending) {
       list = std::move(*result);
     }
     return status;
   }
 
   SettingsStatus settings_set_im_list(const std::vector<std::string> &enabled, ImList &list,
-                                      std::string &error) override {
+                                      std::string &error,
+                                      SettingsDetail *detail = nullptr) override {
     auto result = std::make_shared<ImList>();
     const auto status = invoke_settings(
         [this, enabled, result](std::string &taskError) {
           return apply_im_list_on_loop(enabled, *result, taskError);
         },
-        error, SettingsStatus::Indeterminate);
-    if (status == SettingsStatus::Ok) {
+        error, SettingsStatus::Indeterminate, detail);
+    if (status == SettingsStatus::Ok || status == SettingsStatus::Pending) {
       list = std::move(*result);
     }
     return status;
@@ -959,10 +982,13 @@ private:
   };
 
   SettingsStatus invoke_settings(const std::function<SettingsStatus(std::string &)> &function,
-                                 std::string &error, SettingsStatus running_timeout_status) {
+                                 std::string &error, SettingsStatus running_timeout_status,
+                                 SettingsDetail *detail = nullptr) {
     bool expected = false;
     if (!settings_pending_.compare_exchange_strong(expected, true)) {
       error = "Another settings request is already in progress.";
+      if (detail != nullptr)
+        *detail = SettingsDetail::RequestInProgress;
       return SettingsStatus::Busy;
     }
     if (!healthy()) {
@@ -1036,6 +1062,117 @@ private:
     }
     return false;
   }
+
+  // What a *deferred* apply has to wait for, which is narrower than the predicate above.
+  //
+  // The strict predicate also counts any non-empty candidate panel. A panel can be on screen
+  // with no buffer behind it — a prediction shown before anything was typed — and a staged
+  // change must not wait for that for as long as the panel happens to be up. So this asks the
+  // two questions a deferred apply actually cares about: is there a preedit the user is still
+  // building, and does this Host still owe the frontend ordered work.
+  SettingsDetail composition_blocker_on_loop() const {
+    for (const auto &[id, context] : contexts_) {
+      (void)id;
+      if (!context->inputPanel().clientPreedit().empty() || !context->inputPanel().preedit().empty())
+        return SettingsDetail::CompositionInProgress;
+      if (context->hasPendingEventsStrictOrder())
+        return SettingsDetail::UnsettledWork;
+    }
+    return SettingsDetail::None;
+  }
+
+  // --- staged settings -------------------------------------------------------------------
+  // The two settings an official setter can only publish by applying — the engine's own
+  // configuration and the input-method group — are held here between the moment the user
+  // submits them and the first moment applying them cannot destroy a composition. This is a
+  // bounded record of *requests*, not a second configuration store: three entries at most
+  // (one per engine page and one for the list), holding exactly the delta the client
+  // submitted, never the whole configuration, and never consulted by anything that reads a
+  // setting. When the last entry goes, nothing of it remains.
+  struct StagedSetting {
+    enum class Kind { Method, ImList } kind = Kind::Method;
+    std::string method;               // Kind::Method
+    SettingsValue submitted;          // Kind::Method — the delta, option subtrees only
+    std::vector<std::string> enabled; // Kind::ImList
+  };
+  static constexpr std::size_t max_staged_settings = 3;
+
+  // Only the option subtrees this submission names, newest wins. A list option arrives as one
+  // complete map, so replacing a named subtree wholesale is what keeps a removal a removal;
+  // merging inside one would resurrect an entry the user deleted.
+  static void overlay_delta(SettingsValue &into, const SettingsValue &from) {
+    if (!into.is_map)
+      into = SettingsValue::object();
+    for (const auto &[name, value] : from.entries)
+      into.entries[name] = value;
+  }
+
+  void stage_method_settings(const std::string &method, const SettingsValue &submitted) {
+    for (auto &entry : staged_) {
+      if (entry.kind == StagedSetting::Kind::Method && entry.method == method) {
+        overlay_delta(entry.submitted, submitted);
+        return;
+      }
+    }
+    if (staged_.size() >= max_staged_settings)
+      return; // bounded: the oldest intent is not silently replaced by a fourth
+    StagedSetting entry;
+    entry.kind = StagedSetting::Kind::Method;
+    entry.method = method;
+    entry.submitted = submitted;
+    staged_.push_back(std::move(entry));
+  }
+
+  void stage_im_list(const std::vector<std::string> &enabled) {
+    for (auto &entry : staged_) {
+      if (entry.kind == StagedSetting::Kind::ImList) {
+        entry.enabled = enabled; // the newest requested order is the intent
+        return;
+      }
+    }
+    if (staged_.size() >= max_staged_settings)
+      return;
+    StagedSetting entry;
+    entry.kind = StagedSetting::Kind::ImList;
+    entry.enabled = enabled;
+    staged_.push_back(std::move(entry));
+  }
+
+  // The safe point: called on this loop, never from a TSF callback, before and after a
+  // stimulus. Staged work is applied only when nothing is composing and nothing is unsettled;
+  // the official setter is then called exactly once, and the record is dropped whether it
+  // succeeded or finally failed. A failure is logged and not replayed — the next GetConfig
+  // shows the stored value, and the client keeps the user's intent rather than claiming it.
+  void apply_staged_settings_on_loop() {
+    if (staged_.empty() || instance_ == nullptr)
+      return;
+    if (composition_blocker_on_loop() != SettingsDetail::None)
+      return;
+    for (auto it = staged_.begin(); it != staged_.end();) {
+      std::string error;
+      SettingsStatus status = SettingsStatus::Error;
+      if (it->kind == StagedSetting::Kind::Method) {
+        SettingsSnapshot snapshot;
+        status = apply_method_settings_now_on_loop(it->method, it->submitted, snapshot, error);
+      } else {
+        ImList list;
+        status = apply_im_list_now_on_loop(it->enabled, list, error);
+      }
+      const bool settled = status == SettingsStatus::Ok || status == SettingsStatus::Error ||
+                           status == SettingsStatus::Invalid ||
+                           status == SettingsStatus::Unsupported;
+      std::fprintf(stderr,
+                   "[FusionHost] staged settings: kind=%s status=%d%s%s\n",
+                   it->kind == StagedSetting::Kind::Method ? "method" : "im-list",
+                   static_cast<int>(status), error.empty() ? "" : " ", error.c_str());
+      if (!settled)
+        return; // still blocked: a later safe point tries again
+      it = staged_.erase(it);
+    }
+  }
+
+  std::size_t staged_settings_count() const { return staged_.size(); }
+  std::vector<StagedSetting> staged_;
 
   SettingsStatus read_global_settings_on_loop(SettingsSnapshot &snapshot, std::string &error) {
     const auto &global = instance_->globalConfig();
@@ -1267,23 +1404,54 @@ private:
       snapshot = std::move(current);
       return SettingsStatus::Ok;
     }
-    // This is the one page that cannot be written without being applied, and cannot be
-    // applied while a composition is live. `setConfigForInputMethod` is the engine's own
-    // setter: PinyinEngine::setConfig loads the tree, saves conf/pinyin.conf and calls
+    // This page cannot be written without being applied, and cannot be applied while a
+    // composition is live. `setConfigForInputMethod` is the engine's own setter:
+    // PinyinEngine::setConfig loads the tree, saves conf/pinyin.conf and calls
     // populateConfig, and populateConfig always installs a freshly constructed
     // `ShuangpinProfile` (chinese-addons `pinyin.h`/`pinyin.cpp`). libime's PinyinIME
     // compares that shared_ptr and emits `optionChanged`, and PinyinContext connects that
-    // signal to `clear()` (`libime/pinyin/pinyincontext.cpp:432`), so every composing
-    // context in the Host loses the buffer the user was typing. There is no official call
-    // that persists this configuration without publishing it, and holding the submitted tree
-    // in Host memory instead would be neither the official store nor a save. So the request
-    // is refused while a composition is live, with the reason named rather than "busy".
-    if (has_active_composition_on_loop()) {
-      error = "This Pinyin/Shuangpin setting can only be applied by the engine's own setter, "
-              "which clears every composing context, and there is no official way to store it "
-              "without applying it. Finish the composition, then save again; nothing was "
-              "changed, so the same change can be retried.";
-      return SettingsStatus::Busy;
+    // signal to `clear()` (`libime/pinyin/pinyincontext.cpp:432`), so every composing context
+    // in the Host would lose the buffer the user was typing.
+    //
+    // So the request is not refused and not applied either: the delta the user submitted is
+    // staged (one bounded record, no second store) and applied through this same setter at
+    // the first safe point on this very loop — see apply_staged_settings_on_loop. Nothing is
+    // on disk yet, which is why the status is Pending and not Ok.
+    if (composition_blocker_on_loop() != SettingsDetail::None) {
+      stage_method_settings(method, submitted);
+      // The reply carries the configuration as it still stands, so the client can show the
+      // stored value beside the intent it is holding instead of mistaking one for the other.
+      snapshot = std::move(current);
+      error = "Accepted; it will be applied through the engine's own setter as soon as the "
+              "current input finishes, and written then.";
+      return SettingsStatus::Pending;
+    }
+    return apply_method_settings_now_on_loop(method, submitted, snapshot, error);
+  }
+
+  // The apply half of apply_settings_on_loop, with no staging: it writes through the official
+  // setter and reports what the engine then holds. Used both for a request that arrives when
+  // nothing is composing and for a staged request whose safe point has come.
+  SettingsStatus apply_method_settings_now_on_loop(const std::string &method,
+                                                   const SettingsValue &submitted,
+                                                   SettingsSnapshot &snapshot,
+                                                   std::string &error) {
+    SettingsSnapshot current;
+    if (const auto status = read_settings_on_loop(method, current, error);
+        status != SettingsStatus::Ok) {
+      return status;
+    }
+    if (current.types.empty()) {
+      error = "Fcitx returned no schema for this input method.";
+      return SettingsStatus::Error;
+    }
+    SettingsValue merged = current.values;
+    if (!merge_schema_values(current.types, current.types.front().name, submitted, merged, error)) {
+      return SettingsStatus::Invalid;
+    }
+    if (merged == current.values) {
+      snapshot = std::move(current);
+      return SettingsStatus::Ok;
     }
     const auto *entry = instance_->inputMethodManager().entry(method);
     auto *engine = instance_->inputMethodEngine(method);
@@ -1399,18 +1567,57 @@ private:
         current_group.defaultInputMethod() == plan->methods.front()) {
       return im_list_on_loop(out, error);
     }
-    // Refused while a composition is live, and for a reason that is the engine's, not a
-    // policy: `setGroup` on the current group emits CurrentGroupChanged, every context
-    // re-resolves its input method, and the engine that was composing is deactivated — which
-    // for Pinyin is `reset`. The group and the profile are written by that same call
-    // (`setGroup` then `save`), so there is no order in which the list is stored without the
-    // switch happening.
-    if (has_active_composition_on_loop()) {
-      error = "Changing the input-method list switches the method a composing context uses, "
-              "which ends its composition, and the list is stored by that same official call. "
-              "Finish the composition, then save again; nothing was changed, so the same "
-              "change can be retried.";
-      return SettingsStatus::Busy;
+    // The list cannot be stored without the switch happening: `setGroup` on the current group
+    // emits CurrentGroupChanged, every context re-resolves its input method, and the engine
+    // that was composing is deactivated — which for Pinyin is `reset`. The group and the
+    // profile are written by that same call (`setGroup` then `save`), so there is no order in
+    // which the list is stored without ending a composition.
+    //
+    // The requested order is therefore staged, exactly like the engine page's delta, and
+    // applied through this same `setGroup`/`save` at the first safe point. Re-submitting
+    // replaces the staged list (the newest intent wins) instead of queueing a second one.
+    if (composition_blocker_on_loop() != SettingsDetail::None) {
+      stage_im_list(requested);
+      // The reply carries the list as it still stands; the requested order is the client's
+      // intent, not something the Host has stored.
+      std::string ignored;
+      (void)im_list_on_loop(out, ignored);
+      return SettingsStatus::Pending;
+    }
+    return apply_im_list_now_on_loop(requested, out, error);
+  }
+
+  // The apply half of apply_im_list_on_loop, with no staging. Used for a request that arrives
+  // when nothing is composing and for a staged list whose safe point has come.
+  SettingsStatus apply_im_list_now_on_loop(const std::vector<std::string> &requested, ImList &out,
+                                           std::string &error) {
+    auto &manager = instance_->inputMethodManager();
+    const auto available = available_method_names_on_loop();
+    if (available.empty()) {
+      error = "This Host has no Pinyin or Shuangpin input method available.";
+      return SettingsStatus::Unsupported;
+    }
+    const auto &current_group = manager.currentGroup();
+    const auto plan =
+        selection::plan_im_list_update(requested, available, current_group.defaultInputMethod());
+    if (!plan) {
+      error = "The input-method list must contain at least one method this Host defines, and every "
+              "entry must be available.";
+      return SettingsStatus::Invalid;
+    }
+    // Re-checked here, not only at submission time: a staged list may have been overtaken by
+    // another edit, and a request that would write the group it already has writes no file.
+    const auto already = [&] {
+      std::vector<std::string> names;
+      for (const auto &item : selection::group_enabled_items(group_items(current_group))) {
+        if (std::find(available.begin(), available.end(), item.name) != available.end())
+          names.push_back(item.name);
+      }
+      return names;
+    }();
+    if (already == plan->methods &&
+        current_group.defaultInputMethod() == plan->methods.front()) {
+      return im_list_on_loop(out, error);
     }
     // The first enabled method is the one in use, so it is also Items/0's content and
     // DefaultIM; the rest follow in the user's order (see group_items_with_off_slot).

@@ -36,7 +36,7 @@ public static class WireLimits
     // mismatch with a version error, so this is a compatibility constant, not a hint: a
     // client that guessed would be served nothing at all.
     public const uint ProtocolVersion = 7;
-    public const uint SettingsApiVersion = 2;
+    public const uint SettingsApiVersion = 3;
     public const uint SettingsApiMinVersion = 1;
 
     public const int HeaderSize = 5;

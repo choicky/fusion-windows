@@ -45,7 +45,28 @@ public sealed class ImListDraft
     /// <summary>Items/0, or an empty string when the group is empty.</summary>
     public string Active => _enabled.Count == 0 ? string.Empty : _enabled[0];
 
-    public bool HasChanges => !_enabled.SequenceEqual(Baseline.Enabled, StringComparer.Ordinal);
+    /// <summary>
+    /// The order the Host accepted and is holding until the current input finishes. While it is
+    /// set the requested order is neither unsaved nor saved: the Host will apply it by itself,
+    /// and nothing is on disk yet.
+    /// </summary>
+    private List<string>? _awaitingOrder;
+
+    public bool HasAwaitingApply => _awaitingOrder is not null;
+
+    /// <summary>Anything the user has meant that the Host has not written yet.</summary>
+    public bool HasUnsettledChanges => HasChanges || HasAwaitingApply;
+
+    /// <summary>
+    /// A requested order is a change unless the Host is already holding exactly that order: a
+    /// submitted list is not an unsaved edit any more, and saying it were would keep the save
+    /// button offering to send a request that is already staged.
+    /// </summary>
+    public bool HasChanges =>
+        !_enabled.SequenceEqual(Baseline.Enabled, StringComparer.Ordinal) && _awaitingOrder is null;
+
+    /// <summary>Records that the Host staged this order; it applies it when the input ends.</summary>
+    public void MarkAwaiting() => _awaitingOrder = new List<string>(_enabled);
 
     public bool IsAvailable(string name) =>
         Baseline.Available.Contains(name, StringComparer.Ordinal);
@@ -96,6 +117,7 @@ public sealed class ImListDraft
 
     public void Revert()
     {
+        _awaitingOrder = null;
         _enabled.Clear();
         _enabled.AddRange(Baseline.Enabled);
     }
@@ -130,6 +152,16 @@ public sealed class ImListDraft
 
         // Ask the question against the old baseline. After the assignment below, the two lists
         // would be compared with each other and the answer would always be "clean".
+        // A staged order is reconciled first: if the Host now shows it, it was applied and the
+        // request is done; if it does not, the order is not applied and goes back to being
+        // unsaved, so the user can submit it again instead of believing it landed.
+        if (_awaitingOrder is not null)
+        {
+            _awaitingOrder = null;
+            Baseline = fresh;
+            return;
+        }
+
         var hadPendingEdits = HasChanges;
         Baseline = fresh;
 

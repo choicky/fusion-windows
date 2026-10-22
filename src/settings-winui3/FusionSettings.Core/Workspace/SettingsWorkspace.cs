@@ -208,6 +208,19 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         (PinyinDraft?.HasChanges ?? false) || (GlobalDraft?.HasChanges ?? false) ||
         (PresentationDraft?.HasChanges ?? false) || (Methods?.HasChanges ?? false);
 
+    /// <summary>
+    /// Edits the Host accepted and is holding until the current input finishes. Nothing is
+    /// written, so they are not saved; the Host applies them by itself, so they are not lost
+    /// either. Closing the window must still warn about them, and the bar must not call them
+    /// saved.
+    /// </summary>
+    public bool HasAwaitingApply =>
+        (PinyinDraft?.HasAwaitingApply ?? false) || (GlobalDraft?.HasAwaitingApply ?? false) ||
+        (PresentationDraft?.HasAwaitingApply ?? false) || (Methods?.HasAwaitingApply ?? false);
+
+    /// <summary>Anything the user has meant that the Host has not written.</summary>
+    public bool HasUnsettledChanges => HasChanges || HasAwaitingApply;
+
     public IReadOnlyList<string> Diagnostics => _log;
 
     /// <summary>True when a retry is meaningful: nothing loaded yet, or the Host went away.</summary>
@@ -625,6 +638,19 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 Log($"save {uri}: ok");
                 return $"{name}：已保存。";
 
+            case SettingsStatus.Pending:
+                // The Host accepted the change and is holding it until the current input
+                // finishes, because the only official setter publishes by applying and would
+                // end the composition. Nothing has been written, so this is not a save: the
+                // edit becomes "waiting" — still the user'''s value on screen, no longer an
+                // unsaved edit, and never described as stored.
+                draft.RefreshBaseline(result.Value!);
+                draft.MarkAwaiting(sentPaths);
+                SetSnapshot(target, result.Value!);
+                MarkConnected();
+                Log($"save {uri}: pending, the Host applies it when the input finishes");
+                return $"{name}：已提交，等待当前输入结束后自动应用（尚未写入磁盘）。";
+
             case SettingsStatus.Indeterminate:
                 // The Host may have applied it. Reread and reconcile; never replay.
                 var reread = await _client.GetConfigAsync(uri, cancellationToken).ConfigureAwait(true);
@@ -643,8 +669,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return $"{name}：写入结果不确定，可能已生效。已重新读取当前配置并据此核对。";
 
             case SettingsStatus.Busy:
-                Log($"save {uri}: busy");
-                return $"{name}：{BusyRefusal(target)}";
+                Log($"save {uri}: busy ({result.Detail})");
+                return $"{name}：{BusyRefusal(result.Detail)}";
 
             default:
                 Log($"save {uri}: {result.Status} {result.Error}");
@@ -682,6 +708,14 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 Methods = new ImListDraft(result.Value!);
                 Log("save im-list: ok");
                 return "输入方式列表：已保存。";
+
+            case SettingsStatus.Pending:
+                // Staged by the Host, applied when the current input finishes. Nothing is on
+                // disk yet: the list is waiting, not saved.
+                methods.MarkAwaiting();
+                Raise(nameof(HasChanges));
+                Log("save im-list: pending, the Host applies it when the input finishes");
+                return "输入方式列表：已提交，等待当前输入结束后自动应用（尚未写入磁盘）。";
 
             case SettingsStatus.Indeterminate:
                 // The Host may have applied the list. The reread is authoritative for what it
@@ -749,19 +783,23 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// rather than being called saved.
     /// </para>
     /// </remarks>
-    public static string BusyRefusal(SettingsTarget target) => target switch
+    public static string BusyRefusal(SettingsDetail detail) => detail switch
     {
-        SettingsTarget.Pinyin or SettingsTarget.Shuangpin =>
-            "正在组合中，未保存——拼音/双拼配置只能由输入法自己的设置入口写入，而它会清空正在进行的组合。"
-            + "修改已保留，完成当前输入后可再次保存。",
-        _ => "Host 正在处理另一次设置请求，未保存。修改已保留，请稍后再次保存。",
+        SettingsDetail.RequestInProgress =>
+            "Host 正在处理另一次设置请求，未保存。修改已保留，请稍后再次保存。",
+        SettingsDetail.CompositionInProgress =>
+            "正在组合中，未保存。修改已保留，完成当前输入后可再次保存。",
+        SettingsDetail.UnsettledWork =>
+            "Host 还有尚未结算的输入工作，未保存。修改已保留，请稍后再次保存。",
+        _ => "Host 没有接受这次写入，未保存。修改已保留，请稍后再次保存。",
     };
 
     /// <summary>A short, user-facing sentence for a status.</summary>
     public static string Describe(SettingsStatus status, string error) => status switch
     {
         SettingsStatus.Ok => "正常。",
-        SettingsStatus.Busy => "Host 暂时没有接受这次请求：正在组合中，或另一次请求正在进行。",
+        SettingsStatus.Busy => "Host 暂时没有接受这次请求。",
+        SettingsStatus.Pending => "已提交，等待当前输入结束后自动应用（尚未写入磁盘）。",
         SettingsStatus.Unsupported => string.IsNullOrEmpty(error) ? "Host 不支持该操作。" : error,
         SettingsStatus.Invalid => string.IsNullOrEmpty(error) ? "请求无效。" : error,
         SettingsStatus.Timeout => "Host 没有在限定时间内响应。",

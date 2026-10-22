@@ -272,21 +272,25 @@ public:
   // blocks or resets a text context. Non-Fcitx test backends default to an
   // explicit unsupported result.
   virtual SettingsStatus settings_get_config(const std::string &, SettingsSnapshot &,
-                                             std::string &error) {
+                                             std::string &error,
+                                             SettingsDetail * = nullptr) {
     error = "settings are not supported by this backend";
     return SettingsStatus::Unsupported;
   }
   virtual SettingsStatus settings_set_config(const std::string &, const SettingsValue &,
-                                             SettingsSnapshot &, std::string &error) {
+                                             SettingsSnapshot &, std::string &error,
+                                             SettingsDetail * = nullptr) {
     error = "settings are not supported by this backend";
     return SettingsStatus::Unsupported;
   }
-  virtual SettingsStatus settings_get_selection(SettingsSelection &, std::string &error) {
+  virtual SettingsStatus settings_get_selection(SettingsSelection &, std::string &error,
+                                                 SettingsDetail * = nullptr) {
     error = "input-method selection is not supported by this backend";
     return SettingsStatus::Unsupported;
   }
   virtual SettingsStatus settings_select_input_method(const std::string &, SettingsSelection &,
-                                                       std::string &error) {
+                                                       std::string &error,
+                                                       SettingsDetail * = nullptr) {
     error = "input-method selection is not supported by this backend";
     return SettingsStatus::Unsupported;
   }
@@ -296,12 +300,14 @@ public:
   // back through the manager's official setGroup/save. These are separate from the
   // single-select path above: selection changes which method a context follows,
   // list management changes which methods belong to the group and their order.
-  virtual SettingsStatus settings_get_im_list(ImList &, std::string &error) {
+  virtual SettingsStatus settings_get_im_list(ImList &, std::string &error,
+                                               SettingsDetail * = nullptr) {
     error = "input-method list management is not supported by this backend";
     return SettingsStatus::Unsupported;
   }
   virtual SettingsStatus settings_set_im_list(const std::vector<std::string> &, ImList &,
-                                              std::string &error) {
+                                              std::string &error,
+                                              SettingsDetail * = nullptr) {
     error = "input-method list management is not supported by this backend";
     return SettingsStatus::Unsupported;
   }
