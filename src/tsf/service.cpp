@@ -895,8 +895,9 @@ STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lpa
   // Only the Shift key-ups this shell relayed are claimed, and only so that OnKeyUp is
   // reached at all: the engine decides whether the press completed one of its own
   // modifier-only bindings (Hotkey/AltTriggerKeys). Every other key-up stays the
-  // application's, exactly as before.
-  *pfEaten = entry->semantic.routes_release(action);
+  // application's, exactly as before. A context the hard policy closes is not claimed
+  // here either, because OnKeyUp would drop the release.
+  *pfEaten = entry->semantic.routes_release(action) && hard_policy_allows(*entry);
   diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
         *pfEaten);
   return S_OK;
@@ -922,15 +923,38 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam,
   if (!entry->semantic.routes_release(action)) {
     return S_OK;
   }
+  // The release goes through the same gates a key-down does, in the same order: hard
+  // policy first (a closed or disabled context never receives it), then the outstanding
+  // work this context still owes the document. A release that arrives while that work is
+  // unresolved is dropped rather than settled out of order — the engine's own
+  // ModifierOnlyKeyTimeout expires the press it recorded.
+  if (!hard_policy_allows(*entry)) {
+    diagf("RELEASE_POLICY", "vk=0x%03llX", static_cast<unsigned long long>(wparam));
+    return S_OK;
+  }
+  entry->semantic.retire_terminals();
+  if (entry->cleanup.pending() || !entry->semantic.pending().empty() ||
+      entry->semantic.pass_probe() != fusion::Pass::Clear) {
+    diagf("RELEASE_DEFERRED", "vk=0x%03llX cleanup=%d pending=%zu user=%d",
+          static_cast<unsigned long long>(wparam), entry->cleanup.pending() ? 1 : 0,
+          entry->semantic.pending().size(),
+          entry->semantic.pass_probe() != fusion::Pass::Clear ? 1 : 0);
+    return S_OK;
+  }
   auto lifetime_guard = hold_entry(entry);
   handling_key_ = true;
   const SemanticDecision decision = entry->semantic.release_key(action);
-  diagf("BACKEND", "symbolic=%s route=%s eaten=%d", decision.symbolic.c_str(),
-        route_name(decision.route), decision.eaten ? 1 : 0);
+  diagf("BACKEND", "symbolic=%s route=%s eaten=%d ops=%zu", decision.symbolic.c_str(),
+        route_name(decision.route), decision.eaten ? 1 : 0, decision.frontend.size());
   if (decision.route != SemanticDecision::Route::FailOpen &&
       decision.route != SemanticDecision::Route::CancelledRecovery) {
-    // The engine has had its say: it either consumed the release or handed it back. A
-    // release owns no composition, so nothing else needs settling here.
+    // The engine answers a modifier-only release with the same ordered document work a
+    // key-down produces — in the measured case the commit of what was composing and the
+    // cleared preedit. It settles through the one path that owns document writes, in
+    // order, once; `pfEaten` is left false because the release owns no pass barrier of
+    // its own (there is no physical key to hand back: the application's `Shift` key-up
+    // was already claimed in T).
+    settle_frontend_work(*entry, decision, nullptr);
     if (decision.eaten) {
       *pfEaten = TRUE;
     }

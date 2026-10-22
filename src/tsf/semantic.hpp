@@ -220,10 +220,20 @@ private:
   std::uint64_t bound_incarnation_ = 0;
   std::uint64_t bound_connection_ = 0;
   std::uint64_t next_stimulus_ = 1;
-  // The Shift key whose press this shell relayed and that no other key-down has ended
-  // yet; 0 when there is no such press. Per context, cleared by any other key-down and by
-  // the release it belongs to, so a combination can never be settled as a lone modifier.
-  std::uint32_t shift_press_keysym_ = 0;
+  // The Shift key whose physical press was last observed (T or K); 0 when none. Only a
+  // physical fact: it never claims the engine received anything.
+  std::uint32_t shift_pressed_keysym_ = 0;
+  // The press the engine actually received, with the binding and link it belongs to. A
+  // key-up may settle only this, and only while that same link is current, so a release
+  // can never cross a policy refusal, a failed send, a reconnect or a Host change.
+  struct ShiftPress {
+    std::uint32_t keysym = 0;
+    std::uint64_t context = 0;
+    std::uint64_t incarnation = 0;
+    std::uint64_t generation = 0;
+    void reset() { *this = ShiftPress{}; }
+  };
+  ShiftPress shift_forwarded_;
   SemanticDecision begin_real_key(const KeyAction &action, bool policy_allows);
   // The composition-state work that makes a gated key engine work: raw input, a projected
   // page, queued frontend work, an unresolved pass barrier. The Mock Backend answers true

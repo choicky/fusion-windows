@@ -335,11 +335,15 @@ inline bool is_candidate_action(BackendStimulus::Type type) {
   return type == BackendStimulus::Type::SelectCandidate ||
          type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev;
 }
-// The two Shift keys: the only modifier-only keys this runtime relays to the engine, and
-// the keys `Hotkey/AltTriggerKeys` is configured with by default. A release of one of
-// them can toggle an inactive context back, so they are never passed through blindly.
-inline bool is_modifier_only_keysym(std::uint32_t keysym) {
-  return keysym == 0xffe1 || keysym == 0xffe2;
+// Whether a stimulus carries a character, i.e. is something an input method would compose
+// from. Everything else — function keys, bare modifiers, navigation and editing keys — is a
+// candidate for the engine's own global hotkeys and stays the engine's business even while
+// the context is inactive.
+inline bool stimulus_carries_character(const BackendStimulus &stimulus) {
+  if (stimulus.type == BackendStimulus::Type::Character ||
+      stimulus.type == BackendStimulus::Type::Space)
+    return true;
+  return (stimulus.keysym >= 0x20 && stimulus.keysym < 0x7f) || stimulus.keysym >= 0x01000000u;
 }
 
 class InputContext final : public fcitx::InputContext {
@@ -362,6 +366,18 @@ public:
   // (`Hotkey/AltTriggerKeys`). No state is invented: the answer is Fcitx's own, read per
   // dispatch, and `ever_active_` only keeps a brand-new context's first key going to the
   // engine, which is what activates it.
+  // Fcitx hands "an inactive context forwards keys to the application" to the keyboard
+  // input method, and this runtime compiles none. The frontend half of that rule lives
+  // here: once the engine has been active for this context and reports it inactive again,
+  // a key that carries a character is the application's and must not reach an input method
+  // (which would start composing again).
+  //
+  // "English" is not "Fcitx stops seeing keys". The engine's own global keys —
+  // `Hotkey/TriggerKeys`, `ActivateKeys`, the layout hots — are handled before any input
+  // method and deliberately do not require an active context; that is exactly how a
+  // configured key turns the input method back on. So character-less keys are still
+  // dispatched and the engine decides: a bound key consumes them, anything else comes back
+  // as Forward with nothing composed. No second matcher, no hard-coded key.
   bool inactive_passthrough(const BackendStimulus &stimulus) {
     if (!instance_ || !ever_active_)
       return false;
@@ -371,7 +387,7 @@ public:
       return false;
     if (instance_->state() != 1) // 2 = active, 1 = inactive, 0 = no context at all
       return false;
-    return !is_modifier_only_keysym(stimulus.keysym);
+    return stimulus_carries_character(stimulus);
   }
   // Record that the engine has been active here. Called after every dispatch, so the
   // transition is observed rather than predicted.
@@ -1125,12 +1141,10 @@ private:
       error = "This Host has no Pinyin or Shuangpin input method available.";
       return SettingsStatus::Unsupported;
     }
-    const auto &items = group.inputMethodList();
-    for (std::size_t i = 1; i < items.size(); ++i) {
-      const auto &name = items[i].name();
-      if (std::find(list.available.begin(), list.available.end(), name) !=
+    for (const auto &item : selection::group_enabled_items(group_items(group))) {
+      if (std::find(list.available.begin(), list.available.end(), item.name) !=
           list.available.end()) {
-        list.enabled.push_back(name);
+        list.enabled.push_back(item.name);
       }
     }
     if (!list.enabled.empty()) {
@@ -1165,11 +1179,9 @@ private:
     // leaving Items/0 as the group's other slot, persists nothing.
     const auto current_enabled = [&] {
       std::vector<std::string> names;
-      const auto &items = current_group.inputMethodList();
-      for (std::size_t i = 1; i < items.size(); ++i) {
-        const auto &name = items[i].name();
-        if (std::find(available.begin(), available.end(), name) != available.end()) {
-          names.push_back(name);
+      for (const auto &item : selection::group_enabled_items(group_items(current_group))) {
+        if (std::find(available.begin(), available.end(), item.name) != available.end()) {
+          names.push_back(item.name);
         }
       }
       return names;
@@ -1185,24 +1197,40 @@ private:
     // The first enabled method is the one in use, so it is also Items/0's content and
     // DefaultIM; the rest follow in the user's order (see group_items_with_off_slot).
     auto group = current_group;
-    std::vector<fcitx::InputMethodGroupItem> rebuilt;
-    rebuilt.reserve(plan->methods.size() + 1);
-    for (const auto &name :
-         selection::group_items_with_off_slot(plan->methods, plan->methods.front(), available)) {
-      fcitx::InputMethodGroupItem item(name);
-      const auto &layout = current_group.layoutFor(name);
-      if (!layout.empty()) {
-        item.setLayout(layout);
-      }
-      rebuilt.push_back(std::move(item));
+    auto items = selection::group_items_with_off_slot(plan->methods, plan->methods.front(),
+                                                      available);
+    // A retained entry keeps the keyboard layout it had; the marked slot keeps its marker.
+    for (std::size_t i = 1; i < items.size(); ++i) {
+      const auto &layout = current_group.layoutFor(items[i].name);
+      if (!layout.empty())
+        items[i].layout = layout;
     }
-    group.inputMethodList() = std::move(rebuilt);
-    group.setDefaultInputMethod(plan->methods.front());
+    write_group(group, items, plan->methods.front());
     manager.setGroup(std::move(group));
     manager.save();
     return im_list_on_loop(out, error);
   }
 
+  static std::vector<selection::GroupItem> group_items(const fcitx::InputMethodGroup &group) {
+    std::vector<selection::GroupItem> items;
+    items.reserve(group.inputMethodList().size());
+    for (const auto &item : group.inputMethodList()) {
+      items.push_back({item.name(), item.layout()});
+    }
+    return items;
+  }
+  static void write_group(fcitx::InputMethodGroup &group,
+                          const std::vector<selection::GroupItem> &items,
+                          const std::string &default_method) {
+    group.inputMethodList().clear();
+    for (const auto &item : items) {
+      fcitx::InputMethodGroupItem entry(item.name);
+      if (!item.layout.empty())
+        entry.setLayout(item.layout);
+      group.inputMethodList().push_back(std::move(entry));
+    }
+    group.setDefaultInputMethod(default_method);
+  }
   static std::vector<std::string> method_names(const fcitx::InputMethodGroup &group) {
     std::vector<std::string> names;
     names.reserve(group.inputMethodList().size());
@@ -1235,25 +1263,34 @@ private:
                                       .locate(fcitx::StandardPathsType::PkgConfig, "profile")
                                       .empty();
     auto group = manager.currentGroup();
-    auto names = method_names(group);
-    const auto plan = selection::plan_startup_group(profile_present, group.defaultInputMethod(),
-                                                    names, available);
-    if (plan.replace) {
-      names = plan.methods;
-    }
-    // The method in use: the first enabled one, which is what the group resolved to
-    // before this change (Items/0 while inactive) and what a first-run plan names.
-    const std::string active = names.empty() ? std::string() : names.front();
-    if (active.empty() || (!plan.replace && selection::group_has_off_slot(names,
-                                                                        group.defaultInputMethod()))) {
+    const auto stored = group_items(group);
+    const auto plan = selection::plan_startup_group(
+        profile_present, group.defaultInputMethod(), method_names(group), available);
+    if (!plan.replace && selection::group_has_off_slot(stored)) {
+      // Already this feature's shape: the user's methods and the method in use are what
+      // was written last time. Rewriting would churn the profile for nothing.
       log_group(instance, profile_present, false);
       return;
     }
-    group.inputMethodList().clear();
-    for (const auto &name : selection::group_items_with_off_slot(names, active, available)) {
-      group.inputMethodList().emplace_back(name);
+    // A group that predates the marker is migrated without reinterpreting it: its Items are
+    // the user's methods in their order, and its first item is the method those builds were
+    // typing with (`Instance::inputMethod` while inactive). A first-run plan names the
+    // method to use explicitly.
+    std::vector<std::string> methods;
+    std::string active;
+    if (plan.replace) {
+      methods = plan.methods;
+      active = methods.empty() ? plan.default_method : methods.front();
+    } else {
+      for (const auto &item : stored)
+        methods.push_back(item.name);
+      active = selection::legacy_in_use_method(stored, plan.default_method);
     }
-    group.setDefaultInputMethod(active);
+    if (active.empty()) {
+      log_group(instance, profile_present, plan.replace);
+      return;
+    }
+    write_group(group, selection::group_items_with_off_slot(methods, active, available), active);
     manager.setGroup(std::move(group));
     log_group(instance, profile_present, plan.replace);
   }
@@ -1399,12 +1436,9 @@ private:
             const auto active = options_.fixture_default_method.empty() || names.empty()
                                     ? (names.empty() ? std::string() : names.front())
                                     : options_.fixture_default_method;
-            group.inputMethodList().clear();
-            for (const auto &name :
-                 selection::group_items_with_off_slot(names, active, fixture_available)) {
-              group.inputMethodList().emplace_back(name);
-            }
-            group.setDefaultInputMethod(active);
+            write_group(group,
+                        selection::group_items_with_off_slot(names, active, fixture_available),
+                        active);
             instance.inputMethodManager().setGroup(std::move(group));
             log_group(instance, true, false);
           }

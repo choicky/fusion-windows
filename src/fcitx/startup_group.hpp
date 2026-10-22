@@ -92,15 +92,35 @@ inline std::string binding_input_method(const std::string &current_method,
   return current_method;
 }
 
-// The method Items/0 carries: the group's *other* slot, which upstream fills with the
-// keyboard layout. A method the user has not enabled is preferred, so the slot is
-// never mistaken for one of theirs; otherwise any method other than the one in use.
+// One entry of the group, as Fcitx stores it: the input method and its optional layout.
+// The layout field is the only free-form, persisted per-entry value the official model
+// has (`Items/N/Layout` in the profile), so it is what this product uses to mark its own
+// otherwise-invisible slot.
+struct GroupItem {
+  std::string name;
+  std::string layout;
+};
+
+// The marker written into the other slot's layout. It identifies **the format of the
+// group**, not a behaviour: nothing reads it to decide what to type or which method is in
+// use, and removing it only makes the product migrate the group again exactly as it
+// migrates any profile written before this feature existed.
 //
-// It must be a **different** method, because that is what makes Fcitx see an input
-// method change when the state flips: `CheckInputMethodChanged` compares the resolved
-// method and only then calls the engine's deactivate, whose `reset()` clears the
-// preedit (PinyinEngine::deactivate). With the slot repeating the method in use the
-// toggle would leave a composition on screen while reporting English.
+// The alternative — guessing from the shape (`Items/1 == DefaultIM`) — cannot be used: a
+// profile that enabled two methods before this feature has exactly that shape, and reading
+// it as "the first item is ours" would switch the user to a different scheme and hide one
+// of their methods.
+inline constexpr char kOffSlotLayout[] = "fusion-off";
+
+// The method Items/0 carries: the group's *other* slot, which upstream fills with the
+// keyboard layout. A method the user has not enabled is preferred, so the slot is never
+// mistaken for one of theirs; otherwise any method other than the one in use.
+//
+// It must be a **different** method, because that is what makes Fcitx see an input method
+// change when the state flips: `CheckInputMethodChanged` compares the resolved method and
+// only then calls the engine's deactivate, whose `reset()` clears the preedit
+// (PinyinEngine::deactivate). With the slot repeating the method in use the toggle would
+// leave a composition on screen while reporting English.
 inline std::string group_off_slot_method(const std::vector<std::string> &methods,
                                          const std::string &active,
                                          const std::vector<std::string> &available) {
@@ -122,32 +142,56 @@ inline std::string group_off_slot_method(const std::vector<std::string> &methods
 // Fcitx's on/off state needs a second group entry to exist at all: `canTrigger()` is
 // `inputMethodList().size() > 1`, and `activate()`, `toggle()` and
 // `setCurrentInputMethod()` all return early without it. It also refuses a `DefaultIM`
-// equal to Items/0 (InputMethodGroup::setDefaultInputMethod rewrites that to Items/1),
-// so a group whose only entry is the method in use can neither be activated nor
-// switched. Items/0 therefore holds the other method (`group_off_slot_method`) and
-// Items[1..] are the user's list unchanged.
+// equal to Items/0 (InputMethodGroup::setDefaultInputMethod rewrites that to Items/1), so
+// a group whose only entry is the method in use can neither be activated nor switched.
+// Items/0 is therefore the marked other slot and Items[1..] are the user's list, unchanged
+// and in the user's order.
 //
 // The disabled half of that state is implemented by the frontend instead (see
-// InputContext::inactive_passthrough): an inactive context's keys are the
+// InputContext::inactive_passthrough): while the context is inactive its keys are the
 // application's, so Items/0 is never composed through.
-inline std::vector<std::string> group_items_with_off_slot(const std::vector<std::string> &methods,
-                                                         const std::string &active,
-                                                         const std::vector<std::string> &available) {
+inline std::vector<GroupItem> group_items_with_off_slot(const std::vector<std::string> &methods,
+                                                        const std::string &active,
+                                                        const std::vector<std::string> &available) {
+  std::vector<GroupItem> items;
   if (active.empty()) {
-    return methods;
+    for (const auto &name : methods)
+      items.push_back({name, {}});
+    return items;
   }
-  std::vector<std::string> items;
   items.reserve(methods.size() + 1);
-  items.emplace_back(group_off_slot_method(methods, active, available));
-  items.insert(items.end(), methods.begin(), methods.end());
+  items.push_back({group_off_slot_method(methods, active, available), kOffSlotLayout});
+  for (const auto &name : methods)
+    items.push_back({name, {}});
   return items;
 }
 
-// Whether a group already has the shape group_items_with_off_slot produces: Items/0 is
-// the other slot and Items/1 is the method in use, which is what DefaultIM names.
-inline bool group_has_off_slot(const std::vector<std::string> &items,
-                               const std::string &default_method) {
-  return items.size() > 1 && !default_method.empty() && items[1] == default_method;
+// Whether a group already carries the marker, i.e. was written by this feature.
+// Deliberately independent of the names and of `DefaultIM`: a pre-feature profile can look
+// like a marked one in every other respect.
+inline bool group_has_off_slot(const std::vector<GroupItem> &items) {
+  return !items.empty() && items.front().layout == kOffSlotLayout;
+}
+
+// The user's enabled methods: the items after the marked slot, or all of them when the
+// group predates the marker.
+inline std::vector<GroupItem> group_enabled_items(const std::vector<GroupItem> &items) {
+  if (!group_has_off_slot(items) || items.size() < 2) {
+    return items;
+  }
+  return std::vector<GroupItem>(items.begin() + 1, items.end());
+}
+
+// The input method a pre-feature group has been using: `Instance::inputMethod` returns
+// `Items/0` while the input state is inactive, which is what those builds always were, so
+// that entry is the one a migration must keep. Only for a group without the marker.
+inline std::string legacy_in_use_method(const std::vector<GroupItem> &items,
+                                        const std::string &default_method) {
+  for (const auto &item : items) {
+    if (!item.name.empty())
+      return item.name;
+  }
+  return default_method;
 }
 
 } // namespace fusion::selection
