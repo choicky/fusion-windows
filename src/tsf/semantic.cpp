@@ -367,6 +367,14 @@ SemanticDecision SemanticController::release_key(const KeyAction &action) {
   SemanticDecision decision;
   if (!routes_release(action))
     return decision;
+  // The same resource admission a key-down needs: the release's reply is document work and
+  // it occupies the same bounded ledger, so a context already at its limit must not append
+  // to it. Refusing here leaves the engine's press to expire on its own timeout and the
+  // application keeps the key-up.
+  constexpr std::size_t callback_bound = frontend_operation_bound;
+  if (core_.records().size() + callback_bound + recovery_reserve_ > core_.capacity() ||
+      core_.probe_pass() == Pass::RecoveryRequired)
+    return decision;
   // One release settles one press: retire the fact first, so a repeated or duplicated
   // key-up cannot make the engine settle the same binding twice.
   shift_forwarded_.reset();
