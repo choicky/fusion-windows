@@ -1,14 +1,44 @@
 #include "fusion/backend.hpp"
 #include "tsf/semantic.hpp"
 #include <crtdbg.h>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 using namespace fusion;
 using namespace fusion::tsf;
 void require(bool ok, const char *message) {
   if (!ok)
     throw std::runtime_error(message);
 }
+namespace {
+// Every section that completes prints exactly one `PASS` line through this function, and
+// the count is checked on the way out. A section that never runs is therefore a failure
+// rather than a shorter log: an earlier round of this file silently returned after five of
+// its sections and still exited 0, which made "88/88 and unchanged oracles" look like
+// coverage it did not have.
+constexpr int kExpectedSections = 19;
+int sections_completed = 0;
+bool failure_reported = false;
+
+void section(std::string line) {
+  ++sections_completed;
+  std::cout << line << '\n';
+}
+
+// A destructor runs on every exit path, including an early `return` from main; a check at the
+// end of main does not.
+struct SectionCoverage {
+  ~SectionCoverage() {
+    if (failure_reported || sections_completed == kExpectedSections)
+      return;
+    std::cout.flush();
+    std::cerr << "FAIL stage3c completed " << sections_completed << " of " << kExpectedSections
+              << " sections; a scheduled section did not run\n";
+    std::_Exit(1);
+  }
+};
+} // namespace
 struct Document {
   std::string committed, preedit;
   void apply(SemanticController &controller, const SemanticDecision &decision) {
@@ -118,7 +148,7 @@ void fallback() {
   require(unsupported.route == SemanticDecision::Route::CancelledRecovery && unsupported.eaten,
           "non-original forward silently replayed");
   forward.destroy();
-  std::cout << "PASS callback fallback, watermark, uncertainty and original Forward contract\n";
+  section("PASS callback fallback, watermark, uncertainty and original Forward contract");
 }
 int main() {
   _set_error_mode(_OUT_TO_STDERR);
@@ -127,6 +157,7 @@ int main() {
   _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
+  SectionCoverage coverage;
   try {
     fallback();
     auto backend = make_fcitx_backend();
@@ -149,7 +180,7 @@ int main() {
     require(!controller.open_effect(result.frontend[2].key), "later commit overtook first");
     doc.apply(controller, result);
     require(doc.committed == "你好，" && doc.preedit.empty(), "comma final text");
-    std::cout << "PASS real nihao, -> 你好，; callback order and duplicate fencing\n";
+    section("PASS real nihao, -> 你好，; callback order and duplicate fencing");
     // A genuine physical Tab is returned naturally only after all prior effects.
     auto tab = translate_key(9, false, false, false);
     require(controller.routes_key(tab), "Tab excluded before real dispatch");
@@ -158,7 +189,7 @@ int main() {
             "Fcitx did not determine genuine Tab Forward");
     doc.apply(controller, forward);
     require(controller.finish_pass(), "Forward did not settle prior effects");
-    std::cout << "PASS genuine Tab Forward; no owned key or replay\n";
+    section("PASS genuine Tab Forward; no owned key or replay");
     for (const char c : std::string("/@.:")) {
       controller.note_composition_terminated();
       auto action = physical(c, c == '@' || c == ':');
@@ -267,7 +298,7 @@ int main() {
     auto denied = controller.begin_key(physical(','), false);
     require(!denied.backend_session_id && !denied.eaten, "hard policy dispatched");
     controller.destroy();
-    std::cout << "PASS real Backspace/Return and hard-policy gate\n";
+    section("PASS real Backspace/Return and hard-policy gate");
     // R37 control, the other half of the same rule: a configured Fcitx global hotkey is
     // engine work with **nothing** composing, so the shell must keep claiming it. F6 is
     // installed as this isolated instance's own "toggle input method" hotkey
@@ -315,8 +346,8 @@ int main() {
       auto resumed = hotkey.begin_key(physical('n'), true);
       require(!resumed.frontend.empty(), "the hotkey did not turn the input method back on");
       hotkey.destroy();
-      std::cout << "PASS configured global hotkey reached the engine with nothing composing\n";
-      std::cout << "PASS the same global hotkey turns the input method back on\n";
+      section("PASS configured global hotkey reached the engine with nothing composing");
+      section("PASS the same global hotkey turns the input method back on");
     }
 
     // R39: a lone left Shift is the engine's own "temporarily switch input method"
@@ -360,23 +391,31 @@ int main() {
         SemanticController c(context, 64, *shift_backend);
         Document d;
         require(compose(c, d) == scheme, label);
-        std::cout << label << " chinese=[" << d.preedit << "]\n";
+        section(std::string(label) + " chinese=[" + d.preedit + "]");
 
         // One lone press: the engine settles its own binding on the release, which ends
         // the composition, and the next key is the application's with nothing composed.
         auto release = press_shift(c, kVkLShift, kScanShiftLeft);
         require(c.routes_release(release), "a lone Shift release is relayed");
         const auto toggled = c.release_key(release);
-        std::cout << label << " toggle ops=" << toggled.frontend.size()
-                  << " eaten=" << (toggled.eaten ? 1 : 0) << '\n';
+        section(std::string(label) + " toggle ops=" + std::to_string(toggled.frontend.size()) +
+                " eaten=" + std::to_string(toggled.eaten ? 1 : 0));
         d.apply(c, toggled);
         require(d.preedit.empty(), "the engine did not end the composition on the toggle");
         auto english = c.begin_key(physical('n'), true);
-        std::cout << label << " english route=" << static_cast<int>(english.route)
-                  << " forward=" << (english.forward ? 1 : 0)
-                  << " ops=" << english.frontend.size() << '\n';
+        section(std::string(label) + " english route=" +
+                std::to_string(static_cast<int>(english.route)) +
+                " forward=" + std::to_string(english.forward ? 1 : 0) +
+                " ops=" + std::to_string(english.frontend.size()));
         require(english.forward && english.frontend.empty(),
                 "English still fed the engine instead of passing the key through");
+        // While inactive the context resolves Items/0 — the other Pinyin scheme — and a
+        // character-less key is still dispatched, because that is how a configured global
+        // hotkey turns the input method back on. With nothing composing the off slot hands
+        // the key back unchanged, so it composes nothing.
+        const auto arrow = c.begin_key(translate_key(0x25 /*VK_LEFT*/, false, false, false), true);
+        require(arrow.forward && arrow.frontend.empty(),
+                "an inactive character-less key was composed through the off slot");
         require(!c.routes_release(release), "a release with no relayed press is not ours");
 
         // And back: the same press returns to the same input method, so the same keys
@@ -385,7 +424,7 @@ int main() {
         require(c.routes_release(release_back), "the returning Shift release is relayed");
         d.apply(c, c.release_key(release_back));
         require(compose(c, d) == scheme, "the toggle did not return to the same scheme");
-        std::cout << label << " back=[" << d.preedit << "]\n";
+        section(std::string(label) + " back=[" + d.preedit + "]");
         c.destroy();
       };
 
@@ -414,7 +453,7 @@ int main() {
         require(c.release_key(release).frontend.empty(), "the combination produced callbacks");
         auto next = c.begin_key(physical('n'), true);
         require(!next.frontend.empty(), "the combination toggled instead of typing");
-        std::cout << "PASS Shift+letter does not toggle\n";
+        section("PASS Shift+letter does not toggle");
         c.destroy();
       }
 
@@ -430,7 +469,7 @@ int main() {
         require(c.routes_release(release), "the right Shift release is relayed");
         d.apply(c, c.release_key(release));
         require(!compose(c, d).empty(), "the right Shift toggled a binding it does not name");
-        std::cout << "PASS right Shift leaves the binding alone\n";
+        section("PASS right Shift leaves the binding alone");
         c.destroy();
       }
 
@@ -450,7 +489,7 @@ int main() {
         auto english = c.begin_key(physical('n'), true);
         require(english.forward && english.frontend.empty(),
                 "repeated Shift presses toggled more than once");
-        std::cout << "PASS repeated Shift press toggles once\n";
+        section("PASS repeated Shift press toggles once");
         c.destroy();
       }
 
@@ -474,11 +513,45 @@ int main() {
 
         require(c.begin_key(left_shift, true).forward, "the admitted press is not the engine's");
         require(c.routes_release(release), "an admitted press did not arm its release");
+        require(c.release_admissible(release), "an admitted release was refused admission");
         const auto first = c.release_key(release);
         require(!first.frontend.empty(), "the admitted press did not settle");
         require(!c.routes_release(release), "one press produced two releases");
         require(c.release_key(release).frontend.empty(), "a repeated release settled again");
-        std::cout << "PASS only a forwarded press arms its release\n";
+
+        // The same release refused by the *admission* path rather than by routing: a pass
+        // barrier is still up, so the reply could not be settled in order. `routes_release`
+        // is true and `release_admissible` is false — the exact disagreement T and K used to
+        // have, where T claimed a key-up K then dropped and the application never saw its own
+        // modifier release. `release_admissible` is what OnTestKeyUp returns, so this is T's
+        // answer, and `release_key` agrees with it.
+        {
+          auto barrier_backend = make_fcitx_backend(FcitxBackendOptions{});
+          SemanticController gated(971, 64, *barrier_backend);
+          Document gated_doc;
+          compose(gated, gated_doc);
+          // An unsettled EFFECT is what puts the pass barrier up (Core::probe_pass answers
+          // DrainRequired while one is pending), and it is a state a release really arrives
+          // in: the engine's commit is still being written when the key-up comes.
+          const auto gated_commit =
+              gated.begin_key(translate_key(kVkSpace, false, false, false), true);
+          require(!gated_commit.frontend.empty(), "the gated commit produced no work");
+          require(gated.pass_probe() != Pass::Clear, "the gated commit left no barrier");
+          require(gated.begin_key(left_shift, true).forward, "the gated press was not forwarded");
+          auto held = left_shift;
+          held.release = true;
+          require(gated.routes_release(held), "the gated press did not arm a release");
+          require(!gated.release_admissible(held),
+                  "a release was admitted while the pass barrier was up");
+          require(gated.release_key(held).frontend.empty(), "a deferred release still settled");
+          // The same release once that work is settled is admitted, so the check above turns
+          // on the barrier and not on something else.
+          gated_doc.apply(gated, gated_commit);
+          require(gated.pass_probe() == Pass::Clear, "the barrier did not clear");
+          require(gated.release_admissible(held), "a release was refused with a clear barrier");
+          gated.destroy();
+        }
+        section("PASS only a forwarded press arms its release");
       }
 
 
@@ -499,12 +572,13 @@ int main() {
         auto english = c.begin_key(physical('n'), true);
         require(english.forward && english.frontend.empty(),
                 "the configured Shift_R binding did not toggle");
-        std::cout << "PASS the configured modifier-only key decides\n";
+        section("PASS the configured modifier-only key decides");
         c.destroy();
       }
     }
     return 0;
   } catch (const std::exception &e) {
+    failure_reported = true;
     std::cerr << "FAIL " << e.what() << '\n';
     return 1;
   }

@@ -28,6 +28,10 @@ internal static class Program
         KeyTests.Run();
         ImListAndEndpointTests.Run();
 
+        // The two ends of the wire carry the protocol version as separate literals; nothing
+        // else compares them, and a mismatch fails the handshake rather than degrading.
+        ProtocolVersionTests.Run();
+
         // The controlled-peer checks use a real pipe in this process, so they need no Host.
         await ClientTests.RunAsync().ConfigureAwait(false);
 

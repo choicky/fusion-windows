@@ -112,6 +112,12 @@ public:
   // shell relayed and that stayed lone, nothing else.
   bool routes_release(const KeyAction &action) const;
 
+  // Whether a release may be relayed *and* has the resources to be settled: `routes_release`
+  // plus the ledger admission the release's own document work needs. This is the one answer
+  // both the T and the K callback use, so T can never claim a release that K would refuse
+  // (a claimed key-up the application never sees is a stuck modifier on its side).
+  bool release_admissible(const KeyAction &action) const;
+
   // Records whether a key-down starts the press a modifier-only release may settle.
   // Called from both T and K (the application may deliver either), and idempotent.
   void observe_key_down(const KeyAction &action);

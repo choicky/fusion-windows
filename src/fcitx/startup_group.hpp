@@ -110,6 +110,14 @@ struct GroupItem {
 // profile that enabled two methods before this feature has exactly that shape, and reading
 // it as "the first item is ours" would switch the user to a different scheme and hide one
 // of their methods.
+//
+// Nothing in this runtime ever reads the value back. Upstream, `Items/N/Layout` is read only
+// by the profile writer (`inputmethodmanager.cpp`: `itemConfig.layout.setValue(item.layout())`),
+// by `InputState::customXkbState` (`instance.cpp`, inside `#ifdef ENABLE_KEYBOARD`) and by the
+// D-Bus module (`dbusmodule.cpp`), and this build compiles neither of the last two: the
+// pinned runtime is configured with `-DENABLE_KEYBOARD=OFF -DENABLE_DBUS=OFF`
+// (`tools/fcitx/build-native.ps1`) and the resulting `CMakeCache.txt` records both as `OFF`.
+// The marker is therefore a persisted format tag and nothing else.
 inline constexpr char kOffSlotLayout[] = "fusion-off";
 
 // The user's methods, when all that is known is their names (a first-run plan).
