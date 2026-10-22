@@ -50,13 +50,16 @@ These are the properties the presentation may rely on, each covered by a check:
 - **An unparsable key binding is preserved verbatim** (`KeyChord.IsOpaque`) instead of being
   replaced with an empty one, and empty entries keep their positions through a copy or a
   replacement.
-- **A refusal says which page it is about, and never reports it as saved.** The save bar
-  reports each configuration separately, so one page can say `已保存` while another says `未保存`
-  in the same click. Which pages can be refused at all is decided by the Host from what its own
-  apply step does, not by the client: the candidate-window and global pages are stored while a
-  composition is live, and only the Pinyin/Shuangpin configuration and the input-method list are
-  refused, because their official apply step ends the composition that is running. The edit is
-  kept in every refusal.
+- **A save the Host cannot apply yet is submitted, not refused, and never called saved.** The
+  Pinyin/Shuangpin configuration and the input-method list are applied by an official setter that
+  ends a running composition, so the Host stages the request and applies it when the input
+  finishes; the reply is `Pending`, not `Ok`. The client keeps those values as *awaiting*: still
+  what the window shows, no longer counted as an unsaved edit, and dropped only when a fresh read
+  shows the Host applied them — otherwise they go back to being unsaved.
+- **A refusal carries the Host's reason.** Every settings reply has a `detail` byte
+  (`RequestInProgress`, `CompositionInProgress`, `UnsettledWork`), so a request that lost a race
+  with another request is never reported as "you are still typing", which is what a per-page guess
+  did before.
 - **A newer Host is accepted and an older one refused**, per the additive settings-API
   contract; the IPC protocol version is still matched exactly.
 
