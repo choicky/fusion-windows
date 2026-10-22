@@ -1209,6 +1209,55 @@ int main() {
     CHECK(width_of(rect) > 0);
   }
 
+  // 26b. The two column counts the setting offers — five and nine per row — with numbers only
+  //      on the row the engine's keys act on. A one-character, two-character or ordinary short
+  //      word is drawn whole in every cell: numbered or not, and whatever the column count.
+  {
+    const UINT raw = GetDpiForWindow(view.window());
+    const int shown_dpi = raw != 0 ? static_cast<int>(raw) : 96;
+
+    for (const int page_size : {5, 9}) {
+      const auto page = make_scroll_page(page_size, 3, 1);
+      show_and_measure(view, page);
+      CHECK(view.visible());
+      const auto &layout = view.layout();
+      CHECK(layout.slots.size() == page.entries.size());
+      // Columns are the engine's page size, and the second row starts where row one ends.
+      CHECK(layout.slots[static_cast<std::size_t>(page_size)].top > layout.slots[0].top);
+      for (std::size_t index = 0; index < page.entries.size(); ++index) {
+        // The numbered row and the unnumbered ones alike: a short word fits, so nothing is
+        // reported as clipped and nothing is shortened by the painter either.
+        CHECK(!layout.slot_clipped(index));
+      }
+      CHECK(slots_draw_their_text_whole(view, page, shown_dpi));
+
+      // The numbers are on the engine's row only, and that is what the check above covered:
+      // one row numbered, the others not, every cell whole either way.
+      CHECK(page.entries[0].label.empty());
+      CHECK(!page.entries[static_cast<std::size_t>(page_size)].label.empty());
+    }
+
+    // The same question for the horizontal row, which numbers every cell: five and nine
+    // candidates across one line, each at its own measured width.
+    for (const int count : {5, 9}) {
+      const auto page = make_page(fusion::CandidateLayout::Horizontal, count);
+      show_and_measure(view, page);
+      const auto &layout = view.layout();
+      CHECK(layout.slots.size() == page.entries.size());
+      for (std::size_t index = 0; index < page.entries.size(); ++index) {
+        CHECK(!layout.slot_clipped(index));
+        // A slot is exactly its text plus the inset on both sides, so the rectangle the
+        // painter draws into is the width the text was measured at.
+        CHECK(layout.slots[index].right - layout.slots[index].left ==
+              layout.text_rect(index).right - layout.text_rect(index).left +
+                  2 * fusion::tsf::layout_metrics_for(view.line_height(), shown_dpi).item_inset);
+        CHECK(layout.text_rect(index).right - layout.text_rect(index).left ==
+              natural_width(page, fusion::tsf::slot_full_text(page.entries[index]), shown_dpi));
+      }
+      CHECK(slots_draw_their_text_whole(view, page, shown_dpi));
+    }
+  }
+
   // 27. A short last row keeps its columns: two candidates sit under columns one and two, and
   //     nothing is invented for the empty cells.
   {

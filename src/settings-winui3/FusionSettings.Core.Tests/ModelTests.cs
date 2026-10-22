@@ -14,6 +14,46 @@ internal static class ModelTests
         SharedViews();
         SchemaHelpers();
         StringLists();
+        FontFamilies();
+    }
+
+    /// <summary>
+    /// The installed-font list the candidate-window page offers: it is the system's own
+    /// collection, ordered and de-duplicated, and a name it does not contain is reported as
+    /// missing rather than replaced.
+    /// </summary>
+    private static void FontFamilies()
+    {
+        Harness.Section("font list: the installed families, and a name that is not installed");
+
+        var families = FontCatalog.InstalledFamilies();
+        Harness.Check(families.Count > 0, "the system reports installed font families");
+        Harness.Check(families.All(name => name.Trim().Length > 0), "no entry is empty");
+        Harness.CheckEqual(families.Count,
+            families.Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+            "no family is listed twice under one spelling");
+        Harness.Check(
+            families.SequenceEqual(families.OrderBy(name => name, StringComparer.OrdinalIgnoreCase)),
+            "the list is sorted the way the picker shows it");
+
+        if (families.Count > 0)
+        {
+            var first = families[0];
+            Harness.CheckEqual(first, FontCatalog.Find(first), "a listed family is found");
+            Harness.CheckEqual(first, FontCatalog.Find("  " + first.ToUpperInvariant() + " "),
+                "and is found through case and surrounding space");
+            Console.WriteLine($"   {families.Count} families; first is \"{first}\"");
+        }
+
+        Harness.Check(FontCatalog.Find("Fusion No Such Font 12345") is null,
+            "a name the system does not have is reported as missing");
+        Harness.CheckEqual(0, FontCatalog.Search("Fusion No Such Font 12345").Count,
+            "and the search finds nothing for it");
+        Harness.CheckEqual(families.Count, FontCatalog.Search(null).Count,
+            "an empty search shows the whole list");
+        Harness.CheckEqual(1, FontCatalog.Search(families.Count > 0 ? families[0] : string.Empty)
+                .Count(family => string.Equals(family, families[0], StringComparison.Ordinal)),
+            "a search by exact name narrows to that family");
     }
 
     private static void Identity()

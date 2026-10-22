@@ -134,6 +134,13 @@ public:
   // eligibility answers, and only against a currently displayed, unfenced page.
   SemanticDecision begin_candidate_action(CandidateAction action, std::int32_t index);
 
+  /// Moves the engine's candidate cursor left (-1) or right (+1) in the automatic scrolling
+  /// window. Returns false when this key must keep its ordinary meaning — no window is
+  /// displayed, it is not a scrolling one, or the move would leave the list — in which case
+  /// the caller dispatches the key as it always did, which is also how pinyin-string editing
+  /// stays reachable.
+  bool begin_candidate_cursor(int step, SemanticDecision &decision);
+
   // --- real edit observation settlement (called by TSF edit sessions) ---
 
   // EFFECT: propose at the watermark, then (after grant+revalidation) open the

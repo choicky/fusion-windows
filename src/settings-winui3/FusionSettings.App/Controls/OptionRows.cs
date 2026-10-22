@@ -89,6 +89,138 @@ public static class OptionRows
         return row;
     }
 
+    /// <summary>
+    /// The row for <c>FontFamily</c>: the installed families, searchable, with the stored value
+    /// kept verbatim when the system does not have it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The list is the system's, read through DirectWrite, so a name the user picks is a name
+    /// the popup can draw. It is a suggestion, not a constraint: the editor is free text, because
+    /// the configuration may name a font that this machine does not have — installed elsewhere,
+    /// or simply misspelled — and opening this window must not silently replace what the file
+    /// says. When the stored value is not installed the row says so, and says what Windows will
+    /// do instead, without changing the value.
+    /// </para>
+    /// <para>
+    /// The value is written through the same <paramref name="apply"/> as every other row, so it
+    /// lands in the draft like any edit and is stored by the next save.
+    /// </para>
+    /// </remarks>
+    public static FrameworkElement BuildFontFamily(SettingsValue current,
+                                                   Func<SettingsValue, bool> apply,
+                                                   string? label = null, string? help = null)
+    {
+        var title = new TextBlock
+        {
+            Text = label ?? "FontFamily",
+            Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+            TextWrapping = TextWrapping.Wrap,
+        };
+        ToolTipService.SetToolTip(title, new ToolTip { Content = "FontFamily" });
+
+        var left = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+        left.Children.Add(title);
+        if (!string.IsNullOrWhiteSpace(help))
+        {
+            left.Children.Add(new TextBlock
+            {
+                Text = help,
+                Opacity = 0.7,
+                TextWrapping = TextWrapping.Wrap,
+                Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            });
+        }
+
+        var installed = FontCatalog.InstalledFamilies();
+        var stored = current.Scalar;
+
+        var box = new AutoSuggestBox
+        {
+            Text = stored,
+            PlaceholderText = installed.Count == 0 ? "输入字体名称" : "搜索或输入字体名称",
+            MinWidth = 220,
+            // The suggestion list is the system's; typing filters it, and a name that is not
+            // there is still accepted as text.
+            ItemsSource = installed,
+            TextMemberPath = string.Empty,
+        };
+        box.TextChanged += (sender, args) =>
+        {
+            if (args.Reason == AutoSuggestionBoxTextChangeReason.UserInput)
+            {
+                sender.ItemsSource = FontCatalog.Search(sender.Text);
+            }
+        };
+
+        void Commit(string? text)
+        {
+            var value = (text ?? string.Empty).Trim();
+            if (string.Equals(value, stored, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            // A name the draft refuses is not shown as if it had been taken: the box goes
+            // back to what the configuration still holds.
+            if (!apply(SettingsValue.Text(value)))
+            {
+                box.Text = stored;
+                return;
+            }
+
+            stored = value;
+            Note();
+        }
+
+        var note = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Foreground = (Brush)Application.Current.Resources["SystemFillColorCautionBrush"],
+            Visibility = Visibility.Collapsed,
+        };
+
+        void Note()
+        {
+            var value = stored.Trim();
+            if (value.Length == 0 || FontCatalog.Find(value) is not null)
+            {
+                note.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            note.Text = $"系统中没有安装“{value}”。配置里的值会保留，候选窗口将回退到系统默认字体。";
+            note.Visibility = Visibility.Visible;
+        }
+
+        box.SuggestionChosen += (_, args) =>
+        {
+            // Clicking a suggestion fills the box; committing happens in QuerySubmitted, so a
+            // keyboard user and a mouse user take the same path.
+            if (args.SelectedItem is string chosen)
+            {
+                box.Text = chosen;
+            }
+        };
+        box.QuerySubmitted += (_, args) => Commit(args.QueryText);
+        box.LostFocus += (_, _) => Commit(box.Text);
+
+        var control = new StackPanel { Spacing = 4, MinWidth = 220 };
+        control.Children.Add(box);
+        control.Children.Add(note);
+        Note();
+
+        var row = new Grid { ColumnSpacing = 16 };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.Children.Add(left);
+        Grid.SetColumn(control, 1);
+        control.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(control);
+        return row;
+    }
+
     private static FrameworkElement CreateControl(OptionDescription option, SettingsValue current,
                                                   Func<SettingsValue, bool> apply,
                                                   Func<KeyChord, string?>? overlapProbe,

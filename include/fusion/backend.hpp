@@ -62,7 +62,13 @@ struct BackendStimulus {
     // The key-up half of a modifier-only key. It carries the same keysym identity as the
     // down that preceded it and asks Fcitx one question it alone can answer: did this
     // press complete a configured modifier-only binding (`Hotkey/AltTriggerKeys`)?
-    KeyRelease
+    KeyRelease,
+    // Move the engine's own candidate cursor one step, left or right. The engine owns the
+    // cursor (CommonCandidateList is a CursorMovableCandidateList), so this asks it to move
+    // rather than keeping a second highlight anywhere; a window that shows several engine
+    // rows needs it because Left/Right are otherwise the engine's pinyin-string keys.
+    CursorPrev,
+    CursorNext
   };
   Binding binding{};
   std::uint64_t stimulus_id = 0;

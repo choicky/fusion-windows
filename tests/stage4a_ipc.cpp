@@ -938,6 +938,38 @@ void test_protocol() {
     }
   }
 
+  // A cursor step is a candidate action too: it carries no index of its own (the engine owns
+  // the cursor), and the type byte is accepted up to the last type this build defines — an
+  // unknown one still has to fail rather than be guessed at.
+  {
+    BackendStimulus stimulus;
+    stimulus.binding = Binding{7, 8, 9};
+    stimulus.stimulus_id = 11;
+    stimulus.type = BackendStimulus::Type::CursorNext;
+    std::vector<std::uint8_t> payload;
+    serialize(payload, stimulus);
+    const auto decoded = deserialize_stimulus(payload.data(), payload.size());
+    require(decoded && decoded->type == BackendStimulus::Type::CursorNext,
+            "a cursor step round-trips");
+
+    stimulus.type = BackendStimulus::Type::CursorPrev;
+    payload.clear();
+    serialize(payload, stimulus);
+    const auto decoded_prev = deserialize_stimulus(payload.data(), payload.size());
+    require(decoded_prev && decoded_prev->type == BackendStimulus::Type::CursorPrev,
+            "and so does the other direction");
+
+    // One past the last defined type is still refused, so the version bump did not widen the
+    // surface to anything a newer build might add.
+    auto unknown = stimulus;
+    unknown.type = static_cast<BackendStimulus::Type>(
+        static_cast<std::uint8_t>(BackendStimulus::Type::CursorNext) + 1);
+    payload.clear();
+    serialize(payload, unknown);
+    require(!deserialize_stimulus(payload.data(), payload.size()),
+            "a type this build does not define is rejected");
+  }
+
   // The global selection stimulus: it is a candidate action like any other on the wire,
   // and its index is bounded as a list index rather than a page slot.
   {
