@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Linq;
 using Fusion.Settings.Model;
 
@@ -43,6 +44,17 @@ internal static class ModelTests
             Harness.CheckEqual(first, FontCatalog.Find("  " + first.ToUpperInvariant() + " "),
                 "and is found through case and surrounding space");
             Console.WriteLine($"   {families.Count} families; first is \"{first}\"");
+
+            // A Chinese Windows names the CJK families in Chinese (微软雅黑 rather than only
+            // "Microsoft YaHei"), which is what makes the list usable here; an English UI is
+            // not expected to have them, so the check is guarded by the UI language.
+            var localized = families.Count(name => name.Any(ch => ch >= '\u4e00' && ch <= '\u9fff'));
+            Console.WriteLine($"   {localized} families are named in the UI language");
+            if (CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "zh")
+            {
+                Harness.Check(localized > 0,
+                    "a Chinese UI gets Chinese family names, not only their English spelling");
+            }
         }
 
         Harness.Check(FontCatalog.Find("Fusion No Such Font 12345") is null,
