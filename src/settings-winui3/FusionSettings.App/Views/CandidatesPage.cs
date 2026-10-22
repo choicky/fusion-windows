@@ -112,7 +112,14 @@ public sealed class CandidatesPage : SettingsPageBase
                 }
             }
 
-            Render();
+            // The FontFamily TextBox and FontSize NumberBox are the presentation rows built
+            // above, and each one snapshots the draft value when it is created — it has no
+            // live link back to the workspace. Writing the default into the draft alone would
+            // leave those two editors showing the text the user last typed, which is why a
+            // preview-only Render() was not enough. Rebuild the page (the same thing the
+            // method selector does): the rows re-read draft.Effective, so both editors now show
+            // the restored default, and the preview is rebuilt from it too.
+            Refresh();
         };
 
         void OnWorkspace(object? sender, PropertyChangedEventArgs args)
