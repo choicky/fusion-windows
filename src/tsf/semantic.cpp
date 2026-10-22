@@ -363,17 +363,23 @@ void SemanticController::observe_key_down(const KeyAction &action) {
   shift_forwarded_.reset();
 }
 
+bool SemanticController::release_admissible(const KeyAction &action) const {
+  if (!routes_release(action))
+    return false;
+  // The release's reply is document work and it settles through the one ordered path, so it
+  // needs the same two resources a key-down does: room in the bounded ledger, and a pass
+  // barrier that is clear. A release that arrives while the barrier is up is dropped rather
+  // than settled out of order — the engine's own ModifierOnlyKeyTimeout expires the press.
+  constexpr std::size_t callback_bound = frontend_operation_bound;
+  return core_.records().size() + callback_bound + recovery_reserve_ <= core_.capacity() &&
+         core_.probe_pass() != Pass::RecoveryRequired && pass_probe() == Pass::Clear;
+}
+
 SemanticDecision SemanticController::release_key(const KeyAction &action) {
   SemanticDecision decision;
-  if (!routes_release(action))
-    return decision;
-  // The same resource admission a key-down needs: the release's reply is document work and
-  // it occupies the same bounded ledger, so a context already at its limit must not append
-  // to it. Refusing here leaves the engine's press to expire on its own timeout and the
-  // application keeps the key-up.
-  constexpr std::size_t callback_bound = frontend_operation_bound;
-  if (core_.records().size() + callback_bound + recovery_reserve_ > core_.capacity() ||
-      core_.probe_pass() == Pass::RecoveryRequired)
+  // Defence in depth: the callers ask `release_admissible` first, and this guard keeps the
+  // ledger and the link safe even if a future caller forgets to.
+  if (!release_admissible(action))
     return decision;
   // One release settles one press: retire the fact first, so a repeated or duplicated
   // key-up cannot make the engine settle the same binding twice.

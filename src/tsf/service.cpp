@@ -895,9 +895,9 @@ STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lpa
   // Only the Shift key-ups this shell relayed are claimed, and only so that OnKeyUp is
   // reached at all: the engine decides whether the press completed one of its own
   // modifier-only bindings (Hotkey/AltTriggerKeys). Every other key-up stays the
-  // application's, exactly as before. A context the hard policy closes is not claimed
-  // here either, because OnKeyUp would drop the release.
-  *pfEaten = entry->semantic.routes_release(action) && hard_policy_allows(*entry);
+  // application's, exactly as before. The answer is the same predicate OnKeyUp uses, so T
+  // never claims a release K would refuse.
+  *pfEaten = release_admissible(*entry, action);
   diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
         *pfEaten);
   return S_OK;
@@ -921,26 +921,22 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam,
   auto action = physical_key(wparam, lparam);
   action.release = true;
   if (!entry->semantic.routes_release(action)) {
-    return S_OK;
+    return S_OK; // every other key-up is the application's and is not even logged
   }
-  // The release goes through the same gates a key-down does, in the same order: hard
-  // policy first (a closed or disabled context never receives it), then the outstanding
-  // work this context still owes the document. A release that arrives while that work is
-  // unresolved is dropped rather than settled out of order — the engine's own
-  // ModifierOnlyKeyTimeout expires the press it recorded.
-  if (!hard_policy_allows(*entry)) {
-    diagf("RELEASE_POLICY", "vk=0x%03llX", static_cast<unsigned long long>(wparam));
-    return S_OK;
-  }
-  entry->semantic.retire_terminals();
-  if (entry->cleanup.pending() || !entry->semantic.pending().empty() ||
-      entry->semantic.pass_probe() != fusion::Pass::Clear) {
-    diagf("RELEASE_DEFERRED", "vk=0x%03llX cleanup=%d pending=%zu user=%d",
-          static_cast<unsigned long long>(wparam), entry->cleanup.pending() ? 1 : 0,
-          entry->semantic.pending().size(),
+  // The release goes through the same gates a key-down does, in the same order, and through
+  // the very predicate T used: hard policy first (a closed or disabled context never
+  // receives it), then the outstanding work this context still owes the document, then the
+  // ledger. A release that arrives while that work is unresolved is dropped rather than
+  // settled out of order — the engine's own ModifierOnlyKeyTimeout expires the press it
+  // recorded.
+  if (!release_admissible(*entry, action)) {
+    diagf("RELEASE_DECLINED", "vk=0x%03llX policy=%d cleanup=%d pending=%zu user=%d",
+          static_cast<unsigned long long>(wparam), hard_policy_allows(*entry) ? 1 : 0,
+          entry->cleanup.pending() ? 1 : 0, entry->semantic.pending().size(),
           entry->semantic.pass_probe() != fusion::Pass::Clear ? 1 : 0);
     return S_OK;
   }
+  entry->semantic.retire_terminals();
   auto lifetime_guard = hold_entry(entry);
   handling_key_ = true;
   const SemanticDecision decision = entry->semantic.release_key(action);
@@ -1510,6 +1506,21 @@ bool TextService::declare_keyboard_open(const char *reason) {
   }
   diagf("KEYBOARD_OPEN", "declared reason=%s was_closed=%d", reason, was_closed ? 1 : 0);
   return open;
+}
+
+bool TextService::release_admissible(ContextEntry &entry, const KeyAction &action) {
+  // One predicate for both callbacks. T's answer decides whether K is reached at all: an
+  // application that honours only the test callback drops a key-up T declines, so the two
+  // must not be able to disagree — a release T claimed and K refused would leave the
+  // application's modifier stuck down.
+  //
+  // The semantic half answers the routing and resource questions (`routes_release`, the
+  // ledger, the pass barrier); this half adds the Windows hard policy and the work this
+  // context still owes the document. A release that arrives while that work is unresolved is
+  // dropped rather than settled out of order, exactly as before — it is only the *answer*
+  // that is now shared with T.
+  return entry.semantic.release_admissible(action) && hard_policy_allows(entry) &&
+         !entry.cleanup.pending() && entry.semantic.pending().empty();
 }
 
 bool TextService::hard_policy_allows(ContextEntry &entry) {
