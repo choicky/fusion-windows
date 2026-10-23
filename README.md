@@ -89,13 +89,18 @@ but was measured not to change this installation's `cl.exe` banner, and is not w
 dependency tracking work.
 
 **The Chinese engine is the Android product's fork, not a Windows-only copy.**
-`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `a04bcd4` beside the
+`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `2145c4b` beside the
 official Fcitx core (`a7f2528`) and LibIME (`171edcf`), so the MoQi auxiliary filter and the
-mixed Chinese/English pipeline have one implementation for both products. `a04bcd4` is the tip
-of the fork's `fusion` branch: it contains the commit the Android **release** workflow pins
-(`0d0102b82b35debf4cf22ce192060c07f10e7b35`, 66 commits behind) as well as the tip of the
-branch its test-APK workflow follows (`21eecda`, 64 behind). Windows is therefore on the same
-feature line one generation ahead — not on the same commit, and not on a different engine.
+mixed Chinese/English pipeline have one implementation for both products. `2145c4b` is the tip
+of the fork's `fusion` branch — `a04bcd4` plus the mixed-slot fix below — and it contains the
+commit the Android **release** workflow pins (`0d0102b82b35debf4cf22ce192060c07f10e7b35`, 67
+commits behind) as well as the tip of the branch its test-APK workflow follows (`21eecda`, 65
+behind). Windows is therefore on the same feature line, a little further ahead — not on the
+same commit, and not on a different engine. The fix that pin brings: the bounded insertion
+class in `UnifiedRanker` accepted a canonical English word only at the **front** of the raw, so
+Ziranma `woxdmliphone` generated `我想买iPhone` and then buried it at index 127 behind the whole
+classical list (its `ip ho ne` tail also force-decodes to 蠢货呢); the class is now
+position-independent and the fused candidate takes the front-row slot behind the Chinese head.
 Two resources travel with it and both are obtained at **build** time, never at install or run
 time: the MoQi reverse-lookup table, pinned by URL and SHA-256 in the addon's
 `modules/pinyinhelper/moqima-gb18030.cmake`, and the production English lexicon, committed in

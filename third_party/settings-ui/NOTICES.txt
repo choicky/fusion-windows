@@ -13,7 +13,7 @@ Owner authorization, recorded 2026-10-20: the upstream-derived settings executab
 
 4. Pinned Fcitx runtime — component licenses retained, data sources named
    Pinned fcitx5 core and LibIME remain LGPL-2.1-or-later, and fcitx5-chinese-addons is now the
-   owner-maintained fork (choicky/fcitx5-chinese-addons, commit a04bcd4) that the Android build
+   owner-maintained fork (choicky/fcitx5-chinese-addons, commit 2145c4b) that the Android build
    uses, still LGPL-2.1-or-later per its file headers; its MSVC adaptation is a separate patch.
    That addon redistributes two data sources, both shipped in this package and named here:
      - MoQi reverse-lookup table (gaboolic/moqima-tables, MIT): pinned by commit and SHA-256 in

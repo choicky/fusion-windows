@@ -89,7 +89,7 @@ $taskCore=Get-PinnedSource 'fcitx5' 'https://github.com/fcitx/fcitx5.git' 'a7f25
 # both products run one native implementation of the MoQi auxiliary filter and the mixed
 # Chinese/English input rather than two. The Fcitx core and LibIME stay at their official
 # pins above: the fork is based on the same core, and neither is moved for this.
-$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' 'a04bcd4673e5e9c3c630d59078eb0454b14d5541' $taskSourceRoot
+$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' '2145c4bf1cff8c62112b9c38db4e6032a190b280' $taskSourceRoot
 $taskLibime=Get-PinnedSource 'libime' 'https://github.com/fcitx/libime.git' '171edcf137001e8eb8274f53ec010058cda70b09' $taskSourceRoot
 Invoke-Native 'git' @('-C',$taskLibime,'submodule','update','--init','--depth','1')
 $taskLibimeDiff=& git -C $taskLibime status --porcelain
