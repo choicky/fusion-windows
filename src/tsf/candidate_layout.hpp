@@ -261,7 +261,15 @@ layout_candidate_panel(const CandidatePage &page,
     // shape while the highlight walks from row to row. Columns still line up because a cell
     // is placed at its own column's left edge; index arithmetic, hit testing and the
     // row/column navigation are unchanged.
+    //
+    // The column width is the alignment grid, not the width each cell is drawn at. A cell is
+    // as wide as its *own* limit: the label allowance belongs to the entries that carry a
+    // label, and only the current engine page's entries do (candidate_projection.cpp). Sizing
+    // every cell of the column at the widest — including a label it does not have — would let
+    // an unlabelled nine-ideograph candidate on another row show all nine characters and stay
+    // unclipped, which is exactly what the eight-ideograph cap forbids.
     std::vector<int> natural(page.entries.size(), 0);
+    std::vector<int> cell_width(page.entries.size(), 0);
     std::vector<int> column_width(static_cast<std::size_t>(columns), 0);
     int share = 0; // the work area's share for one column; 0 = no budget to apply
     if (bounded_width) {
@@ -275,9 +283,11 @@ layout_candidate_panel(const CandidatePage &page,
         continue;
       const CandidateEntry &entry = page.entries[index];
       natural[index] = measure(slot_full_text(entry)) + 2 * inset;
-      const int wanted = (std::min)(natural[index], slot_limit(entry, share));
+      // This cell's own limit: the cap plus its own label, and no more than the budget. The
+      // column takes the widest of these; the cell keeps its own, left-aligned in the column.
+      cell_width[index] = (std::min)(natural[index], slot_limit(entry, share));
       int &column = column_width[index % static_cast<std::size_t>(columns)];
-      column = (std::max)(column, wanted);
+      column = (std::max)(column, cell_width[index]);
     }
     for (auto &column : column_width)
       column = (std::max)(1, column);
@@ -332,12 +342,11 @@ layout_candidate_panel(const CandidatePage &page,
         continue;
       const int left = column_left[column];
       const int y = top + band + shown * row_height;
-      out.slots[index] =
-          LayoutRect{left, y, left + column_width[column], y + row_height};
-      // Measured against the width this cell is drawn at: the column may be narrower than
-      // the text (the cap, or the budget), and then the painter ellipsizes it and offers the
-      // full string.
-      out.clipped[index] = natural[index] > column_width[column] ? 1 : 0;
+      // Left-aligned in its column, but only as wide as this cell's own limit — so the
+      // rectangle the painter draws into, and `clipped`, follow this entry's label, not the
+      // widest one in the column.
+      out.slots[index] = LayoutRect{left, y, left + cell_width[index], y + row_height};
+      out.clipped[index] = natural[index] > cell_width[index] ? 1 : 0;
     }
     if (page.has_prev)
       out.prev = LayoutRect{side_margin, top, side_margin + pager_width, top + band};
