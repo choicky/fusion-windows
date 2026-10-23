@@ -39,16 +39,58 @@ public static class PresentationMap
             ["Prediction"] = new(PageCandidates, "候选", 20, "联想"),
             ["PredictionSize"] = new(PageCandidates, "候选", 21, "联想候选数量"),
             ["KeepCurrentContext"] = new(PageCandidates, "候选", 22, "联想时保留已输入内容"),
-            ["BackspaceBehaviorOnPrediction"] = new(PageCandidates, "候选", 23, "联想时的退格行为"),
-            ["SpellEnabled"] = new(PageCandidates, "候选", 30, "显示英文候选"),
+            ["BackspaceBehaviorOnPrediction"] = new(PageCandidates, "候选", 23, "联想时的退格行为",
+                null,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    // Keyed by the string the Host publishes and the profile stores, which is
+                    // the engine's own display name for the value
+                    // (FCITX_CONFIG_ENUM_NAME_WITH_I18N), not the C++ identifier.
+                    ["Only Clear candidates"] = "仅清空候选词",
+                    ["Clear candidates & backspace"] = "清空候选词并退格",
+                    ["Backspace when not using on-screen keyboard"] = "不使用屏幕键盘时退格",
+                }),
             ["SymbolsEnabled"] = new(PageCandidates, "候选", 31, "显示符号候选"),
             ["ChaiziEnabled"] = new(PageCandidates, "候选", 32, "显示拆字候选"),
             ["StrokeCandidateEnabled"] = new(PageCandidates, "候选", 33, "输入 h 时显示笔画候选"),
             ["ExtBEnabled"] = new(PageCandidates, "候选", 34, "启用扩展 B 区及之后的汉字"),
             ["UseKeypadAsSelection"] = new(PageCandidates, "候选", 40, "使用小键盘选择候选"),
 
+            // English candidates and mixed input. Two rows, deliberately: the engine has one
+            // gate for English participation (`SpellEnabled`) and one separator switch
+            // (`MixedAutoSpacing`), and no "enable mixed input" master switch to present.
+            ["SpellEnabled"] = new(PageCandidates, "英文候选与混输", 10, "显示英文候选",
+                "英文候选的唯一开关。打开时，英文词可以作为一个候选和中文候选一起出现，"
+                + "也可以和拼音拼成一条中英混输的候选；关闭后拼音与双拼只给中文候选。"
+                + "没有另外的「启用混输」开关。"),
+            ["MixedAutoSpacing"] = new(PageCandidates, "英文候选与混输", 20, "混输候选自动加空格",
+                "只作用于候选本身：一条候选同时含中文段和英文段时，在中文与英文的分界处插一个空格，"
+                + "上屏的整串文字随之带空格。纯中文或纯英文的候选只有一个来源段，不受影响；"
+                + "文档里已经写好的文字也不会被改动。默认关闭。"),
+
+            // Auxiliary filter: the mode here, the trigger key on the 按键 page. The
+            // explanation names the other page instead of repeating the key, so the key
+            // keeps exactly one home.
+            ["AuxiliaryFilter"] = new(PageCandidates, "辅助筛选", 10, "辅助筛选方式",
+                "输入拼音或双拼、候选栏出现后，按下「辅助筛选触发键」进入筛选，再输入辅助码收窄候选："
+                + "笔画按字的笔顺输入，墨奇按两位字母码输入。触发键在「按键 › 辅助筛选」中设置，"
+                + "选「关闭」时它不起作用。",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["Disabled"] = "关闭",
+                    ["Stroke"] = "笔画",
+                    ["MoQi"] = "墨奇",
+                }),
+
             // Preedit
-            ["PreeditMode"] = new(PageCandidates, "预编辑", 10, "预编辑模式"),
+            ["PreeditMode"] = new(PageCandidates, "预编辑", 10, "预编辑模式",
+                null,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["Do not show"] = "不显示",
+                    ["Composing pinyin"] = "显示拼音串",
+                    ["Commit preview"] = "显示提交预览",
+                }),
             ["PinyinInPreedit"] = new(PageCandidates, "预编辑", 20, "在预编辑中显示完整拼音"),
             ["PreeditCursorPositionAtBeginning"] = new(PageCandidates, "预编辑", 30, "光标固定在预编辑开头"),
 
@@ -85,17 +127,57 @@ public static class PresentationMap
             ["VAsQuickphrase"] = new(PageKeys, "快捷短语", 20, "用 v 触发快捷短语"),
 
             // More
-            ["FilterByStroke"] = new(PageKeys, "更多设置", 10, "按笔画筛选"),
+            ["FilterByStroke"] = new(PageKeys, "辅助筛选", 10, "辅助筛选触发键",
+                "候选栏出现后按下这组按键进入辅助筛选。筛选方式在「候选与输入 › 辅助筛选」中设置；"
+                + "选「关闭」时这组按键不起作用。"),
             ["QuickPhraseTriggerRegex"] = new(PageKeys, "更多设置", 20, "触发快捷短语的规则",
                 "每行一条正则表达式。"),
-            ["SwitchInputMethodBehavior"] = new(PageCandidates, "更多设置", 10, "切换输入法时的处理"),
+            ["SwitchInputMethodBehavior"] = new(PageCandidates, "更多设置", 10, "切换输入法时的处理",
+                null,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["Clear"] = "清空",
+                    ["Commit current preedit"] = "提交当前预编辑",
+                    ["Commit default selection"] = "提交默认选择",
+                }),
             ["Number of sentence"] = new(PageCandidates, "更多设置", 20, "联想句子数量"),
             ["WordCandidateLimit"] = new(PageCandidates, "更多设置", 30, "词组候选数量"),
             ["LongWordLengthLimit"] = new(PageCandidates, "更多设置", 40, "长词提示长度"),
 
             // Shuangpin-only
-            ["ShuangpinProfile"] = new(PageCandidates, "双拼", 10, "双拼方案"),
+            ["ShuangpinProfile"] = new(PageCandidates, "双拼", 10, "双拼方案",
+                null,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["Ziranma"] = "自然码",
+                    ["MS"] = "微软",
+                    ["Ziguang"] = "紫光",
+                    ["ABC"] = "智能ABC",
+                    ["Zhongwenzhixing"] = "中文之星",
+                    ["PinyinJiajia"] = "拼音加加",
+                    ["Xiaohe"] = "小鹤",
+                    ["GB"] = "国标",
+                    ["Custom"] = "自定义",
+                }),
             ["ShowShuangpinMode"] = new(PageCandidates, "双拼", 20, "显示双拼提示"),
+        };
+
+    /// <summary>
+    /// The nested <c>Fuzzy</c> configuration. Only the one enumeration there is placed: its
+    /// stored values are <c>None</c> and <c>QWERTY</c>, and leaving them as the Host's English
+    /// labels would put a second language in the middle of a Chinese page. The twenty-one
+    /// toggles keep the Host's own labels; they are not this round's subject.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, Placement> Fuzzy =
+        new Dictionary<string, Placement>(StringComparer.Ordinal)
+        {
+            ["Correction"] = new(PageCandidates, "模糊音", 900, "纠错布局",
+                null,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["None"] = "无",
+                    ["QWERTY"] = "QWERTY",
+                }),
         };
 
     /// <summary>Global options, keyed by the value-tree path inside the global configuration.</summary>
@@ -127,8 +209,12 @@ public static class PresentationMap
             ["Hotkey/NextCandidate"] = new(PageKeys, "系统回退翻页", 40, "下一个候选（回退）"),
 
             ["Behavior/ActiveByDefault"] = new(PageCandidates, "系统输入行为", 10, "默认启用输入法"),
-            ["Behavior/resetStateWhenFocusIn"] = new(PageCandidates, "系统输入行为", 20, "获得焦点时重置状态"),
-            ["Behavior/ShareInputState"] = new(PageCandidates, "系统输入行为", 30, "共享输入状态"),
+            ["Behavior/resetStateWhenFocusIn"] = new(PageCandidates, "系统输入行为", 20, "获得焦点时重置状态",
+                null,
+                PropagatePolicy()),
+            ["Behavior/ShareInputState"] = new(PageCandidates, "系统输入行为", 30, "共享输入状态",
+                null,
+                PropagatePolicy()),
             ["Behavior/PreeditEnabledByDefault"] = new(PageCandidates, "系统输入行为", 40, "在应用中显示预编辑"),
             ["Behavior/DefaultPageSize"] = new(PageCandidates, "系统输入行为", 50, "系统默认每页候选数",
                 "这是系统的默认值，拼音页有自己的每页候选数，两者不同。"),
@@ -177,23 +263,44 @@ public static class PresentationMap
     /// <summary>Section order within a page; anything unknown sorts last.</summary>
     public static readonly IReadOnlyList<string> KeysSections = new[]
     {
-        "翻页", "候选导航", "候选选择", "上屏", "短语选字", "快捷短语", "学习",
+        "翻页", "候选导航", "候选选择", "上屏", "短语选字", "快捷短语", "辅助筛选", "学习",
         "系统快捷键", "系统回退翻页", "更多设置",
     };
 
+    /// <summary>
+    /// Section order within 候选与输入. 英文候选与混输 and 辅助筛选 sit next to 候选 because
+    /// they decide which candidates exist and how they are narrowed, not how they are drawn.
+    /// </summary>
     public static readonly IReadOnlyList<string> CandidateSections = new[]
     {
-        "候选窗口", "候选", "预编辑", "学习", "双拼", "系统输入行为", "更多设置",
+        "候选窗口", "候选", "英文候选与混输", "辅助筛选", "预编辑", "学习", "双拼",
+        "系统输入行为", "更多设置",
     };
 
     public static Placement? FindPinyin(string optionName) =>
         Pinyin.TryGetValue(optionName, out var placement) ? placement : null;
+
+    public static Placement? FindFuzzy(string optionName) =>
+        Fuzzy.TryGetValue(optionName, out var placement) ? placement : null;
 
     public static Placement? FindGlobal(string container, string optionName) =>
         Global.TryGetValue(container + "/" + optionName, out var placement) ? placement : null;
 
     public static Placement? FindPresentation(string optionName) =>
         Presentation.TryGetValue(optionName, out var placement) ? placement : null;
+
+    /// <summary>
+    /// The two 系统输入行为 rows that share one enumeration, <c>PropertyPropagatePolicy</c>
+    /// (<c>inputcontextmanager.h</c>: All, Program, No). Both are already on the page; without
+    /// a label their three values are the last English enumeration values it shows.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> PropagatePolicy() =>
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["All"] = "所有",
+            ["Program"] = "程序",
+            ["No"] = "否",
+        };
 
     /// <summary>Options that are links to other tools rather than values.</summary>
     public static readonly IReadOnlyDictionary<string, string> ExternalToolReason =

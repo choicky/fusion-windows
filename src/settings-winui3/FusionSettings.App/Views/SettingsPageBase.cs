@@ -101,7 +101,7 @@ public abstract class SettingsPageBase : Page
 
             var row = OptionRows.Build(option, draft.Effective(option.Name),
                 value => workspace.TrySet(target, option.Name, value),
-                placement?.Label, placement?.Help, probe);
+                placement?.Label, placement?.Help, probe, placement?.EnumLabels);
 
             yield return (placement?.Section ?? "更多设置", placement?.Order ?? 900, row);
         }
@@ -147,7 +147,8 @@ public abstract class SettingsPageBase : Page
                     draft.EffectiveNested(snapshot, type.Name, option.Name),
                     value => workspace.TrySetNested(SettingsTarget.Global, type.Name, option.Name, value),
                     placement?.Label,
-                    placement?.Help);
+                    placement?.Help,
+                    enumLabels: placement?.EnumLabels);
 
                 yield return (placement?.Section ?? "更多设置", placement?.Order ?? 900, row);
             }

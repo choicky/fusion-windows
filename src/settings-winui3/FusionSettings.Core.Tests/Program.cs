@@ -28,6 +28,11 @@ internal static class Program
         KeyTests.Run();
         ImListAndEndpointTests.Run();
 
+        // The Chinese presentation of the mixed-input options: labels, groups and one label
+        // per stored value. This reads the same table file the window compiles, so it needs
+        // no Host.
+        MixedOptionTests.RunTableChecks();
+
         // The two ends of the wire carry the protocol version as separate literals; nothing
         // else compares them, and a mismatch fails the handshake rather than degrading.
         ProtocolVersionTests.Run();
@@ -51,6 +56,9 @@ internal static class Program
 
         // The candidate-presentation save needs the same writable profile, for the same reason.
         await PresentationSaveSectionAsync().ConfigureAwait(false);
+
+        // And the stored values behind 辅助筛选 and 混输空格, on the same profile.
+        await MixedOptionSectionAsync().ConfigureAwait(false);
 
         // And what the save bar says when one page is stored and another is refused.
         await PartialSaveSectionAsync().ConfigureAwait(false);
@@ -104,6 +112,24 @@ internal static class Program
 
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
         await PresentationSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
+    }
+
+    private static async Task MixedOptionSectionAsync()
+    {
+        var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            Harness.Section("mixed options: SKIPPED (FUSION_SETTINGS_GLOBAL_PROFILE is not set)");
+            return;
+        }
+
+        if (!TryIsolatedEndpoint(out var endpoint))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await MixedOptionTests.RunAgainstHostAsync(endpoint, cancellation.Token).ConfigureAwait(false);
     }
 
     private static async Task PartialSaveSectionAsync()

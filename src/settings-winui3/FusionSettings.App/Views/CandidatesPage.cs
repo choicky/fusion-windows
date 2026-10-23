@@ -164,10 +164,14 @@ public sealed class CandidatesPage : SettingsPageBase
         var rows = new List<FrameworkElement>();
         foreach (var option in fuzzyType.Options)
         {
+            // Only the enumeration in this container is placed; the toggles fall back to the
+            // Host's own labels, which is what this page shows for them today.
+            var placement = PresentationMap.FindFuzzy(option.Name);
             rows.Add(Controls.OptionRows.Build(
                 option,
                 draft.EffectiveNested(snapshot, fuzzyType.Name, option.Name),
-                value => Workspace.TrySetNested(Workspace.CurrentTarget, fuzzyType.Name, option.Name, value)));
+                value => Workspace.TrySetNested(Workspace.CurrentTarget, fuzzyType.Name, option.Name, value),
+                placement?.Label, placement?.Help, enumLabels: placement?.EnumLabels));
         }
 
         PageChrome.AddSection(body, "模糊音",
