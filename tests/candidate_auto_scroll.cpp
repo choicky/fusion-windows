@@ -427,6 +427,109 @@ void run_page_shapes() {
 
 } // namespace
 
+// Arrow-key cursor movement through the engine's own candidate cursor.
+//
+// "ni" is used rather than "nihao" on purpose: every candidate for a single syllable is a
+// complete match for the whole input, so selecting one commits text instead of leaving a
+// committed prefix inside the preedit — which is what makes the assertion below about the
+// committed string, and not about how the engine chose to render a partial selection.
+void run_cursor_steps(const char *method) {
+  Driver d(scrolling(method));
+  d.type("ni");
+  require(!d.page.entries.empty(), "the engine produced no candidates");
+  // Expand the window the way the user does: one page-turn.
+  const auto first_page = d.page.page_size;
+  d.key(BackendStimulus::Type::PageNext);
+  require(d.page.arrangement == CandidateArrangement::Scroll, "the window is not a scrolling one");
+  const int columns = d.page.page_size;
+  require(columns == first_page, "the expanded row is not the engine page");
+  require(d.page.entries.size() > static_cast<std::size_t>(columns),
+          "the window shows more than one engine page");
+
+  const auto cursor_before = d.page.cursor_index;
+  const auto page_before = d.page.current_page;
+  auto batch = d.send(BackendStimulus{d.binding, 0, BackendStimulus::Type::CursorNext});
+  require(batch.disposition != BackendBatch::Disposition::Reject, "a right step was refused");
+  std::printf("[%s] cursor next: entry %d -> %d, engine page %d -> %d\n", method, cursor_before,
+              d.page.cursor_index, page_before, d.page.current_page);
+  require(d.page.cursor_index == cursor_before + 1, "the cursor did not move one cell right");
+
+  batch = d.send(BackendStimulus{d.binding, 0, BackendStimulus::Type::CursorPrev});
+  require(batch.disposition != BackendBatch::Disposition::Reject, "a left step was refused");
+  require(d.page.cursor_index == cursor_before, "the cursor did not move back");
+
+  // One step right again, then the key the user actually presses: Space commits whatever the
+  // engine has highlighted, so this proves the highlight the window shows is the engine's own.
+  batch = d.send(BackendStimulus{d.binding, 0, BackendStimulus::Type::CursorNext});
+  require(d.page.cursor_index == cursor_before + 1, "the cursor did not move right again");
+  const std::string highlighted =
+      entry_text(d.page, static_cast<std::size_t>(d.page.cursor_index));
+  batch = d.type(" ");
+  const std::string committed = d.committed(batch);
+  std::printf("[%s] space committed \"%s\" for the cell the cursor was on (\"%s\")\n", method,
+              committed.c_str(), highlighted.c_str());
+  require(!committed.empty(), "space committed nothing");
+  require(committed == highlighted,
+          "space committed the candidate the engine's cursor was on, which is the cell the "
+          "window highlighted");
+  require(d.preedit(batch).empty(), "and the composition is finished, not left half committed");
+}
+
+// The last candidate of the whole list is the right edge: a further right step is refused
+// rather than wrapped to the first candidate.
+void run_cursor_stops_at_the_end(const char *method) {
+  Driver d(scrolling(method));
+  d.type("ni");
+  require(!d.page.entries.empty(), "the engine produced no candidates");
+  d.key(BackendStimulus::Type::PageNext);
+
+  int accepted = 0;
+  for (;;) {
+    const auto batch = d.send(BackendStimulus{d.binding, 0, BackendStimulus::Type::CursorNext});
+    if (batch.disposition == BackendBatch::Disposition::Reject)
+      break;
+    ++accepted;
+    require(accepted < 200, "a right step kept being accepted, so the end was never reached");
+  }
+
+  // The window re-anchors as the engine pages, so the entry index is not monotonic — the
+  // engine's own global index is what must end up on the last candidate of the list.
+  const auto stopped_at = d.page.global_index_of(static_cast<std::size_t>(d.page.cursor_index));
+  const auto last_shown = d.page.global_index_of(d.page.entries.size() - 1);
+  std::printf("[%s] right steps accepted: %d, then refused at global %d of %d shown\n", method,
+              accepted, stopped_at, last_shown);
+  require(accepted > 0, "not even one right step was accepted");
+  require(stopped_at == last_shown,
+          "the refused step is at the last candidate the window can reach, not in the middle");
+}
+
+// Walking left crosses engine pages (that is navigation, not wrapping) and stops at the true
+// first candidate: the step there is refused rather than wrapped to the last one.
+void run_cursor_stops_at_the_start(const char *method) {
+  Driver d(scrolling(method));
+  d.type("ni");
+  require(!d.page.entries.empty(), "the engine produced no candidates");
+  d.key(BackendStimulus::Type::PageNext);
+  require(d.page.window_first_page > 0, "the window did not move off the first engine page");
+
+  int accepted = 0;
+  for (;;) {
+    const auto batch = d.send(BackendStimulus{d.binding, 0, BackendStimulus::Type::CursorPrev});
+    if (batch.disposition == BackendBatch::Disposition::Reject)
+      break;
+    ++accepted;
+    require(accepted < 200, "a left step kept being accepted, so the start was never reached");
+  }
+
+  const auto global = d.page.global_index_of(static_cast<std::size_t>(d.page.cursor_index));
+  std::printf("[%s] left steps accepted: %d, then refused at global %d (window first %d)\n",
+              method, accepted, global, d.page.window_first_page);
+  require(accepted > 0, "not even one left step was accepted");
+  require(global == 0, "the refused step is at the first candidate of the list, not somewhere else");
+  require(d.page.window_first_page == 0 && d.page.cursor_index == 0,
+          "and the window followed the engine back to its first page");
+}
+
 int main() {
   try {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -438,6 +541,12 @@ int main() {
     run_column_keep("shuangpin", "shuangpin");
     run_capacity("pinyin", nullptr, 3);
     run_capacity("shuangpin", "shuangpin", 2);
+    run_cursor_steps("pinyin");
+    run_cursor_steps("shuangpin");
+    run_cursor_stops_at_the_start("pinyin");
+    run_cursor_stops_at_the_start("shuangpin");
+    run_cursor_stops_at_the_end("pinyin");
+    run_cursor_stops_at_the_end("shuangpin");
     std::printf("PASS automatic scrolling: window, row steps, scroll pages and global selects\n");
     return 0;
   } catch (const std::exception &error) {
