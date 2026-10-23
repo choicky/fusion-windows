@@ -102,8 +102,8 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **731 checks** as of this revision — **540 without a Host** (`--no-integration`), and
-**191 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
+Exit code 0 means every check passed: **821 checks** as of this revision — **575 without a Host** (`--no-integration`), and
+**246 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
 a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
 list, and for the cases of a save that meets a busy Host (busy twice then stored with no second click, a saved page not
@@ -113,8 +113,12 @@ failed half of the shared Pinyin/Shuangpin draft not resubmitted), a
 successful global save with its persistence check, a save that stores one page and is refused for another with the refused
 edit kept, and read/apply/read-back with incarnation stability). The no-Host half also covers the
 installed-font list the 候选字体 row offers: the families this session has, once each, sorted, a
-name it does not contain reported as missing, and a search that narrows. A third
-run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **8 checks**:
+name it does not contain reported as missing, and a search that narrows. It also covers the
+Chinese presentation of the options this engine added: the labels, the group each row lands in,
+one distinct label per stored value, and — the part that is easy to get wrong — that a mapped
+enumeration is keyed by the string the Host stores rather than the C++ identifier, compared
+against the schema a real Host publishes. A third
+run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **3 checks**:
 the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
 
 ### Running the real-Host checks
