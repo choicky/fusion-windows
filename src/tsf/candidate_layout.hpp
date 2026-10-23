@@ -62,6 +62,15 @@ inline std::string panel_upper_text(const CandidatePage &page) {
   return page.aux_up + page.panel_preedit;
 }
 
+// The one "too long" cap shared by every arrangement that lays cells out in a row: a cell
+// shows at most this many CJK ideographs of its candidate text, measured in the candidate
+// font with the same `measure` the layout sizes with. The label ("1. ") and the slot's own
+// inset are added on top of the cap rather than taken out of it, so a labelled cell is not
+// two characters narrower than an unlabelled one. Past the cap the cell is ellipsized,
+// `clipped` is set, and the detail popup offers the whole string: what the engine commits is
+// never shortened, only what is drawn.
+inline constexpr int kLongCandidateIdeographs = 8;
+
 struct CandidatePanelLayout {
   LayoutRect upper;              // empty when there is no upper-row text
   LayoutRect lower;              // empty when there is no auxDown
@@ -215,6 +224,24 @@ layout_candidate_panel(const CandidatePage &page,
     if (!entry.placeholder)
       ++count;
 
+  // The cap is measured once per page, in the font the layout is laying out with. `budget`
+  // is the work area's share for one cell (0 when there is no budget to apply); the smaller
+  // of the two caps wins, so the panel is still inside the screen when the share is tighter
+  // than eight ideographs.
+  std::string ideographs;
+  ideographs.reserve(static_cast<std::size_t>(kLongCandidateIdeographs) * 3);
+  for (int index = 0; index < kLongCandidateIdeographs; ++index)
+    ideographs += "中";
+  const int long_text_cap = measure(ideographs);
+  const auto slot_limit = [&](const CandidateEntry &entry, int budget) {
+    int limit = long_text_cap + 2 * inset;
+    if (!entry.label.empty())
+      limit += measure(entry.label + " ");
+    if (budget > 0)
+      limit = (std::min)(limit, budget);
+    return (std::max)(1, limit);
+  };
+
   // The automatic scrolling arrangement: a grid whose columns are the engine's own page
   // size and whose rows are the engine's own pages. `entries` already is a contiguous run of
   // engine pages (see CandidateScrollWindow), so placement is pure index arithmetic over the
@@ -227,32 +254,55 @@ layout_candidate_panel(const CandidatePage &page,
     const int rows = (static_cast<int>(page.entries.size()) + columns - 1) / columns;
     const int band = pager ? row_height : 0;
 
-    // One width for every cell on every row, taken from the widest text in the window and
-    // then divided by the budget: columns line up, a row cannot be squeezed into a different
-    // shape by its own text, and the panel is inside the screen by construction.
-    std::vector<int> text_width(page.entries.size(), 0);
-    int natural = 0;
+    // One width per column, not one for the whole grid: a column is as wide as the widest
+    // cell it holds, so a page with one long candidate beside single characters does not
+    // draw four empty blocks. The widest cell of a column is taken over every row of the
+    // scroll window — all of `entries`, not only the rows on screen — so the grid keeps its
+    // shape while the highlight walks from row to row. Columns still line up because a cell
+    // is placed at its own column's left edge; index arithmetic, hit testing and the
+    // row/column navigation are unchanged.
+    //
+    // The column width is the alignment grid, not the width each cell is drawn at. A cell is
+    // as wide as its *own* limit: the label allowance belongs to the entries that carry a
+    // label, and only the current engine page's entries do (candidate_projection.cpp). Sizing
+    // every cell of the column at the widest — including a label it does not have — would let
+    // an unlabelled nine-ideograph candidate on another row show all nine characters and stay
+    // unclipped, which is exactly what the eight-ideograph cap forbids.
+    std::vector<int> natural(page.entries.size(), 0);
+    std::vector<int> cell_width(page.entries.size(), 0);
+    std::vector<int> column_width(static_cast<std::size_t>(columns), 0);
+    int share = 0; // the work area's share for one column; 0 = no budget to apply
+    if (bounded_width) {
+      const int content = limits.max_width - 2 * side_margin - (columns - 1) * item_gap;
+      share = content > 0 ? content / columns : 1;
+    }
+    if (limits.max_slot_width > 0)
+      share = share > 0 ? (std::min)(share, limits.max_slot_width) : limits.max_slot_width;
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue;
-      // The cell has to hold the text *and* its own inset, so the inset is part of what the
-      // widest cell is measured at rather than something added to the drawing later.
-      text_width[index] = measure(slot_full_text(page.entries[index])) + 2 * inset;
-      natural = (std::max)(natural, text_width[index]);
+      const CandidateEntry &entry = page.entries[index];
+      natural[index] = measure(slot_full_text(entry)) + 2 * inset;
+      // This cell's own limit: the cap plus its own label, and no more than the budget. The
+      // column takes the widest of these; the cell keeps its own, left-aligned in the column.
+      cell_width[index] = (std::min)(natural[index], slot_limit(entry, share));
+      int &column = column_width[index % static_cast<std::size_t>(columns)];
+      column = (std::max)(column, cell_width[index]);
     }
-    int cell = natural;
-    if (bounded_width) {
-      const int content = limits.max_width - 2 * side_margin - (columns - 1) * item_gap;
-      const int share = content > 0 ? content / columns : 1;
-      cell = (std::min)(cell, share);
-    }
-    if (limits.max_slot_width > 0)
-      cell = (std::min)(cell, limits.max_slot_width);
-    cell = (std::max)(2 * inset + 1, cell);
+    for (auto &column : column_width)
+      column = (std::max)(1, column);
 
-    int panel_width = 2 * side_margin + columns * cell + (columns - 1) * item_gap;
+    // Column left edges from the widths above: column c starts one gap after column c-1 ends.
+    std::vector<int> column_left(static_cast<std::size_t>(columns), side_margin);
+    for (int column = 1; column < columns; ++column)
+      column_left[static_cast<std::size_t>(column)] =
+          column_left[static_cast<std::size_t>(column - 1)] +
+          column_width[static_cast<std::size_t>(column - 1)] + item_gap;
+
+    int panel_width = column_left[static_cast<std::size_t>(columns - 1)] +
+                      column_width[static_cast<std::size_t>(columns - 1)] + side_margin;
     // The pager arrows live in the band above the grid, so they are not taken out of any
-    // row's width — but the panel still has to be wide enough to hold them.
+    // column's width — but the panel still has to be wide enough to hold them.
     if (pager)
       panel_width = (std::max)(panel_width, 2 * side_margin + 2 * pager_width + item_gap);
     if (bounded_width)
@@ -285,15 +335,18 @@ layout_candidate_panel(const CandidatePage &page,
     for (std::size_t index = 0; index < page.entries.size(); ++index) {
       if (page.entries[index].placeholder)
         continue; // keeps its cell, draws nothing
+      const std::size_t column = index % static_cast<std::size_t>(columns);
       const int row = static_cast<int>(index) / columns;
-      const int column = static_cast<int>(index) % columns;
       const int shown = row - first;
       if (shown < 0 || shown >= visible)
         continue;
-      const int left = side_margin + column * (cell + item_gap);
+      const int left = column_left[column];
       const int y = top + band + shown * row_height;
-      out.slots[index] = LayoutRect{left, y, left + cell, y + row_height};
-      out.clipped[index] = text_width[index] > cell ? 1 : 0;
+      // Left-aligned in its column, but only as wide as this cell's own limit — so the
+      // rectangle the painter draws into, and `clipped`, follow this entry's label, not the
+      // widest one in the column.
+      out.slots[index] = LayoutRect{left, y, left + cell_width[index], y + row_height};
+      out.clipped[index] = natural[index] > cell_width[index] ? 1 : 0;
     }
     if (page.has_prev)
       out.prev = LayoutRect{side_margin, top, side_margin + pager_width, top + band};
@@ -307,11 +360,12 @@ layout_candidate_panel(const CandidatePage &page,
   }
 
   if (page.layout == CandidateLayout::Horizontal) {
-    // One row, in page order. The row has a fixed budget: margins, gaps, the pager arrows
-    // and every cell come out of the same width, so K cells can never add up to more than
-    // the screen even when every one of them is long. A cell that has to give is drawn
-    // with an ellipsis and offered in full; the candidate it stands for is unchanged, and
-    // it keeps its rect (so it keeps a click target).
+    // One row, in page order. Each cell is as wide as its own text, up to two caps: the
+    // "too long" cap above, and the work area's share of this row. Without the first, one
+    // long candidate would decide the width of a cell that shows eight characters; without
+    // the second, K cells could add up to more than the screen. A cell that has to give is
+    // drawn with an ellipsis and offered in full; the candidate it stands for is unchanged,
+    // and it keeps its rect (so it keeps a click target).
     int reserve = 0;
     if (page.has_prev)
       reserve += pager_width + item_gap;
@@ -337,7 +391,7 @@ layout_candidate_panel(const CandidatePage &page,
       if (page.entries[index].placeholder)
         continue; // index kept, no displayed slot
       const int natural = measure(slot_full_text(page.entries[index])) + 2 * inset;
-      const int w = cap > 0 ? (std::min)(natural, cap) : natural;
+      const int w = (std::min)(natural, slot_limit(page.entries[index], cap));
       out.slots[index] = LayoutRect{x, top, x + w, top + row_height};
       out.clipped[index] = natural > w ? 1 : 0;
       // A gap belongs *between* things: one after the last cell would be charged to the

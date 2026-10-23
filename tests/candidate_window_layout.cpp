@@ -12,6 +12,12 @@
 //   - one very long candidate cannot stretch the panel past the work area: its slot is
 //     capped, drawn ellipsized, and its full text is available from the tip popup — by
 //     keyboard highlight and by hovering, without taking focus;
+//   - the scrolling grid sizes each column by its own widest cell, so one long candidate
+//     does not draw four single characters at its width, and the columns stay aligned — while
+//     each cell is drawn at its own label-adjusted width, so an unnumbered cell on a row other
+//     than the engine's page is capped at eight ideographs too;
+//   - the one "too long" cap is eight ideographs of candidate text in both arrangements,
+//     with the label and the slot's inset added on top;
 //   - a larger configured font really produces a taller panel, and a font family that does
 //     not exist still draws (GDI substitution) instead of failing;
 //   - the metrics scale with DPI in one place, so 192 dpi is exactly twice 96 dpi.
@@ -1161,19 +1167,20 @@ int main() {
     CHECK(slots_hold_the_text(view));
 
     // Row 0's five cells share a top and are consecutive in x; the sixth cell starts a row.
-    const int cell_width = layout.slots[0].right - layout.slots[0].left;
-    CHECK(cell_width > 0);
+    // Each column has its own width (see 30 for the case where they differ), so the shared
+    // number here is the column's, not the grid's.
+    CHECK(layout.slots[0].right - layout.slots[0].left > 0);
     for (std::size_t column = 1; column < 5; ++column) {
       CHECK(layout.slots[column].top == layout.slots[0].top);
       CHECK(layout.slots[column].left > layout.slots[column - 1].left);
-      CHECK(layout.slots[column].right - layout.slots[column].left == cell_width);
     }
     CHECK(layout.slots[5].top > layout.slots[0].top);
-    // Column alignment, not per-row packing: the cell below column c starts at the same x.
+    // Column alignment, not per-row packing: the cell below column c starts at the same x as
+    // the column it belongs to. Its right edge is its own (a numbered cell is wider than an
+    // unnumbered one in the same column), so only the left edge is shared.
     for (std::size_t index = 5; index < 25; ++index) {
       const std::size_t column = index % 5;
       CHECK(layout.slots[index].left == layout.slots[column].left);
-      CHECK(layout.slots[index].right - layout.slots[index].left == cell_width);
     }
     // Every visible cell is its own click target, and the index the hit reports is the one
     // the page carries — the page-local index the semantic layer turns into a global one.
@@ -1271,7 +1278,9 @@ int main() {
     const auto &first_of_row = layout.slots[20];
     CHECK(last.top == first_of_row.top);
     CHECK(last.left > first_of_row.left);
-    CHECK(last.right - last.left == first_of_row.right - first_of_row.left);
+    // Column one is where column one starts on the row above (16 = row 3, column 1); the
+    // widths are each column's own, so only the left edge is shared.
+    CHECK(last.left == layout.slots[16].left);
     // No candidate exists for columns three to five, so there is nothing to click there.
     const auto nowhere = fusion::tsf::hit_test_candidate_panel(
         layout, last.right + 4, (last.top + last.bottom) / 2);
@@ -1377,6 +1386,352 @@ int main() {
     // Leaving the cell hides it again; the popped box belongs to the cell it describes.
     SendMessageW(view.window(), WM_MOUSEMOVE, 0, MAKELPARAM(1, 1));
     CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+  }
+
+  // 30. The scrolling grid gives every column its own width. The owner's page (自动卷轴,
+  //     0.0.0-winui3+3325514): one long candidate and single characters beside it. Every
+  //     cell used to be as wide as the longest text in the window, so four one-character
+  //     candidates drew as wide as a twelve-character one.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    // Ten pixels per UTF-8 byte, so one ideograph (three bytes) is 30: the arithmetic below
+    // is the test's own, not a copy of GDI's numbers.
+    const auto measure = [](const std::string &text) {
+      return 10 * static_cast<int>(text.size());
+    };
+    fusion::CandidatePage page;
+    page.arrangement = fusion::CandidateArrangement::Scroll;
+    page.layout = fusion::CandidateLayout::Horizontal;
+    page.page_size = 5;
+    page.window_first_page = 1;
+    page.current_page = 2; // the engine sits on the window's second row
+    page.total_pages = 9;
+    page.has_prev = true;
+    page.has_next = true;
+    const char *cells[3][5] = {
+        {"藏", "苍茫的填鸭式我的爱啊啊啊", "仓", "舱", "藏"},
+        {"藏", "仓", "舱", "藏", "仓"},
+        {"藏", "仓", "舱", "藏", "仓"},
+    };
+    for (int row = 0; row < 3; ++row) {
+      for (int column = 0; column < 5; ++column) {
+        fusion::CandidateEntry entry;
+        // Labels exist only on the row the engine's number keys act on.
+        if (row == 1)
+          entry.label = std::to_string(column + 1) + ".";
+        entry.text = cells[row][column];
+        page.entries.push_back(std::move(entry));
+      }
+    }
+    page.cursor_index = 5;
+
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = 1600;
+    limits.max_height = 800;
+    const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+
+    const int inset = layout.text_inset;
+    CHECK(inset == metrics.item_inset);
+    const int one = measure("藏") + 2 * inset;         // a single character
+    const int numbered = measure("1. 仓") + 2 * inset; // and one carrying its label
+    const int label = measure("1. ");                  // every label here is "N. "
+    // The cap: eight ideographs of text, plus the inset. The long candidate in row 0 has no
+    // label, so that is the whole width its cell may take.
+    const int capped = measure("中中中中中中中中") + 2 * inset;
+
+    // A column is as wide as the widest cell it holds — column 1 is the capped long candidate,
+    // the others are a numbered single character — but each cell is drawn at its **own** width:
+    // the label allowance belongs only to the entries that carry a label (the current engine
+    // page's row), so an unnumbered cell in the same column is narrower.
+    const int expected_column[5] = {numbered, capped, numbered, numbered, numbered};
+    for (int column = 0; column < 5; ++column) {
+      for (int row = 0; row < 3; ++row) {
+        const std::size_t index = static_cast<std::size_t>(row * 5 + column);
+        CHECK(!layout.slots[index].empty());
+        // Aligned across rows: same left edge on every row; the width is the cell's own.
+        CHECK(layout.slots[index].left == layout.slots[static_cast<std::size_t>(column)].left);
+        const int natural = measure(fusion::tsf::slot_full_text(page.entries[index])) + 2 * inset;
+        const int limit = capped + (row == 1 ? label : 0);
+        CHECK(layout.slots[index].right - layout.slots[index].left == (std::min)(natural, limit));
+      }
+    }
+    CHECK(expected_column[1] > 3 * expected_column[0]); // a wide column, not an accident
+    // The same single character is narrower on the row without numbers.
+    CHECK(layout.slots[0].right - layout.slots[0].left == one);
+    CHECK(layout.slots[5].right - layout.slots[5].left == numbered);
+
+    // The panel is margins + the five column widths + the four gaps between them.
+    const int sum = expected_column[0] + expected_column[1] + expected_column[2] +
+                    expected_column[3] + expected_column[4];
+    CHECK(layout.width == 2 * metrics.side_margin + sum + 4 * metrics.item_gap);
+
+    // The long cell is ellipsized at the cap and says so; twelve ideographs do not fit eight.
+    CHECK(layout.slot_clipped(1));
+    for (const std::size_t index :
+         {std::size_t{0}, std::size_t{2}, std::size_t{3}, std::size_t{4}, std::size_t{5}})
+      CHECK(!layout.slot_clipped(index));
+
+    // Nothing about placement changed: a cell is found where it is drawn, a step down is the
+    // same column one row lower, and a step right is the next column.
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      const auto &slot = layout.slots[index];
+      const auto hit = fusion::tsf::hit_test_candidate_panel(layout, slot.left + 1, slot.top + 1);
+      CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+            hit->index == static_cast<std::int32_t>(index));
+    }
+    for (std::size_t index = 0; index + 5 < layout.slots.size(); ++index) {
+      CHECK(layout.slots[index + 5].left == layout.slots[index].left);
+      CHECK(layout.slots[index + 5].top > layout.slots[index].top);
+    }
+    for (std::size_t index = 0; index % 5 != 4; ++index)
+      CHECK(layout.slots[index + 1].left > layout.slots[index].left);
+  }
+
+  // 31. One "too long" cap for both arrangements: eight ideographs of candidate text,
+  //     measured in the candidate font, with the label and the inset added on top rather
+  //     than taken out of the eight. Exactly eight is drawn whole; nine is ellipsized at the
+  //     width the eight-character cell gets, and its whole text is in the detail popup.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return 10 * static_cast<int>(text.size());
+    };
+    const std::string eight = "中中中中中中中中";
+    const std::string nine = "中中中中中中中中中";
+    const std::string twelve = "中中中中中中中中中中中中";
+    const int inset = metrics.item_inset;
+    const int cap = measure(eight) + 2 * inset;
+    const int label = measure("2. ");
+
+    fusion::CandidateEntry short_one;
+    short_one.text = eight;
+    fusion::CandidateEntry numbered;
+    numbered.label = "2.";
+    numbered.text = twelve;
+    fusion::CandidateEntry one_too_many;
+    one_too_many.text = nine;
+
+    // Horizontal, no work area to divide: only the cap decides.
+    {
+      fusion::CandidatePage page;
+      page.layout = fusion::CandidateLayout::Horizontal;
+      page.entries = {short_one, numbered, one_too_many};
+      const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics);
+      CHECK(layout.slots.size() == 3);
+      CHECK(layout.slots[0].right - layout.slots[0].left == cap);
+      CHECK(!layout.slot_clipped(0)); // exactly eight: nothing is hidden
+      // Twelve ideographs and a label: the cap plus the label plus the inset, not the cap
+      // shrunk by the label.
+      CHECK(layout.slots[1].right - layout.slots[1].left == cap + label);
+      CHECK(layout.slot_clipped(1));
+      // Nine ideographs: one more than the cap allows, at the same width as eight.
+      CHECK(layout.slots[2].right - layout.slots[2].left == cap);
+      CHECK(layout.slot_clipped(2));
+    }
+
+    // The same three cells as one row of the grid: the cap sets a column width the same way.
+    {
+      fusion::CandidatePage page;
+      page.arrangement = fusion::CandidateArrangement::Scroll;
+      page.layout = fusion::CandidateLayout::Horizontal;
+      page.page_size = 3;
+      page.entries = {short_one, numbered, one_too_many};
+      const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics);
+      CHECK(layout.total_rows == 1);
+      CHECK(layout.slots[0].right - layout.slots[0].left == cap);
+      CHECK(layout.slots[1].right - layout.slots[1].left == cap + label);
+      CHECK(layout.slots[2].right - layout.slots[2].left == cap);
+      CHECK(!layout.slot_clipped(0) && layout.slot_clipped(1) && layout.slot_clipped(2));
+    }
+
+    // On the real popup, with the popup's own font: the cap is eight ideographs of that
+    // font, and the full text of a clipped cell reaches the detail box whole.
+    {
+      auto page = make_page(fusion::CandidateLayout::Horizontal, 2);
+      page.cursor_index = -1;
+      // No label and no comment on either cell, so the cap is the only thing deciding: a
+      // comment would legitimately add to the width.
+      page.entries[0].label.clear();
+      page.entries[0].comment.clear();
+      page.entries[0].text = eight;
+      page.entries[1].label.clear();
+      page.entries[1].comment.clear();
+      for (int i = 0; i < 200; ++i)
+        page.entries[1].text += "中";
+      show_and_measure(view, page);
+      const int popup_dpi = view.dpi();
+      CHECK(!view.layout().slot_clipped(0));
+      CHECK(view.layout().text_rect(0).right - view.layout().text_rect(0).left ==
+            natural_width(page, eight, popup_dpi));
+      CHECK(view.layout().slot_clipped(1));
+      // The cell is the cap, measured by this check's own GDI rather than by the popup.
+      CHECK(view.layout().text_rect(1).right - view.layout().text_rect(1).left ==
+            natural_width(page, eight, popup_dpi));
+
+      const auto &slot = view.layout().slots[1];
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0,
+                   MAKELPARAM((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2));
+      CHECK(view.tip_window() != nullptr && IsWindowVisible(view.tip_window()));
+      // The box carries the *whole* candidate, not the ellipsized eight: its content height
+      // is what this check's own GDI wraps the full text into at the width the box wrapped at.
+      const int expected =
+          wrapped_height_with(page, popup_dpi, to_wide(page.entries[1].text),
+                              view.tip_wrap_width());
+      CHECK(expected > 0);
+      CHECK(std::abs(view.tip_content_height() - expected) <= view.line_height());
+      SendMessageW(view.window(), WM_MOUSEMOVE, 0, MAKELPARAM(1, 1));
+      CHECK(view.tip_window() == nullptr || !IsWindowVisible(view.tip_window()));
+    }
+  }
+
+  // 32. The work area still wins where it is tighter than the cap: five long cells in a
+  //     narrow budget each get their share, the panel stays inside the budget, and every cell
+  //     is still a click target. (The budget tests above are unchanged by the cap.)
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return 10 * static_cast<int>(text.size());
+    };
+    std::string long_text;
+    for (int i = 0; i < 40; ++i)
+      long_text += "中";
+    std::vector<fusion::CandidateEntry> grid_cells;
+    for (int i = 0; i < 10; ++i) {
+      fusion::CandidateEntry entry;
+      entry.label = std::to_string(i % 5 + 1) + ".";
+      entry.text = long_text;
+      grid_cells.push_back(std::move(entry));
+    }
+
+    const int budget = 500;
+    const int share = (budget - 2 * metrics.side_margin - 4 * metrics.item_gap) / 5;
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = budget;
+    limits.max_height = 600;
+
+    fusion::CandidatePage grid;
+    grid.arrangement = fusion::CandidateArrangement::Scroll;
+    grid.layout = fusion::CandidateLayout::Horizontal;
+    grid.page_size = 5;
+    grid.entries = grid_cells;
+    const auto scrolled = fusion::tsf::layout_candidate_panel(grid, measure, metrics, limits);
+    CHECK(scrolled.width <= budget);
+    for (std::size_t index = 0; index < scrolled.slots.size(); ++index) {
+      const auto &slot = scrolled.slots[index];
+      if (slot.empty())
+        continue;
+      CHECK(slot.right - slot.left <= share);
+      CHECK(slot.left >= 0 && slot.right <= budget);
+      CHECK(scrolled.slot_clipped(index)); // the budget is tighter than the text
+      const auto hit = fusion::tsf::hit_test_candidate_panel(scrolled, slot.left + 1, slot.top + 1);
+      CHECK(hit && hit->index == static_cast<std::int32_t>(index));
+    }
+
+    fusion::CandidatePage row = grid;
+    row.arrangement = fusion::CandidateArrangement::Page;
+    row.page_size = 0;
+    row.entries.assign(grid_cells.begin(), grid_cells.begin() + 5);
+    const auto across = fusion::tsf::layout_candidate_panel(row, measure, metrics, limits);
+    CHECK(across.width <= budget);
+    for (const auto &slot : across.slots)
+      CHECK(slot.empty() || slot.right <= budget);
+  }
+
+  // 33. The cap belongs to the cell, not to the column. Only the current engine page's entries
+  //     carry a label (candidate_projection.cpp), so a column can hold a numbered nine-character
+  //     candidate and, on another row, an unnumbered one. Sizing the unnumbered cell at the
+  //     column's width would hand it the label allowance it does not have and let all nine
+  //     characters through unclipped — the cap says eight.
+  {
+    const auto metrics = fusion::tsf::layout_metrics_for(20, 96);
+    const auto measure = [](const std::string &text) {
+      return 10 * static_cast<int>(text.size());
+    };
+    const std::string eight = "中中中中中中中中";
+    const std::string nine = "中中中中中中中中中";
+    const int inset = metrics.item_inset;
+    const int cap = measure(eight) + 2 * inset;
+    const int label = measure("1. ");
+
+    fusion::CandidatePage page;
+    page.arrangement = fusion::CandidateArrangement::Scroll;
+    page.layout = fusion::CandidateLayout::Horizontal;
+    page.page_size = 3;
+    page.window_first_page = 0;
+    page.current_page = 0; // the engine sits on the first row: only that row is numbered
+    page.total_pages = 4;
+    page.has_prev = true;
+    page.has_next = true;
+    // Row 0 (the engine's page): numbered. Row 1: unnumbered, the row the report is about.
+    const char *cells[2][3] = {
+        {"苍茫的填鸭式我的爱啊啊啊", "藏", "仓"},
+        {"苍茫的填鸭式我的爱啊啊啊", "中中中中中中中中", "舱"},
+    };
+    for (int row = 0; row < 2; ++row) {
+      for (int column = 0; column < 3; ++column) {
+        fusion::CandidateEntry entry;
+        if (row == 0)
+          entry.label = std::to_string(column + 1) + ".";
+        entry.text = cells[row][column];
+        page.entries.push_back(std::move(entry));
+      }
+    }
+    page.cursor_index = 0;
+
+    fusion::tsf::LayoutLimits limits;
+    limits.max_width = 1600;
+    limits.max_height = 800;
+    const auto layout = fusion::tsf::layout_candidate_panel(page, measure, metrics, limits);
+
+    // Column 0 is as wide as its widest cell — the numbered one, which owns the label allowance.
+    CHECK(layout.slots[0].right - layout.slots[0].left == cap + label);
+    // The unnumbered cell in the same column is drawn at its own limit: eight ideographs.
+    CHECK(layout.slots[3].right - layout.slots[3].left == cap);
+    CHECK(layout.text_rect(3).right - layout.text_rect(3).left == measure(eight));
+    // Both nine-character cells are ellipsized, and both start at the column's left edge.
+    CHECK(layout.slot_clipped(0));
+    CHECK(layout.slot_clipped(3));
+    CHECK(layout.slots[3].left == layout.slots[0].left);
+    // The cell is narrower than its column, so the column width is still the widest cell's.
+    CHECK(layout.slots[3].right < layout.slots[0].right);
+    // Exactly eight characters, unnumbered: nothing is hidden.
+    CHECK(!layout.slot_clipped(4));
+    CHECK(layout.slots[4].right - layout.slots[4].left == cap);
+    // The panel width still comes from the column widths, not from the cells: column 0 is the
+    // numbered long candidate, column 1 the eight ideographs, column 2 a numbered character.
+    const int sum = (cap + label) + cap + (measure("3. 舱") + 2 * inset);
+    CHECK(layout.width == 2 * metrics.side_margin + sum + 2 * metrics.item_gap);
+    // A click anywhere in a cell is still that cell.
+    for (std::size_t index = 0; index < layout.slots.size(); ++index) {
+      const auto &slot = layout.slots[index];
+      const auto hit = fusion::tsf::hit_test_candidate_panel(layout, slot.left + 1, slot.top + 1);
+      CHECK(hit && hit->kind == fusion::tsf::PanelHit::Kind::Select &&
+            hit->index == static_cast<std::int32_t>(index));
+    }
+
+    // The same shape on the real popup, with the popup's own font: the unnumbered cell's text
+    // rectangle is exactly the eight ideographs this check measures for itself.
+    {
+      auto real = page;
+      real.entries[0].text = nine;   // numbered, nine characters
+      real.entries[3].text = nine;   // unnumbered, nine characters
+      real.entries[4].text = eight;  // unnumbered, exactly eight
+      show_and_measure(view, real);
+      const int popup_dpi = view.dpi();
+      const auto &drawn = view.layout();
+      CHECK(drawn.slot_clipped(0));
+      CHECK(drawn.slot_clipped(3));
+      CHECK(!drawn.slot_clipped(4));
+      CHECK(drawn.slots[3].left == drawn.slots[0].left);
+      CHECK(drawn.text_rect(3).right - drawn.text_rect(3).left ==
+            natural_width(real, eight, popup_dpi));
+      // The numbered cell is allowed its label on top of the eight, and nothing more.
+      const int label_width = natural_width(real, "1. ", popup_dpi);
+      const int numbered_width = drawn.text_rect(0).right - drawn.text_rect(0).left;
+      const int unnumbered_width = drawn.text_rect(3).right - drawn.text_rect(3).left;
+      CHECK(numbered_width - unnumbered_width >= label_width - 1);
+      CHECK(numbered_width - unnumbered_width <= label_width + 1);
+    }
   }
 
   view.destroy();
