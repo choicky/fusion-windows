@@ -105,6 +105,7 @@ VIAddVersionKey "LegalCopyright" "Fusion Windows"
 Var InstallLog
 Var UninstallLog
 Var VersionDir
+Var Entry
 Var DataFlag
 
 Function .onInit
@@ -152,7 +153,13 @@ Section "安装 ${PRODUCT_NAME} ${PRODUCT_VERSION}"
 
   DetailPrint "运行安装流程（校验、停止 Host、复制、登记、启动）…"
   DetailPrint "日志：$InstallLog"
-  SetOutPath "$PLUGINSDIR"
+  ; The working directory must not be $PLUGINSDIR: NSIS extracts its own plug-ins
+  ; there, and one of them is a native System.dll. Add-Type in host-state.ps1 compiles
+  ; C# and resolves the default reference "System.dll" against the working directory
+  ; first, so it picks up that 12 KB native plug-in instead of the .NET assembly and
+  ; dies with "not a valid assembly" (SOURCE_CODE_ERROR) before install.ps1 writes a
+  ; single line. A dedicated empty directory has nothing a reference can collide with.
+  SetOutPath "$PLUGINSDIR\run"
   nsExec::ExecToLog '"${SHELL}" -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -PackageDir "$PLUGINSDIR\payload" -TranscriptPath "$InstallLog"'
   Pop $0
   ${If} $0 != "0"
@@ -193,25 +200,52 @@ Section "Uninstall"
 
   SetRegView 64
 
-  ; The version directories are the product's; install.ps1 created the newest one.
-  ; uninstall.ps1 removes all of them, so any one of them is a valid entry point —
-  ; and it is the same script the zip-based uninstall uses.
-  StrCpy $VersionDir ""
-  FindFirst $0 $1 "$INSTDIR\*.*"
-  fusion_find_loop:
-    StrCmp $1 "" fusion_find_done
-    StrCmp $1 "." fusion_find_next
-    StrCmp $1 ".." fusion_find_next
-    IfFileExists "$INSTDIR\$1\uninstall.ps1" 0 fusion_find_next
-      StrCpy $VersionDir "$INSTDIR\$1"
-      Goto fusion_find_done
-  fusion_find_next:
-    FindNext $0 $1
-    Goto fusion_find_loop
-  fusion_find_done:
-  FindClose $0
+  ; Which uninstall.ps1 to run. The Uninstall key names the version the user sees in
+  ; "已安装的应用", and that version's directory is the one this EXE installed, so it
+  ; is the entry point whenever it is still there. Older version directories can be
+  ; left behind by an upgrade (a process held them), and their scripts are older
+  ; copies: picking one of those — the old code took whichever name FindFirst returned
+  ; first, which is alphabetical, not newest — would run a stale script.
+  ; Only when the named directory is gone: take the newest uninstall.ps1 on disk,
+  ; ordered by the OS's own last-write time (dir /o-d, newest first).
+  StrCpy $Entry ""
+  ReadRegStr $VersionDir HKLM "${UNINST_KEY}" "DisplayVersion"
+  ${If} $VersionDir != ""
+    StrCpy $Entry "$INSTDIR\$VersionDir\uninstall.ps1"
+    IfFileExists "$Entry" fusion_entry_ready
+    DetailPrint "已安装版本目录不在：$INSTDIR\$VersionDir"
+  ${EndIf}
+  StrCpy $Entry ""
+  InitPluginsDir
+  ; `dir` accepts a wildcard only in the last component — "…\*\uninstall.ps1" is a
+  ; syntax error — so the directories are listed newest-first and the first one that
+  ; actually holds an uninstall.ps1 wins.
+  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /c dir /b /ad /o-d "$INSTDIR" > "$PLUGINSDIR\fusion-candidates.txt"'
+  Pop $R0
+  Pop $R1
+  FileOpen $0 "$PLUGINSDIR\fusion-candidates.txt" r
+  fusion_scan:
+    ClearErrors
+    StrCpy $1 ""
+    FileRead $0 $1
+    IfErrors fusion_scan_done
+    ; FileRead keeps the line's CRLF; drop exactly that, and only if it is there.
+    StrCpy $2 $1 "" -2
+    ${If} $2 == "$\r$\n"
+      StrCpy $1 $1 -2
+    ${EndIf}
+    StrCmp $1 "" fusion_scan
+    IfFileExists "$INSTDIR\$1\uninstall.ps1" 0 fusion_scan
+      StrCpy $Entry "$INSTDIR\$1\uninstall.ps1"
+  fusion_scan_done:
+  FileClose $0
+  StrCmp $Entry "" fusion_entry_missing
 
-  ${If} $VersionDir == ""
+fusion_entry_ready:
+  DetailPrint "卸载入口：$Entry"
+fusion_entry_missing:
+
+  ${If} $Entry == ""
     MessageBox MB_OK|MB_ICONINFORMATION "没有找到已安装的版本目录，只清理安装记录。"
   ${Else}
     StrCpy $DataFlag ""
@@ -221,7 +255,11 @@ Section "Uninstall"
     fusion_keep_data:
 
     DetailPrint "运行卸载流程（停止 Host、注销输入法组件、删除任务与版本目录）…"
-    nsExec::ExecToLog '"${SHELL}" -NoProfile -ExecutionPolicy Bypass -File "$VersionDir\uninstall.ps1" $DataFlag -TranscriptPath "$UninstallLog"'
+    ; Same rule as the install step: an empty working directory, never $PLUGINSDIR,
+    ; because the native System.dll plug-in NSIS unpacks there would be the
+    ; "System.dll" that Add-Type resolves first inside uninstall.ps1.
+    SetOutPath "$PLUGINSDIR\run"
+    nsExec::ExecToLog '"${SHELL}" -NoProfile -ExecutionPolicy Bypass -File "$Entry" $DataFlag -TranscriptPath "$UninstallLog"'
     Pop $0
     ${If} $0 != "0"
       ; Nothing is removed from the registry on a failed uninstall: the entry

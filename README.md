@@ -580,6 +580,11 @@ installer is a 32-bit process, so `$SYSDIR` is redirected to SysWOW64 and would 
 refuses a 32-bit Windows by name rather than failing inside `regsvr32`. After a successful uninstall the uninstaller
 deletes itself from the install root and then removes that root only if it is empty.
 
+Both halves also set the **working directory to an empty directory** before starting PowerShell, never `$PLUGINSDIR`:
+NSIS unpacks its own plug-ins there, including a native `System.dll`, and `Add-Type` in `host-state.ps1` resolves the
+default reference `System.dll` against the working directory first — the owner's first install with `+c2a5ee1` died
+exactly there, with `SOURCE_CODE_ERROR` and "not a valid assembly", before `install.ps1` could write a line.
+
 Build it from a clean commit, after the package:
 
 ```powershell
