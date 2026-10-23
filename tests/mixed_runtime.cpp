@@ -8,7 +8,9 @@
 // syllable still produces the Chinese candidate and commits it, the default auxiliary
 // filter is still Stroke (MoQi is opt-in through the configuration, unchanged default), and
 // a raw string that mixes both produces a candidate carrying both readings which commits as
-// the whole mixed text — on Pinyin and on Shuangpin.
+// the whole mixed text — on Pinyin, on Shuangpin, and on the Ziranma raw the owner reported
+// (`woxdmliphone`), whose fused candidate has to be on the first screen and not merely
+// somewhere in the list.
 //
 // Printed lines are the evidence record. It runs as an isolated process: no TIP is
 // registered, no product installation is used and no user configuration is read or
@@ -108,24 +110,18 @@ void print_candidates(const char *label, const Driver &driver) {
   std::printf("\n");
 }
 
-// Finds `expected` in the engine's own candidate order — on the page it is shown, paging
-// forward if the engine put it behind the classical list — and commits it by selecting it
-// there. The placement policy deliberately keeps some mixed candidates behind the Chinese
-// ones (they stay reachable by paging), so requiring the first page would be asserting a rank
-// the design does not promise.
-std::string commit_candidate(Driver &driver, const std::string &expected, int max_pages) {
-  for (int page = 0; page <= max_pages; ++page) {
-    const auto index = driver.index_of(expected);
-    if (index >= 0) {
-      std::printf("[page %d] found [%s] at %d\n", page, expected.c_str(),
-                  static_cast<int>(index));
-      return driver.committed(driver.select(index));
-    }
-    if (!driver.page.has_next)
-      break;
-    driver.send(BackendStimulus{driver.binding, 0, BackendStimulus::Type::PageNext});
-  }
-  return std::string();
+// Finds `expected` on the candidate screen the engine shows first, and commits it by
+// selecting it there. The two Ziranma cases below are members of the bounded insertion class,
+// whose whole point is that the fused reading takes the front-row slot behind the Chinese
+// head — so "on the first screen" is the promise being checked, not a lucky rank. A candidate
+// that needs paging would be a regression, and the paging tests cover paging.
+std::string commit_first_screen(Driver &driver, const std::string &expected) {
+  const auto index = driver.index_of(expected);
+  if (index < 0)
+    return std::string();
+  std::printf("[first screen] found [%s] at %d\n", expected.c_str(),
+              static_cast<int>(index));
+  return driver.committed(driver.select(index));
 }
 
 // 1. A Latin word is an English candidate of the mixed pipeline and commits as itself.
@@ -174,15 +170,15 @@ void section_default_auxiliary_filter() {
 //    Both cases are the pinned addon's own, from `test/testmixedengine.cpp` section 2
 //    ("woxiangmaiiphone" -> 我想买 iPhone) and `test/testmixedshuangpin.cpp` Part C
 //    (Ziranma "woiphone" -> 我 + iPhone), so the expectation is the upstream one and not
-//    something written to fit this build. The target candidate is looked up by its text
-//    rather than required to rank first: the pool order is the engine's, and a test must not
-//    push it around.
+//    something written to fit this build. The target is located by its text, on the first
+//    screen but not necessarily first: the order inside the screen is the engine's, and a
+//    test must not push it around.
 void section_mixed_full_pinyin() {
   const std::string expected = "\u6211\u60f3\u4e70iPhone"; // 我想买iPhone
   Driver driver;
   driver.type("woxiangmaiiphone");
   print_candidates("woxiangmaiiphone", driver);
-  const auto committed = commit_candidate(driver, expected, 0);
+  const auto committed = commit_first_screen(driver, expected);
   std::printf("[woxiangmaiiphone] committed [%s]\n", committed.c_str());
   require(!committed.empty(),
           "no candidate fused the Chinese reading with the English word for "
@@ -193,9 +189,9 @@ void section_mixed_full_pinyin() {
 
 // 5. The same on the second input method. Ziranma is the engine's default Shuangpin
 //    profile, so "wo" is 我 and the rest of the raw is the English word. An even-length
-//    English tail is also a run of valid two-letter Ziranma codes, so the classical list
-//    keeps a whole-Han reading and the policy puts the fused one behind it, reachable by
-//    paging — which is what the search below walks.
+//    English tail is also a run of valid two-letter Ziranma codes, so the classical decoder
+//    also has a whole-Han reading of the raw; before the placement fix that sent the fused
+//    candidate to page 16, and it now takes the front-row slot behind the Chinese head.
 void section_mixed_shuangpin() {
   const std::string expected = "\u6211iPhone"; // 我iPhone
   FcitxBackendOptions options;
@@ -206,12 +202,35 @@ void section_mixed_shuangpin() {
   Driver driver(std::move(options));
   driver.type("woiphone");
   print_candidates("shuangpin woiphone", driver);
-  const auto committed = commit_candidate(driver, expected, 20);
+  const auto committed = commit_first_screen(driver, expected);
   std::printf("[shuangpin woiphone] committed [%s]\n", committed.c_str());
   require(!committed.empty(),
           "no candidate fused the Ziranma reading with the English word for \"woiphone\"");
   require(committed == expected,
           "the fused Shuangpin candidate did not commit the whole mixed text");
+}
+
+// 6. The owner's case (2026-10-23): Ziranma "woxdmliphone" (preedit wo xd ml ip ho ne) must
+//    offer 我想买iPhone on the first screen and commit it whole. Not a ranking preference: the
+//    candidate was generated all along and landed at index 127, behind the whole classical
+//    list, because the bounded insertion class only accepted a canonical English word at the
+//    FRONT of the raw ("openaimoxing" -> [OpenAI][模型]). Ziranma produces the trailing shape
+//    often — an even-length English tail is also a run of two-letter codes, so "ip ho ne"
+//    force-decodes to 蠢货呢 — and the class is position-independent now.
+void section_mixed_ziranma_trailing() {
+  const std::string expected = "\u6211\u60f3\u4e70iPhone"; // 我想买iPhone
+  FcitxBackendOptions options;
+  options.fixture_input_methods = {"shuangpin"};
+  options.fixture_default_method = "shuangpin";
+  Driver driver(std::move(options));
+  driver.type("woxdmliphone");
+  print_candidates("shuangpin woxdmliphone", driver);
+  const auto committed = commit_first_screen(driver, expected);
+  std::printf("[shuangpin woxdmliphone] committed [%s]\n", committed.c_str());
+  require(!committed.empty(),
+          "the fused Ziranma reading is not on the first screen for \"woxdmliphone\"");
+  require(committed == expected,
+          "the fused Ziranma candidate did not commit the whole mixed text");
 }
 
 } // namespace
@@ -224,6 +243,7 @@ int main() {
     section_default_auxiliary_filter();
     section_mixed_full_pinyin();
     section_mixed_shuangpin();
+    section_mixed_ziranma_trailing();
     std::printf("PASS the Host runs the enhanced Chinese runtime: English candidates, the "
                 "Chinese candidate, the Stroke default, and a mixed Chinese/English "
                 "candidate that commits whole on Pinyin and Shuangpin\n");

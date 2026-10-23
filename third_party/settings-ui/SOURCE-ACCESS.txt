@@ -10,7 +10,7 @@ The settings build uses these exact upstream/fork revisions (also recorded in cm
   pinned configtool fork commit: https://github.com/choicky/fcitx5-configtool/tree/abc2c6644b030d761d3d5e7c27c888af019e63f0
   fcitx5-qt source base: https://github.com/fcitx/fcitx5-qt/tree/0285a5d18367d8f3af80dab7e4819d5555982340
   fcitx5: https://github.com/fcitx/fcitx5/tree/a7f2528773ebfec98a20c49b6eea2333110b1c88
-  fcitx5-chinese-addons: https://github.com/choicky/fcitx5-chinese-addons/tree/a04bcd4673e5e9c3c630d59078eb0454b14d5541
+  fcitx5-chinese-addons: https://github.com/choicky/fcitx5-chinese-addons/tree/2145c4bf1cff8c62112b9c38db4e6032a190b280
     (the same commit the Android build runs; it carries the MoQi auxiliary filter and the mixed
     Chinese/English pipeline. Its MSVC adaptation is cmake/patches/chinese-addons-msvc.patch.
     Two data sources ship with it and are fetched or committed at build time, never at install
