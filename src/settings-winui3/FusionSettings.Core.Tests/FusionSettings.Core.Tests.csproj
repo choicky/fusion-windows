@@ -23,4 +23,15 @@
     <ProjectReference Include="..\FusionSettings.Core\FusionSettings.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      The display table is compiled from the same file the window compiles, so a label and a
+      stored-value map can be checked without starting the UI. The file is presentation data
+      and depends on nothing but the base class library; if it ever gains a WinUI dependency
+      this reference stops compiling, which is the intended signal rather than a copy.
+    -->
+    <Compile Include="..\FusionSettings.App\Services\PresentationMap.cs"
+             Link="Presentation\PresentationMap.cs" />
+  </ItemGroup>
+
 </Project>
