@@ -574,6 +574,12 @@ wizard with the exit code and the transcript path (`%LOCALAPPDATA%\fusion-instal
 the entry in place for a retry. Re-running the EXE is the repair path; it recognises an installed version and either
 re-applies it or upgrades through the existing stop-then-install order.
 
+Both halves run those scripts through the **native 64-bit Windows PowerShell** (`$WINDIR\Sysnative\…`; an NSIS
+installer is a 32-bit process, so `$SYSDIR` is redirected to SysWOW64 and would give the 32-bit shell, hence
+`Program Files (x86)`, the WOW64 registry view and the 32-bit `regsvr32`). The product is x64 only, and the installer
+refuses a 32-bit Windows by name rather than failing inside `regsvr32`. After a successful uninstall the uninstaller
+deletes itself from the install root and then removes that root only if it is empty.
+
 Build it from a clean commit, after the package:
 
 ```powershell

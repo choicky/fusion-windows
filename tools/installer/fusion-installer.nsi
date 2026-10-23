@@ -27,6 +27,7 @@ SetCompressorDictSize 64
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+!include "x64.nsh"
 
 ; ---- inputs -----------------------------------------------------------------
 ; PRODUCT_VERSION  the package's own version identifier (0.0.0-winui3+<sha>)
@@ -53,7 +54,20 @@ SetCompressorDictSize 64
 !define INSTALL_ROOT "$PROGRAMFILES64\Fcitx5 Fusion"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fusion"
 !define LOG_DIR "$LOCALAPPDATA\fusion-installer"
-!define SHELL "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+; The shell that runs install.ps1 and uninstall.ps1 must be the native 64-bit
+; Windows PowerShell, not the 32-bit one beside it. An NSIS installer is a 32-bit
+; process, so its $SYSDIR is redirected to SysWOW64 and "$SYSDIR\WindowsPowerShell"
+; is the 32-bit shell; everything those scripts decide from their own bitness then
+; comes out 32-bit, measured with a read-only probe:
+;   [Environment]::Is64BitProcess      False
+;   process path                       C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+;   [Environment]::GetFolderPath(...)  C:\Program Files (x86)
+; install.ps1 would then install into "Program Files (x86)", host-state.ps1 would
+; read HKLM in the WOW64 view, and the bare regsvr32 that register.ps1 runs would
+; be the 32-bit one, which cannot register a 64-bit TSF DLL. Sysnative is the
+; WOW64 alias for the real system directory, so this is the 64-bit shell; the
+; installer and the uninstaller use this one define, so they cannot disagree.
+!define SHELL "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 
 Name "${PRODUCT_NAME}"
 BrandingText "${PRODUCT_NAME} ${PRODUCT_VERSION}"
@@ -94,6 +108,13 @@ Var VersionDir
 Var DataFlag
 
 Function .onInit
+  ; The product is x64 only (its TIP is a 64-bit DLL), so a 32-bit Windows cannot run
+  ; it and is refused here rather than failing part-way through an install.
+  ${IfNot} ${RunningX64}
+    MessageBox MB_ICONSTOP "${PRODUCT_NAME} 只能在 64 位 Windows 上安装：它的输入法组件是 64 位 DLL。"
+    Abort
+  ${EndIf}
+
   ; A 64-bit product: every registry read and write in this script and in the
   ; package's own scripts must land in the 64-bit view, or the "installed apps"
   ; entry and the TIP registration would be split across two views.
@@ -160,6 +181,10 @@ SectionEnd
 
 ; ---- uninstall --------------------------------------------------------------
 Function un.onInit
+  ${IfNot} ${RunningX64}
+    MessageBox MB_ICONSTOP "${PRODUCT_NAME} 只能在 64 位 Windows 上卸载：它的输入法组件是 64 位 DLL。"
+    Abort
+  ${EndIf}
   SetRegView 64
   StrCpy $UninstallLog "${LOG_DIR}\uninstall-${PRODUCT_VERSION}.log"
 FunctionEnd
@@ -206,7 +231,14 @@ Section "Uninstall"
     ${EndIf}
   ${EndIf}
 
+  ; The entry goes only now, after uninstall.ps1 reported success, so a failure
+  ; above leaves the product retryable. The uninstaller then removes itself — it is
+  ; running from its own copy in %TEMP%, so the file in the install root can be
+  ; deleted — and the root is removed only if that left it empty. Nothing here
+  ; recurses: a version directory a process still holds was left in place by
+  ; uninstall.ps1 and keeps the root, as it should.
   DeleteRegKey HKLM "${UNINST_KEY}"
+  Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
 SectionEnd
