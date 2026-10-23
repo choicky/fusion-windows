@@ -132,14 +132,17 @@ $taskPrefix=Join-Path $WorkRoot ('runtime-'+$taskSuffix)
 $taskBuildRoot=Join-Path $WorkRoot ('native-build\'+$Configuration)
 $taskToolchain=Join-Path $taskVcpkg 'scripts\buildsystems\vcpkg.cmake'
 $taskCommon=@('-G','Ninja',('-DCMAKE_BUILD_TYPE='+$Configuration),('-DCMAKE_TOOLCHAIN_FILE='+$taskToolchain),('-DCMAKE_INSTALL_PREFIX='+$taskPrefix),('-DCMAKE_PREFIX_PATH='+$taskPrefix),('-DFUSION_UPSTREAM_DIR='+$taskSourceRoot))
+Write-Output '[1/5] Fcitx core'
 $taskCoreBuild=Join-Path $taskBuildRoot 'core'
 Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'core'),'-B',$taskCoreBuild)+$taskCommon+@('-DENABLE_SERVER=OFF','-DENABLE_KEYBOARD=OFF','-DENABLE_X11=OFF','-DENABLE_WAYLAND=OFF','-DENABLE_DBUS=OFF','-DENABLE_ENCHANT=OFF','-DENABLE_EMOJI=OFF','-DENABLE_LIBUUID=OFF','-DENABLE_TEST=OFF','-DENABLE_TESTING_ADDONS=OFF','-DENABLE_DL=OFF','-DBUILD_SHARED_FCITX_ADDON=OFF','-DBUILD_SPELL_DICT=OFF','-DENABLE_XDGAUTOSTART=OFF','-DEVENT_LOOP_BACKEND=libuv'))
 Invoke-Native 'cmake' @('--build',$taskCoreBuild,'--parallel','8')
 Invoke-Native 'cmake' @('--install',$taskCoreBuild)
+Write-Output '[2/5] LibIME'
 $taskLibimeBuild=Join-Path $taskBuildRoot 'libime'
 Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'libime'),'-B',$taskLibimeBuild)+$taskCommon+@('-DENABLE_DATA=OFF','-DENABLE_TEST=OFF','-DENABLE_TOOLS=ON'))
 Invoke-Native 'cmake' @('--build',$taskLibimeBuild,'--parallel','8')
 Invoke-Native 'cmake' @('--install',$taskLibimeBuild)
+Write-Output '[3/5] Chinese addon'
 $taskChineseBuild=Join-Path $taskBuildRoot 'chinese'
 # The MoQi reverse-lookup table is hash-pinned by the addon itself
 # (modules/pinyinhelper/moqima-gb18030.cmake) and fetched by its CMake at configure time.
@@ -148,15 +151,25 @@ $taskChineseBuild=Join-Path $taskBuildRoot 'chinese'
 # table is the pinned one. The pin is read from the source rather than repeated here.
 $taskMoqiPin=Join-Path $taskChinese 'modules\pinyinhelper\moqima-gb18030.cmake'
 $taskMoqiPinText=Get-Content -LiteralPath $taskMoqiPin -Raw
+$taskMoqiCommit=[regex]::Match($taskMoqiPinText,'MOQI_TABLE_COMMIT\s+"([^"]+)"').Groups[1].Value
 $taskMoqiUrl=[regex]::Match($taskMoqiPinText,'MOQI_TABLE_URL\s+"([^"]+)"').Groups[1].Value
 $taskMoqiHash=[regex]::Match($taskMoqiPinText,'MOQI_TABLE_SHA256\s+"([^"]+)"').Groups[1].Value
-if(-not $taskMoqiUrl -or -not $taskMoqiHash) {throw "Cannot read the MoQi table pin: $taskMoqiPin"}
+if(-not $taskMoqiCommit -or -not $taskMoqiUrl -or -not $taskMoqiHash) {throw "Cannot read the MoQi table pin: $taskMoqiPin"}
+# The pin file writes the URL with the commit as a CMake variable, and this script does not
+# evaluate CMake — an earlier version passed the text through unchanged, so a cache miss
+# would have requested the literal path ".../${MOQI_TABLE_COMMIT}/moqima_gb18030.txt". The
+# commit is the only variable that URL uses and it is read from the same three lines, so it
+# is substituted here; anything still unresolved is an error rather than a request.
+$taskMoqiUrl=$taskMoqiUrl.Replace('${MOQI_TABLE_COMMIT}',$taskMoqiCommit)
+if($taskMoqiUrl -match '\$\{') {throw "Unresolved CMake variable in the MoQi table URL: $taskMoqiUrl"}
+Write-Output ('MoQi table URL: '+$taskMoqiUrl)
 $taskMoqiTable=Get-PinnedDownload 'moqima_gb18030.txt' $taskMoqiUrl $taskMoqiHash
 $taskMoqiTargetDir=Join-Path $taskChineseBuild 'chinese\modules\pinyinhelper'
 New-Item -ItemType Directory -Force $taskMoqiTargetDir | Out-Null
 Copy-Item -LiteralPath $taskMoqiTable -Destination (Join-Path $taskMoqiTargetDir 'moqima_gb18030.txt') -Force
 Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'chinese'),'-B',$taskChineseBuild)+$taskCommon+@('-DENABLE_TEST=OFF','-DENABLE_GUI=OFF','-DENABLE_BROWSER=OFF','-DENABLE_OPENCC=OFF','-DENABLE_CLOUDPINYIN=OFF','-DENABLE_DATA=OFF','-DENABLE_TOOLS=OFF','-DBUILD_SHARED_FCITX_ADDON=OFF'))
 Invoke-Native 'cmake' @('--build',$taskChineseBuild,'--parallel','8','--target','pinyin','pinyinhelper','punctuation','py-stroke-extract','py-table-extract','chinese/im/pinyin/pinyin-addon.conf','chinese/im/pinyin/pinyin.conf','chinese/im/pinyin/shuangpin.conf','chinese/modules/punctuation/punctuation.conf','chinese/modules/pinyinhelper/pinyinhelper.conf')
+Write-Output '[4/5] Assembling the runtime tree'
 $taskData=Join-Path $taskPrefix 'data\fcitx5'
 foreach($taskDirectory in @($taskData,(Join-Path $taskData 'addon'),(Join-Path $taskData 'inputmethod'),(Join-Path $taskData 'pinyin'),(Join-Path $taskData 'pinyinhelper'),(Join-Path $taskData 'punctuation'),(Join-Path $taskPrefix 'data\libime'),(Join-Path $taskPrefix 'lib\libime'))) {New-Item -ItemType Directory -Force $taskDirectory | Out-Null}
 Copy-Item (Join-Path $taskPrefix 'share\fcitx5\*') $taskData -Recurse -Force
@@ -176,12 +189,16 @@ Copy-Item (Join-Path $taskChinese 'im\pinyin\symbols') (Join-Path $taskData 'pin
 # source (verified against data-licenses/english/manifest.json at configure time) and the
 # table came through the pinned download above, so both ship inside the package.
 Copy-Item (Join-Path $taskChinese 'im\pinyin\english_lexicon.tsv') (Join-Path $taskData 'pinyin') -Force
-Copy-Item (Join-Path $taskMoqiTable) (Join-Path $taskData 'pinyinhelper\moqima_gb18030.txt') -Force
+# `Join-Path` has a mandatory -ChildPath, so `Join-Path $taskMoqiTable` in an earlier version
+# did not build a path at all: it asked for the missing value on the console and the build sat
+# there with no child process and no output. The table is already a full path.
+Copy-Item -LiteralPath $taskMoqiTable -Destination (Join-Path $taskData 'pinyinhelper\moqima_gb18030.txt') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\modules\pinyinhelper\*.mb') (Join-Path $taskData 'pinyinhelper') -Force
 Copy-Item (Join-Path $taskChinese 'modules\punctuation\punc.mb.*') (Join-Path $taskData 'punctuation') -Force
 $taskNativeBin=Join-Path $taskVcpkg ('installed\x64-windows\'+$(if($Configuration -eq 'Debug') {'debug\bin'} else {'bin'}))
 Copy-Item (Join-Path $taskNativeBin '*.dll') (Join-Path $taskPrefix 'bin') -Force
 $env:PATH=(Join-Path $taskPrefix 'bin')+';'+$env:PATH
+Write-Output '[5/5] Dictionaries and the language model'
 $taskResources=Join-Path $WorkRoot 'resources'
 function Get-Resource([string]$Name,[string]$Hash) {
   $taskArchive=Get-PinnedDownload $Name ('https://download.fcitx-im.org/data/'+$Name) $Hash

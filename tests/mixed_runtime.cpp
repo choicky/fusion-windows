@@ -5,8 +5,10 @@
 // lexicon and the mixed Chinese/English pipeline are native parts of the engine the Host
 // already loads. This check measures that on the real pinned engine and the packed data:
 // a Latin word produces an English candidate from the lexicon and commits it, a Chinese
-// syllable still produces the Chinese candidate and commits it, and the default auxiliary
-// filter is still Stroke (MoQi is opt-in through the configuration, unchanged default).
+// syllable still produces the Chinese candidate and commits it, the default auxiliary
+// filter is still Stroke (MoQi is opt-in through the configuration, unchanged default), and
+// a raw string that mixes both produces a candidate carrying both readings which commits as
+// the whole mixed text — on Pinyin and on Shuangpin.
 //
 // Printed lines are the evidence record. It runs as an isolated process: no TIP is
 // registered, no product installation is used and no user configuration is read or
@@ -19,6 +21,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace fusion;
@@ -36,7 +39,8 @@ struct Driver {
   std::uint64_t next = 1;
   CandidatePage page;
 
-  Driver() : backend(make_fcitx_backend({})) {
+  explicit Driver(FcitxBackendOptions options = {})
+      : backend(make_fcitx_backend(std::move(options))) {
     if (!backend->healthy() || !backend->bind(binding))
       throw std::runtime_error("the real backend did not bind");
   }
@@ -104,6 +108,26 @@ void print_candidates(const char *label, const Driver &driver) {
   std::printf("\n");
 }
 
+// Finds `expected` in the engine's own candidate order — on the page it is shown, paging
+// forward if the engine put it behind the classical list — and commits it by selecting it
+// there. The placement policy deliberately keeps some mixed candidates behind the Chinese
+// ones (they stay reachable by paging), so requiring the first page would be asserting a rank
+// the design does not promise.
+std::string commit_candidate(Driver &driver, const std::string &expected, int max_pages) {
+  for (int page = 0; page <= max_pages; ++page) {
+    const auto index = driver.index_of(expected);
+    if (index >= 0) {
+      std::printf("[page %d] found [%s] at %d\n", page, expected.c_str(),
+                  static_cast<int>(index));
+      return driver.committed(driver.select(index));
+    }
+    if (!driver.page.has_next)
+      break;
+    driver.send(BackendStimulus{driver.binding, 0, BackendStimulus::Type::PageNext});
+  }
+  return std::string();
+}
+
 // 1. A Latin word is an English candidate of the mixed pipeline and commits as itself.
 void section_english_candidate() {
   Driver driver;
@@ -141,6 +165,55 @@ void section_default_auxiliary_filter() {
           "the default auxiliary filter is not Stroke");
 }
 
+// 4-5. The mixed pipeline proper: one raw string that is part Chinese syllables and part
+//    English word, one candidate that carries both, and a commit that is that whole mixed
+//    string. Sections 1 and 2 above only prove the two halves separately, which a Chinese
+//    candidate plus an English candidate in the same list would also satisfy; these read the
+//    fused candidate and commit it.
+//
+//    Both cases are the pinned addon's own, from `test/testmixedengine.cpp` section 2
+//    ("woxiangmaiiphone" -> 我想买 iPhone) and `test/testmixedshuangpin.cpp` Part C
+//    (Ziranma "woiphone" -> 我 + iPhone), so the expectation is the upstream one and not
+//    something written to fit this build. The target candidate is looked up by its text
+//    rather than required to rank first: the pool order is the engine's, and a test must not
+//    push it around.
+void section_mixed_full_pinyin() {
+  const std::string expected = "\u6211\u60f3\u4e70iPhone"; // 我想买iPhone
+  Driver driver;
+  driver.type("woxiangmaiiphone");
+  print_candidates("woxiangmaiiphone", driver);
+  const auto committed = commit_candidate(driver, expected, 0);
+  std::printf("[woxiangmaiiphone] committed [%s]\n", committed.c_str());
+  require(!committed.empty(),
+          "no candidate fused the Chinese reading with the English word for "
+          "\"woxiangmaiiphone\"");
+  require(committed == expected,
+          "the fused candidate did not commit the whole mixed text");
+}
+
+// 5. The same on the second input method. Ziranma is the engine's default Shuangpin
+//    profile, so "wo" is 我 and the rest of the raw is the English word. An even-length
+//    English tail is also a run of valid two-letter Ziranma codes, so the classical list
+//    keeps a whole-Han reading and the policy puts the fused one behind it, reachable by
+//    paging — which is what the search below walks.
+void section_mixed_shuangpin() {
+  const std::string expected = "\u6211iPhone"; // 我iPhone
+  FcitxBackendOptions options;
+  // A user whose group holds Shuangpin: applied in memory through the same normalization
+  // the product uses at startup, so nothing is written and the owner's profile is untouched.
+  options.fixture_input_methods = {"shuangpin"};
+  options.fixture_default_method = "shuangpin";
+  Driver driver(std::move(options));
+  driver.type("woiphone");
+  print_candidates("shuangpin woiphone", driver);
+  const auto committed = commit_candidate(driver, expected, 20);
+  std::printf("[shuangpin woiphone] committed [%s]\n", committed.c_str());
+  require(!committed.empty(),
+          "no candidate fused the Ziranma reading with the English word for \"woiphone\"");
+  require(committed == expected,
+          "the fused Shuangpin candidate did not commit the whole mixed text");
+}
+
 } // namespace
 
 int main() {
@@ -149,8 +222,11 @@ int main() {
     section_english_candidate();
     section_chinese_candidate();
     section_default_auxiliary_filter();
+    section_mixed_full_pinyin();
+    section_mixed_shuangpin();
     std::printf("PASS the Host runs the enhanced Chinese runtime: English candidates, the "
-                "Chinese candidate, and the Stroke default\n");
+                "Chinese candidate, the Stroke default, and a mixed Chinese/English "
+                "candidate that commits whole on Pinyin and Shuangpin\n");
     return 0;
   } catch (const std::exception &error) {
     std::printf("FAIL %s\n", error.what());
