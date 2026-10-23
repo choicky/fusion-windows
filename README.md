@@ -88,6 +88,20 @@ an existing build directory cannot be repaired by a later build. `VSLANG=1033` i
 but was measured not to change this installation's `cl.exe` banner, and is not what makes
 dependency tracking work.
 
+**The Chinese engine is the Android product's fork, not a Windows-only copy.**
+`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `a04bcd4` — the commit the
+Android release checks out — beside the official Fcitx core (`a7f2528`) and LibIME (`171edcf`),
+so the MoQi auxiliary filter and the mixed Chinese/English pipeline have one implementation for
+both products. Two resources travel with it and both are obtained at **build** time, never at
+install or run time: the MoQi reverse-lookup table, pinned by URL and SHA-256 in the addon's
+`modules/pinyinhelper/moqima-gb18030.cmake` and fetched through the script's pinned-download rule
+(cache + hash), and the production English lexicon, committed in the addon source and verified
+against `data-licenses/english/manifest.json` while configuring. The script materialises the
+addon source from its commit (`core.autocrlf=false`, `core.eol=lf`) because that hash check sees
+whatever the checkout wrote. Its MSVC adaptation is `cmake/patches/chinese-addons-msvc.patch` —
+two fixes (the pinyin history validity guard and `loadDict` taking a `std::filesystem::path`);
+nothing else is patched, and no MoQi or mixed-input code lives in this repository.
+
 ## Portable model boundary
 
 `Core` represents one Windows-owned logical context. The TSF adapter

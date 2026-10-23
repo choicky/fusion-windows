@@ -184,6 +184,27 @@ if(BUILD_TESTING)
     target_link_libraries(candidate_auto_scroll PRIVATE FusionFcitxHost)
     add_test(NAME candidate_auto_scroll COMMAND candidate_auto_scroll)
 
+    # The enhanced Chinese runtime inside the Host: the packed English lexicon supplies a
+    # candidate for a Latin word and commits it, a Chinese syllable still commits the
+    # Chinese word, and the auxiliary filter still defaults to Stroke (MoQi is a value of
+    # that option, not a second switch).
+    add_executable(mixed_runtime tests/mixed_runtime.cpp)
+    target_include_directories(mixed_runtime PRIVATE src include)
+    target_compile_features(mixed_runtime PRIVATE cxx_std_20)
+    target_compile_options(mixed_runtime PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(mixed_runtime PRIVATE FusionFcitxHost)
+    add_test(NAME mixed_runtime COMMAND mixed_runtime)
+
+    # The MoQi auxiliary filter end to end, on the same engine and the table the package
+    # ships. It writes its own throwaway Fcitx profile (in %TEMP%) and never reads or
+    # writes the owner's configuration.
+    add_executable(moqi_filter tests/moqi_filter.cpp)
+    target_include_directories(moqi_filter PRIVATE src include)
+    target_compile_features(moqi_filter PRIVATE cxx_std_20)
+    target_compile_options(moqi_filter PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(moqi_filter PRIVATE FusionFcitxHost)
+    add_test(NAME moqi_filter COMMAND moqi_filter)
+
     # Settings saves taken while a composition is live, and a write the filesystem refuses,
     # against the real pinned engine and Fcitx's own files. It needs a writable per-user
     # configuration directory, so it runs only when the launcher names a throwaway profile
