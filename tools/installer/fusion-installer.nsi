@@ -70,13 +70,16 @@ VIAddVersionKey "ProductVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey "LegalCopyright" "Fusion Windows"
 
 ; ---- pages ------------------------------------------------------------------
+; The welcome and finish texts are kept to what MUI's text area really shows: a
+; longer string is silently clipped, and the two facts that must not be clipped
+; are that the resident Host does not run elevated and that user data is kept.
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "此向导将把 ${PRODUCT_NAME} ${PRODUCT_VERSION} 安装到本机。$\r$\n$\r$\n$\r$\n安装内容包括：输入法 Host、输入法框架组件（TIP）、托盘程序、Fusion 设置，以及它们运行所需的文件与许可证；安装程序会一并登记随包的对应源代码材料。$\r$\n$\r$\n$\r$\n安装需要管理员权限：持久登记输入法组件会写入 HKLM。常驻的 Host 不会以管理员身份运行——它由登录任务以当前用户、普通权限启动。$\r$\n$\r$\n$\r$\n用户词库、学习数据和配置保存在 %APPDATA%\Fcitx5，安装与升级都不会改动它们。"
+!define MUI_WELCOMEPAGE_TEXT "本向导将把 ${PRODUCT_NAME} ${PRODUCT_VERSION} 安装到本机：输入法 Host、输入法框架组件、托盘程序、Fusion 设置，以及它们运行所需的文件、许可证与对应源代码材料。$\r$\n$\r$\n安装需要管理员权限（登记输入法组件要写入 HKLM）；常驻的 Host 不会以管理员身份运行。$\r$\n$\r$\n用户词库、学习数据和配置保存在 %APPDATA%\Fcitx5，安装与升级都不会改动它们。"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_TITLE "${PRODUCT_NAME} ${PRODUCT_VERSION} 安装完成"
-!define MUI_FINISHPAGE_TEXT "${PRODUCT_NAME} ${PRODUCT_VERSION} 已安装，Host 已在本会话中以普通权限启动。$\r$\n$\r$\n$\r$\n开始菜单的 Fusion 组里有 Fusion Settings（设置）和 Restart FusionHost（重启 Host）；托盘图标提供同样的入口与日志目录。$\r$\n$\r$\n$\r$\n安装已登记并启用本输入法，但不会强行把它设为当前输入法——请在 Windows 语言栏中选择 Fusion。"
+!define MUI_FINISHPAGE_TEXT "${PRODUCT_NAME} ${PRODUCT_VERSION} 已安装，Host 已在本会话中以普通权限启动。$\r$\n$\r$\n开始菜单的 Fusion 组里有 Fusion Settings 和 Restart FusionHost；托盘图标提供同样的入口。$\r$\n$\r$\n安装已启用本输入法，但不会强行把它设为当前输入法——请在 Windows 语言栏中选择 Fusion。"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -162,6 +165,8 @@ Function un.onInit
 FunctionEnd
 
 Section "Uninstall"
+
+  SetRegView 64
 
   ; The version directories are the product's; install.ps1 created the newest one.
   ; uninstall.ps1 removes all of them, so any one of them is a valid entry point —

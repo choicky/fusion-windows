@@ -59,6 +59,7 @@ repository entry point only.
 - `tests/fcitx_candidate_filter.cpp` — Stage 5 display outputFilter contract against the real Fcitx5 core (Windows `FUSION_WITH_FCITX5` build against the pinned runtime, and non-Windows builds with Fcitx5 dev libraries): candidate label/text/comment like classic-ui, the client preedit like the dbus frontend (segments, flags, cursor, engine password masking), and the panel rows like classic-ui.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
 - `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers), `walkthrough-assertions.ps1` (the argument formatter, the elevated launcher and the assertions on the installed TIP) and `verify-wp4.ps1` (the owner walkthrough).
+- `tools/installer/` — the single-EXE install entry point: `fusion-installer.nsi` (NSIS 3; unpacks the package, runs its own `install.ps1`/`uninstall.ps1`, and writes the "installed apps" entry) and `build-installer.ps1` (package zip → EXE, with the payload verified before it is compressed).
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
 ## Local validation
@@ -559,7 +560,33 @@ and both accept `-TranscriptPath <file>` so the whole run — including the part
 log. A version directory that a process still holds is kept and reported, never force-deleted; a `.ps1` call is checked
 with `$?`/`try`/`catch`, never with `$LASTEXITCODE` (a script call does not set it unless the callee calls `exit`).
 
+**The single EXE installer.** `fusion-<version>-setup.exe` is the distribution entry point: the user downloads it and
+runs it, with no unzip and no script. It is an NSIS 3 wrapper around the package above and adds nothing to the install
+lifecycle — it unpacks the package into a temporary directory, runs that package's own `install.ps1` (so the manifest
+check, the orderly stop, the version directory, the TIP registration, the logon tasks, the tray and Start Menu entries
+and the user-data policy are the ones already described here), and then writes the Windows Add/Remove entry
+(`Fusion 输入法`, `DisplayVersion`, `DisplayIcon`, `UninstallString`, `EstimatedSize`, `NoModify`/`NoRepair`). Its
+uninstaller runs the package's `uninstall.ps1` and removes that entry only after it succeeded. The wizard is Chinese,
+needs administrator rights for the same reason `install.ps1` does, and prints the real version on both the welcome and
+the finish page; the Host it starts is the logon task's — interactive, `RunLevel Limited` — so it never inherits the
+installer's administrator token. Both halves report failure as failure: a non-zero exit from `install.ps1` aborts the
+wizard with the exit code and the transcript path (`%LOCALAPPDATA%\fusion-installer\`), and a failed uninstall leaves
+the entry in place for a retry. Re-running the EXE is the repair path; it recognises an installed version and either
+re-applies it or upgrades through the existing stop-then-install order.
+
+Build it from a clean commit, after the package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package\build-package.ps1 -Version <version> -BuildDir <release build> -SettingsAppDir <published client> -VcpkgRoot <pinned vcpkg> -UpstreamRoot <pinned sources> -OutDir <out>
+powershell -ExecutionPolicy Bypass -File tools\installer\build-installer.ps1 -PackageZip <out>\fusion-<version>.zip -OutDir <out> -NsisRoot <nsis 3 directory>
+```
+
+`build-installer.ps1` verifies the payload with the package's own `install.ps1 -VerifyOnly` before compressing it,
+compiles with `/INPUTCHARSET UTF8` (the wizard strings are Chinese), keeps makensis's verbose log beside the EXE, and
+prints the EXE's size and SHA-256. NSIS 3 is not vendored; the EXE is **unsigned**, because signing is still undecided
+(U4).
+
 Known limits at this scope: an old version directory stays locked until the applications that loaded its DLL exit;
 nothing restarts the Host after a crash (WP5/U7 evidence); the task, the pipe, the claim and the stop event are all
-single user × session, so a machine with several interactive users needs the install per user; and no MSI, signing or
-distribution channel is decided here (U4, WP8).
+single user × session, so a machine with several interactive users needs the install per user; and the installer is
+unsigned — signing and the distribution channel are still undecided (U4), and no MSI is produced.

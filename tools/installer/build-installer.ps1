@@ -127,9 +127,10 @@ try {
     "/DOUT_FILE=`"$outFile`"",
     (Join-Path $PSScriptRoot 'fusion-installer.nsi')
   )
-  $nsisLog = & $makensis '/V3' @nsisArgs 2>&1 | Out-String
+  # /V4 is the level that names every packed file, so the log beside the EXE is the
+  # evidence that this build packed this payload, file by file.
+  $nsisLog = & $makensis '/V4' @nsisArgs 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw ("makensis failed with exit code {0}:`n{1}" -f $LASTEXITCODE, $nsisLog) }
-  # Kept as evidence that this build packed this payload, file by file.
   $buildLog = [IO.Path]::ChangeExtension($outFile, '.build.log')
   Set-Content -LiteralPath $buildLog -Value $nsisLog -Encoding UTF8
   # Warnings matter here: a duplicate define or an unhandled page would mean the
