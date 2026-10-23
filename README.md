@@ -88,6 +88,37 @@ an existing build directory cannot be repaired by a later build. `VSLANG=1033` i
 but was measured not to change this installation's `cl.exe` banner, and is not what makes
 dependency tracking work.
 
+**The Chinese engine is the Android product's fork, not a Windows-only copy.**
+`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `a04bcd4` beside the
+official Fcitx core (`a7f2528`) and LibIME (`171edcf`), so the MoQi auxiliary filter and the
+mixed Chinese/English pipeline have one implementation for both products. `a04bcd4` is the tip
+of the fork's `fusion` branch: it contains the commit the Android **release** workflow pins
+(`0d0102b82b35debf4cf22ce192060c07f10e7b35`, 66 commits behind) as well as the tip of the
+branch its test-APK workflow follows (`21eecda`, 64 behind). Windows is therefore on the same
+feature line one generation ahead — not on the same commit, and not on a different engine.
+Two resources travel with it and both are obtained at **build** time, never at install or run
+time: the MoQi reverse-lookup table, pinned by URL and SHA-256 in the addon's
+`modules/pinyinhelper/moqima-gb18030.cmake`, and the production English lexicon, committed in
+the addon source and verified against `data-licenses/english/manifest.json` while configuring.
+That pin file writes its URL with `${MOQI_TABLE_COMMIT}` in it, so the script reads the commit,
+the URL and the hash from those three lines, substitutes the variable, and refuses to request
+a URL that still contains one — an earlier version passed the text through unchanged and would
+have asked for a literal `${MOQI_TABLE_COMMIT}` path on any cache miss. The download is
+cache-then-hash (the cached file is reused only while it matches, otherwise it is fetched again
+and re-checked). The script materialises the addon source from its commit (`core.autocrlf=false`,
+`core.eol=lf`) because that hash check sees whatever the checkout wrote. Its MSVC adaptation is
+`cmake/patches/chinese-addons-msvc.patch` — two fixes (the pinyin history validity guard and
+`loadDict` taking a `std::filesystem::path`); nothing else is patched, and no MoQi or mixed-input
+code lives in this repository.
+
+The script runs to completion by itself: Fcitx core, LibIME, the Chinese addon, the runtime tree,
+the dictionaries and the language model, ending with `Native runtime ready` and exit code 0, with
+the pinned sources, the vcpkg tree and the downloaded resources reused from the previous run. The
+build directory must belong to this checkout (CMake records the source path a cache was generated
+from), and one statement in the assembly step used to call `Join-Path` without its mandatory
+`-ChildPath`, which made PowerShell wait for console input and left the build idle right after the
+Chinese addon was linked; that is fixed.
+
 ## Portable model boundary
 
 `Core` represents one Windows-owned logical context. The TSF adapter

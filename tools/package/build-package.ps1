@@ -172,6 +172,18 @@ try {
       if ($LASTEXITCODE -ne 0) { throw "Could not create corresponding-source archive for $source" }
       $runtime[$pair[1]] = $sourceCommit
     }
+    # The enhanced Chinese addon redistributes two data sources of its own, and this package
+    # carries both of them: the MoQi reverse-lookup table (MIT, fetched at build time by
+    # pinned hash) and the production English lexicon (its own notice and integrity
+    # manifest). Their notices travel with the runtime licence texts.
+    $chineseSource = Join-Path $UpstreamRoot 'fcitx5-chinese-addons'
+    foreach ($notice in @(@('third_party\moqima-tables.LICENSE', 'moqima-tables.LICENSE'),
+                          @('data-licenses\english\NOTICE', 'english-lexicon.NOTICE'),
+                          @('data-licenses\english\manifest.json', 'english-lexicon.manifest.json'))) {
+      $from = Join-Path $chineseSource $notice[0]
+      if (-not (Test-Path -LiteralPath $from)) { throw "Required data notice is missing: $from" }
+      Copy-Item -LiteralPath $from -Destination (Join-Path $stage "licenses\runtime\$($notice[1])") -Force
+    }
     $runtime.sourceAccess = 'source/runtime/*-source.zip (pinned source)'
     $runtime.buildInstructions = 'licenses/settings-ui/SOURCE-ACCESS.txt'
   }

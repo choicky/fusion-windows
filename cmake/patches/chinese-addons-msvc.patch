@@ -1,16 +1,25 @@
 diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
-index 7047c16..f7dff03 100644
+index a3ee282..c73490b 100644
 --- a/im/pinyin/pinyin.cpp
 +++ b/im/pinyin/pinyin.cpp
-@@ -928,6 +928,7 @@ PinyinEngine::PinyinEngine(Instance *instance)
+@@ -1252,10 +1252,14 @@ PinyinEngine::PinyinEngine(Instance *instance)
+     do {
          auto file =
              standardPath.open(StandardPathsType::PkgData, "pinyin/user.history",
                                StandardPathsMode::User);
-+        if (!file.isValid()) { break; }
  
++        if (!file.isValid()) {
++            break;
++        }
++
          try {
              IFDStreamBuf buffer(file.fd());
-@@ -1035,7 +1036,7 @@ void PinyinEngine::loadSymbols(const UnixFD &file) {
+             std::istream in(&buffer);
+             ime_->model()->load(in);
+         } catch (const std::exception &e) {
+@@ -1359,11 +1363,11 @@ void PinyinEngine::loadSymbols(const UnixFD &file) {
+     } catch (const std::exception &e) {
+         PINYIN_ERROR() << "Failed to load symbol dict: " << e.what();
      }
  }
  
@@ -19,17 +28,15 @@ index 7047c16..f7dff03 100644
                              std::list<std::unique_ptr<TaskToken>> &taskTokens) {
      if (fullPath.empty()) {
          return;
-@@ -2616,3 +2617,5 @@ void PinyinEngine::cloudPinyinSelected(InputContext *inputContext,
- }
- 
- } // namespace fcitx
-+
-+
+     }
+     ime_->dict()->addEmptyDict();
 diff --git a/im/pinyin/pinyin.h b/im/pinyin/pinyin.h
-index 3023307..10ab756 100644
+index 07bef4e..7e277b3 100644
 --- a/im/pinyin/pinyin.h
 +++ b/im/pinyin/pinyin.h
-@@ -12,6 +12,7 @@
+@@ -10,10 +10,11 @@
+ #include "customphrase.h"
+ #include "symboldictionary.h"
  #include "workerthread.h"
  #include <cstddef>
  #include <cstdint>
@@ -37,7 +44,11 @@ index 3023307..10ab756 100644
  #include <fcitx-config/configuration.h>
  #include <fcitx-config/enum.h>
  #include <fcitx-config/iniparser.h>
-@@ -497,7 +498,7 @@ private:
+ #include <fcitx-config/option.h>
+ #include <fcitx-config/rawconfig.h>
+@@ -552,11 +553,11 @@ private:
+ #endif
+     void loadBuiltInDict();
      void loadExtraDict();
      void loadCustomPhrase();
      void loadSymbols(const UnixFD &file);
@@ -46,8 +57,5 @@ index 3023307..10ab756 100644
                    std::list<std::unique_ptr<TaskToken>> &taskTokens);
      void saveCustomPhrase();
  
-@@ -534,3 +535,4 @@ private:
- } // namespace fcitx
- 
- #endif // _PINYIN_PINYIN_H_
-+
+     // Architecture A: English system/user lexicon + Chinese arc oracle +
+     // Han resolver + orchestrator. Loaded once at addon init; a missing
