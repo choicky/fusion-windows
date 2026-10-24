@@ -119,6 +119,16 @@ try {
   }
   Copy-Item -LiteralPath $settingsApp -Destination (Join-Path $stage 'bin\settings') -Recurse -Force
 
+  # The client's startup trace is a run artifact, not a product file: when the app is
+  # launched from the publish folder with no usable local-app-data folder, it writes
+  # `fusion-settings\trace.log` beside itself, and the whole folder is copied here. Drop
+  # that one known path so a package built after a local run does not ship a log.
+  $strayTrace = Join-Path $stage 'bin\settings\fusion-settings\trace.log'
+  if (Test-Path -LiteralPath $strayTrace) {
+    Remove-Item -LiteralPath $strayTrace -Force
+    Write-Host 'Excluded the settings client run log from the published folder: fusion-settings\trace.log'
+  }
+
   if ($includeQtSettings) {
     $qtPlugins = Join-Path $binDir 'plugins'
     Copy-Item -LiteralPath $qtPlugins -Destination (Join-Path $stage 'bin\plugins') -Recurse -Force
