@@ -30,20 +30,28 @@ public sealed class DictionariesPage : SettingsPageBase
     private const string SupportedTypes = "拼音词库：.dict（LibIME 二进制）或 .txt（文本词库）";
 
     private SettingsClient _client = null!;
-    private readonly TextBlock _status = new()
-    {
-        TextWrapping = TextWrapping.Wrap,
-        Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
-        Opacity = 0.75,
-    };
 
-    private readonly StackPanel _rows = new() { Spacing = 12 };
+    // Built with the page, not once for the object: Refresh() replaces Content by calling
+    // BuildContent() again, and a control can only have one parent. A status line and a row
+    // container kept across rebuilds were therefore added to a second panel while the old
+    // page still owned them, which is the "element is already the child of another element"
+    // fault the window's 重新加载 button produced on this page.
+    private TextBlock _status = null!;
+    private StackPanel _rows = null!;
     private Button? _importButton;
     private Button? _reloadButton;
     private bool _busy;
 
     protected override UIElement BuildContent()
     {
+        _status = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+            Opacity = 0.75,
+        };
+        _rows = new StackPanel { Spacing = 12 };
+
         // A conversion reads and rewrites a whole dictionary, so the default five seconds of
         // a settings request is not enough for an import. The workspace is bound before the
         // page is built, which is when its endpoint is known.

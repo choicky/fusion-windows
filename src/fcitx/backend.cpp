@@ -34,6 +34,7 @@
 #include <future>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -1034,17 +1035,14 @@ public:
     }
 
     const fs::path directory = dictionary_directory(true);
-    const fs::path target = directory / (name + ".dict");
+    const fs::path target = dictionary_file(directory, name, ".dict");
+    if (target.empty()) {
+      error = "The file name cannot be used as a dictionary name.";
+      return SettingsStatus::Invalid;
+    }
     if (fs::exists(target, ec) && !overwrite) {
       error = "A dictionary named \"" + name + "\" already exists. Confirm whether to replace it.";
       return SettingsStatus::Exists;
-    }
-
-    // A reload changes the candidate source under a live composition, and the engine's own
-    // reload happens on the same pass as the file placement, so a live buffer stops the
-    // whole operation before anything is written.
-    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
-      return busy;
     }
 
     if (!fs::create_directories(directory, ec) && !fs::is_directory(directory, ec)) {
@@ -1052,56 +1050,89 @@ public:
       return SettingsStatus::Error;
     }
 
-    const fs::path temporary = directory / ("." + name + ".import.dict");
+    // Reading and converting is the slow part, so it happens here, off the engine's loop: a
+    // large text dictionary takes seconds, and blocking the loop for that would stall every
+    // context. Nothing in the engine's dictionary set changes until the callback below.
+    auto staging = std::make_shared<StagingFile>();
+    if (!staging->create(directory, error)) {
+      return SettingsStatus::Error;
+    }
+
     {
       libime::PinyinDictionary probe;
+      std::ifstream in(source, std::ios::binary);
+      if (!in) {
+        error = "The selected file could not be opened.";
+        return SettingsStatus::Invalid;
+      }
       try {
-        if (binary) {
-          // Loading it is the only honest validation: a .dict is a trie dump, and a
-          // truncated or foreign file fails here rather than inside the engine later.
-          std::ifstream in(source, std::ios::binary);
-          probe.load(0, in, libime::PinyinDictFormat::Binary);
-          in.close();
-          fs::copy_file(source, temporary, fs::copy_options::overwrite_existing, ec);
-          if (ec) {
-            error = "The dictionary file could not be copied: " + ec.message();
-            return SettingsStatus::Error;
-          }
-        } else {
-          std::ifstream in(source, std::ios::binary);
-          probe.load(0, in, libime::PinyinDictFormat::Text);
-          in.close();
-          std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-          probe.save(0, out, libime::PinyinDictFormat::Binary);
-          out.close();
-          if (!out) {
-            error = "The converted dictionary could not be written.";
-            return SettingsStatus::Error;
-          }
-        }
+        // Loading it is the only honest validation: a .dict is a trie dump, and a truncated
+        // or foreign file fails here rather than inside the engine later.
+        probe.load(0, in, binary ? libime::PinyinDictFormat::Binary
+                                 : libime::PinyinDictFormat::Text);
       } catch (const std::exception &e) {
-        std::error_code ignored;
-        fs::remove(temporary, ignored);
-        // The existing dictionary is untouched: nothing was renamed over it.
+        // The existing dictionary is untouched: nothing has been renamed over it.
         error = binary ? std::string("This file is not a loadable pinyin dictionary: ") + e.what()
                        : std::string("No dictionary entry could be read from this text file: ") +
                              e.what();
         return SettingsStatus::Invalid;
       }
+      if (in.bad()) {
+        error = "The dictionary file could not be read to the end.";
+        return SettingsStatus::Error;
+      }
+      in.close();
+
+      // libime skips a line it cannot parse and reports nothing, so a file with no valid line
+      // parses "successfully" into an empty trie. Writing that over an installed dictionary
+      // would delete the user's words, so the parse result itself is what is checked — not
+      // that the parse returned. A file with some invalid lines and at least one valid entry
+      // is still accepted, which is libime's own tolerance and not a format policy here.
+      const auto *trie = probe.trie(0);
+      if (!trie || trie->empty()) {
+        error = binary ? std::string("This file is not a loadable pinyin dictionary: it holds "
+                                     "no entry.")
+                       : std::string("No dictionary entry could be read from this text file.");
+        return SettingsStatus::Invalid;
+      }
+
+      if (binary) {
+        fs::copy_file(source, staging->path(), fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+          error = "The dictionary file could not be copied: " + ec.message();
+          return SettingsStatus::Error;
+        }
+      } else {
+        std::ofstream out(staging->path(), std::ios::binary | std::ios::trunc);
+        if (!out) {
+          error = "The converted dictionary could not be written.";
+          return SettingsStatus::Error;
+        }
+        probe.save(0, out, libime::PinyinDictFormat::Binary);
+        out.close();
+        if (!out) {
+          error = "The converted dictionary could not be written.";
+          return SettingsStatus::Error;
+        }
+      }
     }
 
-    if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-      std::error_code ignored;
-      fs::remove(temporary, ignored);
-      error = "The dictionary file could not be replaced.";
-      return SettingsStatus::Error;
-    }
-
-    // The file is in place. If the engine cannot reload it now, say exactly that instead of
-    // reporting a success the candidate list does not show.
-    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
-      error = "The dictionary file was written, but the engine could not reload it: " + error;
-      return SettingsStatus::Indeterminate;
+    // One callback for the part that must not be interrupted: the composition check, the
+    // replacement of the installed file, and the engine's reload. A key that starts a
+    // composition cannot land between them, and a live composition stops the replacement
+    // instead of having the candidate source swapped underneath it.
+    const auto applied = dictionaries_apply_on_loop(
+        [staging, target](std::string &taskError) {
+          if (!MoveFileExW(staging->path().c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            taskError = "The dictionary file could not be replaced.";
+            return SettingsStatus::Error;
+          }
+          staging->keep();
+          return SettingsStatus::Ok;
+        },
+        "The dictionary file was written, but the engine could not reload it: ", error);
+    if (applied != SettingsStatus::Ok) {
+      return applied;
     }
 
     const auto status = dictionaries_list(list, error);
@@ -1138,30 +1169,41 @@ public:
       return SettingsStatus::Ok;
     }
 
-    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
-      return busy;
-    }
-
     const fs::path directory = dictionary_directory(true);
-    const fs::path marker = directory / (name + ".dict.disable");
+    const fs::path marker = dictionary_file(directory, name, ".dict.disable");
     std::error_code ec;
     if (!fs::create_directories(directory, ec) && !fs::is_directory(directory, ec)) {
       error = "The dictionary directory could not be created.";
       return SettingsStatus::Error;
     }
-    if (enabled) {
-      fs::remove(marker, ec);
-    } else {
-      std::ofstream out(marker, std::ios::binary | std::ios::trunc);
-      if (!out) {
-        error = "The disable marker could not be written.";
-        return SettingsStatus::Error;
-      }
-    }
-
-    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
-      error = "The dictionary state was written, but the engine could not reload it: " + error;
-      return SettingsStatus::Indeterminate;
+    // The marker and the reload are one step: a composition that starts in between must not
+    // be able to have the dictionary set changed under it.
+    const auto applied = dictionaries_apply_on_loop(
+        [marker, enabled](std::string &taskError) {
+          if (enabled) {
+            // Enabling is the removal of the marker, so a marker that cannot be removed
+            // leaves the dictionary disabled — and saying so is the only honest answer.
+            std::error_code removeError;
+            fs::remove(marker, removeError);
+            if (removeError) {
+              taskError = "The disable marker could not be removed: " + removeError.message();
+              return SettingsStatus::Error;
+            }
+            return SettingsStatus::Ok;
+          }
+          std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+          out.close();
+          if (!out) {
+            taskError = "The disable marker could not be written.";
+            return SettingsStatus::Error;
+          }
+          return SettingsStatus::Ok;
+        },
+        enabled ? "The dictionary was enabled, but the engine could not reload: "
+                : "The dictionary was disabled, but the engine could not reload: ",
+        error);
+    if (applied != SettingsStatus::Ok) {
+      return applied;
     }
     return dictionaries_list(list, error);
   }
@@ -1186,29 +1228,51 @@ public:
       return SettingsStatus::Invalid;
     }
 
-    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
-      return busy;
-    }
-
     const fs::path directory = dictionary_directory(true);
-    std::error_code ec;
-    fs::remove(directory / (name + ".dict"), ec);
-    std::error_code ignored;
-    fs::remove(directory / (name + ".dict.disable"), ignored);
-
-    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
-      error = "The dictionary file was deleted, but the engine could not reload: " + error;
+    const fs::path file = dictionary_file(directory, name, ".dict");
+    const fs::path marker = dictionary_file(directory, name, ".dict.disable");
+    auto markerProblem = std::make_shared<std::string>();
+    const auto applied = dictionaries_apply_on_loop(
+        [file, marker, markerProblem](std::string &taskError) {
+          std::error_code removeError;
+          const bool removed = fs::remove(file, removeError);
+          if (!removed || removeError) {
+            // A file another program holds open is exactly the case that must not report
+            // success. The marker is left alone, so the dictionary is still installed and
+            // still disabled: the state the user had is the state they keep.
+            taskError = removeError
+                            ? "The dictionary file could not be deleted: " + removeError.message()
+                            : "The dictionary file could not be deleted.";
+            return SettingsStatus::Error;
+          }
+          // Only now that the dictionary itself is gone does the marker go. It is a stale
+          // marker for a file that no longer exists if this fails, so the result is reported
+          // rather than hidden — the reload below still has to happen.
+          std::error_code markerError;
+          fs::remove(marker, markerError);
+          if (markerError) {
+            *markerProblem = markerError.message();
+          }
+          return SettingsStatus::Ok;
+        },
+        "The dictionary file was deleted, but the engine could not reload: ", error);
+    if (applied != SettingsStatus::Ok) {
+      return applied;
+    }
+    if (!markerProblem->empty()) {
+      error = "The dictionary file was deleted, but its disable marker could not be removed: " +
+              *markerProblem;
       return SettingsStatus::Indeterminate;
     }
     return dictionaries_list(list, error);
   }
 
   SettingsStatus settings_reload_dictionaries(DictionaryList &list, std::string &error) override {
-    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
-      return busy;
-    }
-    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
-      return reloaded;
+    const auto applied = dictionaries_apply_on_loop(
+        [](std::string &) { return SettingsStatus::Ok; },
+        "The engine could not reload the dictionaries: ", error);
+    if (applied != SettingsStatus::Ok) {
+      return applied;
     }
     return dictionaries_list(list, error);
   }
@@ -1257,6 +1321,17 @@ private:
     return narrow;
   }
 
+  // A dictionary's file name is UTF-8 everywhere in this product — the protocol carries it
+  // that way and so does the list. A `std::filesystem::path` built from a narrow string
+  // reads those bytes in the ANSI code page instead, so a Chinese name would address a file
+  // that does not exist (and create one that cannot be read back). Every path that carries a
+  // user-supplied name therefore goes through the same conversion as the incoming path.
+  static std::filesystem::path dictionary_file(const std::filesystem::path &directory,
+                                               const std::string &name, const char *suffix) {
+    const auto file = path_from_utf8(name + suffix);
+    return file.empty() ? std::filesystem::path() : directory / file;
+  }
+
   static bool is_user_dictionary_path(const std::filesystem::path &file) {
     std::error_code ec;
     const auto userDirectory = dictionary_directory(true);
@@ -1294,10 +1369,11 @@ private:
       const auto &path = item.second;
       std::error_code ec;
       const auto size = std::filesystem::file_size(path, ec);
-      result.entries.push_back(DictionaryEntry{
-          fileName.stem().string(), is_user_dictionary_path(path) ? "user" : "bundled",
-          disabled.find(fileName) == disabled.end(),
-          ec ? 0 : static_cast<std::uint64_t>(size)});
+      result.entries.push_back(
+          DictionaryEntry{wide_to_utf8(fileName.stem().wstring()),
+                          is_user_dictionary_path(path) ? "user" : "bundled",
+                          disabled.find(fileName) == disabled.end(),
+                          ec ? 0 : static_cast<std::uint64_t>(size)});
     }
     // `locate` already collapses one name to the highest-priority root, which is the file
     // the engine loads; the order it returns is a map order, so make it readable.
@@ -1308,39 +1384,103 @@ private:
     return SettingsStatus::Ok;
   }
 
-  // A reload re-runs `loadExtraDict()`, which drops and rebuilds the extra dictionaries
-  // under any composition that is using them, so the official protection applies: refuse
-  // while a buffer is live, and say that nothing was written.
-  SettingsStatus dictionaries_require_idle(std::string &error) {
+  // The file an import converts into before anything installed is touched. Two properties
+  // matter. The engine's own filter is `*.dict`, so a half-written staging file must not
+  // carry that extension: it can then never be loaded as a dictionary. And its name must be
+  // one no dictionary can have, because `.<name>.import.dict` was a legal dictionary name —
+  // an import could overwrite it, and a failed import could delete it. The file is created
+  // exclusively so two imports never share one, and only the file this object created is
+  // ever removed.
+  class StagingFile {
+  public:
+    StagingFile() = default;
+    StagingFile(const StagingFile &) = delete;
+    StagingFile &operator=(const StagingFile &) = delete;
+    ~StagingFile() {
+      if (!kept_ && !path_.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+      }
+    }
+
+    bool create(const std::filesystem::path &directory, std::string &error) {
+      for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        std::wstring name = L"fusion-import-";
+        name += std::to_wstring(GetCurrentProcessId());
+        name += L"-";
+        name += std::to_wstring(GetTickCount64());
+        name += L"-";
+        name += std::to_wstring(attempt);
+        name += L".tmp";
+        const auto candidate = directory / name;
+        const HANDLE handle = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+          CloseHandle(handle);
+          path_ = candidate;
+          return true;
+        }
+        const DWORD failure = GetLastError();
+        if (failure != ERROR_FILE_EXISTS && failure != ERROR_ALREADY_EXISTS) {
+          break;
+        }
+      }
+      error = "A staging file for the converted dictionary could not be created.";
+      return false;
+    }
+
+    const std::filesystem::path &path() const { return path_; }
+    void keep() { kept_ = true; }
+
+  private:
+    std::filesystem::path path_;
+    bool kept_ = false;
+  };
+
+  // The part of a dictionary change that must not be interrupted. Reading and converting
+  // happen before this; what runs here is the composition check, the change on disk and the
+  // engine's reload, in one event-loop callback, so a key that starts a composition cannot
+  // land between them. A live composition stops the whole thing while nothing on disk has
+  // been touched yet, which leaves both the dictionary and its marker as they were.
+  //
+  // `change` is taken by value: the scheduled task outlives this call when the loop does not
+  // reach it in time, so it must not hold a reference to anything on this stack.
+  SettingsStatus dictionaries_apply_on_loop(
+      std::function<SettingsStatus(std::string &)> change, const char *reload_failure,
+      std::string &error) {
     return invoke_settings(
-        [this](std::string &taskError) {
+        [this, change = std::move(change), reload_failure](std::string &taskError) {
           if (has_active_composition_on_loop()) {
             taskError = "A composition is in progress. Reloading dictionaries would change the "
                         "candidate source under it, so nothing was changed; finish or cancel the "
                         "composition and try again.";
             return SettingsStatus::Busy;
           }
+          if (const auto changed = change(taskError); changed != SettingsStatus::Ok) {
+            return changed;
+          }
+          if (const auto reloaded = reload_dictionaries_now(taskError);
+              reloaded != SettingsStatus::Ok) {
+            taskError = std::string(reload_failure) + taskError;
+            return SettingsStatus::Indeterminate;
+          }
           return SettingsStatus::Ok;
         },
-        error, SettingsStatus::Timeout);
+        error, SettingsStatus::Indeterminate);
   }
 
   // The addon instance is the PinyinEngine itself (pinyinenginefactory.cpp returns it from
   // `create`), so its `dictmanager` sub-config is the same call the official Qt dict
-  // manager makes when it closes.
-  SettingsStatus reload_dictionaries_on_loop(std::string &error) {
-    return invoke_settings(
-        [this](std::string &taskError) {
-          auto *addon = instance_->addonManager().addon("pinyin", true);
-          if (!addon) {
-            taskError = "The pinyin addon is not available in this Host.";
-            return SettingsStatus::Error;
-          }
-          fcitx::RawConfig config;
-          addon->setSubConfig("dictmanager", config);
-          return SettingsStatus::Ok;
-        },
-        error, SettingsStatus::Indeterminate);
+  // manager makes when it closes. Called on the event loop, from the callback above.
+  SettingsStatus reload_dictionaries_now(std::string &error) {
+    auto *addon = instance_->addonManager().addon("pinyin", true);
+    if (!addon) {
+      error = "The pinyin addon is not available in this Host.";
+      return SettingsStatus::Error;
+    }
+    fcitx::RawConfig config;
+    addon->setSubConfig("dictmanager", config);
+    return SettingsStatus::Ok;
   }
 
   enum class SettingsTaskPhase : int { Queued, Running, Cancelled, Done };

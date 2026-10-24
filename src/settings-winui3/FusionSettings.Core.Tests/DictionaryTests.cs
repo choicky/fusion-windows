@@ -134,6 +134,47 @@ internal static class DictionaryTests
         Harness.CheckEqual(0, dictionaryFiles.Count, "no file of that dictionary remains");
         Harness.CheckEqual(learnedBefore, FindLearnedDictionary(profileRoot),
             "the user's learned dictionary is exactly as it was");
+
+        // A Chinese name has to survive the whole boundary: the client encodes the path as
+        // UTF-8, the Host turns it into a wide path for the file and back for the list, and
+        // every later request names the dictionary by the name the list reported.
+        Harness.Section("dictionaries: a Chinese name end to end");
+        const string ChineseName = "中文词库";
+        var chineseFile = Path.Combine(profileRoot, ChineseName + ".txt");
+        await File.WriteAllTextAsync(chineseFile, Word + " mo'ke 1000\n", cancellationToken)
+            .ConfigureAwait(false);
+
+        var chineseImport = await client.ImportDictionaryAsync(chineseFile, overwrite: false, cancellationToken)
+            .ConfigureAwait(false);
+        Console.WriteLine($"   chinese import: {chineseImport.Status} {chineseImport.Error}");
+        Harness.Check(chineseImport.IsOk, "a dictionary with a Chinese name is imported");
+        Harness.CheckEqual(ChineseName, chineseImport.Value?.Entry.Name ?? "(none)",
+            "and its name is the file's name, not a decoding of it");
+        Harness.Check(chineseImport.Value?.List.Entries.Any(entry => entry.Name == ChineseName) == true,
+            "and it is listed under that name");
+
+        var chineseDisabled = await client.SetDictionaryEnabledAsync(ChineseName, false, cancellationToken)
+            .ConfigureAwait(false);
+        Harness.Check(chineseDisabled.IsOk, "it can be disabled by that name");
+        Harness.Check(chineseDisabled.Value?.Entries.FirstOrDefault(entry => entry.Name == ChineseName)
+                          is { Enabled: false },
+            "and reads back disabled");
+
+        var chineseEnabled = await client.SetDictionaryEnabledAsync(ChineseName, true, cancellationToken)
+            .ConfigureAwait(false);
+        Harness.Check(chineseEnabled.IsOk, "it can be enabled again");
+        Harness.Check(chineseEnabled.Value?.Entries.FirstOrDefault(entry => entry.Name == ChineseName)
+                          is { Enabled: true },
+            "and reads back enabled");
+
+        var chineseDeleted = await client.DeleteDictionaryAsync(ChineseName, cancellationToken)
+            .ConfigureAwait(false);
+        Console.WriteLine($"   chinese delete: {chineseDeleted.Status} {chineseDeleted.Error}");
+        Harness.Check(chineseDeleted.IsOk, "it can be deleted by that name");
+        Harness.Check(chineseDeleted.Value?.Entries.All(entry => entry.Name != ChineseName) == true,
+            "and is gone from the list");
+        Harness.Check(!Directory.EnumerateFiles(profileRoot, ChineseName + "*.dict*", SearchOption.AllDirectories).Any(),
+            "no file of that dictionary remains");
     }
 
     private static string FindLearnedDictionary(string profileRoot) =>

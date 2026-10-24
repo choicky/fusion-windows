@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -140,19 +141,66 @@ constexpr const char *kBinaryName = "mozike2";
 constexpr const char *kWord = "墨珂";
 constexpr const char *kTyped = "moke";
 
+// The settings protocol carries a path as UTF-8, and that is what the backend converts back
+// to a wide path. `fs::path::string()` would hand over the ANSI code page instead, which is
+// the exact boundary a Chinese file name is lost at, so the checks pass paths this way.
+std::string utf8(const fs::path &path) {
+  const auto wide = path.wstring();
+  const int length = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
+                                         nullptr, 0, nullptr, nullptr);
+  if (length <= 0) {
+    return {};
+  }
+  std::string text(static_cast<std::size_t>(length), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), text.data(), length,
+                      nullptr, nullptr);
+  return text;
+}
+
+std::string read_file(const fs::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+void write_file(const fs::path &path, const std::string &contents) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out << contents;
+}
+
 // Where the Host put a dictionary, found rather than assumed: Fcitx resolves its per-user
 // data root from APPDATA, and the exact level below it is the runtime's business. What this
 // check cares about is that the file is inside the profile, in a `dictionaries` directory.
-fs::path find_placed_dictionary(const fs::path &profileRoot, const std::string &name) {
+fs::path find_placed_dictionary(const fs::path &profileRoot, const std::wstring &name) {
   std::error_code ec;
   for (const auto &entry : fs::recursive_directory_iterator(profileRoot, ec)) {
-    if (!entry.is_regular_file() || entry.path().filename() != name + ".dict")
+    if (!entry.is_regular_file() || entry.path().filename() != name + L".dict")
       continue;
     if (entry.path().parent_path().filename() == "dictionaries")
       return entry.path();
   }
   return {};
 }
+
+fs::path find_placed_dictionary(const fs::path &profileRoot, const std::string &name) {
+  return find_placed_dictionary(profileRoot, fs::path(name).wstring());
+}
+
+// The staging files an import is allowed to leave behind: none.
+std::vector<fs::path> staging_leftovers(const fs::path &dictionaryDirectory) {
+  std::vector<fs::path> found;
+  std::error_code ec;
+  if (!fs::is_directory(dictionaryDirectory, ec)) {
+    return found;
+  }
+  for (const auto &entry : fs::directory_iterator(dictionaryDirectory, ec)) {
+    const auto name = entry.path().filename().wstring();
+    if (name.rfind(L"fusion-import-", 0) == 0) {
+      found.push_back(entry.path());
+    }
+  }
+  return found;
+}
+
 
 // The word cannot come from the base dictionary, so anything the candidate list shows later
 // is the file a section wrote.
@@ -179,7 +227,7 @@ void section_refused_while_composing(const fs::path &profileRoot) {
   DictionaryEntry imported;
   DictionaryList list;
   std::string error;
-  const auto status = driver.backend->settings_import_dictionary(textFile.string(), false, imported,
+  const auto status = driver.backend->settings_import_dictionary(utf8(textFile), false, imported,
                                                                  list, error);
   std::printf("[while composing] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
   require(status == SettingsStatus::Busy, "a dictionary change was accepted during a composition");
@@ -200,7 +248,7 @@ void section_import_text(DictionaryList &list, const fs::path &profileRoot) {
   SettingsStatus status = SettingsStatus::Error;
   idle_call(driver, [&] {
     status =
-        driver.backend->settings_import_dictionary(textFile.string(), false, imported, list, error);
+        driver.backend->settings_import_dictionary(utf8(textFile), false, imported, list, error);
   });
   std::printf("[import] status=%d error=[%s] list=%s\n", static_cast<int>(status), error.c_str(),
               describe(list).c_str());
@@ -231,14 +279,14 @@ void section_conflict_and_overwrite(DictionaryList &list, const fs::path &profil
 
   idle_call(driver, [&] {
     status =
-        driver.backend->settings_import_dictionary(textFile.string(), false, imported, list, error);
+        driver.backend->settings_import_dictionary(utf8(textFile), false, imported, list, error);
   });
   std::printf("[import again] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
   require(status == SettingsStatus::Exists, "a second import of the same name was not refused");
   require(!error.empty(), "the refusal carries no explanation");
 
   idle_call(driver, [&] {
-    status = driver.backend->settings_import_dictionary(textFile.string(), true, imported, list,
+    status = driver.backend->settings_import_dictionary(utf8(textFile), true, imported, list,
                                                         error);
   });
   std::printf("[import overwrite] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
@@ -259,7 +307,7 @@ void section_invalid_file(DictionaryList &list, const fs::path &profileRoot) {
   SettingsStatus status = SettingsStatus::Ok;
   idle_call(driver, [&] {
     status =
-        driver.backend->settings_import_dictionary(broken.string(), false, imported, list, error);
+        driver.backend->settings_import_dictionary(utf8(broken), false, imported, list, error);
   });
   std::printf("[broken] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
   require(status == SettingsStatus::Invalid, "a corrupt .dict was accepted");
@@ -331,7 +379,7 @@ void section_binary_import(DictionaryList &list, const fs::path &profileRoot) {
   std::string error;
   SettingsStatus status = SettingsStatus::Error;
   idle_call(driver, [&] {
-    status = driver.backend->settings_import_dictionary(copy.string(), false, imported, list, error);
+    status = driver.backend->settings_import_dictionary(utf8(copy), false, imported, list, error);
   });
   std::printf("[import .dict] status=%d error=[%s] list=%s\n", static_cast<int>(status),
               error.c_str(), describe(list).c_str());
@@ -378,6 +426,263 @@ void section_reload(DictionaryList &list) {
   require(status == SettingsStatus::Ok, "the explicit reload failed");
 }
 
+// The file an import converts into is not a name a dictionary can have. `.<name>.import.dict`
+// was both a legal dictionary name and a `.dict` file the engine loads, so importing
+// `collide.txt` could overwrite — and a failed import could delete — an installed dictionary
+// called `.collide.import`.
+void section_staging_does_not_collide(DictionaryList &list, const fs::path &profileRoot) {
+  Driver driver(nullptr);
+  const fs::path source = profileRoot / "staging-source.txt";
+  write_file(source, std::string(kWord) + " mo'ke 1000\n");
+  DictionaryEntry imported;
+  std::string error;
+  SettingsStatus status = SettingsStatus::Error;
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(source), false, imported, list, error);
+  });
+  require(status == SettingsStatus::Ok, "the staging source dictionary could not be imported");
+
+  const fs::path placed = find_placed_dictionary(profileRoot, "staging-source");
+  require(!placed.empty(), "the imported dictionary is not in the user root");
+  const fs::path squatter = placed.parent_path() / L".collide.import.dict";
+  std::error_code ec;
+  fs::copy_file(placed, squatter, fs::copy_options::overwrite_existing, ec);
+  require(!ec, "the squatting dictionary could not be written");
+  const auto before = read_file(squatter);
+
+  idle_call(driver, [&] {
+    std::string reloadError;
+    require(driver.backend->settings_reload_dictionaries(list, reloadError) == SettingsStatus::Ok,
+            "the squatting dictionary could not be loaded");
+  });
+  require(find_entry(list, ".collide.import") != nullptr,
+          "the squatting dictionary is not listed, so this check would prove nothing");
+
+  const fs::path collide = profileRoot / "collide.txt";
+  write_file(collide, std::string(kWord) + " mo'ke 1000\n");
+  idle_call(driver, [&] {
+    status =
+        driver.backend->settings_import_dictionary(utf8(collide), false, imported, list, error);
+  });
+  std::printf("[staging] status=%d error=[%s] list=%s\n", static_cast<int>(status), error.c_str(),
+              describe(list).c_str());
+  require(status == SettingsStatus::Ok,
+          "an import next to a dictionary named like the staging file failed");
+  require(fs::exists(squatter), "the import deleted a dictionary that had the staging file's name");
+  require(read_file(squatter) == before, "the import overwrote that dictionary");
+  require(find_entry(list, ".collide.import") != nullptr, "that dictionary left the list");
+  require(staging_leftovers(placed.parent_path()).empty(), "the import left a staging file behind");
+}
+
+// A successful parse is not a dictionary. libime skips every line it cannot read and says
+// nothing, so plain text, an empty file or a file of invalid lines parses "successfully" into
+// an empty trie — which used to be written over the installed dictionary.
+void section_invalid_text_does_not_replace(DictionaryList &list, const fs::path &profileRoot) {
+  Driver driver(nullptr);
+  const fs::path keep = profileRoot / "keepme.txt";
+  write_file(keep, std::string(kWord) + " mo'ke 1000\n");
+  DictionaryEntry imported;
+  std::string error;
+  SettingsStatus status = SettingsStatus::Error;
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(keep), false, imported, list, error);
+  });
+  require(status == SettingsStatus::Ok, "the dictionary this check protects could not be imported");
+  const fs::path placed = find_placed_dictionary(profileRoot, "keepme");
+  require(!placed.empty(), "the protected dictionary is not in the user root");
+  const auto before = read_file(placed);
+
+  write_file(keep, "this file is not a dictionary at all, it is a sentence\n");
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(keep), true, imported, list, error);
+  });
+  std::printf("[plain text] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status == SettingsStatus::Invalid, "a text file with no dictionary entry was accepted");
+  require(read_file(placed) == before, "the refused import replaced the installed dictionary");
+
+  write_file(keep, "");
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(keep), true, imported, list, error);
+  });
+  std::printf("[empty text] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status == SettingsStatus::Invalid, "an empty text file was accepted as a dictionary");
+  require(read_file(placed) == before, "the empty file replaced the installed dictionary");
+
+  driver.type(kTyped);
+  require(driver.has(kWord), "the installed dictionary stopped supplying its word");
+
+  // An invalid line beside a valid one is still accepted: libime's own tolerance is not
+  // turned into a stricter format policy here.
+  write_file(keep, "justonetoken\n" + std::string(kWord) + " mo'ke 1000\n");
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(keep), true, imported, list, error);
+  });
+  std::printf("[partial] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status == SettingsStatus::Ok,
+          "a file with one invalid line and one valid entry was refused");
+}
+
+// A Chinese file name is UTF-8 on the wire and a wide path on disk, and both ends of that
+// conversion are the product's: the name it reports and the file it writes.
+void section_chinese_name(DictionaryList &list, const fs::path &profileRoot) {
+  Driver driver(nullptr);
+  const std::wstring wideName = L"中文词库";
+  const std::string expected = utf8(fs::path(wideName));
+  const fs::path file = profileRoot / (wideName + L".txt");
+  write_file(file, std::string(kWord) + " mo'ke 1000\n");
+
+  DictionaryEntry imported;
+  std::string error;
+  SettingsStatus status = SettingsStatus::Error;
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(file), false, imported, list, error);
+  });
+  std::printf("[chinese] status=%d name=[%s] expected=[%s] error=[%s]\n", static_cast<int>(status),
+              imported.name.c_str(), expected.c_str(), error.c_str());
+  require(status == SettingsStatus::Ok, "importing a dictionary with a Chinese name failed");
+  require(imported.name == expected, "the imported dictionary's name is not the file's name");
+  require(find_entry(list, expected) != nullptr, "the Chinese-named dictionary is not listed");
+  const fs::path placed = find_placed_dictionary(profileRoot, wideName);
+  require(!placed.empty(), "the Chinese-named dictionary is not on disk under its own name");
+
+  driver.type(kTyped);
+  require(driver.has(kWord), "the engine did not load the Chinese-named dictionary");
+
+  idle_call(driver, [&] {
+    status = driver.backend->settings_set_dictionary_enabled(expected, false, list, error);
+  });
+  require(status == SettingsStatus::Ok, "disabling a Chinese-named dictionary failed");
+  const auto *entry = find_entry(list, expected);
+  require(entry != nullptr && !entry->enabled, "it does not read back disabled");
+  const fs::path marker = placed.parent_path() / (wideName + L".dict.disable");
+  require(fs::exists(marker), "the disable marker was not written under the Chinese name");
+
+  idle_call(driver, [&] {
+    status = driver.backend->settings_set_dictionary_enabled(expected, true, list, error);
+  });
+  require(status == SettingsStatus::Ok, "enabling a Chinese-named dictionary failed");
+  entry = find_entry(list, expected);
+  require(entry != nullptr && entry->enabled, "it does not read back enabled");
+
+  idle_call(driver, [&] {
+    status = driver.backend->settings_delete_dictionary(expected, list, error);
+  });
+  std::printf("[chinese delete] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status == SettingsStatus::Ok, "deleting a Chinese-named dictionary failed");
+  require(find_entry(list, expected) == nullptr, "it is still listed after being deleted");
+  require(find_placed_dictionary(profileRoot, wideName).empty(), "its file is still on disk");
+}
+
+// The conversion finishes before the final step, so a composition that is live when the
+// import is applied must stop the replacement rather than have the candidate source swapped
+// underneath it. The installed file has to be exactly what it was.
+void section_busy_after_conversion(DictionaryList &list, const fs::path &profileRoot) {
+  Driver driver(nullptr);
+  const fs::path file = profileRoot / "busy.txt";
+  write_file(file, std::string(kWord) + " mo'ke 1000\n");
+  DictionaryEntry imported;
+  std::string error;
+  SettingsStatus status = SettingsStatus::Error;
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(file), false, imported, list, error);
+  });
+  require(status == SettingsStatus::Ok, "the dictionary this check protects could not be imported");
+  const fs::path placed = find_placed_dictionary(profileRoot, "busy");
+  require(!placed.empty(), "it is not in the user root");
+  const auto before = read_file(placed);
+
+  // A different word under the same name: this is what the engine would serve if the
+  // replacement had gone through.
+  write_file(file, "墨客 mo'ke 1000\n");
+
+  driver.type(kTyped);
+  const auto refused =
+      driver.backend->settings_import_dictionary(utf8(file), true, imported, list, error);
+  std::printf("[busy after conversion] status=%d error=[%s]\n", static_cast<int>(refused),
+              error.c_str());
+  require(refused == SettingsStatus::Busy, "an import was applied under a live composition");
+  require(read_file(placed) == before, "the refused import replaced the installed dictionary");
+  require(staging_leftovers(placed.parent_path()).empty(),
+          "the refused import left a staging file behind");
+
+  // What the user still has is what the engine serves.
+  driver.backend->unbind(driver.binding);
+  driver.page = CandidatePage{};
+  require(driver.backend->bind(driver.binding), "the test context could not be re-bound");
+  driver.type(kTyped);
+  require(driver.has(kWord), "the refused import changed what the engine serves");
+}
+
+// A file operation that fails must say so. A delete that cannot remove the dictionary has to
+// leave the dictionary and its marker alone, and enabling — which is the removal of the
+// marker — has to fail when the marker cannot be removed.
+void section_file_failures(DictionaryList &list, const fs::path &profileRoot) {
+  Driver driver(nullptr);
+  const fs::path file = profileRoot / "locked.txt";
+  write_file(file, std::string(kWord) + " mo'ke 1000\n");
+  DictionaryEntry imported;
+  std::string error;
+  SettingsStatus status = SettingsStatus::Error;
+  idle_call(driver, [&] {
+    status = driver.backend->settings_import_dictionary(utf8(file), false, imported, list, error);
+  });
+  require(status == SettingsStatus::Ok, "the dictionary this check locks could not be imported");
+  const fs::path placed = find_placed_dictionary(profileRoot, "locked");
+  require(!placed.empty(), "it is not in the user root");
+  const fs::path marker = placed.parent_path() / L"locked.dict.disable";
+
+  idle_call(driver, [&] {
+    status = driver.backend->settings_set_dictionary_enabled("locked", false, list, error);
+  });
+  require(status == SettingsStatus::Ok, "disabling it failed");
+  require(fs::exists(marker), "the disable marker is not there");
+
+  // Held open without delete sharing, so Windows refuses the delete.
+  const HANDLE hold = CreateFileW(placed.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  require(hold != INVALID_HANDLE_VALUE, "the dictionary file could not be held open");
+  idle_call(driver, [&] {
+    status = driver.backend->settings_delete_dictionary("locked", list, error);
+  });
+  std::printf("[delete locked] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status != SettingsStatus::Ok,
+          "deleting a file that could not be deleted reported success");
+  CloseHandle(hold);
+
+  DictionaryList after;
+  std::string listError;
+  require(driver.backend->settings_list_dictionaries(after, listError) == SettingsStatus::Ok,
+          "the list could not be read after the failed delete");
+  const auto *entry = find_entry(after, "locked");
+  require(entry != nullptr, "the failed delete removed the dictionary from the list");
+  require(!entry->enabled, "the failed delete changed the dictionary's enabled state");
+  require(fs::exists(marker), "the failed delete removed the disable marker");
+
+  const HANDLE markerHold = CreateFileW(marker.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  require(markerHold != INVALID_HANDLE_VALUE, "the disable marker could not be held open");
+  idle_call(driver, [&] {
+    status = driver.backend->settings_set_dictionary_enabled("locked", true, list, error);
+  });
+  std::printf("[enable locked] status=%d error=[%s]\n", static_cast<int>(status), error.c_str());
+  require(status != SettingsStatus::Ok,
+          "enabling with a marker that cannot be removed reported success");
+  CloseHandle(markerHold);
+
+  require(driver.backend->settings_list_dictionaries(after, listError) == SettingsStatus::Ok,
+          "the list could not be read after the failed enable");
+  entry = find_entry(after, "locked");
+  require(entry != nullptr && !entry->enabled,
+          "the failed enable reported the dictionary as enabled");
+
+  // With nothing held the same delete succeeds, so the refusals above turned on the lock.
+  idle_call(driver, [&] {
+    status = driver.backend->settings_delete_dictionary("locked", list, error);
+  });
+  require(status == SettingsStatus::Ok, "the same delete failed with the file released");
+  require(find_entry(list, "locked") == nullptr, "the dictionary is still listed");
+}
+
 } // namespace
 
 int main() {
@@ -395,6 +700,11 @@ int main() {
     section_binary_import(list, profileRoot);
     section_delete(list);
     section_reload(list);
+    section_staging_does_not_collide(list, profileRoot);
+    section_invalid_text_does_not_replace(list, profileRoot);
+    section_chinese_name(list, profileRoot);
+    section_busy_after_conversion(list, profileRoot);
+    section_file_failures(list, profileRoot);
 
     std::printf("dictionary manager: PASS\n");
     return 0;
