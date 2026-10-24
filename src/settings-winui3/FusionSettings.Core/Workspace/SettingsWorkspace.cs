@@ -1000,6 +1000,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         SettingsStatus.VersionMismatch => string.IsNullOrEmpty(error)
             ? "Host 的协议版本与设置程序不匹配。"
             : error,
+        SettingsStatus.Exists => string.IsNullOrEmpty(error) ? "同名词库已存在。" : error,
         SettingsStatus.Unreachable => string.IsNullOrEmpty(error)
             ? "无法连接 FusionHost，请确认它正在运行。"
             : $"无法连接 FusionHost：{error}",

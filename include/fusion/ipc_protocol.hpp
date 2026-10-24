@@ -125,10 +125,29 @@ enum class MessageType : std::uint8_t {
   SettingsGetImListResponse = 0x16,
   SettingsSetImListRequest = 0x17,
   SettingsSetImListResponse = 0x18,
+  // Pinyin dictionary management (settings_api_version 3). The list reads the two data
+  // roots the engine itself searches; import converts a file through libime and places it
+  // in the per-user root; enable/disable writes the engine's own `<stem>.disable` marker;
+  // delete removes a user dictionary and its marker; reload calls the addon's official
+  // `dictmanager` sub-config, which is what re-runs `loadExtraDict()`.
+  // Additive on v4: a settings client that never sends these is unaffected.
+  SettingsListDictionariesRequest = 0x19,
+  SettingsListDictionariesResponse = 0x1A,
+  SettingsImportDictionaryRequest = 0x1B,
+  SettingsImportDictionaryResponse = 0x1C,
+  SettingsSetDictionaryEnabledRequest = 0x1D,
+  SettingsSetDictionaryEnabledResponse = 0x1E,
+  SettingsDeleteDictionaryRequest = 0x1F,
+  SettingsDeleteDictionaryResponse = 0x20,
+  SettingsReloadDictionariesRequest = 0x21,
+  SettingsReloadDictionariesResponse = 0x22,
 };
 
+// The transport admits frames up to the last message type it defines. Adding a type
+// without raising this bound makes the frame unreadable ("invalid data") rather than
+// unknown, which is why the two move together.
 inline constexpr std::uint8_t max_message_type =
-    static_cast<std::uint8_t>(MessageType::SettingsSetImListResponse);
+    static_cast<std::uint8_t>(MessageType::SettingsReloadDictionariesResponse);
 
 struct WireFrame {
   MessageType type{};

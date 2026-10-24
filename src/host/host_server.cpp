@@ -468,6 +468,41 @@ void HostServer::Connection::run() {
         pipe->disconnect_client();
       }
       break;
+    case MessageType::SettingsListDictionariesRequest:
+      if (settings_capable) {
+        handle_settings_list_dictionaries(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsImportDictionaryRequest:
+      if (settings_capable) {
+        handle_settings_import_dictionary(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsSetDictionaryEnabledRequest:
+      if (settings_capable) {
+        handle_settings_set_dictionary_enabled(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsDeleteDictionaryRequest:
+      if (settings_capable) {
+        handle_settings_delete_dictionary(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
+    case MessageType::SettingsReloadDictionariesRequest:
+      if (settings_capable) {
+        handle_settings_reload_dictionaries(frame->payload);
+      } else {
+        pipe->disconnect_client();
+      }
+      break;
     default: {
       const unsigned type = static_cast<unsigned>(static_cast<std::uint8_t>(frame->type));
       std::fprintf(stderr, "[FusionHost] unknown message type 0x%02x, disconnecting\n", type);
@@ -707,6 +742,129 @@ void HostServer::Connection::handle_settings_set_im_list(
         "before retrying.");
   }
   send_response(MessageType::SettingsSetImListResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_list_dictionaries(
+    const std::vector<std::uint8_t> &payload) {
+  if (!payload.empty()) {
+    pipe->disconnect_client();
+    return;
+  }
+  DictionaryList list;
+  std::string error;
+  const auto status = backend.settings_list_dictionaries(list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_dictionary_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Error, "The dictionary list exceeds the supported response bound.");
+  }
+  send_response(MessageType::SettingsListDictionariesResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_import_dictionary(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  std::string path;
+  bool overwrite = false;
+  if (!deserialize_settings_import_dictionary_request(payload.data(), payload.size(), path,
+                                                      overwrite)) {
+    pipe->disconnect_client();
+    return;
+  }
+  DictionaryEntry imported;
+  DictionaryList list;
+  std::string error;
+  const auto status = backend.settings_import_dictionary(path, overwrite, imported, list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok) {
+    settings_detail::write_dictionary_entry(response_payload, imported);
+    if (!settings_detail::write_dictionary_list(response_payload, list)) {
+      response_payload = serialize_settings_status(
+          SettingsStatus::Indeterminate,
+          "The dictionary was imported, but the Host could not return the resulting list. "
+          "Reload before retrying.");
+    }
+  }
+  send_response(MessageType::SettingsImportDictionaryResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_set_dictionary_enabled(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  std::string name;
+  bool enabled = false;
+  if (!deserialize_settings_set_dictionary_enabled_request(payload.data(), payload.size(), name,
+                                                           enabled)) {
+    pipe->disconnect_client();
+    return;
+  }
+  DictionaryList list;
+  std::string error;
+  const auto status = backend.settings_set_dictionary_enabled(name, enabled, list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_dictionary_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Indeterminate,
+        "The dictionary state was written, but the Host could not return the resulting list. "
+        "Reload before retrying.");
+  }
+  send_response(MessageType::SettingsSetDictionaryEnabledResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_delete_dictionary(
+    const std::vector<std::uint8_t> &payload) {
+  if (payload.size() > max_settings_payload) {
+    pipe->disconnect_client();
+    return;
+  }
+  std::string name;
+  if (!deserialize_settings_dictionary_name_request(payload.data(), payload.size(), name)) {
+    pipe->disconnect_client();
+    return;
+  }
+  DictionaryList list;
+  std::string error;
+  const auto status = backend.settings_delete_dictionary(name, list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_dictionary_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Indeterminate,
+        "The dictionary was deleted, but the Host could not return the resulting list. Reload "
+        "before retrying.");
+  }
+  send_response(MessageType::SettingsDeleteDictionaryResponse, response_payload);
+  close_after_settings_request = true;
+}
+
+void HostServer::Connection::handle_settings_reload_dictionaries(
+    const std::vector<std::uint8_t> &payload) {
+  if (!payload.empty()) {
+    pipe->disconnect_client();
+    return;
+  }
+  DictionaryList list;
+  std::string error;
+  const auto status = backend.settings_reload_dictionaries(list, error);
+  std::vector<std::uint8_t> response_payload = serialize_settings_status(status, error);
+  if (status == SettingsStatus::Ok &&
+      !settings_detail::write_dictionary_list(response_payload, list)) {
+    response_payload = serialize_settings_status(
+        SettingsStatus::Error, "The dictionary list exceeds the supported response bound.");
+  }
+  send_response(MessageType::SettingsReloadDictionariesResponse, response_payload);
   close_after_settings_request = true;
 }
 

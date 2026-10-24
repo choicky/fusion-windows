@@ -102,8 +102,13 @@ dotnet publish src/settings-winui3/FusionSettings.App/FusionSettings.App.csproj 
 with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copies
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
-Exit code 0 means every check passed: **821 checks** as of this revision — **575 without a Host** (`--no-integration`), and
-**246 more against one** (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
+Exit code 0 means every check passed, and the count depends on the runtime the Host is built
+from. Against the enhanced runtime these documents are written against it is **846 checks**; against
+the pinned `runtime-wp3-20261018` this workspace builds, which has no 辅助筛选 (`AuxiliaryFilter`),
+the mixed-option section stops at that assertion and the run prints **814**, with that one check
+failing — the option is not in the engine there, which is not a client defect. **575 of the 846**
+(**585 of the 814**) need no Host (`--no-integration`), and **271 more run against one**
+ (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
 a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
 list, and for the cases of a save that meets a busy Host (busy twice then stored with no second click, a saved page not
@@ -117,7 +122,11 @@ name it does not contain reported as missing, and a search that narrows. It also
 Chinese presentation of the options this engine added: the labels, the group each row lands in,
 one distinct label per stored value, and — the part that is easy to get wrong — that a mapped
 enumeration is keyed by the string the Host stores rather than the C++ identifier, compared
-against the schema a real Host publishes. A third
+against the schema a real Host publishes. The same half covers dictionary management: the
+list, an import, the name conflict and its confirmed overwrite, a corrupt file that leaves the
+imported dictionary alone, enable/disable, reload and delete — each read back from the Host,
+with the learned dictionary compared before and after, and the whole chain again for a Chinese
+name, which is the case that travels as UTF-8 and has to come back unchanged. A third
 run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **3 checks**:
 the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
 

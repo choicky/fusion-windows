@@ -46,7 +46,9 @@ public sealed class AboutPage : SettingsPageBase
         {
             Paragraph("带 Ctrl/Alt/Win 的组合键、纯修饰键以及小键盘回车在此输入路径上不会被送达引擎。这些绑定可以保存，但不会触发；" +
                       "这是当前 TSF 路径的限制，不是设置界面可以改变的。"),
-            Paragraph("简繁转换、词典管理、自定义短语、标点映射与快捷短语编辑器是 Fcitx 上游的独立工具，本安装包没有提供。"),
+            Paragraph("词库管理在本窗口的「词库管理」页提供；简繁转换、自定义短语、标点映射与快捷短语编辑器是 Fcitx " +
+                      "上游的独立工具，本安装包没有提供。"),
+            Paragraph("搜狗 .scel 词库暂不支持导入：它需要 addon 的 scel2org5 转换工具，当前 Windows 运行时没有构建该工具。"),
             Paragraph("云拼音组件未包含在本安装包中，因此没有对应选项。"),
             Paragraph("设置窗口只读写配置，不会自动重启 Host，也不会修改输入法的注册状态。"),
         };

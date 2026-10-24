@@ -60,6 +60,9 @@ internal static class Program
         // And the stored values behind 辅助筛选 and 混输空格, on the same profile.
         await MixedOptionSectionAsync().ConfigureAwait(false);
 
+        // Dictionary management: list, import, conflict, corrupt file, enable, delete.
+        await DictionarySectionAsync().ConfigureAwait(false);
+
         // And what the save bar says when one page is stored and another is refused.
         await PartialSaveSectionAsync().ConfigureAwait(false);
 
@@ -130,6 +133,24 @@ internal static class Program
 
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
         await MixedOptionTests.RunAgainstHostAsync(endpoint, cancellation.Token).ConfigureAwait(false);
+    }
+
+    private static async Task DictionarySectionAsync()
+    {
+        var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            Harness.Section("dictionaries: SKIPPED (FUSION_SETTINGS_GLOBAL_PROFILE is not set)");
+            return;
+        }
+
+        if (!TryIsolatedEndpoint(out var endpoint))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await DictionaryTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
     }
 
     private static async Task PartialSaveSectionAsync()

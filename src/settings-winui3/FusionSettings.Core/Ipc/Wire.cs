@@ -24,6 +24,16 @@ public enum MessageType : byte
     SettingsGetImListResponse = 0x16,
     SettingsSetImListRequest = 0x17,
     SettingsSetImListResponse = 0x18,
+    SettingsListDictionariesRequest = 0x19,
+    SettingsListDictionariesResponse = 0x1A,
+    SettingsImportDictionaryRequest = 0x1B,
+    SettingsImportDictionaryResponse = 0x1C,
+    SettingsSetDictionaryEnabledRequest = 0x1D,
+    SettingsSetDictionaryEnabledResponse = 0x1E,
+    SettingsDeleteDictionaryRequest = 0x1F,
+    SettingsDeleteDictionaryResponse = 0x20,
+    SettingsReloadDictionariesRequest = 0x21,
+    SettingsReloadDictionariesResponse = 0x22,
 }
 
 /// <summary>
@@ -36,7 +46,10 @@ public static class WireLimits
     // mismatch with a version error, so this is a compatibility constant, not a hint: a
     // client that guessed would be served nothing at all.
     public const uint ProtocolVersion = 8;
-    public const uint SettingsApiVersion = 2;
+
+    // 3 adds dictionary management. A v2 client still works against a v3 Host: it simply
+    // never sends the new message types, and every older message keeps its shape.
+    public const uint SettingsApiVersion = 3;
     public const uint SettingsApiMinVersion = 1;
 
     public const int HeaderSize = 5;

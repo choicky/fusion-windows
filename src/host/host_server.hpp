@@ -248,6 +248,13 @@ private:
     void handle_settings_select_input_method(const std::vector<std::uint8_t> &payload);
     void handle_settings_get_im_list(const std::vector<std::uint8_t> &payload);
     void handle_settings_set_im_list(const std::vector<std::uint8_t> &payload);
+    // Dictionary management (settings_api_version 3). Each reply carries the list the Host
+    // left behind, so the window re-reads the result from the same reply that reports it.
+    void handle_settings_list_dictionaries(const std::vector<std::uint8_t> &payload);
+    void handle_settings_import_dictionary(const std::vector<std::uint8_t> &payload);
+    void handle_settings_set_dictionary_enabled(const std::vector<std::uint8_t> &payload);
+    void handle_settings_delete_dictionary(const std::vector<std::uint8_t> &payload);
+    void handle_settings_reload_dictionaries(const std::vector<std::uint8_t> &payload);
     void handle_bind(const std::vector<std::uint8_t> &payload);
     void handle_reset(const std::vector<std::uint8_t> &payload);
     void handle_unbind(const std::vector<std::uint8_t> &payload);

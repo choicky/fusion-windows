@@ -71,6 +71,28 @@ struct ImList {
   bool operator==(const ImList &) const = default;
 };
 
+// Pinyin dictionary management (settings_api_version 3). One entry per dictionary the
+// engine can actually load: the file stem the engine matches `<stem>.disable` against,
+// which root it came from, whether that marker is present, and the file's size. No word
+// count is carried — nothing on disk reports one without loading the dictionary, and a
+// number computed here would not be the engine's.
+struct DictionaryEntry {
+  std::string name;
+  // "user" is the writable per-user data root (deletable, importable); "bundled" is the
+  // packaged data root, which this manager never writes or deletes.
+  std::string source;
+  bool enabled = true;
+  std::uint64_t size = 0;
+
+  bool operator==(const DictionaryEntry &) const = default;
+};
+
+struct DictionaryList {
+  std::vector<DictionaryEntry> entries;
+
+  bool operator==(const DictionaryList &) const = default;
+};
+
 enum class SettingsStatus : std::uint8_t {
   Ok = 0,
   Error = 1,
@@ -80,6 +102,10 @@ enum class SettingsStatus : std::uint8_t {
   Timeout = 5,
   Indeterminate = 6,
   VersionMismatch = 7,
+  // A dictionary with the requested name already exists. Nothing was written; the same
+  // request with overwrite set replaces it. Separate from Invalid so the window can ask
+  // instead of reporting a failure.
+  Exists = 8,
 };
 
 } // namespace fusion
