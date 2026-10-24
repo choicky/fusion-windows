@@ -104,7 +104,7 @@ with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copie
 
 Exit code 0 means every check passed, and the count depends on the runtime the Host is built
 from, so each figure belongs to the machine and the revision that printed it. Against an enhanced
-runtime Host — the machine that has one, not this workspace — the suite printed **821 checks** for the
+runtime Host — on the other machine then, and since 2026-10-24 also here — the suite printed **821 checks** for the
 round that added the Chinese option labels and **846** for the round that added dictionary
 management: **575 of them need no Host** (`--no-integration`), and **271 more run against one**
 (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
@@ -115,12 +115,15 @@ resubmitted, the wait reported as unsaved and stoppable, an ordinary refusal tha
 another way — `Error`, `Invalid` or `Indeterminate` — while a different page waits and is submitted exactly once, and the
 failed half of the shared Pinyin/Shuangpin draft not resubmitted), a
 successful global save with its persistence check, a save that stores one page and is refused for another with the refused
-edit kept, and read/apply/read-back with incarnation stability). Against the pinned
-`runtime-wp3-20261018` this workspace builds, which has no 辅助筛选 (`AuxiliaryFilter`), the
-mixed-option section stops at that assertion and the same suite prints **814** with exactly that
-one check failing — the option is not in the engine there, which is not a client defect. That 814
-is what `b8a81aa` printed on this machine on 2026-10-24; the no-Host half was not run separately
-against the pinned runtime, so no split figure is quoted for it, and neither the 821 nor the 846
+edit kept, and read/apply/read-back with incarnation stability). Until 2026-10-24 this workspace's
+`runtime-wp3-20261018` was the pre-fork official `61474bd`, which has no 辅助筛选 (`AuxiliaryFilter`):
+against that runtime the mixed-option section stopped at that assertion and the same suite printed
+**814** with exactly that one check failing — the option was not in the engine there, which is not a
+client defect. That 814 is what `b8a81aa` printed on this machine. `tools/fcitx/build-native.ps1` has since
+rebuilt the same pinned generation from the sources `cmake/settings-ui/versions.cmake` names — the addon
+now the maintained fork at `2145c4bf1cff8c62112b9c38db4e6032a190b280` — and against that runtime the suite
+prints **856 checks with nothing failing** at `e43ccad`; the no-Host half was not run
+separately there either, so no split figure is quoted for it, and neither the 821 nor the 846
 above covers the Chinese-name chain, which landed after both. The no-Host half also covers the
 installed-font list the 候选字体 row offers: the families this session has, once each, sorted, a
 name it does not contain reported as missing, and a search that narrows. It also covers the
