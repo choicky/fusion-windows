@@ -708,11 +708,42 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // Fcitx's decision, taken from its configuration; this shell keeps no state for it.
   if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR)
     return true;
+  // A digit is engine work only while the engine will select a candidate with it. Measured
+  // on the pinned pinyin engine (stage3c): with no candidate page it answers a digit with
+  // ForwardKey — there is nothing to select — while a page on screen makes the same key
+  // select, on the top row and on the keypad alike. Claiming a key the engine only hands
+  // back loses it in an application that honours OnTestKeyDown alone, which is the shape
+  // R36 and R37 fixed for Return and the editing keys.
+  if (is_candidate_digit(action))
+    return digit_selects_a_candidate(action);
   // Every key this shell admitted before R37 keeps its admission; only the keys whose
   // Fcitx handling needs a live composition are gated on the composition state.
   if (!editing_key_needs_composition(action))
     return true;
   return engine_has_composition_work();
+}
+
+bool SemanticController::is_candidate_digit(const KeyAction &action) {
+  // The top row and the keypad both, told apart from every other key by the virtual key:
+  // the keypad's digits carry the same keysym as the top row's and behave the same way.
+  return (action.virtual_key >= '0' && action.virtual_key <= '9') ||
+         (action.virtual_key >= kVkNumpad0 && action.virtual_key <= kVkNumpad9);
+}
+
+bool SemanticController::digit_selects_a_candidate(const KeyAction &action) const {
+  // The page, not the composition, is the oracle: a number key means "the candidate with
+  // this number", so it is engine work exactly while the page holds a candidate to select.
+  // A panel carrying only text rows (aux/panel preedit) has no candidate slot, and the
+  // engine forwards a digit for it like it does with no page at all. Which index the engine
+  // acts on, and what it does with a number past the last entry, stays the engine's own
+  // decision — measured: it consumes such a digit rather than forwarding it.
+  (void)action;
+  if (!page_present_ || !displayed_page_)
+    return false;
+  for (const auto &entry : displayed_page_->entries)
+    if (!entry.placeholder)
+      return true;
+  return false;
 }
 
 bool SemanticController::editing_key_needs_composition(const KeyAction &action) {

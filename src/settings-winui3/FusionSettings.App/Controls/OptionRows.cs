@@ -152,6 +152,12 @@ public static class OptionRows
                 sender.ItemsSource = FontCatalog.Search(sender.Text);
             }
         };
+        // Opening the list shows it from its first row, so with the catalogue in its own order
+        // the reader starts at "A" while the box says "Microsoft YaHei UI". The list is put
+        // back in front of them instead: the value the box holds — the draft's value, which is
+        // what an unsaved choice is — comes first, the rest follows in catalogue order. Only
+        // the order changes; opening the list commits nothing and rewrites no configuration.
+        box.GotFocus += (_, _) => AnchorSuggestionList(box, stored);
 
         void Commit(string? text)
         {
@@ -219,6 +225,38 @@ public static class OptionRows
         control.VerticalAlignment = VerticalAlignment.Center;
         row.Children.Add(control);
         return row;
+    }
+
+    /// <summary>
+    /// Puts the value the box holds at the top of the suggestion list, so opening the list shows
+    /// the font that is in effect instead of the beginning of the alphabet.
+    /// </summary>
+    /// <remarks>
+    /// The list is the same catalogue; only its order changes, and nothing is written: the box's
+    /// text, the draft and the configuration are left exactly as they were. A value that names no
+    /// installed family is not invented into the list — the row already says Windows will
+    /// substitute, and the list keeps its own order.
+    /// </remarks>
+    private static void AnchorSuggestionList(AutoSuggestBox box, string value)
+    {
+        var families = FontCatalog.InstalledFamilies();
+        var current = FontCatalog.Find(value);
+        if (current is null || families.Count == 0)
+        {
+            box.ItemsSource = families;
+            return;
+        }
+
+        var ordered = new List<string>(families.Count) { current };
+        foreach (var family in families)
+        {
+            if (!string.Equals(family, current, StringComparison.OrdinalIgnoreCase))
+            {
+                ordered.Add(family);
+            }
+        }
+
+        box.ItemsSource = ordered;
     }
 
     private static FrameworkElement CreateControl(OptionDescription option, SettingsValue current,
