@@ -50,7 +50,7 @@ public static class SettingsCodec
     {
         status = SettingsStatus.Error;
         error = string.Empty;
-        if (!reader.TryU8(out var raw) || raw > (byte)SettingsStatus.VersionMismatch)
+        if (!reader.TryU8(out var raw) || raw > (byte)SettingsStatus.Exists)
         {
             return false;
         }
@@ -107,6 +107,110 @@ public static class SettingsCodec
         }
 
         return writer.ToArray();
+    }
+
+    // Dictionary management (settings API 3). An import carries the local path only — the
+    // Host reads the file — plus the answer to a previous "that name already exists".
+    public static byte[] EncodeImportDictionary(string path, bool overwrite)
+    {
+        var writer = new ProtoWriter();
+        if (!writer.Text(path))
+        {
+            throw new ArgumentException("the path exceeds the wire bound", nameof(path));
+        }
+
+        writer.U8(overwrite ? (byte)1 : (byte)0);
+        return writer.ToArray();
+    }
+
+    public static byte[] EncodeSetDictionaryEnabled(string name, bool enabled)
+    {
+        var writer = new ProtoWriter();
+        if (!writer.Text(name))
+        {
+            throw new ArgumentException("the name exceeds the wire bound", nameof(name));
+        }
+
+        writer.U8(enabled ? (byte)1 : (byte)0);
+        return writer.ToArray();
+    }
+
+    public static byte[] EncodeDictionaryName(string name)
+    {
+        var writer = new ProtoWriter();
+        if (!writer.Text(name))
+        {
+            throw new ArgumentException("the name exceeds the wire bound", nameof(name));
+        }
+
+        return writer.ToArray();
+    }
+
+    public static bool TryDecodeDictionaryList(ProtoReader reader, out DictionaryList list)
+    {
+        list = DictionaryList.Empty;
+        if (!TryReadDictionaryEntries(reader, out var entries))
+        {
+            return false;
+        }
+
+        list = new DictionaryList(entries);
+        return true;
+    }
+
+    /// <summary>The import reply is the placed dictionary followed by the resulting list.</summary>
+    public static bool TryDecodeDictionaryImport(ProtoReader reader, out DictionaryImport import)
+    {
+        import = null!;
+        if (!TryReadDictionaryEntry(reader, out var entry) ||
+            !TryReadDictionaryEntries(reader, out var entries))
+        {
+            return false;
+        }
+
+        import = new DictionaryImport(entry, new DictionaryList(entries));
+        return true;
+    }
+
+    private static bool TryReadDictionaryEntries(ProtoReader reader, out IReadOnlyList<DictionaryEntry> entries)
+    {
+        entries = Array.Empty<DictionaryEntry>();
+        if (!reader.TryU32(out var count) || count > WireLimits.MaxSettingsMapEntries)
+        {
+            return false;
+        }
+
+        var list = new List<DictionaryEntry>((int)count);
+        for (var i = 0U; i < count; i++)
+        {
+            if (!TryReadDictionaryEntry(reader, out var entry))
+            {
+                return false;
+            }
+
+            list.Add(entry);
+        }
+
+        if (!reader.AtEnd)
+        {
+            return false;
+        }
+
+        entries = list;
+        return true;
+    }
+
+    private static bool TryReadDictionaryEntry(ProtoReader reader, out DictionaryEntry entry)
+    {
+        entry = null!;
+        if (!reader.TryString(out var name) || !reader.TryString(out var source) ||
+            !reader.TryU8(out var enabled) || !reader.TryU32(out var size) || enabled > 1)
+        {
+            return false;
+        }
+
+        entry = new DictionaryEntry(name, source, enabled == 1, size);
+        return true;
     }
 
     public static bool TryDecodeSnapshot(ProtoReader reader, out SettingsSnapshot snapshot)

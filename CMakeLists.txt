@@ -205,6 +205,17 @@ if(BUILD_TESTING)
     target_link_libraries(moqi_filter PRIVATE FusionFcitxHost)
     add_test(NAME moqi_filter COMMAND moqi_filter)
 
+    # Pinyin dictionary management the way the settings window drives it: list, import,
+    # enable, disable, delete, reload. It asserts what the candidate list does (an imported
+    # word appears, a disabled one goes, a deleted one is gone) rather than that files exist,
+    # and it writes its own throwaway Fcitx profile in %TEMP%.
+    add_executable(dictionary_manager tests/dictionary_manager.cpp)
+    target_include_directories(dictionary_manager PRIVATE src include)
+    target_compile_features(dictionary_manager PRIVATE cxx_std_20)
+    target_compile_options(dictionary_manager PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(dictionary_manager PRIVATE FusionFcitxHost)
+    add_test(NAME dictionary_manager COMMAND dictionary_manager)
+
     # Settings saves taken while a composition is live, and a write the filesystem refuses,
     # against the real pinned engine and Fcitx's own files. It needs a writable per-user
     # configuration directory, so it runs only when the launcher names a throwaway profile

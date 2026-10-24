@@ -16,7 +16,11 @@ namespace fusion::ipc {
 // client in [min, current] — a v1 client simply never sends the newer types — and
 // a client requires a Host at least as new as itself, while a newer Host stays
 // usable because it must keep the older messages intact.
-inline constexpr std::uint32_t settings_api_version = 2;
+//
+// 3 adds pinyin dictionary management (list/import/enable/delete/reload). A v2
+// client still works: it never sends the new types, and every message it does send
+// keeps its shape.
+inline constexpr std::uint32_t settings_api_version = 3;
 inline constexpr std::uint32_t settings_api_min_version = 1;
 inline constexpr std::size_t max_settings_payload = 60 * 1024;
 inline constexpr std::size_t max_settings_nodes = 4096;
@@ -267,6 +271,57 @@ inline bool read_im_list(detail::Reader &reader, ImList &list) {
   return read_string_list(reader, list.enabled) && read_string_list(reader, list.available);
 }
 
+// Dictionary list (settings_api_version 3). The size travels as u32: a dictionary this
+// engine can load is a pinyin trie of a few tens of megabytes, and the value is display
+// information only, so saturation is honest where an overflow error would not be.
+inline void write_dictionary_entry(std::vector<std::uint8_t> &out, const DictionaryEntry &entry) {
+  detail::write_string(out, entry.name);
+  detail::write_string(out, entry.source);
+  detail::write_u8(out, entry.enabled ? 1 : 0);
+  detail::write_u32(out, static_cast<std::uint32_t>(entry.size > UINT32_MAX ? UINT32_MAX
+                                                                           : entry.size));
+}
+
+inline bool write_dictionary_list(std::vector<std::uint8_t> &out, const DictionaryList &list) {
+  if (list.entries.size() > max_settings_map_entries) {
+    return false;
+  }
+  detail::write_u32(out, static_cast<std::uint32_t>(list.entries.size()));
+  for (const auto &entry : list.entries) {
+    write_dictionary_entry(out, entry);
+  }
+  return out.size() <= max_settings_payload;
+}
+
+inline bool read_dictionary_entry(detail::Reader &reader, DictionaryEntry &entry) {
+  auto name = reader.read_string();
+  auto source = reader.read_string();
+  auto enabled = reader.read_u8();
+  auto size = reader.read_u32();
+  if (!name || !source || !enabled || !size || *enabled > 1) {
+    return false;
+  }
+  entry = DictionaryEntry{std::move(*name), std::move(*source), *enabled == 1, *size};
+  return true;
+}
+
+inline bool read_dictionary_list(detail::Reader &reader, DictionaryList &list) {
+  auto count = reader.read_u32();
+  if (!count || *count > max_settings_map_entries) {
+    return false;
+  }
+  list.entries.clear();
+  list.entries.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    DictionaryEntry entry;
+    if (!read_dictionary_entry(reader, entry)) {
+      return false;
+    }
+    list.entries.push_back(std::move(entry));
+  }
+  return true;
+}
+
 } // namespace settings_detail
 
 inline std::vector<std::uint8_t> serialize_settings_hello(std::uint32_t protocol,
@@ -365,6 +420,58 @@ inline bool deserialize_settings_set_im_list_request(const std::uint8_t *data, s
   return true;
 }
 
+// A dictionary import carries the local file path, never its contents: the Host reads the
+// file itself, so nothing large ever travels through the settings pipe. `overwrite` is the
+// answer to a previous `Exists`, and is the only way an existing dictionary is replaced.
+inline bool deserialize_settings_import_dictionary_request(const std::uint8_t *data,
+                                                           std::size_t size, std::string &path,
+                                                           bool &overwrite) {
+  if (size > max_settings_payload) {
+    return false;
+  }
+  detail::Reader reader{data, size};
+  auto read_path = reader.read_string();
+  auto flag = reader.read_u8();
+  if (!read_path || !flag || *flag > 1 || !reader.at_end()) {
+    return false;
+  }
+  path = std::move(*read_path);
+  overwrite = *flag == 1;
+  return true;
+}
+
+inline bool deserialize_settings_set_dictionary_enabled_request(const std::uint8_t *data,
+                                                               std::size_t size,
+                                                               std::string &name,
+                                                               bool &enabled) {
+  if (size > max_settings_payload) {
+    return false;
+  }
+  detail::Reader reader{data, size};
+  auto read_name = reader.read_string();
+  auto flag = reader.read_u8();
+  if (!read_name || !flag || *flag > 1 || !reader.at_end()) {
+    return false;
+  }
+  name = std::move(*read_name);
+  enabled = *flag == 1;
+  return true;
+}
+
+inline bool deserialize_settings_dictionary_name_request(const std::uint8_t *data,
+                                                         std::size_t size, std::string &name) {
+  if (size > max_settings_payload) {
+    return false;
+  }
+  detail::Reader reader{data, size};
+  auto read_name = reader.read_string();
+  if (!read_name || !reader.at_end()) {
+    return false;
+  }
+  name = std::move(*read_name);
+  return true;
+}
+
 inline std::vector<std::uint8_t> serialize_settings_status(SettingsStatus status,
                                                            const std::string &error) {
   std::vector<std::uint8_t> payload;
@@ -377,7 +484,7 @@ inline std::optional<SettingsReplyPrefix>
 deserialize_settings_status(detail::Reader &reader) {
   auto status = reader.read_u8();
   auto error = reader.read_string();
-  if (!status || *status > static_cast<std::uint8_t>(SettingsStatus::VersionMismatch) || !error) {
+  if (!status || *status > static_cast<std::uint8_t>(SettingsStatus::Exists) || !error) {
     return std::nullopt;
   }
   return SettingsReplyPrefix{static_cast<SettingsStatus>(*status), std::move(*error)};

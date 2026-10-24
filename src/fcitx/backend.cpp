@@ -11,6 +11,10 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cwctype>
+#include <filesystem>
+#include <fstream>
+#include <unordered_set>
 #include <fcitx-utils/environ.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/key.h>
@@ -26,6 +30,7 @@
 #include <fcitx/inputpanel.h>
 #include <fcitx/globalconfig.h>
 #include <fcitx/instance.h>
+#include <libime/pinyin/pinyindictionary.h>
 #include <future>
 #include <iterator>
 #include <map>
@@ -986,7 +991,358 @@ public:
     return status;
   }
 
+  // Pinyin dictionary management. The engine loads `pinyin/dictionaries/*.dict` from the
+  // data roots it already searches (the per-user one first), skips a name whose
+  // `<stem>.disable` exists beside it, and re-reads the whole set in `loadExtraDict()` —
+  // which the addon runs when its `dictmanager` sub-config is set. This layer therefore
+  // owns file placement and conversion only; it keeps no list, because `locate()` is the
+  // list and the `.disable` marker is the enabled state.
+  SettingsStatus settings_list_dictionaries(DictionaryList &list, std::string &error) override {
+    return dictionaries_list(list, error);
+  }
+
+  SettingsStatus settings_import_dictionary(const std::string &path, bool overwrite,
+                                            DictionaryEntry &imported, DictionaryList &list,
+                                            std::string &error) override {
+    namespace fs = std::filesystem;
+    const fs::path source = path_from_utf8(path);
+    std::error_code ec;
+    if (source.empty() || !fs::is_regular_file(source, ec)) {
+      error = "The selected file cannot be read.";
+      return SettingsStatus::Invalid;
+    }
+
+    auto extension = source.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    const bool binary = extension == L".dict";
+    if (!binary && extension != L".txt") {
+      if (extension == L".scel") {
+        error = "Sogou .scel dictionaries are not supported in this build: converting one needs "
+                "the addon's scel2org5 tool, which this Windows runtime does not build. Import a "
+                "text dictionary or a .dict file instead.";
+        return SettingsStatus::Unsupported;
+      }
+      error = "Only Fcitx/LibIME .dict files and text dictionaries (.txt) can be imported.";
+      return SettingsStatus::Invalid;
+    }
+
+    const std::string name = wide_to_utf8(source.stem().wstring());
+    if (name.empty() || name.size() > 128 || name.find_first_of("\\/:*?\"<>|") != std::string::npos) {
+      error = "The file name cannot be used as a dictionary name.";
+      return SettingsStatus::Invalid;
+    }
+
+    const fs::path directory = dictionary_directory(true);
+    const fs::path target = directory / (name + ".dict");
+    if (fs::exists(target, ec) && !overwrite) {
+      error = "A dictionary named \"" + name + "\" already exists. Confirm whether to replace it.";
+      return SettingsStatus::Exists;
+    }
+
+    // A reload changes the candidate source under a live composition, and the engine's own
+    // reload happens on the same pass as the file placement, so a live buffer stops the
+    // whole operation before anything is written.
+    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
+      return busy;
+    }
+
+    if (!fs::create_directories(directory, ec) && !fs::is_directory(directory, ec)) {
+      error = "The dictionary directory could not be created.";
+      return SettingsStatus::Error;
+    }
+
+    const fs::path temporary = directory / ("." + name + ".import.dict");
+    {
+      libime::PinyinDictionary probe;
+      try {
+        if (binary) {
+          // Loading it is the only honest validation: a .dict is a trie dump, and a
+          // truncated or foreign file fails here rather than inside the engine later.
+          std::ifstream in(source, std::ios::binary);
+          probe.load(0, in, libime::PinyinDictFormat::Binary);
+          in.close();
+          fs::copy_file(source, temporary, fs::copy_options::overwrite_existing, ec);
+          if (ec) {
+            error = "The dictionary file could not be copied: " + ec.message();
+            return SettingsStatus::Error;
+          }
+        } else {
+          std::ifstream in(source, std::ios::binary);
+          probe.load(0, in, libime::PinyinDictFormat::Text);
+          in.close();
+          std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+          probe.save(0, out, libime::PinyinDictFormat::Binary);
+          out.close();
+          if (!out) {
+            error = "The converted dictionary could not be written.";
+            return SettingsStatus::Error;
+          }
+        }
+      } catch (const std::exception &e) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        // The existing dictionary is untouched: nothing was renamed over it.
+        error = binary ? std::string("This file is not a loadable pinyin dictionary: ") + e.what()
+                       : std::string("No dictionary entry could be read from this text file: ") +
+                             e.what();
+        return SettingsStatus::Invalid;
+      }
+    }
+
+    if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      std::error_code ignored;
+      fs::remove(temporary, ignored);
+      error = "The dictionary file could not be replaced.";
+      return SettingsStatus::Error;
+    }
+
+    // The file is in place. If the engine cannot reload it now, say exactly that instead of
+    // reporting a success the candidate list does not show.
+    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
+      error = "The dictionary file was written, but the engine could not reload it: " + error;
+      return SettingsStatus::Indeterminate;
+    }
+
+    const auto status = dictionaries_list(list, error);
+    if (status != SettingsStatus::Ok) {
+      return status;
+    }
+    for (const auto &entry : list.entries) {
+      if (entry.name == name) {
+        imported = entry;
+        break;
+      }
+    }
+    return SettingsStatus::Ok;
+  }
+
+  SettingsStatus settings_set_dictionary_enabled(const std::string &name, bool enabled,
+                                                 DictionaryList &list,
+                                                 std::string &error) override {
+    namespace fs = std::filesystem;
+    DictionaryList current;
+    if (const auto status = dictionaries_list(current, error); status != SettingsStatus::Ok) {
+      return status;
+    }
+    const auto found = std::find_if(current.entries.begin(), current.entries.end(),
+                                    [&name](const DictionaryEntry &entry) {
+                                      return entry.name == name;
+                                    });
+    if (found == current.entries.end()) {
+      error = "No dictionary named \"" + name + "\" is installed.";
+      return SettingsStatus::Invalid;
+    }
+    if (found->enabled == enabled) {
+      list = std::move(current);
+      return SettingsStatus::Ok;
+    }
+
+    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
+      return busy;
+    }
+
+    const fs::path directory = dictionary_directory(true);
+    const fs::path marker = directory / (name + ".dict.disable");
+    std::error_code ec;
+    if (!fs::create_directories(directory, ec) && !fs::is_directory(directory, ec)) {
+      error = "The dictionary directory could not be created.";
+      return SettingsStatus::Error;
+    }
+    if (enabled) {
+      fs::remove(marker, ec);
+    } else {
+      std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        error = "The disable marker could not be written.";
+        return SettingsStatus::Error;
+      }
+    }
+
+    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
+      error = "The dictionary state was written, but the engine could not reload it: " + error;
+      return SettingsStatus::Indeterminate;
+    }
+    return dictionaries_list(list, error);
+  }
+
+  SettingsStatus settings_delete_dictionary(const std::string &name, DictionaryList &list,
+                                            std::string &error) override {
+    namespace fs = std::filesystem;
+    DictionaryList current;
+    if (const auto status = dictionaries_list(current, error); status != SettingsStatus::Ok) {
+      return status;
+    }
+    const auto found = std::find_if(current.entries.begin(), current.entries.end(),
+                                    [&name](const DictionaryEntry &entry) {
+                                      return entry.name == name;
+                                    });
+    if (found == current.entries.end()) {
+      error = "No dictionary named \"" + name + "\" is installed.";
+      return SettingsStatus::Invalid;
+    }
+    if (found->source != "user") {
+      error = "This dictionary ships with the package and cannot be deleted; disable it instead.";
+      return SettingsStatus::Invalid;
+    }
+
+    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
+      return busy;
+    }
+
+    const fs::path directory = dictionary_directory(true);
+    std::error_code ec;
+    fs::remove(directory / (name + ".dict"), ec);
+    std::error_code ignored;
+    fs::remove(directory / (name + ".dict.disable"), ignored);
+
+    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
+      error = "The dictionary file was deleted, but the engine could not reload: " + error;
+      return SettingsStatus::Indeterminate;
+    }
+    return dictionaries_list(list, error);
+  }
+
+  SettingsStatus settings_reload_dictionaries(DictionaryList &list, std::string &error) override {
+    if (const auto busy = dictionaries_require_idle(error); busy != SettingsStatus::Ok) {
+      return busy;
+    }
+    if (const auto reloaded = reload_dictionaries_on_loop(error); reloaded != SettingsStatus::Ok) {
+      return reloaded;
+    }
+    return dictionaries_list(list, error);
+  }
+
 private:
+  // The roots the engine itself searches, expressed the same way: the per-user writable
+  // data root, then whatever the package installed.
+  static std::filesystem::path dictionary_directory(bool user) {
+    const auto &standardPath = fcitx::StandardPaths::global();
+    auto base = user ? standardPath.userDirectory(fcitx::StandardPathsType::PkgData)
+                     : std::filesystem::path();
+    if (base.empty()) {
+      return {};
+    }
+    return base / "pinyin" / "dictionaries";
+  }
+
+  static std::filesystem::path path_from_utf8(const std::string &text) {
+    if (text.empty()) {
+      return {};
+    }
+    const int wideLength = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                               static_cast<int>(text.size()), nullptr, 0);
+    if (wideLength <= 0) {
+      return {};
+    }
+    std::wstring wide(static_cast<std::size_t>(wideLength), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(),
+                        wideLength);
+    return std::filesystem::path(wide);
+  }
+
+  static std::string wide_to_utf8(const std::wstring &text) {
+    if (text.empty()) {
+      return {};
+    }
+    const int narrowLength = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                                 static_cast<int>(text.size()), nullptr, 0,
+                                                 nullptr, nullptr);
+    if (narrowLength <= 0) {
+      return {};
+    }
+    std::string narrow(static_cast<std::size_t>(narrowLength), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), narrow.data(),
+                        narrowLength, nullptr, nullptr);
+    return narrow;
+  }
+
+  static bool is_user_dictionary_path(const std::filesystem::path &file) {
+    std::error_code ec;
+    const auto userDirectory = dictionary_directory(true);
+    if (userDirectory.empty()) {
+      return false;
+    }
+    const auto user = std::filesystem::weakly_canonical(userDirectory, ec);
+    if (ec) {
+      return false;
+    }
+    const auto parent = std::filesystem::weakly_canonical(file.parent_path(), ec);
+    if (ec) {
+      return false;
+    }
+    return _wcsicmp(user.wstring().c_str(), parent.wstring().c_str()) == 0;
+  }
+
+  SettingsStatus dictionaries_list(DictionaryList &list, std::string &error) {
+    auto &standardPath = fcitx::StandardPaths::global();
+    // The engine compares the *dictionary file name* against the marker's stem, so the
+    // marker for `foo.dict` is `foo.dict.disable` and its stem is `foo.dict`. Both sides
+    // use that name here, which is also what the official dict manager writes.
+    std::unordered_set<std::filesystem::path> disabled;
+    for (const auto &item : standardPath.locate(
+             fcitx::StandardPathsType::PkgData, "pinyin/dictionaries",
+             fcitx::pathfilter::extension(".disable"))) {
+      disabled.insert(item.first.stem());
+    }
+
+    DictionaryList result;
+    for (const auto &item : standardPath.locate(
+             fcitx::StandardPathsType::PkgData, "pinyin/dictionaries",
+             fcitx::pathfilter::extension(".dict"))) {
+      const auto &fileName = item.first;
+      const auto &path = item.second;
+      std::error_code ec;
+      const auto size = std::filesystem::file_size(path, ec);
+      result.entries.push_back(DictionaryEntry{
+          fileName.stem().string(), is_user_dictionary_path(path) ? "user" : "bundled",
+          disabled.find(fileName) == disabled.end(),
+          ec ? 0 : static_cast<std::uint64_t>(size)});
+    }
+    // `locate` already collapses one name to the highest-priority root, which is the file
+    // the engine loads; the order it returns is a map order, so make it readable.
+    std::sort(result.entries.begin(), result.entries.end(),
+              [](const DictionaryEntry &a, const DictionaryEntry &b) { return a.name < b.name; });
+    list = std::move(result);
+    error.clear();
+    return SettingsStatus::Ok;
+  }
+
+  // A reload re-runs `loadExtraDict()`, which drops and rebuilds the extra dictionaries
+  // under any composition that is using them, so the official protection applies: refuse
+  // while a buffer is live, and say that nothing was written.
+  SettingsStatus dictionaries_require_idle(std::string &error) {
+    return invoke_settings(
+        [this](std::string &taskError) {
+          if (has_active_composition_on_loop()) {
+            taskError = "A composition is in progress. Reloading dictionaries would change the "
+                        "candidate source under it, so nothing was changed; finish or cancel the "
+                        "composition and try again.";
+            return SettingsStatus::Busy;
+          }
+          return SettingsStatus::Ok;
+        },
+        error, SettingsStatus::Timeout);
+  }
+
+  // The addon instance is the PinyinEngine itself (pinyinenginefactory.cpp returns it from
+  // `create`), so its `dictmanager` sub-config is the same call the official Qt dict
+  // manager makes when it closes.
+  SettingsStatus reload_dictionaries_on_loop(std::string &error) {
+    return invoke_settings(
+        [this](std::string &taskError) {
+          auto *addon = instance_->addonManager().addon("pinyin", true);
+          if (!addon) {
+            taskError = "The pinyin addon is not available in this Host.";
+            return SettingsStatus::Error;
+          }
+          fcitx::RawConfig config;
+          addon->setSubConfig("dictmanager", config);
+          return SettingsStatus::Ok;
+        },
+        error, SettingsStatus::Indeterminate);
+  }
+
   enum class SettingsTaskPhase : int { Queued, Running, Cancelled, Done };
   struct SettingsTaskState {
     std::atomic<SettingsTaskPhase> phase{SettingsTaskPhase::Queued};

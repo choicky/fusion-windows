@@ -28,6 +28,12 @@ public abstract class SettingsPageBase : Page
         Services.Trace.Write("page built " + GetType().Name);
     }
 
+    /// <summary>
+    /// Navigates to another page by tag. It is set by the window, which owns navigation; a
+    /// page that links to another page (the 词库管理 entry) uses it instead of building one.
+    /// </summary>
+    public Action<string>? NavigateRequested { get; set; }
+
     /// <summary>Rebuilds after a save, discard or method switch.</summary>
     public void Refresh()
     {

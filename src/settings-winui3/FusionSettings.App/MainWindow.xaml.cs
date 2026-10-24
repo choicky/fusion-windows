@@ -72,6 +72,21 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // A page can link to another one (the external-tool row for 词库管理 does), so the
+        // left navigation follows: selecting the item runs this method again with the tag
+        // already current, and the guard below then decides whether to rebuild.
+        if (Navigation.SelectedItem is NavigationViewItem { Tag: string selected } && selected != tag)
+        {
+            foreach (var item in Navigation.MenuItems)
+            {
+                if (item is NavigationViewItem entry && entry.Tag is string candidate && candidate == tag)
+                {
+                    Navigation.SelectedItem = entry;
+                    return;
+                }
+            }
+        }
+
         if (_currentTag == tag && PageHost.Content is SettingsPageBase)
         {
             return;
@@ -93,10 +108,12 @@ public sealed partial class MainWindow : Window
             {
                 "keys" => new KeysPage(),
                 "candidates" => new CandidatesPage(),
+                "dictionaries" => new DictionariesPage(),
                 "about" => new AboutPage(),
                 _ => (SettingsPageBase)new InputMethodsPage(),
             };
 
+            page.NavigateRequested = Navigate;
             page.Initialize(_workspace);
             PageHost.Content = page;
             UpdateStatus();

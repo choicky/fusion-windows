@@ -306,7 +306,6 @@ public static class PresentationMap
     public static readonly IReadOnlyDictionary<string, string> ExternalToolReason =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["DictManager"] = "词典管理工具尚未在 Windows 上提供。",
             ["CustomPhrase"] = "自定义短语编辑器尚未在 Windows 上提供。",
             ["Punctuation"] = "标点映射编辑器尚未在 Windows 上提供。",
             ["Chttrans"] = "简繁转换组件（chttrans）未包含在本安装包中。",

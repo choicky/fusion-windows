@@ -312,6 +312,37 @@ public:
     return SettingsStatus::Unsupported;
   }
 
+  // Pinyin dictionary management (settings_api_version 3). The list reads the two data
+  // roots the engine itself searches for `pinyin/dictionaries/*.dict`; import converts a
+  // text dictionary through libime and places the result in the per-user root; enable and
+  // disable write the engine's own `<stem>.disable` marker; delete removes a user
+  // dictionary and its marker; reload re-runs the addon's `loadExtraDict()` through its
+  // `dictmanager` sub-config. Every mutating call returns the list it left behind, so the
+  // window never keeps a second copy of what is on disk.
+  virtual SettingsStatus settings_list_dictionaries(DictionaryList &, std::string &error) {
+    error = "dictionary management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_import_dictionary(const std::string &, bool, DictionaryEntry &,
+                                                    DictionaryList &, std::string &error) {
+    error = "dictionary management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_set_dictionary_enabled(const std::string &, bool,
+                                                         DictionaryList &, std::string &error) {
+    error = "dictionary management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_delete_dictionary(const std::string &, DictionaryList &,
+                                                    std::string &error) {
+    error = "dictionary management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+  virtual SettingsStatus settings_reload_dictionaries(DictionaryList &, std::string &error) {
+    error = "dictionary management is not supported by this backend";
+    return SettingsStatus::Unsupported;
+  }
+
   // Link lifecycle. Defaults describe a backend with no transport, so every
   // existing implementation (Mock, in-process Fcitx, test fakes) stays valid and
   // keeps exactly the Stage 4A lifecycle: established, no incarnation, one bind.

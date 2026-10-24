@@ -75,9 +75,11 @@ void test_protocol() {
   }
 
   // A GetImList / GetSelection request is an empty payload; max_message_type must
-  // admit the new response types so a bound Host accepts the frame.
+  // admit the new response types so a bound Host accepts the frame. Dictionary
+  // management (settings API 3) added the last six, so the bound follows them.
   static_assert(fusion::ipc::max_message_type ==
-                static_cast<std::uint8_t>(fusion::ipc::MessageType::SettingsSetImListResponse));
+                static_cast<std::uint8_t>(
+                    fusion::ipc::MessageType::SettingsReloadDictionariesResponse));
 }
 
 void test_bounds() {

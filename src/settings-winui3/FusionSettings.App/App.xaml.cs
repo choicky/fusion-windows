@@ -26,6 +26,12 @@ public partial class App : Application
     /// <summary>The workspace the window and its pages share.</summary>
     public SettingsWorkspace? Workspace { get; private set; }
 
+    /// <summary>
+    /// The window, for the two things a page cannot do without it: a picker needs the
+    /// window's handle, and a page links to another page.
+    /// </summary>
+    public Window? MainWindow => _window;
+
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         Trace.Write("onlaunched");

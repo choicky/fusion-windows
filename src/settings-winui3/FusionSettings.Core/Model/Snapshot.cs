@@ -17,6 +17,12 @@ public enum SettingsStatus
     VersionMismatch = 7,
 
     /// <summary>
+    /// A dictionary with that name already exists; nothing was written. The window asks,
+    /// then sends the same import with overwrite set.
+    /// </summary>
+    Exists = 8,
+
+    /// <summary>
     /// Client-only: the Host could not be reached, or the connection failed before a
     /// reply. It is never sent by the Host and it never means "the write happened".
     /// </summary>

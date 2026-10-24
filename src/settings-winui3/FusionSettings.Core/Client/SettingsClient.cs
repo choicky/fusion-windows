@@ -96,6 +96,44 @@ public sealed class SettingsClient
                                     MessageType.SettingsSelectInputMethodResponse,
                                     SettingsCodec.TryDecodeSelection, isMutation: true, cancellationToken);
 
+    // Dictionary management. Each mutating call answers with the list it left behind, so a
+    // caller never has to ask twice to know what the Host now sees.
+    public Task<SettingsResult<DictionaryList>> ListDictionariesAsync(CancellationToken cancellationToken) =>
+        RunAsync<DictionaryList>(MessageType.SettingsListDictionariesRequest, Array.Empty<byte>(),
+                                 MessageType.SettingsListDictionariesResponse,
+                                 SettingsCodec.TryDecodeDictionaryList, isMutation: false,
+                                 cancellationToken);
+
+    public Task<SettingsResult<DictionaryImport>> ImportDictionaryAsync(string path, bool overwrite,
+                                                                       CancellationToken cancellationToken) =>
+        RunAsync<DictionaryImport>(MessageType.SettingsImportDictionaryRequest,
+                                   SettingsCodec.EncodeImportDictionary(path, overwrite),
+                                   MessageType.SettingsImportDictionaryResponse,
+                                   SettingsCodec.TryDecodeDictionaryImport, isMutation: true,
+                                   cancellationToken);
+
+    public Task<SettingsResult<DictionaryList>> SetDictionaryEnabledAsync(string name, bool enabled,
+                                                                         CancellationToken cancellationToken) =>
+        RunAsync<DictionaryList>(MessageType.SettingsSetDictionaryEnabledRequest,
+                                 SettingsCodec.EncodeSetDictionaryEnabled(name, enabled),
+                                 MessageType.SettingsSetDictionaryEnabledResponse,
+                                 SettingsCodec.TryDecodeDictionaryList, isMutation: true,
+                                 cancellationToken);
+
+    public Task<SettingsResult<DictionaryList>> DeleteDictionaryAsync(string name,
+                                                                     CancellationToken cancellationToken) =>
+        RunAsync<DictionaryList>(MessageType.SettingsDeleteDictionaryRequest,
+                                 SettingsCodec.EncodeDictionaryName(name),
+                                 MessageType.SettingsDeleteDictionaryResponse,
+                                 SettingsCodec.TryDecodeDictionaryList, isMutation: true,
+                                 cancellationToken);
+
+    public Task<SettingsResult<DictionaryList>> ReloadDictionariesAsync(CancellationToken cancellationToken) =>
+        RunAsync<DictionaryList>(MessageType.SettingsReloadDictionariesRequest, Array.Empty<byte>(),
+                                 MessageType.SettingsReloadDictionariesResponse,
+                                 SettingsCodec.TryDecodeDictionaryList, isMutation: true,
+                                 cancellationToken);
+
     private delegate bool Decoder<T>(ProtoReader reader, out T value);
 
     private async Task<SettingsResult<T>> RunAsync<T>(

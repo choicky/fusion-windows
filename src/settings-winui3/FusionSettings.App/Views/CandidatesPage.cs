@@ -195,6 +195,14 @@ public sealed class CandidatesPage : SettingsPageBase
         var rows = new List<FrameworkElement>();
         foreach (var option in snapshot.Types[0].Options.Where(option => option.IsExternal))
         {
+            // 词库管理 is implemented here rather than by the upstream tool, so its row opens
+            // this window's own page instead of reporting a missing tool.
+            if (string.Equals(option.Name, "DictManager", StringComparison.Ordinal))
+            {
+                rows.Add(ExternalToolEntry("词库管理", "导入、启用、停用和删除拼音词库。", "打开", NavigateToDictionaries));
+                continue;
+            }
+
             var label = PresentationMap.ExternalToolReason.TryGetValue(option.Name, out var reason)
                 ? reason
                 : "该工具尚未在 Windows 上提供。";
@@ -218,5 +226,38 @@ public sealed class CandidatesPage : SettingsPageBase
         PageChrome.AddSection(body, "外部工具",
             "这些是 Fcitx 上游的独立工具页面。本安装包没有提供它们，因此这里只说明状态，不提供入口。",
             rows);
+    }
+
+    private void NavigateToDictionaries() => NavigateRequested?.Invoke("dictionaries");
+
+    /// <summary>One external-tool row that is actually available, with the action that opens it.</summary>
+    private static FrameworkElement ExternalToolEntry(string title, string description, string action,
+                                                      Action onAction)
+    {
+        var stack = new StackPanel { Spacing = 2 };
+        stack.Children.Add(new TextBlock
+        {
+            Text = title,
+            Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+        });
+        stack.Children.Add(new TextBlock
+        {
+            Text = description,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+            Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
+        });
+
+        var button = new Button { Content = action, Padding = new Thickness(12, 5, 12, 5) };
+        button.Click += (_, _) => onAction();
+
+        var row = new Grid { ColumnSpacing = 16 };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.Children.Add(stack);
+        Grid.SetColumn(button, 1);
+        button.VerticalAlignment = VerticalAlignment.Center;
+        row.Children.Add(button);
+        return row;
     }
 }
