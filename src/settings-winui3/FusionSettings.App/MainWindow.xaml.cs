@@ -1,13 +1,16 @@
 using System;
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Fusion.Settings.App.Controls;
 using Fusion.Settings.App.Services;
 using Fusion.Settings.App.Views;
 using Fusion.Settings.Workspace;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Windows.Graphics;
 
 namespace Fusion.Settings.App;
 
@@ -17,6 +20,19 @@ namespace Fusion.Settings.App;
 /// </summary>
 public sealed partial class MainWindow : Window
 {
+    // The size this window opens at, and the smallest it may be dragged to, in effective
+    // pixels. The framework default is much wider than this layout uses: measured at 150%
+    // on a 3840x2160 display it opened at 1920x1025, while the navigation pane is 240 wide
+    // and the content column is capped at 880 — nearly 40% of the window was empty. 1080
+    // wide leaves the column its own room and no empty band. The minimum is not the point
+    // where the layout breaks (that is lower): it is the point below which the option
+    // labels, their controls and the save bar start wrapping into something harder to read
+    // than the same content in a slightly wider window.
+    private const double DefaultWidth = 1080;
+    private const double DefaultHeight = 800;
+    private const double MinimumWidth = 880;
+    private const double MinimumHeight = 560;
+
     private readonly SettingsWorkspace _workspace;
     private bool _initialised;
     private string? _currentTag;
@@ -36,6 +52,42 @@ public sealed partial class MainWindow : Window
         Activated += OnFirstActivated;
     }
 
+    /// <summary>
+    /// Sizes the window once, before the first paint. Both figures are given in effective
+    /// pixels and converted with the display's scaling, because <c>AppWindow</c> works in
+    /// physical ones — an unconverted 1080 is 720 effective at 150%. The scaling comes from
+    /// the window's own handle rather than from <c>Content.XamlRoot</c>: at the first
+    /// activation the content has no XamlRoot yet and its scale reads 1.0, which is how the
+    /// first version of this sized the window to 720x533 effective on this display.
+    /// </summary>
+    private void ApplyWindowSize()
+    {
+        var scale = 1.0;
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        var dpi = hwnd == IntPtr.Zero ? 0u : GetDpiForWindow(hwnd);
+        if (dpi != 0)
+        {
+            scale = dpi / 96.0;
+        }
+
+        // The window must stay resizable; this only sets where dragging stops. A presenter
+        // that is not the overlapped one (a full-screen or compact one, never used here)
+        // has no such property, and the size below still applies.
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.PreferredMinimumWidth = (int)Math.Round(MinimumWidth * scale);
+            presenter.PreferredMinimumHeight = (int)Math.Round(MinimumHeight * scale);
+        }
+
+        AppWindow.Resize(new SizeInt32(
+            (int)Math.Round(DefaultWidth * scale),
+            (int)Math.Round(DefaultHeight * scale)));
+        Trace.Write($"window size {AppWindow.Size.Width}x{AppWindow.Size.Height} dpi={dpi}");
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
+
     private async void OnFirstActivated(object sender, WindowActivatedEventArgs args)
     {
         if (_initialised)
@@ -45,6 +97,7 @@ public sealed partial class MainWindow : Window
 
         _initialised = true;
         Trace.Write("activated");
+        ApplyWindowSize();
 
         // Selecting the first item shows the page, so the window is never empty while the
         // Host is contacted; the load then fills it in.
