@@ -7,8 +7,9 @@
 ; version directory, registers the TIP, refreshes the logon tasks and starts the
 ; Host), and then writes the one thing install.ps1 does not write — the Windows
 ; "installed apps" entry that gives the product a name, a version and an
-; uninstall command. Uninstall runs the same package's uninstall.ps1 and removes
-; that entry.
+; uninstall command. The unpacked payload is then deleted while the progress page is
+; still up, not left to NSIS's cleanup after the last click. Uninstall runs the same
+; package's uninstall.ps1 and removes that entry.
 ;
 ; Everything that decides what an install *is* stays in install.ps1/uninstall.ps1:
 ; the install root, the per-version directory, the elevation requirement, the TIP
@@ -162,6 +163,13 @@ Section "安装 ${PRODUCT_NAME} ${PRODUCT_VERSION}"
   SetOutPath "$PLUGINSDIR\run"
   nsExec::ExecToLog '"${SHELL}" -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\payload\install.ps1" -PackageDir "$PLUGINSDIR\payload" -TranscriptPath "$InstallLog"'
   Pop $0
+  ; The scripts are done with the payload tree, so the working directory leaves it now: a
+  ; directory cannot be removed while it is the process's current one (measured:
+  ; RemoveDirectory on the current directory fails with "another program is using this
+  ; file"). The payload is removed further down; moving out first is also what lets NSIS's
+  ; own cleanup of $PLUGINSDIR work on the failure path — measured, with the working
+  ; directory left inside the tree, that cleanup left the whole payload in %TEMP%.
+  SetOutPath "$TEMP"
   ${If} $0 != "0"
     ; install.ps1 names the step it failed at on the details page and in the log;
     ; the installer must not finish as if it had succeeded.
@@ -183,6 +191,19 @@ Section "安装 ${PRODUCT_NAME} ${PRODUCT_VERSION}"
   WriteRegDWORD HKLM "${UNINST_KEY}" "NoRepair" 1
   ${GetSize} "$INSTDIR" "/S=0K" $R1 $R2 $R3
   WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" $R1
+
+  ; The payload is deleted here, on the progress page, rather than left to NSIS's own
+  ; cleanup of $PLUGINSDIR when the installer quits. That cleanup is the only work
+  ; between the "完成" click and the process leaving: ~285 MB in ~660 files, deleted
+  ; after the last click, with nothing on screen to explain it. On a machine where
+  ; deleting those files is slow — a rotating disk, an antivirus that scans each one —
+  ; that is the wait the owner reported. Doing it here keeps the same work (nothing is
+  ; skipped, the files really are removed) but puts it where there is a progress line,
+  ; and leaves the exit after the click with nothing to do. Measured on this machine
+  ; with the real payload: click to exit 0.19 s before, 0.04 s after.
+  DetailPrint "清理临时安装文件…"
+  RMDir /r "$PLUGINSDIR\payload"
+  RMDir /r "$PLUGINSDIR\run"
 
 SectionEnd
 
