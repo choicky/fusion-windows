@@ -103,12 +103,11 @@ with "Cannot locate resource from ms-appx:///MainWindow.xaml". The project copie
 `FusionSettings.pri` across in a post-publish target, so the published folder is complete.
 
 Exit code 0 means every check passed, and the count depends on the runtime the Host is built
-from. Against the enhanced runtime these documents are written against it is **846 checks**; against
-the pinned `runtime-wp3-20261018` this workspace builds, which has no 辅助筛选 (`AuxiliaryFilter`),
-the mixed-option section stops at that assertion and the run prints **814**, with that one check
-failing — the option is not in the engine there, which is not a client defect. **575 of the 846**
-(**585 of the 814**) need no Host (`--no-integration`), and **271 more run against one**
- (the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
+from, so each figure belongs to the machine and the revision that printed it. Against an enhanced
+runtime Host — the machine that has one, not this workspace — the suite printed **821 checks** for the
+round that added the Chinese option labels and **846** for the round that added dictionary
+management: **575 of them need no Host** (`--no-integration`), and **271 more run against one**
+(the protocol checks, a controlled pipe peer for mutation outcomes and handshake versions, the
 workspace path — Global routing, a Shuangpin-only save, clearing the last binding, clearing a string list, the method list,
 a failed start and its retry — a scripted peer for an uncertain method-list write, for the three reconnect cases of the
 list, and for the cases of a save that meets a busy Host (busy twice then stored with no second click, a saved page not
@@ -116,7 +115,13 @@ resubmitted, the wait reported as unsaved and stoppable, an ordinary refusal tha
 another way — `Error`, `Invalid` or `Indeterminate` — while a different page waits and is submitted exactly once, and the
 failed half of the shared Pinyin/Shuangpin draft not resubmitted), a
 successful global save with its persistence check, a save that stores one page and is refused for another with the refused
-edit kept, and read/apply/read-back with incarnation stability). The no-Host half also covers the
+edit kept, and read/apply/read-back with incarnation stability). Against the pinned
+`runtime-wp3-20261018` this workspace builds, which has no 辅助筛选 (`AuxiliaryFilter`), the
+mixed-option section stops at that assertion and the same suite prints **814** with exactly that
+one check failing — the option is not in the engine there, which is not a client defect. That 814
+is what `b8a81aa` printed on this machine on 2026-10-24; the no-Host half was not run separately
+against the pinned runtime, so no split figure is quoted for it, and neither the 821 nor the 846
+above covers the Chinese-name chain, which landed after both. The no-Host half also covers the
 installed-font list the 候选字体 row offers: the families this session has, once each, sorted, a
 name it does not contain reported as missing, and a search that narrows. It also covers the
 Chinese presentation of the options this engine added: the labels, the group each row lands in,
