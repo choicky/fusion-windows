@@ -71,7 +71,9 @@
 
 namespace fusion::ipc {
 
-inline constexpr std::uint32_t protocol_version = 8;
+// 9: the backend batch carries whether the context was already active when the engine
+// answered a key it declined (see BackendBatch::context_was_active).
+inline constexpr std::uint32_t protocol_version = 9;
 
 // Size of the Stage 4B response envelope (one host_incarnation field).
 inline constexpr std::size_t response_envelope_size = 8;
@@ -553,6 +555,7 @@ inline void serialize(std::vector<std::uint8_t> &buf, const BackendBatch &batch)
   serialize(buf, batch.binding);
   detail::write_u64(buf, batch.stimulus_id);
   detail::write_u8(buf, static_cast<std::uint8_t>(batch.disposition));
+  detail::write_u8(buf, batch.context_was_active ? 1 : 0);
   detail::write_u32(buf, static_cast<std::uint32_t>(batch.operations.size()));
   for (const auto &op : batch.operations)
     serialize(buf, op);
@@ -564,8 +567,9 @@ inline std::optional<BackendBatch> deserialize_batch(const std::uint8_t *data, s
   auto binding = r.read_binding();
   auto stimulus_id = r.read_u64();
   auto disp_byte = r.read_u8();
+  auto was_active_byte = r.read_u8();
   auto op_count = r.read_u32();
-  if (!session_id || !binding || !stimulus_id || !disp_byte || !op_count ||
+  if (!session_id || !binding || !stimulus_id || !disp_byte || !was_active_byte || !op_count ||
       *op_count > max_vector_length)
     return std::nullopt;
   if (*disp_byte > static_cast<std::uint8_t>(BackendBatch::Disposition::Reject))
@@ -585,6 +589,7 @@ inline std::optional<BackendBatch> deserialize_batch(const std::uint8_t *data, s
   batch.binding = *binding;
   batch.stimulus_id = *stimulus_id;
   batch.disposition = static_cast<BackendBatch::Disposition>(*disp_byte);
+  batch.context_was_active = *was_active_byte != 0;
   batch.operations = std::move(operations);
   return batch;
 }

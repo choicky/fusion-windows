@@ -45,7 +45,7 @@ public static class WireLimits
     // Must match `fusion::ipc::protocol_version`. Both ends check it exactly and refuse a
     // mismatch with a version error, so this is a compatibility constant, not a hint: a
     // client that guessed would be served nothing at all.
-    public const uint ProtocolVersion = 8;
+    public const uint ProtocolVersion = 9;
 
     // 3 adds dictionary management. A v2 client still works against a v3 Host: it simply
     // never sends the new message types, and every older message keeps its shape.

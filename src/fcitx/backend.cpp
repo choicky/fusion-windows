@@ -432,6 +432,11 @@ public:
   // configured key turns the input method back on. So character-less keys are still
   // dispatched and the engine decides: a bound key consumes them, anything else comes back
   // as Forward with nothing composed. No second matcher, no hard-coded key.
+
+  // Whether this context has ever been active. A key that arrives before that is the one
+  // that activates it, and it is the application's whatever the engine answers: the engine is
+  // asked only so that the key reaches it (see `ever_active_` below).
+  bool was_active() const { return ever_active_; }
   bool inactive_passthrough(const BackendStimulus &stimulus) {
     if (!instance_ || !ever_active_)
       return false;
@@ -718,6 +723,11 @@ public:
       // keeping an active flag of our own. The context was just focused above, so the
       // no-argument form addresses this one.
       instance_->activate();
+      // `activate()` above is what makes the context active; record that fact now, because a
+      // key that arrives before the first dispatch would otherwise be reported as "this
+      // context was never active" and the character the engine declines for it would not be
+      // delivered (the engine is already active — the first letter composes).
+      context->note_engine_state();
       context->lifecycle = false;
       contexts_.emplace(binding.context, std::move(context));
       return true;
@@ -775,6 +785,7 @@ public:
                       ? fcitx::Key(static_cast<fcitx::KeySym>(stimulus.keysym),
                                    fcitx::KeyStates(stimulus.modifiers))
                       : fcitx::Key(key_name(stimulus));
+              const bool was_active = context->was_active();
               if (!context->inactive_passthrough(stimulus)) {
                 context->dispatched_key = key;
                 fcitx::KeyEvent event(context, key,
@@ -782,6 +793,7 @@ public:
                 const bool consumed = context->keyEvent(event);
                 output->disposition = consumed ? BackendBatch::Disposition::Consumed
                                                : BackendBatch::Disposition::Forward;
+                output->context_was_active = was_active;
               } else {
                 // The engine is inactive for this context, so the key is the
                 // application's: nothing was composed, nothing is forwarded twice.

@@ -1,5 +1,9 @@
 #include "fusion/backend.hpp"
 #include "tsf/semantic.hpp"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <crtdbg.h>
 #include <cstdlib>
 #include <iostream>
@@ -17,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 22;
+constexpr int kExpectedSections = 23;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -757,6 +761,208 @@ int main() {
       digits.destroy();
       section("PASS number keys: an idle digit is the application's, a page's own number "
               "still selects on the top row and on the keypad");
+    }
+    // R47: the printable symbols. The digit gate above is a prediction about what the engine
+    // will do with a key, and for punctuation that prediction cannot be made in the shell:
+    // whether "," becomes "，" is the engine's punctuation configuration, not a property of
+    // the key. So the shell claims the key and, when the engine declines it, delivers the
+    // character the engine declined — which is what the Linux frontend's Forward amounts to
+    // on a platform where a T claim cannot be retracted (R36/R37/R44).
+    {
+      const HKL us = LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL);
+      require(us != nullptr, "US keyboard layout for the symbol table");
+      const char printable[] =
+          " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+      const auto symbol_key = [&](char ch) {
+        const SHORT scan = VkKeyScanExW(static_cast<WCHAR>(ch), us);
+        require(scan != -1, "the layout has no key for a printable ASCII character");
+        return translate_key(static_cast<std::uint32_t>(scan & 0xff), false, false, false,
+                             static_cast<char32_t>(ch), ((scan >> 8) & 1) != 0);
+      };
+      // Every case below is the FIRST key of a freshly bound context: a bound context is
+      // already active (the Host activates it when it binds), so nothing is warmed up and no
+      // letter is typed first — the case the owner hit when a field had just been focused.
+
+      // (a) Translation, for every printable ASCII character: the layout's own VK and shift,
+      // the character Windows produces for them, and the keysym the shell derives. The live
+      // path makes the same ToUnicodeEx call with the live keyboard state; pinning the
+      // layout here keeps the table identical on every machine.
+      for (const char *c = printable; *c; ++c) {
+        const SHORT scan = VkKeyScanExW(static_cast<WCHAR>(*c), us);
+        require(scan != -1, "layout mapping for a printable ASCII character");
+        const auto vk = static_cast<std::uint32_t>(scan & 0xff);
+        BYTE state[256]{};
+        if ((scan >> 8) & 1)
+          state[VK_SHIFT] = 0x80;
+        wchar_t text[8]{};
+        const int count = ToUnicodeEx(vk, MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, us), state, text, 8,
+                                      0, us);
+        require(count == 1 && text[0] == static_cast<WCHAR>(*c),
+                "the layout produced a different character than the table expects");
+        require(symbol_key(*c).keysym == static_cast<unsigned char>(*c),
+                "translate_key lost the character the layout produced");
+      }
+      // (b) Nothing printable is lost. Every printable ASCII symbol, idle: the key is claimed
+      // in T, so either the engine handles it or the shell delivers it; the application is
+      // never left with a key that has been taken away from it.
+      for (const char *c = printable; *c; ++c) {
+        if (*c >= '0' && *c <= '9')
+          continue; // the digit gate leaves these to the application (R44)
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(970, 64, *symbol_backend);
+        Document symbol_doc;
+        const auto action = symbol_key(*c);
+        require(symbols.routes_key(action), "a printable symbol is a T-routable key class");
+        auto d = symbols.begin_key(action, true);
+        if (d.forward) {
+          std::cout << "lost '" << *c << "'\n";
+          require(false, "a printable symbol was neither handled nor delivered");
+        }
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        symbols.destroy();
+      }
+      // (c) The symbols the owner reported, delivered as themselves, from the top row and
+      // from the keypad alike. These are the keys the engine declines with nothing
+      // composing: it has no punctuation entry for them.
+      const struct {
+        const char *name;
+        KeyAction action;
+        const char *expected;
+      } delivered[] = {
+          {"/", symbol_key('/'), "/"},         {"-", symbol_key('-'), "-"},
+          {"+", symbol_key('+'), "+"},         {"=", symbol_key('='), "="},
+          {"&", symbol_key('&'), "&"},         {"*", symbol_key('*'), "*"},
+          {"|", symbol_key('|'), "|"},         {"@", symbol_key('@'), "@"},
+          {"keypad /", translate_key(0x6f, false, false, false, U'/'), "/"},
+          {"keypad *", translate_key(0x6a, false, false, false, U'*'), "*"},
+          {"keypad -", translate_key(0x6d, false, false, false, U'-'), "-"},
+          {"keypad +", translate_key(0x6b, false, false, false, U'+'), "+"},
+      };
+      for (const auto &row : delivered) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(971, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(row.action, true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "delivered " << row.name << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && !d.forward && symbol_doc.committed == row.expected,
+                "a declined symbol was not delivered as itself");
+        symbols.destroy();
+      }
+      // (d) The engine still owns the punctuation it maps: the same key produces the
+      // official full-width character, and the shell adds nothing to it.
+      const struct {
+        char key;
+        const char *expected;
+      } punctuated[] = {{',', "，"}, {'.', "。"}, {'?', "？"}, {':', "："}, {'(', "（"}};
+      for (const auto &row : punctuated) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(972, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(symbol_key(row.key), true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "punctuated " << row.key << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && symbol_doc.committed == row.expected,
+                "the engine no longer converts punctuation the way it did");
+        symbols.destroy();
+      }
+      // (e) Composing: a declined symbol commits the candidate first and then delivers
+      // itself, in that order — the engine's own commit is not disturbed.
+      {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(973, 64, *symbol_backend);
+        Document symbol_doc;
+        type(symbols, symbol_doc, "nihao");
+        auto d = symbols.begin_key(symbol_key('-'), true);
+        std::cout << "composing '-' ops=" << d.frontend.size() << " committed=[" << symbol_doc.committed
+                  << "]\n";
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        require(d.eaten && symbol_doc.committed == "你好-",
+                "a declined symbol broke the composition it followed");
+        require(symbols.raw_buffer().empty(), "a declined symbol left a projection");
+        symbols.destroy();
+      }
+      // (f) 中文标点 switched off. The switch is the punctuation module's own toggle key
+      // (Ctrl+. by default) — the user's control, not a shell rule — and what it changes is
+      // the engine's answer for the same key: a comma becomes the engine's Forward, which is
+      // exactly the case (c) proves the shell delivers. The engine is asked directly here
+      // because the shell never dispatches a modified key (routes_key refuses them).
+      {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(975, 64, *symbol_backend);
+        Document symbol_doc;
+        (void)symbols.begin_key(physical('n'), true); // binds the context, starts composing
+        (void)symbols.finish_pass();
+        (void)symbols.begin_key(translate_key(kVkEscape, false, false, false), true);
+        (void)symbols.finish_pass();
+        const Binding binding{975, 1, 1};
+        const auto ask = [&](std::uint64_t id, std::uint32_t keysym, std::uint32_t modifiers) {
+          BackendStimulus stimulus{binding, id};
+          stimulus.type = BackendStimulus::Type::Character;
+          stimulus.keysym = keysym;
+          stimulus.modifiers = modifiers;
+          return symbol_backend->send(stimulus);
+        };
+        const auto toggled = ask(3, '.', 4); // fcitx KeyState::Ctrl is bit 2
+        require(toggled.disposition != BackendBatch::Disposition::Reject,
+                "the punctuation toggle key was refused");
+        const auto plain_comma = ask(4, ',', 0);
+        std::cout << "punctuation off: comma consumed="
+                  << (plain_comma.disposition == BackendBatch::Disposition::Consumed ? 1 : 0)
+                  << '\n';
+        require(plain_comma.disposition == BackendBatch::Disposition::Forward,
+                "with punctuation off the engine still converted a comma");
+        symbols.destroy();
+      }
+      // (g) Latin-1: translate_key encodes every character below 0x100 as the keysym itself, so
+      // these keys carry 0xe9 / 0xa3 rather than an ASCII byte. The digit-row case is the one
+      // that used to go wrong: its raw-input character is the unshifted "2", and falling back
+      // to it delivered "2" instead of "é".
+      const struct {
+        const char *name;
+        KeyAction action;
+        const char *expected;
+      } latin1[] = {
+          // A digit-row key whose translated character is é: AppendChar keeps ch = '2'.
+          {"digit row é", translate_key('2', false, false, false, U'\u00e9', true), "\xc3\xa9"},
+          // A symbol key with no raw-input character at all: Pass type, ch = 0, keysym 0xa3.
+          {"symbol £", translate_key(0xbf, false, false, false, U'\u00a3'), "\xc2\xa3"},
+      };
+      for (const auto &row : latin1) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(977, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(row.action, true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "latin1 " << row.name << " keysym=0x" << std::hex << row.action.keysym
+                  << std::dec << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && symbol_doc.committed == row.expected,
+                "a forwarded Latin-1 character was not delivered as itself");
+        symbols.destroy();
+      }
+      // (h) The first key of a freshly bound context. A bound context is already active — the
+      // Host activates it when it binds — so a symbol pressed into a field that was just
+      // focused must be delivered like any other. Nothing is typed first here on purpose.
+      for (const char first : {'/', '@'}) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(978, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(symbol_key(first), true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "first key '" << first << "' eaten=" << (d.eaten ? 1 : 0)
+                  << " forward=" << (d.forward ? 1 : 0) << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && !d.forward && symbol_doc.committed == std::string(1, first),
+                "the first key of a new context was not delivered");
+        symbols.destroy();
+      }
+      section("PASS symbols: every printable ASCII key reaches the document, the engine keeps "
+              "the punctuation it maps, and a declined symbol is delivered by the shell");
     }
     return 0;
   } catch (const std::exception &e) {

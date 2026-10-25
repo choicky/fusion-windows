@@ -274,7 +274,10 @@ private:
   // Shared real-frontend tail: dispatch one stimulus, validate the returned
   // batch, own the ordered Core records, and project any candidate snapshot.
   // Used by both the key and the candidate-action paths.
-  void dispatch_real(const BackendStimulus &stimulus, SemanticDecision &decision);
+  // `claimed_in_t` is the T answer for a key-down: the shell may only deliver a character
+  // the engine declined when it had claimed that key in the first place.
+  void dispatch_real(const BackendStimulus &stimulus, SemanticDecision &decision,
+                     bool claimed_in_t = false);
   // Drop the displayed candidate projection (hide). The fence is no longer
   // meaningful once there is no page to fence.
   void clear_displayed_page();
