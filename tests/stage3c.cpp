@@ -17,7 +17,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 21;
+constexpr int kExpectedSections = 22;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -674,6 +674,89 @@ int main() {
       b.destroy();
       a.destroy();
       section("PASS the configured global hotkey reactivates A after B became most recent");
+    }
+
+    // R44: the number keys. Measured on the pinned engine: with nothing composing a digit
+    // comes back as ForwardKey — there is nothing to select — so the shell must stop
+    // claiming it, because an application that honours OnTestKeyDown alone drops a key the
+    // claim cannot retract (the shape R36 and R37 fixed for Return and the editing keys).
+    // With a page on screen the same key selects, on the top row and on the keypad alike.
+    // Its own engine instance, so the selections this section makes cannot move the
+    // candidates the sections above assert.
+    {
+      auto digits_backend = make_fcitx_backend();
+      SemanticController digits(953, 64, *digits_backend);
+      Document digits_doc;
+      const auto number = [](std::uint32_t vk, char ch) {
+        return translate_key(vk, false, false, false, ch);
+      };
+      type(digits, digits_doc, "nihao");
+      auto number_commit = digits.begin_key(translate_key(kVkSpace, false, false, false), true);
+      require(number_commit.eaten && !number_commit.frontend.empty(), "number-key section commit");
+      digits_doc.apply(digits, number_commit);
+      require(digits.finish_pass(), "number-key commit barrier");
+      for (const auto &[vk, name] :
+           {std::pair<std::uint32_t, const char *>{'3', "top-row 3"},
+            std::pair<std::uint32_t, const char *>{0x63, "keypad 3"}}) {
+        const auto idle = number(vk, '3');
+        require(digits.routes_key(idle), "a digit is still a T-routable key class");
+        require(!digits.engine_has_work_for(idle),
+                "an idle digit is not engine work, so T must not claim it");
+        const auto handed_back = digits.begin_key(idle, true);
+        std::cout << "idle " << name << " forward=" << (handed_back.forward ? 1 : 0)
+                  << " route=" << static_cast<int>(handed_back.route) << '\n';
+        require(handed_back.forward && !handed_back.eaten && handed_back.frontend.empty(),
+                "the engine did not hand an idle digit back to the application");
+        require(digits.finish_pass(), "idle digit barrier");
+      }
+      // The gate reads the translated keysym, so the punctuation Shift puts on the same
+      // physical keys is not a candidate digit: with nothing composing it keeps the routing
+      // it had before R44 and still reaches the engine.
+      const auto check_punctuation = [&](std::uint32_t vk, char ch, const char *name) {
+        const auto shifted = translate_key(vk, false, false, false, ch, true);
+        const bool engine_work = digits.engine_has_work_for(shifted);
+        std::cout << name << " keysym=" << static_cast<char>(shifted.keysym)
+                  << " engine_work=" << (engine_work ? 1 : 0) << '\n';
+        require(engine_work, "shifted punctuation was gated as if it were a number key");
+        const auto handed = digits.begin_key(shifted, true);
+        require(handed.eaten && !handed.forward && !handed.frontend.empty(),
+                "the engine did not take the punctuation Shift produced");
+        digits_doc.apply(digits, handed);
+        require(digits.finish_pass(), "punctuation barrier");
+      };
+      check_punctuation('1', '!', "Shift+1");
+      check_punctuation('9', '(', "Shift+9");
+      check_punctuation('0', ')', "Shift+0");
+      type(digits, digits_doc, "nihao");
+      require(digits.displayed_page().has_value() &&
+                  digits.displayed_page()->entries.size() > 3,
+              "the composing page a number key selects from");
+      const auto keypad = number(0x63, '3');
+      const auto top_row = number('3', '3');
+      require(digits.engine_has_work_for(top_row) && digits.engine_has_work_for(keypad),
+              "a number key is engine work while a page is on screen, top row and keypad");
+      const auto keypad_selected = digits.begin_key(keypad, true);
+      std::cout << "composing keypad 3 eaten=" << (keypad_selected.eaten ? 1 : 0)
+                << " ops=" << keypad_selected.frontend.size() << '\n';
+      require(keypad_selected.eaten && !keypad_selected.forward &&
+                  !keypad_selected.frontend.empty(),
+              "a keypad number no longer selects the candidate the page shows");
+      digits_doc.apply(digits, keypad_selected);
+      (void)digits.finish_pass();
+      type(digits, digits_doc, "nihao");
+      const auto top_row_selected = digits.begin_key(top_row, true);
+      std::cout << "composing 3 eaten=" << (top_row_selected.eaten ? 1 : 0)
+                << " ops=" << top_row_selected.frontend.size() << '\n';
+      require(top_row_selected.eaten && !top_row_selected.forward &&
+                  !top_row_selected.frontend.empty(),
+              "a number key no longer selects the candidate the page shows");
+      digits_doc.apply(digits, top_row_selected);
+      (void)digits.finish_pass();
+      (void)digits.begin_key(translate_key(kVkEscape, false, false, false), true);
+      (void)digits.finish_pass();
+      digits.destroy();
+      section("PASS number keys: an idle digit is the application's, a page's own number "
+              "still selects on the top row and on the keypad");
     }
     return 0;
   } catch (const std::exception &e) {

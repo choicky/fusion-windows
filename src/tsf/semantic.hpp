@@ -265,6 +265,12 @@ private:
   // editing/navigation keys Fcitx handles inside its non-empty-input branch, plus Return
   // (R36). Measured against the pinned engine in stage3c, not inferred from the key class.
   static bool editing_key_needs_composition(const KeyAction &action);
+  // A number key selects a candidate only while a page is on screen — top row and keypad
+  // alike, measured in stage3c. Told apart by the translated keysym, so the punctuation
+  // Shift puts on those keys keeps its own routing. Kept apart from the composition gate
+  // above because the page, not the composition, is the oracle.
+  static bool is_candidate_digit(const KeyAction &action);
+  bool digit_selects_a_candidate(const KeyAction &action) const;
   // Shared real-frontend tail: dispatch one stimulus, validate the returned
   // batch, own the ordered Core records, and project any candidate snapshot.
   // Used by both the key and the candidate-action paths.
