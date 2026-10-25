@@ -124,13 +124,34 @@ public static class PageChrome
     /// </summary>
     public static FrameworkElement MethodSelector(SettingsWorkspace workspace, Action onChanged)
     {
-        var combo = new ComboBox { MinWidth = 180 };
-        combo.Items.Add(new ComboBoxItem { Content = "拼音", Tag = "pinyin" });
-        combo.Items.Add(new ComboBoxItem { Content = "双拼", Tag = "shuangpin" });
-        combo.SelectedIndex = workspace.EditingMethod == "shuangpin" ? 1 : 0;
+        // The same row style as every other selection list: the method being edited carries the
+        // mark, and it moves with the selection without rebuilding the items.
+        var rows = new List<Controls.ChoiceRow>
+        {
+            new("拼音", "pinyin", workspace.EditingMethod != "shuangpin"),
+            new("双拼", "shuangpin", workspace.EditingMethod == "shuangpin"),
+        };
+        var combo = new ComboBox
+        {
+            MinWidth = 180,
+            ItemsSource = rows,
+            ItemTemplate = Controls.ChoiceMark.TextTemplate,
+            SelectedIndex = workspace.EditingMethod == "shuangpin" ? 1 : 0,
+        };
+        Controls.ChoiceMark.ApplyTo(combo);
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is ComboBoxItem item && item.Tag is string method)
+            if (combo.SelectedIndex < 0 || combo.SelectedIndex >= rows.Count)
+            {
+                return;
+            }
+
+            for (var i = 0; i < rows.Count; i++)
+            {
+                rows[i].IsCurrent = i == combo.SelectedIndex;
+            }
+
+            if (rows[combo.SelectedIndex].Value is { } method)
             {
                 workspace.EditMethod(method);
                 onChanged();

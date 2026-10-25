@@ -4,12 +4,10 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 using Fusion.Settings.Model;
-using Microsoft.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Markup;
 using Microsoft.UI.Xaml.Media;
 using Windows.System;
 
@@ -144,8 +142,8 @@ public static class OptionRows
             // The suggestion list is the system's; typing filters it, and a name that is not
             // there is still accepted as text.
             ItemsSource = FontChoices(installed, stored),
-            TextMemberPath = nameof(FontChoice.Name),
-            ItemTemplate = FontRowTemplate(),
+            TextMemberPath = nameof(ChoiceRow.Name),
+            ItemTemplate = ChoiceMark.Template,
         };
         box.TextChanged += (sender, args) =>
         {
@@ -206,7 +204,7 @@ public static class OptionRows
         {
             // Clicking a suggestion fills the box; committing happens in QuerySubmitted, so a
             // keyboard user and a mouse user take the same path.
-            if (args.SelectedItem is FontChoice chosen)
+            if (args.SelectedItem is ChoiceRow chosen)
             {
                 box.Text = chosen.Name;
             }
@@ -261,64 +259,20 @@ public static class OptionRows
         box.ItemsSource = FontChoices(ordered, value);
     }
 
-    /// <summary>One row of the font list: the family name and the fill it is drawn on.</summary>
-    private sealed class FontChoice
-    {
-        public string Name { get; init; } = string.Empty;
-
-        public Brush Background { get; init; } = Transparent;
-
-        // The suggestion list shows this row's name to a screen reader; without it the row
-        // announces the type name instead of the family.
-        public override string ToString() => Name;
-    }
-
-    private static readonly SolidColorBrush Transparent =
-        new(Microsoft.UI.Colors.Transparent);
-
-    private static DataTemplate? fontRowTemplate_;
-
     /// <summary>
-    /// The row layout: a filled border with the name inside it. The fill comes from the row's
-    /// own <see cref="FontChoice.Background"/>, so the family in effect is drawn on the accent
-    /// tint while every other row is transparent — the hover and keyboard-navigation fills the
-    /// list already has are left untouched.
-    /// </summary>
-    private static DataTemplate FontRowTemplate() =>
-        fontRowTemplate_ ??= (DataTemplate)XamlReader.Load(
-            "<DataTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>" +
-            "<Border Background='{Binding Background}' Padding='8,4' CornerRadius='4'>" +
-            "<TextBlock Text='{Binding Name}' TextTrimming='CharacterEllipsis'/>" +
-            "</Border></DataTemplate>");
-
-    /// <summary>
-    /// The fill of the family in effect: the theme's own accent colour at a quarter of its
-    /// strength. A theme brush would have to be resolved for the popup's own theme, and the
-    /// attention fill it offers is too close to the list's background to read as a mark; a
-    /// translucent accent tint is visible on the light and the dark surface alike, and it is
-    /// clearly heavier than the fills hover and keyboard navigation draw.
-    /// </summary>
-    private static SolidColorBrush AccentTint()
-    {
-        var accent = (Windows.UI.Color)Application.Current.Resources["SystemAccentColor"];
-        return new SolidColorBrush(Windows.UI.Color.FromArgb(0x40, accent.R, accent.G, accent.B));
-    }
-
-    /// <summary>
-    /// The catalogue as rows, with the family that is in effect drawn on the accent tint.
+    /// The catalogue as rows, with the family that is in effect carrying the mark.
     /// <paramref name="inEffect"/> is the value the box holds — the draft's value, so an
     /// unsaved choice is the one marked — and a name no installed family matches marks nothing.
     /// </summary>
-    private static List<FontChoice> FontChoices(IReadOnlyList<string> families, string? inEffect)
+    private static List<ChoiceRow> FontChoices(IReadOnlyList<string> families, string? inEffect)
     {
-        var highlight = AccentTint();
         var current = FontCatalog.Find(inEffect);
-        var rows = new List<FontChoice>(families.Count);
+        var rows = new List<ChoiceRow>(families.Count);
         foreach (var family in families)
         {
             var isCurrent = current is not null &&
                             string.Equals(family, current, StringComparison.OrdinalIgnoreCase);
-            rows.Add(new FontChoice { Name = family, Background = isCurrent ? highlight : Transparent });
+            rows.Add(new ChoiceRow(family, family, isCurrent));
         }
 
         return rows;
@@ -418,20 +372,26 @@ public static class OptionRows
         return box;
     }
 
+    /// <summary>
+    /// A closed set of values. The list marks the value in effect the same way the font list does,
+    /// and the mark moves with the selection — the dropdown's own highlight keeps saying where the
+    /// pointer or the keyboard is, which is a different question.
+    /// </summary>
     private static FrameworkElement EnumControl(OptionDescription option, SettingsValue current,
                                                 Func<SettingsValue, bool> apply,
                                                 IReadOnlyDictionary<string, string>? enumLabels)
     {
         var labels = option.LocalizedEnumLabels;
         var stored = option.EnumLabels;
-        var combo = new ComboBox { MinWidth = 200 };
-
+        var rows = new List<ChoiceRow>(labels.Count);
         for (var i = 0; i < labels.Count; i++)
         {
             var value = i < stored.Count ? stored[i] : labels[i];
-            // The label is display text; the Tag stays the stored value the Host round-trips.
-            var shown = enumLabels is not null && enumLabels.TryGetValue(value, out var mapped) ? mapped : labels[i];
-            combo.Items.Add(new ComboBoxItem { Content = shown, Tag = value });
+            // The label is display text; the row's Value stays the stored value the Host round-trips.
+            var shown = enumLabels is not null && enumLabels.TryGetValue(value, out var mapped)
+                            ? mapped
+                            : labels[i];
+            rows.Add(new ChoiceRow(shown, value));
         }
 
         var index = stored.ToList().IndexOf(current.Scalar);
@@ -439,19 +399,54 @@ public static class OptionRows
         {
             // A value the schema does not list (an older config, or a Host that changed an
             // enum): show it rather than silently selecting the first entry.
-            combo.Items.Add(new ComboBoxItem { Content = current.Scalar, Tag = current.Scalar });
-            index = combo.Items.Count - 1;
+            rows.Add(new ChoiceRow(current.Scalar, current.Scalar));
+            index = rows.Count - 1;
         }
 
-        combo.SelectedIndex = index;
+        var combo = new ComboBox
+        {
+            MinWidth = 200,
+            ItemsSource = rows,
+            ItemTemplate = ChoiceMark.TextTemplate,
+            // Selection is decided below, once the mark is in place: setting it here would raise
+            // SelectionChanged against a list that has no current row yet.
+            SelectedIndex = index,
+        };
+        ChoiceMark.ApplyTo(combo);
+        Mark(rows, index);
+
+        var updating = false;
+        var marked = index;
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is ComboBoxItem item && item.Tag is string value)
+            if (updating || combo.SelectedIndex < 0 || combo.SelectedIndex >= rows.Count)
             {
-                apply(SettingsValue.Text(value));
+                return;
             }
+
+            var chosen = rows[combo.SelectedIndex];
+            if (!apply(SettingsValue.Text(chosen.Value ?? string.Empty)))
+            {
+                // A value the draft refused is not shown as taken, and not marked as if it were.
+                updating = true;
+                combo.SelectedIndex = marked;
+                updating = false;
+                return;
+            }
+
+            marked = combo.SelectedIndex;
+            Mark(rows, marked);
         };
         return combo;
+    }
+
+    /// <summary>Moves the mark to <paramref name="index"/>; every other row loses it.</summary>
+    private static void Mark(IReadOnlyList<ChoiceRow> rows, int index)
+    {
+        for (var i = 0; i < rows.Count; i++)
+        {
+            rows[i].IsCurrent = i == index;
+        }
     }
 
     private static FrameworkElement StringListControl(SettingsValue current, Func<SettingsValue, bool> apply)
