@@ -260,6 +260,12 @@ struct BackendBatch {
   Binding binding{};
   std::uint64_t stimulus_id = 0;
   Disposition disposition = Disposition::Reject;
+  // For a Forward: whether this context had already been active when the engine answered.
+  // A key the engine declines in an active context is the engine's own "not mine"; the same
+  // answer before the context was ever active belongs to the key that activates it, and that
+  // key stays the application's. The frontend needs the difference because a key it claimed
+  // in T cannot be handed back — it may only deliver what an active engine declined.
+  bool context_was_active = false;
   std::vector<BackendOperation> operations;
 };
 class Backend {

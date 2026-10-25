@@ -9,6 +9,7 @@ using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Markup;
 using Microsoft.UI.Xaml.Media;
 using Windows.System;
 
@@ -142,14 +143,15 @@ public static class OptionRows
             MinWidth = 220,
             // The suggestion list is the system's; typing filters it, and a name that is not
             // there is still accepted as text.
-            ItemsSource = installed,
-            TextMemberPath = string.Empty,
+            ItemsSource = FontChoices(installed, stored),
+            TextMemberPath = nameof(FontChoice.Name),
+            ItemTemplate = FontRowTemplate(),
         };
         box.TextChanged += (sender, args) =>
         {
             if (args.Reason == AutoSuggestionBoxTextChangeReason.UserInput)
             {
-                sender.ItemsSource = FontCatalog.Search(sender.Text);
+                sender.ItemsSource = FontChoices(FontCatalog.Search(sender.Text), sender.Text);
             }
         };
         // Opening the list shows it from its first row, so with the catalogue in its own order
@@ -204,9 +206,9 @@ public static class OptionRows
         {
             // Clicking a suggestion fills the box; committing happens in QuerySubmitted, so a
             // keyboard user and a mouse user take the same path.
-            if (args.SelectedItem is string chosen)
+            if (args.SelectedItem is FontChoice chosen)
             {
-                box.Text = chosen;
+                box.Text = chosen.Name;
             }
         };
         box.QuerySubmitted += (_, args) => Commit(args.QueryText);
@@ -243,7 +245,7 @@ public static class OptionRows
         var current = FontCatalog.Find(value);
         if (current is null || families.Count == 0)
         {
-            box.ItemsSource = families;
+            box.ItemsSource = FontChoices(families, value);
             return;
         }
 
@@ -256,7 +258,70 @@ public static class OptionRows
             }
         }
 
-        box.ItemsSource = ordered;
+        box.ItemsSource = FontChoices(ordered, value);
+    }
+
+    /// <summary>One row of the font list: the family name and the fill it is drawn on.</summary>
+    private sealed class FontChoice
+    {
+        public string Name { get; init; } = string.Empty;
+
+        public Brush Background { get; init; } = Transparent;
+
+        // The suggestion list shows this row's name to a screen reader; without it the row
+        // announces the type name instead of the family.
+        public override string ToString() => Name;
+    }
+
+    private static readonly SolidColorBrush Transparent =
+        new(Microsoft.UI.Colors.Transparent);
+
+    private static DataTemplate? fontRowTemplate_;
+
+    /// <summary>
+    /// The row layout: a filled border with the name inside it. The fill comes from the row's
+    /// own <see cref="FontChoice.Background"/>, so the family in effect is drawn on the accent
+    /// tint while every other row is transparent — the hover and keyboard-navigation fills the
+    /// list already has are left untouched.
+    /// </summary>
+    private static DataTemplate FontRowTemplate() =>
+        fontRowTemplate_ ??= (DataTemplate)XamlReader.Load(
+            "<DataTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'>" +
+            "<Border Background='{Binding Background}' Padding='8,4' CornerRadius='4'>" +
+            "<TextBlock Text='{Binding Name}' TextTrimming='CharacterEllipsis'/>" +
+            "</Border></DataTemplate>");
+
+    /// <summary>
+    /// The fill of the family in effect: the theme's own accent colour at a quarter of its
+    /// strength. A theme brush would have to be resolved for the popup's own theme, and the
+    /// attention fill it offers is too close to the list's background to read as a mark; a
+    /// translucent accent tint is visible on the light and the dark surface alike, and it is
+    /// clearly heavier than the fills hover and keyboard navigation draw.
+    /// </summary>
+    private static SolidColorBrush AccentTint()
+    {
+        var accent = (Windows.UI.Color)Application.Current.Resources["SystemAccentColor"];
+        return new SolidColorBrush(Windows.UI.Color.FromArgb(0x40, accent.R, accent.G, accent.B));
+    }
+
+    /// <summary>
+    /// The catalogue as rows, with the family that is in effect drawn on the accent tint.
+    /// <paramref name="inEffect"/> is the value the box holds — the draft's value, so an
+    /// unsaved choice is the one marked — and a name no installed family matches marks nothing.
+    /// </summary>
+    private static List<FontChoice> FontChoices(IReadOnlyList<string> families, string? inEffect)
+    {
+        var highlight = AccentTint();
+        var current = FontCatalog.Find(inEffect);
+        var rows = new List<FontChoice>(families.Count);
+        foreach (var family in families)
+        {
+            var isCurrent = current is not null &&
+                            string.Equals(family, current, StringComparison.OrdinalIgnoreCase);
+            rows.Add(new FontChoice { Name = family, Background = isCurrent ? highlight : Transparent });
+        }
+
+        return rows;
     }
 
     private static FrameworkElement CreateControl(OptionDescription option, SettingsValue current,

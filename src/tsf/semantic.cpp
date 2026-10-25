@@ -23,6 +23,41 @@ bool incarnation_tracked(const LinkStatus &link) {
   return link.host_incarnation != 0 || link.connection_generation != 0;
 }
 
+// The character a forwarded key carries, in UTF-8, or nothing when the key is not text.
+// The keysym is the translated one (`translate_key`), so this is the character the user's
+// own layout produced — the keypad and the top row included, and Shift included — and not a
+// guess made from the virtual key. `character` is only the raw-input fallback: for a shifted
+// digit it still holds the unshifted digit, which is not what the user pressed.
+std::optional<std::string> forwarded_character(const BackendStimulus &stimulus) {
+  const std::uint32_t keysym = stimulus.keysym;
+  std::uint32_t code = 0;
+  if (keysym >= 0x20 && keysym < 0x7f)
+    code = keysym;
+  else if ((keysym & 0xff000000u) == 0x01000000u)
+    code = keysym & 0x00ffffffu;
+  else if (stimulus.character != 0)
+    code = static_cast<unsigned char>(stimulus.character);
+  if (code == 0)
+    return std::nullopt;
+  std::string text;
+  if (code < 0x80) {
+    text.push_back(static_cast<char>(code));
+  } else if (code < 0x800) {
+    text.push_back(static_cast<char>(0xc0 | (code >> 6)));
+    text.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+  } else if (code < 0x10000) {
+    text.push_back(static_cast<char>(0xe0 | (code >> 12)));
+    text.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+  } else {
+    text.push_back(static_cast<char>(0xf0 | (code >> 18)));
+    text.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3f)));
+    text.push_back(static_cast<char>(0x80 | (code & 0x3f)));
+  }
+  return text;
+}
+
 } // namespace
 
 SemanticController::SemanticController(std::uint64_t context_id, std::size_t capacity,
@@ -315,7 +350,7 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     return decision;
   }
   decision.symbolic = "fcitx:" + std::to_string(stimulus.keysym);
-  dispatch_real(stimulus, decision);
+  dispatch_real(stimulus, decision, engine_has_work_for(action));
   if ((action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR) &&
       decision.route != SemanticDecision::Route::CancelledRecovery &&
       decision.backend_session_id != 0) {
@@ -541,7 +576,7 @@ bool SemanticController::begin_candidate_cursor(int step, SemanticDecision &deci
 }
 
 void SemanticController::dispatch_real(const BackendStimulus &stimulus,
-                                       SemanticDecision &decision) {
+                                       SemanticDecision &decision, bool claimed_in_t) {
   const auto batch = real_backend_->send(stimulus);
   decision.backend_session_id = batch.backend_session_id;
   decision.stimulus_id = batch.stimulus_id;
@@ -580,7 +615,9 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
     clear_displayed_page();
     return;
   }
-  decision.forward = original_forward || batch.disposition == BackendBatch::Disposition::Forward;
+  const bool engine_declined =
+      original_forward || batch.disposition == BackendBatch::Disposition::Forward;
+  decision.forward = engine_declined;
   decision.eaten = !decision.forward;
   std::optional<CandidatePage> captured;
   for (const auto &operation : batch.operations) {
@@ -623,6 +660,28 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
     displayed_page_ = page_present_ ? captured : std::nullopt;
     displayed_fence_ = PageFence{batch.backend_session_id, stimulus.binding, batch.stimulus_id,
                                  link.host_incarnation, link.connection_generation};
+  }
+  // A key the engine declined cannot be handed back on this platform: the claim made in T
+  // cannot be retracted, and an application that consults T alone never delivers the key
+  // natively (R36 Return, R37 the editing keys, R44 the number keys). So when the engine
+  // itself answers ForwardKey for a key that carries a printable character, the shell
+  // delivers that character — the same character the Linux frontend would have passed to
+  // the application. Nothing is synthesized: it is the key the user pressed, at the position
+  // the engine left the document.
+  //
+  // Only for a key T claimed, and only when this context was already active: a key T leaves
+  // alone (a digit, an idle editing key) keeps the route it had, the key that first activates
+  // a context stays the application's, and the inactive-context pass-through is not an engine
+  // decision at all.
+  if (engine_declined && claimed_in_t && batch.context_was_active) {
+    if (const auto text = forwarded_character(stimulus)) {
+      if (auto key = core_.own(Kind::Effect, true)) {
+        decision.frontend.push_back({{BackendOperation::Type::CommitText, *text, {}}, *key});
+        (void)core_.propose_effect(*key, state_dependency_);
+        decision.forward = false;
+        decision.eaten = true;
+      }
+    }
   }
   if (decision.frontend.empty()) {
     if (!decision.forward) {
