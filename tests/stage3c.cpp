@@ -709,6 +709,24 @@ int main() {
                 "the engine did not hand an idle digit back to the application");
         require(digits.finish_pass(), "idle digit barrier");
       }
+      // The gate reads the translated keysym, so the punctuation Shift puts on the same
+      // physical keys is not a candidate digit: with nothing composing it keeps the routing
+      // it had before R44 and still reaches the engine.
+      const auto check_punctuation = [&](std::uint32_t vk, char ch, const char *name) {
+        const auto shifted = translate_key(vk, false, false, false, ch, true);
+        const bool engine_work = digits.engine_has_work_for(shifted);
+        std::cout << name << " keysym=" << static_cast<char>(shifted.keysym)
+                  << " engine_work=" << (engine_work ? 1 : 0) << '\n';
+        require(engine_work, "shifted punctuation was gated as if it were a number key");
+        const auto handed = digits.begin_key(shifted, true);
+        require(handed.eaten && !handed.forward && !handed.frontend.empty(),
+                "the engine did not take the punctuation Shift produced");
+        digits_doc.apply(digits, handed);
+        require(digits.finish_pass(), "punctuation barrier");
+      };
+      check_punctuation('1', '!', "Shift+1");
+      check_punctuation('9', '(', "Shift+9");
+      check_punctuation('0', ')', "Shift+0");
       type(digits, digits_doc, "nihao");
       require(digits.displayed_page().has_value() &&
                   digits.displayed_page()->entries.size() > 3,

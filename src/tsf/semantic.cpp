@@ -724,10 +724,10 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
 }
 
 bool SemanticController::is_candidate_digit(const KeyAction &action) {
-  // The top row and the keypad both, told apart from every other key by the virtual key:
-  // the keypad's digits carry the same keysym as the top row's and behave the same way.
-  return (action.virtual_key >= '0' && action.virtual_key <= '9') ||
-         (action.virtual_key >= kVkNumpad0 && action.virtual_key <= kVkNumpad9);
+  // The translated keysym, not the virtual key: the top row and the keypad both carry a
+  // digit keysym, while Shift+1/9/0 carry '!' '(' ')' — punctuation the engine handles like
+  // any other character, so the gate must not reach it.
+  return action.keysym >= '0' && action.keysym <= '9';
 }
 
 bool SemanticController::digit_selects_a_candidate(const KeyAction &action) const {
