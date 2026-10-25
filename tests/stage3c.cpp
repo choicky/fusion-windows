@@ -779,20 +779,10 @@ int main() {
         return translate_key(static_cast<std::uint32_t>(scan & 0xff), false, false, false,
                              static_cast<char32_t>(ch), ((scan >> 8) & 1) != 0);
       };
-      // Every case below is a symbol pressed into an already active context, which is what a
-      // user does with the input method on. The first key of a fresh context is the one that
-      // activates it, and that key stays the application's (R44's stage4b contract), so it is
-      // spent on a letter first and cancelled.
-      const auto activate = [&](SemanticController &controller, Document &document) {
-        auto start = controller.begin_key(translate_key('A', false, false, false, U'a'), true);
-        require(start.eaten && !start.forward, "the activating key did not start a composition");
-        document.apply(controller, start);
-        (void)controller.finish_pass();
-        auto cancel = controller.begin_key(translate_key(kVkEscape, false, false, false), true);
-        document.apply(controller, cancel);
-        (void)controller.finish_pass();
-        require(document.committed.empty(), "activating the context committed text");
-      };
+      // Every case below is the FIRST key of a freshly bound context: a bound context is
+      // already active (the Host activates it when it binds), so nothing is warmed up and no
+      // letter is typed first — the case the owner hit when a field had just been focused.
+
       // (a) Translation, for every printable ASCII character: the layout's own VK and shift,
       // the character Windows produces for them, and the keysym the shell derives. The live
       // path makes the same ToUnicodeEx call with the live keyboard state; pinning the
@@ -821,7 +811,6 @@ int main() {
         auto symbol_backend = make_fcitx_backend();
         SemanticController symbols(970, 64, *symbol_backend);
         Document symbol_doc;
-        activate(symbols, symbol_doc);
         const auto action = symbol_key(*c);
         require(symbols.routes_key(action), "a printable symbol is a T-routable key class");
         auto d = symbols.begin_key(action, true);
@@ -854,7 +843,6 @@ int main() {
         auto symbol_backend = make_fcitx_backend();
         SemanticController symbols(971, 64, *symbol_backend);
         Document symbol_doc;
-        activate(symbols, symbol_doc);
         auto d = symbols.begin_key(row.action, true);
         symbol_doc.apply(symbols, d);
         (void)symbols.finish_pass();
@@ -873,7 +861,6 @@ int main() {
         auto symbol_backend = make_fcitx_backend();
         SemanticController symbols(972, 64, *symbol_backend);
         Document symbol_doc;
-        activate(symbols, symbol_doc);
         auto d = symbols.begin_key(symbol_key(row.key), true);
         symbol_doc.apply(symbols, d);
         (void)symbols.finish_pass();
@@ -929,6 +916,49 @@ int main() {
                   << '\n';
         require(plain_comma.disposition == BackendBatch::Disposition::Forward,
                 "with punctuation off the engine still converted a comma");
+        symbols.destroy();
+      }
+      // (g) Latin-1: translate_key encodes every character below 0x100 as the keysym itself, so
+      // these keys carry 0xe9 / 0xa3 rather than an ASCII byte. The digit-row case is the one
+      // that used to go wrong: its raw-input character is the unshifted "2", and falling back
+      // to it delivered "2" instead of "é".
+      const struct {
+        const char *name;
+        KeyAction action;
+        const char *expected;
+      } latin1[] = {
+          // A digit-row key whose translated character is é: AppendChar keeps ch = '2'.
+          {"digit row é", translate_key('2', false, false, false, U'\u00e9', true), "\xc3\xa9"},
+          // A symbol key with no raw-input character at all: Pass type, ch = 0, keysym 0xa3.
+          {"symbol £", translate_key(0xbf, false, false, false, U'\u00a3'), "\xc2\xa3"},
+      };
+      for (const auto &row : latin1) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(977, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(row.action, true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "latin1 " << row.name << " keysym=0x" << std::hex << row.action.keysym
+                  << std::dec << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && symbol_doc.committed == row.expected,
+                "a forwarded Latin-1 character was not delivered as itself");
+        symbols.destroy();
+      }
+      // (h) The first key of a freshly bound context. A bound context is already active — the
+      // Host activates it when it binds — so a symbol pressed into a field that was just
+      // focused must be delivered like any other. Nothing is typed first here on purpose.
+      for (const char first : {'/', '@'}) {
+        auto symbol_backend = make_fcitx_backend();
+        SemanticController symbols(978, 64, *symbol_backend);
+        Document symbol_doc;
+        auto d = symbols.begin_key(symbol_key(first), true);
+        symbol_doc.apply(symbols, d);
+        (void)symbols.finish_pass();
+        std::cout << "first key '" << first << "' eaten=" << (d.eaten ? 1 : 0)
+                  << " forward=" << (d.forward ? 1 : 0) << "=[" << symbol_doc.committed << "]\n";
+        require(d.eaten && !d.forward && symbol_doc.committed == std::string(1, first),
+                "the first key of a new context was not delivered");
         symbols.destroy();
       }
       section("PASS symbols: every printable ASCII key reaches the document, the engine keeps "

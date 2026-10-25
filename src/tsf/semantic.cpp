@@ -31,7 +31,11 @@ bool incarnation_tracked(const LinkStatus &link) {
 std::optional<std::string> forwarded_character(const BackendStimulus &stimulus) {
   const std::uint32_t keysym = stimulus.keysym;
   std::uint32_t code = 0;
-  if (keysym >= 0x20 && keysym < 0x7f)
+  // translate_key encodes every character below 0x100 as the keysym itself, so the printable
+  // Latin-1 range is a direct code point as well: a digit-row key that produces "é" carries
+  // 0xe9, and taking the raw-input fallback there would deliver the unshifted digit instead.
+  // 0x7f..0x9f stay out — DEL and the C1 controls are not text.
+  if ((keysym >= 0x20 && keysym < 0x7f) || (keysym >= 0xa0 && keysym <= 0xff))
     code = keysym;
   else if ((keysym & 0xff000000u) == 0x01000000u)
     code = keysym & 0x00ffffffu;

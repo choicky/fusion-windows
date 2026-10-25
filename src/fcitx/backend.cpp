@@ -723,6 +723,11 @@ public:
       // keeping an active flag of our own. The context was just focused above, so the
       // no-argument form addresses this one.
       instance_->activate();
+      // `activate()` above is what makes the context active; record that fact now, because a
+      // key that arrives before the first dispatch would otherwise be reported as "this
+      // context was never active" and the character the engine declines for it would not be
+      // delivered (the engine is already active — the first letter composes).
+      context->note_engine_state();
       context->lifecycle = false;
       contexts_.emplace(binding.context, std::move(context));
       return true;
