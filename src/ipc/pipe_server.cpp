@@ -26,7 +26,9 @@ PipeServer::~PipeServer() {
 
 bool PipeServer::create() {
   last_error_ = 0;
-  security_attrs_ = make_pipe_security();
+  // The data pipe is the one object a packaged client has to reach (R49); the
+  // claim and stop events keep the user-only descriptor.
+  security_attrs_ = make_data_pipe_security();
   if (!security_attrs_.lpSecurityDescriptor)
     return false; // fail closed: security descriptor construction failed
   DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;

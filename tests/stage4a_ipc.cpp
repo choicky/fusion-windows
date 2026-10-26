@@ -1,7 +1,7 @@
 // Stage 4A IPC tests: protocol serialization, loopback pipe, HostServer, and the
 // end-to-end FusionHost.exe integration.
 //
-// Usage: stage4a <mode>, one of: protocol | pipeendpoint | loopback | hostserver |
+// Usage: stage4a <mode>, one of: protocol | pipeendpoint | pipesecurity | loopback | hostserver |
 // wp3singleton | wp3shutdown | wp4stopevent | wp4sessionend | integration
 //
 // - protocol: serialization round-trip, bounds, malformed input, trailing byte rejection
@@ -9,6 +9,10 @@
 //   keeps the product identity and round-trips to compute_pipe_name(), an explicit
 //   isolated endpoint keeps its complete name, and empty/malformed endpoints are
 //   rejected instead of being rewritten into another endpoint.
+// - pipesecurity: the two pipe descriptors — the user-only one (claim event, stop
+//   event) names the current user alone; the data pipe adds exactly one more
+//   principal, the search package's AppContainer SID, with the same rights, and
+//   names no broad or anonymous principal (R49).
 // - loopback: real Named Pipe with a CallbackBackend server thread (no Fcitx)
 // - hostserver: real HostServer with a fake Backend that mimics FcitxBackend
 //   admission (duplicate bind rejected, every call fails on admission contention):
@@ -45,6 +49,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+#include <aclapi.h>
+#include <sddl.h>
+#include <userenv.h>
 
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
@@ -1212,6 +1220,149 @@ void test_pipe_endpoint() {
     require(wide_from_utf8("fusion-selftest-8f2c") == L"fusion-selftest-8f2c",
             "a UTF-8 endpoint converts to the same logical name");
     require(wide_from_utf8("\xff\xfe").empty(), "invalid UTF-8 is rejected");
+  }
+}
+
+namespace {
+
+// The descriptor under test is only visible through an object that exists, so
+// each one is applied to a throwaway pipe and read back.
+HANDLE create_security_probe_pipe(const std::wstring &suffix, SECURITY_ATTRIBUTES &sa) {
+  const std::wstring name = L"\\\\.\\pipe\\fusion-stage4a-security-" +
+                            std::to_wstring(GetCurrentProcessId()) + L"-" + suffix;
+  HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_WAIT,
+                                 PIPE_UNLIMITED_INSTANCES, 512, 512, 0, &sa);
+  require(pipe != INVALID_HANDLE_VALUE, "a pipe accepts the descriptor under test");
+  return pipe;
+}
+
+std::wstring current_user_sid_string() {
+  HANDLE token = nullptr;
+  require(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE,
+          "the current process token is openable");
+  DWORD len = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+  require(len > 0, "the current user SID has a size");
+  std::vector<std::uint8_t> buf(len);
+  require(GetTokenInformation(token, TokenUser, buf.data(), len, &len) != FALSE,
+          "the current user SID is readable");
+  CloseHandle(token);
+  auto *user = reinterpret_cast<TOKEN_USER *>(buf.data());
+  LPWSTR text = nullptr;
+  require(ConvertSidToStringSidW(user->User.Sid, &text) != FALSE, "the current user SID converts");
+  std::wstring out(text);
+  LocalFree(text);
+  return out;
+}
+
+// Every ACE of one object's DACL as (SID string, mask). An ACE that is not an
+// allow ACE fails the check rather than being skipped.
+std::vector<std::pair<std::wstring, ACCESS_MASK>> read_dacl(HANDLE object) {
+  PACL dacl = nullptr;
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  require(GetSecurityInfo(object, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                          &dacl, nullptr, &sd) == ERROR_SUCCESS,
+          "the pipe's DACL is readable");
+  ACL_SIZE_INFORMATION info{};
+  require(GetAclInformation(dacl, &info, sizeof(info), AclSizeInformation) != FALSE,
+          "the pipe's DACL is enumerable");
+  std::vector<std::pair<std::wstring, ACCESS_MASK>> entries;
+  for (DWORD i = 0; i < info.AceCount; ++i) {
+    void *ace = nullptr;
+    if (!GetAce(dacl, i, &ace))
+      continue;
+    auto *header = static_cast<ACE_HEADER *>(ace);
+    require(header->AceType == ACCESS_ALLOWED_ACE_TYPE, "every ACE in the pipe DACL allows");
+    auto *allowed = static_cast<ACCESS_ALLOWED_ACE *>(ace);
+    LPWSTR text = nullptr;
+    require(ConvertSidToStringSidW(reinterpret_cast<PSID>(&allowed->SidStart), &text) != FALSE,
+            "an ACE's trustee SID converts");
+    entries.emplace_back(text, allowed->Mask);
+    LocalFree(text);
+  }
+  LocalFree(sd);
+  return entries;
+}
+
+} // namespace
+
+// R49: what the two descriptors actually grant. This is the mechanical half of
+// the AppContainer question — the access check itself needs a real AppContainer
+// token and is measured outside this suite (a Low IL AppContainer client opens
+// the data pipe once, and only once, its package SID is named).
+void test_pipe_security() {
+  const ACCESS_MASK pipe_read_write = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+  const std::wstring user = current_user_sid_string();
+
+  // 1. The user-only descriptor — the Host claim event and the stop event — names
+  //    exactly the current user. A packaged client that could signal the stop
+  //    event could end the Host, so this must not gain a second principal.
+  {
+    SECURITY_ATTRIBUTES sa = fusion::ipc::make_pipe_security();
+    require(sa.lpSecurityDescriptor != nullptr, "the user-only descriptor is built");
+    HANDLE pipe = create_security_probe_pipe(L"user", sa);
+    const auto entries = read_dacl(pipe);
+    CloseHandle(pipe);
+    fusion::ipc::free_pipe_security(sa);
+
+    require(entries.size() == 1, "the user-only descriptor names one principal");
+    require(entries[0].first == user, "the user-only descriptor names the current user");
+    require(entries[0].second == pipe_read_write,
+            "the user-only descriptor grants pipe read/write and nothing more");
+  }
+
+  // 2. The data pipe adds exactly one principal: the search package's AppContainer
+  //    SID, with the same rights. Not ALL APPLICATION PACKAGES, not ALL RESTRICTED
+  //    APPLICATION PACKAGES, not Everyone, not Authenticated Users, not anonymous.
+  {
+    SECURITY_ATTRIBUTES sa = fusion::ipc::make_data_pipe_security();
+    require(sa.lpSecurityDescriptor != nullptr, "the data pipe descriptor is built");
+    HANDLE pipe = create_security_probe_pipe(L"data", sa);
+    const auto entries = read_dacl(pipe);
+    CloseHandle(pipe);
+    fusion::ipc::free_pipe_security(sa);
+
+    PSID package = nullptr;
+    std::wstring package_sid;
+    if (SUCCEEDED(DeriveAppContainerSidFromAppContainerName(
+            fusion::ipc::search_package_family_name, &package)) &&
+        package != nullptr) {
+      LPWSTR text = nullptr;
+      if (ConvertSidToStringSidW(package, &text)) {
+        package_sid = text;
+        LocalFree(text);
+      }
+      FreeSid(package);
+    }
+
+    if (package_sid.empty()) {
+      // An edition without the package must fall back to the user-only
+      // descriptor, not to something broader.
+      require(entries.size() == 1, "without the package the data pipe names the user only");
+      require(entries[0].first == user, "without the package the data pipe still names the user");
+      return;
+    }
+
+    // The product carries the SID as a constant; the derivation is what holds it
+    // to this package family, so the two cannot drift apart silently.
+    require(package_sid == fusion::ipc::search_package_sid,
+            "the product's package SID is the one derived from the family name");
+
+    std::set<std::wstring> trustees;
+    for (const auto &[sid, mask] : entries) {
+      trustees.insert(sid);
+      require(mask == pipe_read_write, "every data-pipe ACE grants pipe read/write and nothing more");
+    }
+    require(entries.size() == 2, "the data pipe names exactly two principals");
+    require(trustees.count(user) == 1, "the data pipe keeps the current user's grant");
+    require(trustees.count(package_sid) == 1,
+            "the data pipe names the search package's AppContainer SID");
+    require(package_sid.rfind(L"S-1-15-2-", 0) == 0,
+            "the second principal is a package AppContainer SID");
+    for (const wchar_t *broad : {L"S-1-1-0", L"S-1-5-11", L"S-1-5-32-545", L"S-1-5-7",
+                                 L"S-1-15-2-1", L"S-1-15-2-2"})
+      require(trustees.count(broad) == 0,
+              "the data pipe does not name a broad or anonymous principal");
   }
 }
 
@@ -2833,11 +2984,11 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
+                      "<protocol|pipeendpoint|pipesecurity|loopback|hostserver|wp3singleton|wp3shutdown|"
                       "wp4stopevent|wp4sessionend|hostdiag|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
+                      "<protocol|pipeendpoint|pipesecurity|loopback|hostserver|wp3singleton|wp3shutdown|"
                       "wp4stopevent|wp4sessionend|hostdiag>\n";
 #endif
   if (argc < 2) {
@@ -2850,6 +3001,8 @@ int main(int argc, char *argv[]) {
       test_protocol();
     else if (mode == "pipeendpoint")
       test_pipe_endpoint();
+    else if (mode == "pipesecurity")
+      test_pipe_security();
     else if (mode == "loopback")
       test_loopback();
     else if (mode == "hostserver")

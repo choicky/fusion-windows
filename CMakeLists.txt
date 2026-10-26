@@ -277,7 +277,10 @@ if(BUILD_TESTING)
     # std::getenv in the integration mode; same convention as FusionFcitxHost.
     target_compile_definitions(stage4a PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(stage4a PRIVATE MockBackend)
+    # userenv: this suite derives the search package's AppContainer SID and holds
+    # the product constant to it (R49). The Host itself needs no such dependency.
+    target_link_libraries(stage4a PRIVATE MockBackend userenv)
+    add_test(NAME stage4a_ipc_pipesecurity COMMAND stage4a pipesecurity)
     add_executable(tray_settings_window tests/tray_settings_window.cpp src/tray/settings_window.cpp)
     target_include_directories(tray_settings_window PRIVATE include src)
     target_compile_features(tray_settings_window PRIVATE cxx_std_20)

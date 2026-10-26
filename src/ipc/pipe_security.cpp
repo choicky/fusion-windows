@@ -16,6 +16,92 @@
 
 namespace fusion::ipc {
 
+namespace {
+
+// Owns a SID that LocalFree() releases, so a failure path cannot leak it.
+class OwnedSid {
+public:
+  OwnedSid() = default;
+  OwnedSid(const OwnedSid &) = delete;
+  OwnedSid &operator=(const OwnedSid &) = delete;
+  ~OwnedSid() {
+    if (sid_ != nullptr)
+      LocalFree(sid_);
+  }
+
+  PSID *receive() { return &sid_; }
+  PSID get() const { return sid_; }
+
+private:
+  PSID sid_ = nullptr;
+};
+
+// Build a pipe DACL that grants read/write to the current user and, when
+// `extra_principals` is not empty, to each of those principals as well. Fails
+// closed: a null lpSecurityDescriptor means the caller must not create the pipe.
+SECURITY_ATTRIBUTES build_pipe_security(const std::vector<PSID> &extra_principals) {
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    return sa; // fail closed: null SD
+  DWORD len = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+  if (len == 0) {
+    CloseHandle(token);
+    return sa; // fail closed
+  }
+  std::vector<std::uint8_t> buf(len);
+  if (!GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
+    CloseHandle(token);
+    return sa; // fail closed
+  }
+  CloseHandle(token);
+  auto *user = reinterpret_cast<TOKEN_USER *>(buf.data());
+
+  std::vector<EXPLICIT_ACCESSW> entries;
+  entries.reserve(1 + extra_principals.size());
+  auto add_allow = [&entries](PSID sid) {
+    EXPLICIT_ACCESSW ea{};
+    ea.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+    entries.push_back(ea);
+  };
+  add_allow(user->User.Sid);
+  for (PSID sid : extra_principals)
+    add_allow(sid);
+
+  PACL new_dacl = nullptr;
+  if (SetEntriesInAclW(static_cast<ULONG>(entries.size()), entries.data(), nullptr, &new_dacl) !=
+      ERROR_SUCCESS)
+    return sa; // fail closed: null SD, no DACL to free
+
+  sa.lpSecurityDescriptor = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
+  if (!sa.lpSecurityDescriptor) {
+    LocalFree(new_dacl);
+    return sa; // fail closed
+  }
+  if (!InitializeSecurityDescriptor(sa.lpSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION)) {
+    LocalFree(new_dacl);
+    LocalFree(sa.lpSecurityDescriptor);
+    sa.lpSecurityDescriptor = nullptr;
+    return sa; // fail closed
+  }
+  if (!SetSecurityDescriptorDacl(sa.lpSecurityDescriptor, TRUE, new_dacl, FALSE)) {
+    LocalFree(new_dacl);
+    LocalFree(sa.lpSecurityDescriptor);
+    sa.lpSecurityDescriptor = nullptr;
+    return sa; // fail closed
+  }
+  return sa;
+}
+
+} // namespace
+
 std::wstring compute_pipe_name() {
   HANDLE token = nullptr;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
@@ -143,55 +229,18 @@ bool verify_server_identity(HANDLE pipe_handle, ConnectFailure *failure) {
 }
 
 SECURITY_ATTRIBUTES make_pipe_security() {
-  SECURITY_ATTRIBUTES sa{};
-  sa.nLength = sizeof(sa);
+  return build_pipe_security({});
+}
 
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-    return sa; // fail closed: null SD
-  DWORD len = 0;
-  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
-  if (len == 0) {
-    CloseHandle(token);
-    return sa; // fail closed
-  }
-  std::vector<std::uint8_t> buf(len);
-  if (!GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
-    CloseHandle(token);
-    return sa; // fail closed
-  }
-  CloseHandle(token);
-  auto *user = reinterpret_cast<TOKEN_USER *>(buf.data());
-
-  EXPLICIT_ACCESSW ea{};
-  ea.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
-  ea.grfAccessMode = SET_ACCESS;
-  ea.grfInheritance = NO_INHERITANCE;
-  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-  ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(user->User.Sid);
-
-  PACL new_dacl = nullptr;
-  if (SetEntriesInAclW(1, &ea, nullptr, &new_dacl) != ERROR_SUCCESS)
-    return sa; // fail closed: null SD, no DACL to free
-
-  sa.lpSecurityDescriptor = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
-  if (!sa.lpSecurityDescriptor) {
-    LocalFree(new_dacl);
-    return sa; // fail closed
-  }
-  if (!InitializeSecurityDescriptor(sa.lpSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION)) {
-    LocalFree(new_dacl);
-    LocalFree(sa.lpSecurityDescriptor);
-    sa.lpSecurityDescriptor = nullptr;
-    return sa; // fail closed
-  }
-  if (!SetSecurityDescriptorDacl(sa.lpSecurityDescriptor, TRUE, new_dacl, FALSE)) {
-    LocalFree(new_dacl);
-    LocalFree(sa.lpSecurityDescriptor);
-    sa.lpSecurityDescriptor = nullptr;
-    return sa; // fail closed
-  }
-  return sa;
+SECURITY_ATTRIBUTES make_data_pipe_security() {
+  // The search package is not present on every Windows edition this Host may run
+  // on. When the SID cannot be built the pipe keeps exactly the DACL it had
+  // before — a packaged client is refused, as it is today — rather than failing
+  // closed and leaving the ordinary clients without a Host.
+  OwnedSid package;
+  if (!ConvertStringSidToSidW(search_package_sid, package.receive()) || package.get() == nullptr)
+    return build_pipe_security({});
+  return build_pipe_security({package.get()});
 }
 
 void free_pipe_security(SECURITY_ATTRIBUTES &sa) {
