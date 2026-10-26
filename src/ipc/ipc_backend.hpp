@@ -42,6 +42,8 @@ public:
 
   // Link lifecycle (see the header comment).
   LinkStatus link_status() const override;
+  // Diagnostics only: the stage and Win32 code of the last failed establishment.
+  ConnectFailure last_connect_failure() const override { return last_connect_failure_; }
   // Bounded establishment: transport connect (up to `timeout`) plus one Hello
   // round trip (up to `timeout`). Never unbounded, and no I/O while established.
   bool ensure_link(std::chrono::milliseconds timeout) override;
@@ -57,7 +59,10 @@ public:
   std::uint64_t incarnation() const;
 
 private:
+  bool handshake(std::chrono::milliseconds timeout, ConnectFailure *failure);
+
   PipeClient client_;
+  ConnectFailure last_connect_failure_;
   // Not std::mutex: this class is compiled into the TIP DLL, which must not hold
   // CRT-owned synchronization state (see win32/srw_mutex.hpp).
   mutable win32::SrwMutex rpc_mutex_;

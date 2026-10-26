@@ -32,6 +32,84 @@ struct LinkStatus {
   std::uint64_t connection_generation = 0;
 };
 
+// Where an establishment attempt stopped, and why. Diagnostics only: these are
+// reported when a link cannot be established, so that "the Host is unreachable"
+// becomes the stage that failed, the Win32 code of the call that failed, and —
+// for the identity check — whether an API failed or the server simply was a
+// different user or session. Nothing here is semantic state and nothing reads it
+// to decide behaviour.
+enum class ConnectStage {
+  None,
+  PipeName,       // the per-user pipe name could not be computed
+  Open,           // CreateFileW on the pipe failed
+  PipeMode,       // SetNamedPipeHandleState failed
+  Identity,       // verify_server_identity refused the server
+  HelloTransport, // the Hello could not be written, or no reply arrived
+  HelloProtocol,  // a reply arrived and was refused (payload or version)
+};
+
+enum class IdentityFailure {
+  None,
+  ServerProcessId, // GetNamedPipeServerProcessId failed
+  ServerSession,   // ProcessIdToSessionId(server) failed
+  MySession,       // ProcessIdToSessionId(self) failed
+  SessionMismatch, // the server is in another session
+  OpenProcess,     // OpenProcess(server) failed: an access check, not a mismatch
+  OpenToken,       // OpenProcessToken(server) failed
+  TokenUser,       // GetTokenInformation(TokenUser) failed on either side
+  UserMismatch,    // both SIDs were read, and they differ
+};
+
+struct ConnectFailure {
+  ConnectStage stage = ConnectStage::None;
+  IdentityFailure identity = IdentityFailure::None;
+  unsigned long win32_error = 0; // GetLastError() at the failing call; 0 when none
+};
+
+inline const char *connect_stage_name(ConnectStage stage) {
+  switch (stage) {
+  case ConnectStage::None:
+    return "none";
+  case ConnectStage::PipeName:
+    return "pipe_name";
+  case ConnectStage::Open:
+    return "open";
+  case ConnectStage::PipeMode:
+    return "pipe_mode";
+  case ConnectStage::Identity:
+    return "identity";
+  case ConnectStage::HelloTransport:
+    return "hello_transport";
+  case ConnectStage::HelloProtocol:
+    return "hello_protocol";
+  }
+  return "?";
+}
+
+inline const char *identity_failure_name(IdentityFailure why) {
+  switch (why) {
+  case IdentityFailure::None:
+    return "none";
+  case IdentityFailure::ServerProcessId:
+    return "server_process_id";
+  case IdentityFailure::ServerSession:
+    return "server_session";
+  case IdentityFailure::MySession:
+    return "my_session";
+  case IdentityFailure::SessionMismatch:
+    return "session_mismatch";
+  case IdentityFailure::OpenProcess:
+    return "open_process";
+  case IdentityFailure::OpenToken:
+    return "open_token";
+  case IdentityFailure::TokenUser:
+    return "token_user";
+  case IdentityFailure::UserMismatch:
+    return "user_mismatch";
+  }
+  return "?";
+}
+
 // POC-LOCAL / NOT ACCEPTED ARCHITECTURE: a Host adapter interface,
 // not a final wire schema, ownership policy, or D072 P0 resolution.
 //
@@ -277,6 +355,10 @@ public:
   virtual bool healthy() const = 0;
   virtual std::uint64_t session_id() const = 0;
   virtual BackendBatch send(const BackendStimulus &stimulus) = 0;
+
+  // Diagnostics only: where the last establishment attempt stopped. A backend
+  // without a transport has nothing to report and keeps the default.
+  virtual ConnectFailure last_connect_failure() const { return {}; }
 
   // Settings control calls are separate from the input stimulus path. Production
   // FcitxBackend implementations execute them on the Fcitx event loop and keep

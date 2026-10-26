@@ -14,10 +14,21 @@ PipeClient::PipeClient(std::wstring pipe_name) : pipe_name_(std::move(pipe_name)
 
 PipeClient::~PipeClient() { disconnect(); }
 
-bool PipeClient::connect(std::chrono::milliseconds timeout) {
+bool PipeClient::connect(std::chrono::milliseconds timeout, ConnectFailure *failure) {
   std::lock_guard lock(mutex_);
   if (connected_)
     return true;
+
+  // Every failure below records what failed and the Win32 code, captured at the
+  // call itself: an empty name, a refused open and a refused identity check all
+  // end up as "the Host is unreachable" without this.
+  const auto fail = [failure](ConnectStage stage, unsigned long error) {
+    if (failure) {
+      failure->stage = stage;
+      failure->win32_error = error;
+    }
+    return false;
+  };
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
@@ -26,11 +37,14 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
     if (handle_ != INVALID_HANDLE_VALUE) {
       DWORD mode = PIPE_READMODE_BYTE;
       if (!SetNamedPipeHandleState(handle_, &mode, nullptr, nullptr)) {
+        const unsigned long error = GetLastError();
         CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
-        return false;
+        return fail(ConnectStage::PipeMode, error);
       }
-      if (!verify_server_identity(handle_)) {
+      if (!verify_server_identity(handle_, failure)) {
+        if (failure)
+          failure->stage = ConnectStage::Identity;
         CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
         return false;
@@ -38,18 +52,18 @@ bool PipeClient::connect(std::chrono::milliseconds timeout) {
       connected_ = true;
       return true;
     }
-    auto err = GetLastError();
+    const unsigned long err = GetLastError();
     if (err != ERROR_PIPE_BUSY)
-      return false;
+      return fail(pipe_name_.empty() ? ConnectStage::PipeName : ConnectStage::Open, err);
     if (std::chrono::steady_clock::now() >= deadline)
-      return false;
+      return fail(ConnectStage::Open, err);
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                          deadline - std::chrono::steady_clock::now())
                          .count();
     if (remaining <= 0)
-      return false;
+      return fail(ConnectStage::Open, err);
     if (!WaitNamedPipeW(pipe_name_.c_str(), static_cast<DWORD>(remaining)))
-      return false;
+      return fail(ConnectStage::Open, GetLastError());
   }
 }
 

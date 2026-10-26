@@ -69,25 +69,35 @@ std::wstring logical_pipe_name(const std::wstring &endpoint) {
   return name;
 }
 
-bool verify_server_identity(HANDLE pipe_handle) {
+bool verify_server_identity(HANDLE pipe_handle, ConnectFailure *failure) {
+  const auto refuse = [failure](IdentityFailure why, unsigned long error) {
+    if (failure) {
+      failure->identity = why;
+      failure->win32_error = error;
+    }
+    return false;
+  };
+
   DWORD server_pid = 0;
   if (!GetNamedPipeServerProcessId(pipe_handle, &server_pid))
-    return false;
+    return refuse(IdentityFailure::ServerProcessId, GetLastError());
 
   // Check session ID first (cheap).
   DWORD server_session = 0;
   if (!ProcessIdToSessionId(server_pid, &server_session))
-    return false;
+    return refuse(IdentityFailure::ServerSession, GetLastError());
   DWORD my_session = 0;
   if (!ProcessIdToSessionId(GetCurrentProcessId(), &my_session))
-    return false;
+    return refuse(IdentityFailure::MySession, GetLastError());
   if (server_session != my_session)
-    return false;
+    return refuse(IdentityFailure::SessionMismatch, 0);
 
-  // Check user SID.
+  // Check user SID. An API that fails here is not a mismatch: it is the access
+  // check refusing this process a handle to the server, which is a different
+  // fact about the same refusal.
   HANDLE server_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, server_pid);
   if (!server_proc)
-    return false;
+    return refuse(IdentityFailure::OpenProcess, GetLastError());
   HANDLE server_token = nullptr;
   bool ok = false;
   if (OpenProcessToken(server_proc, TOKEN_QUERY, &server_token)) {
@@ -106,13 +116,27 @@ bool verify_server_identity(HANDLE pipe_handle) {
             if (GetTokenInformation(my_token, TokenUser, my_buf.data(), my_len, &my_len)) {
               auto *my_user = reinterpret_cast<TOKEN_USER *>(my_buf.data());
               ok = EqualSid(server_user->User.Sid, my_user->User.Sid) != FALSE;
+              if (!ok)
+                refuse(IdentityFailure::UserMismatch, 0);
+            } else {
+              refuse(IdentityFailure::TokenUser, GetLastError());
             }
+          } else {
+            refuse(IdentityFailure::TokenUser, GetLastError());
           }
           CloseHandle(my_token);
+        } else {
+          refuse(IdentityFailure::TokenUser, GetLastError());
         }
+      } else {
+        refuse(IdentityFailure::TokenUser, GetLastError());
       }
+    } else {
+      refuse(IdentityFailure::TokenUser, GetLastError());
     }
     CloseHandle(server_token);
+  } else {
+    refuse(IdentityFailure::OpenToken, GetLastError());
   }
   CloseHandle(server_proc);
   return ok;

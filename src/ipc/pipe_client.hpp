@@ -39,7 +39,10 @@ public:
   PipeClient &operator=(const PipeClient &) = delete;
 
   // connect_timeout: max wait for ERROR_PIPE_BUSY (UNFROZEN engineering constant).
-  bool connect(std::chrono::milliseconds connect_timeout = std::chrono::milliseconds(200));
+  // `failure` (optional, diagnostics only) receives the stage that failed and the
+  // Win32 code of the call that failed.
+  bool connect(std::chrono::milliseconds connect_timeout = std::chrono::milliseconds(200),
+               ConnectFailure *failure = nullptr);
   void disconnect();
   bool connected() const;
 

@@ -20,17 +20,39 @@ void IpcBackend::drop_link() {
   // generation only ever advances when a new connection is established.
 }
 
-bool IpcBackend::handshake(std::chrono::milliseconds timeout) {
+bool IpcBackend::handshake(std::chrono::milliseconds timeout, ConnectFailure *failure) {
   // Hello handshake: send protocol_version, expect envelope(incarnation) +
   // version + session_id.
+  //
+  // A transport failure and a protocol refusal are different facts: the first
+  // says the bytes never moved, the second says the Host answered and the answer
+  // was not acceptable. `failure` keeps them apart, and for a transport failure
+  // carries the last Win32 code the write/read path left behind.
+  const auto transport_failed = [failure](unsigned long error) {
+    if (failure) {
+      failure->stage = ConnectStage::HelloTransport;
+      failure->win32_error = error;
+    }
+    return false;
+  };
+  const auto protocol_refused = [failure]() {
+    if (failure) {
+      failure->stage = ConnectStage::HelloProtocol;
+      failure->win32_error = 0;
+    }
+    return false;
+  };
+
   std::vector<std::uint8_t> hello_payload;
   detail::write_u32(hello_payload, protocol_version);
 
   if (client_.send_request(MessageType::HelloRequest, hello_payload) != WriteOutcome::Written)
-    return false;
+    return transport_failed(GetLastError());
   auto response = client_.recv_response(timeout);
-  if (!response || response->type != MessageType::HelloResponse)
-    return false;
+  if (!response)
+    return transport_failed(GetLastError());
+  if (response->type != MessageType::HelloResponse)
+    return protocol_refused();
 
   detail::Reader r(response->payload.data(), response->payload.size());
   auto envelope_incarnation = r.read_u64();
@@ -39,9 +61,9 @@ bool IpcBackend::handshake(std::chrono::milliseconds timeout) {
   // A zero incarnation is never a usable Host identity, and a version mismatch
   // (including the Host's explicit version=0 rejection) fails closed.
   if (!envelope_incarnation || *envelope_incarnation == 0 || !version || !sid || !r.at_end())
-    return false;
+    return protocol_refused();
   if (*version != protocol_version)
-    return false;
+    return protocol_refused();
 
   cached_session_id_ = *sid;
   incarnation_ = *envelope_incarnation;
@@ -57,12 +79,13 @@ bool IpcBackend::ensure_link(std::chrono::milliseconds timeout) {
 
   // Never carry a previous connection (or its identity) into a new one.
   drop_link();
-  if (!client_.connect(timeout))
+  last_connect_failure_ = ConnectFailure{};
+  if (!client_.connect(timeout, &last_connect_failure_))
     return false;
   // Transport is up; the Host incarnation is not established until Hello
   // succeeds, so nothing semantic may be admitted from here.
   link_state_ = LinkState::Connected;
-  if (!handshake(timeout)) {
+  if (!handshake(timeout, &last_connect_failure_)) {
     drop_link();
     return false;
   }
