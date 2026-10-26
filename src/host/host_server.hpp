@@ -50,9 +50,10 @@ namespace fusion::ipc {
 //     per-session object namespace, and the pipe name it is derived from already
 //     carries the user SID and session id (compute_pipe_name), so the claim is per
 //     user SID x session — the same scope as the pipe it protects.
-//   * Security: the buffer's SECURITY_ATTRIBUTES is the pipe's own user-only DACL
-//     (make_pipe_security), so another principal cannot pre-create the name and
-//     hold the Host down.
+//   * Security: the buffer's SECURITY_ATTRIBUTES is the user-only DACL
+//     (make_pipe_security) — not the data pipe's, which also names the search
+//     package (R49) — so another principal cannot pre-create the name and hold the
+//     Host down.
 //   * Fail closed: `acquire` returns false when the descriptor cannot be built,
 //     when creation fails, or when the name already exists
 //     (ERROR_ALREADY_EXISTS) — a live second Host is always refused.
@@ -101,8 +102,10 @@ private:
 //     that a later install would signal).
 //   * Name scope: `Local\FusionHost-stop-<user SID>-<session id>` — exactly the
 //     principal and session the pipe and the claim are scoped to.
-//   * Security: the same user-only DACL as the pipe and HostClaim, so another
-//     principal can neither create nor signal it.
+//   * Security: the same user-only DACL as HostClaim (make_pipe_security), so
+//     another principal can neither create nor signal it. The data pipe is the one
+//     object that is not user-only: it also names the search package (R49), and a
+//     client that could signal this event could end the Host.
 //   * The event carries no request payload and no acknowledgement: signalling it
 //     means "perform the normal ordered shutdown". The HostClaim stays the
 //     authority for "only one Host per user x session".
