@@ -6,6 +6,8 @@
 // These functions require <windows.h> and are separated from ipc_protocol.hpp
 // so that the protocol header remains platform-free.
 
+#include "fusion/backend.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -46,8 +48,9 @@ std::wstring logical_pipe_name(const std::wstring &endpoint);
 
 // Verify that the server process at the other end of the pipe has the same
 // user SID and session ID as the current process. Returns true only if both
-// match.
-bool verify_server_identity(HANDLE pipe_handle);
+// match. `failure` (optional, diagnostics only) receives which step refused —
+// an API that failed, with its Win32 code, or a real mismatch.
+bool verify_server_identity(HANDLE pipe_handle, ConnectFailure *failure = nullptr);
 
 // Build a SECURITY_ATTRIBUTES with a DACL granting read/write only to the
 // current user. Fails closed: if the DACL/SD cannot be built, the returned

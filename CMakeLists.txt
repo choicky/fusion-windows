@@ -288,6 +288,7 @@ if(BUILD_TESTING)
 
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_pipeendpoint COMMAND stage4a pipeendpoint)
+    add_test(NAME stage4a_ipc_connectfailure COMMAND stage4a connectfailure)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
     add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
     add_test(NAME stage4a_ipc_wp3singleton COMMAND stage4a wp3singleton)

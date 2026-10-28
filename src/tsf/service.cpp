@@ -698,7 +698,14 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
     try {
       backend_ = std::make_unique<fusion::ipc::IpcBackend>();
       if (!backend_->ensure_link(std::chrono::milliseconds(200))) {
-        diagf("IPC_HOST_UNREACHABLE", "FusionHost not reachable, fail-open PASS, reconnect armed");
+        const auto failure = backend_->last_connect_failure();
+        // The aggregate used to be the whole message; the stage, the Win32 code
+        // and — for the identity check — whether an API failed or the server was
+        // somebody else are what tell the four cases apart.
+        diagf("IPC_HOST_UNREACHABLE",
+              "stage=%s win32=%lu identity=%s fail-open PASS, reconnect armed",
+              connect_stage_name(failure.stage), failure.win32_error,
+              identity_failure_name(failure.identity));
         // Fail open: activate without a link, all keys PASS until a Host answers.
       }
     } catch (const std::exception &error) {

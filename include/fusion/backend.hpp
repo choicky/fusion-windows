@@ -32,6 +32,120 @@ struct LinkStatus {
   std::uint64_t connection_generation = 0;
 };
 
+// Where an establishment attempt stopped, and why. Diagnostics only: these are
+// reported when a link cannot be established, so that "the Host is unreachable"
+// becomes the stage that failed, the Win32 code of the call that failed, and —
+// for the identity check — whether an API failed or the server simply was a
+// different user or session. Nothing here is semantic state and nothing reads it
+// to decide behaviour.
+enum class ConnectStage {
+  None,
+  PipeName,     // the per-user pipe name could not be computed
+  Open,         // CreateFileW on the pipe failed
+  PipeMode,     // SetNamedPipeHandleState failed
+  Identity,     // verify_server_identity refused the server
+  HelloWrite,   // the Hello could not be written
+  HelloRead,    // the Hello was written and no reply arrived
+  HelloProtocol, // a reply arrived and was refused (payload or version)
+};
+
+enum class IdentityFailure {
+  None,
+  ServerProcessId, // GetNamedPipeServerProcessId failed
+  ServerSession,   // ProcessIdToSessionId(server) failed
+  MySession,       // ProcessIdToSessionId(self) failed
+  SessionMismatch, // the server is in another session
+  OpenProcess,     // OpenProcess(server) failed: an access check, not a mismatch
+  OpenToken,       // OpenProcessToken(server) failed
+  TokenUser,       // GetTokenInformation(TokenUser) failed on either side
+  UserMismatch,    // both SIDs were read, and they differ
+  // The AppContainer path (see pipe_security.hpp): it reads the pipe object instead of
+  // the server process, so its failures name the object's properties.
+  TokenIsAppContainer, // GetTokenInformation(TokenIsAppContainer) failed
+  TokenSession,        // GetTokenInformation(TokenSessionId) failed
+  PipeServerSession,   // GetNamedPipeServerSessionId failed
+  PipeOwner,           // GetSecurityInfo(OWNER|LABEL) failed
+  PipeOwnerMismatch,   // the pipe's owner SID is not this process's user
+  PipeLabel,           // the mandatory label could not be read
+  PipeIntegrityLow,    // the pipe carries a label below Medium
+};
+
+// The Win32 code a deadline expiry reports in ConnectFailure::win32_error.
+//
+// A read or write that the transport never completed is reported as ERROR_TIMEOUT
+// (1460) and nothing else. It is not WAIT_TIMEOUT: that is the wait's own return
+// value, not an error code, and it is not the ERROR_OPERATION_ABORTED (995) that the
+// cancellation and handle cleanup on the way out would otherwise leave in the
+// thread's last-error slot — which is exactly the wrong answer the diagnostic used to
+// report. The value is spelled out so this header stays free of <windows.h>.
+inline constexpr unsigned long transport_timeout_error = 1460; // ERROR_TIMEOUT
+
+struct ConnectFailure {
+  ConnectStage stage = ConnectStage::None;
+  IdentityFailure identity = IdentityFailure::None;
+  unsigned long win32_error = 0; // captured at the failing call; 0 when none
+};
+
+inline const char *connect_stage_name(ConnectStage stage) {
+  switch (stage) {
+  case ConnectStage::None:
+    return "none";
+  case ConnectStage::PipeName:
+    return "pipe_name";
+  case ConnectStage::Open:
+    return "open";
+  case ConnectStage::PipeMode:
+    return "pipe_mode";
+  case ConnectStage::Identity:
+    return "identity";
+  case ConnectStage::HelloWrite:
+    return "hello_write";
+  case ConnectStage::HelloRead:
+    return "hello_read";
+  case ConnectStage::HelloProtocol:
+    return "hello_protocol";
+  }
+  return "?";
+}
+
+inline const char *identity_failure_name(IdentityFailure why) {
+  switch (why) {
+  case IdentityFailure::None:
+    return "none";
+  case IdentityFailure::ServerProcessId:
+    return "server_process_id";
+  case IdentityFailure::ServerSession:
+    return "server_session";
+  case IdentityFailure::MySession:
+    return "my_session";
+  case IdentityFailure::SessionMismatch:
+    return "session_mismatch";
+  case IdentityFailure::OpenProcess:
+    return "open_process";
+  case IdentityFailure::OpenToken:
+    return "open_token";
+  case IdentityFailure::TokenUser:
+    return "token_user";
+  case IdentityFailure::UserMismatch:
+    return "user_mismatch";
+  case IdentityFailure::TokenIsAppContainer:
+    return "token_is_appcontainer";
+  case IdentityFailure::TokenSession:
+    return "token_session";
+  case IdentityFailure::PipeServerSession:
+    return "pipe_server_session";
+  case IdentityFailure::PipeOwner:
+    return "pipe_owner";
+  case IdentityFailure::PipeOwnerMismatch:
+    return "pipe_owner_mismatch";
+  case IdentityFailure::PipeLabel:
+    return "pipe_label";
+  case IdentityFailure::PipeIntegrityLow:
+    return "pipe_integrity_low";
+  }
+  return "?";
+}
+
 // POC-LOCAL / NOT ACCEPTED ARCHITECTURE: a Host adapter interface,
 // not a final wire schema, ownership policy, or D072 P0 resolution.
 //
@@ -277,6 +391,10 @@ public:
   virtual bool healthy() const = 0;
   virtual std::uint64_t session_id() const = 0;
   virtual BackendBatch send(const BackendStimulus &stimulus) = 0;
+
+  // Diagnostics only: where the last establishment attempt stopped. A backend
+  // without a transport has nothing to report and keeps the default.
+  virtual ConnectFailure last_connect_failure() const { return {}; }
 
   // Settings control calls are separate from the input stimulus path. Production
   // FcitxBackend implementations execute them on the Fcitx event loop and keep
