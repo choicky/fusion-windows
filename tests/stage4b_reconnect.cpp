@@ -593,6 +593,14 @@ void test_cycles() {
   IpcBackend client(name);
   const Binding binding{9, 1, 1};
 
+  // The first data-pipe descriptor initialises the AppContainer SID derivation
+  // (userenv), which takes a fixed set of process-wide handles once. It is warmed here so
+  // the measurement below is about the reconnect cycles and not about that one-time cost:
+  // a second hundred descriptors add nothing.
+  {
+    SECURITY_ATTRIBUTES warm = make_data_pipe_security(true);
+    free_pipe_security(warm);
+  }
   DWORD handles_before = 0;
   GetProcessHandleCount(GetCurrentProcess(), &handles_before);
 

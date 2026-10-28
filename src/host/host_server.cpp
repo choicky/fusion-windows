@@ -317,7 +317,9 @@ void HostServer::drain_connections() {
 void HostServer::accept_loop() {
   bool is_first = true;
   while (running_) {
-    auto pipe = std::make_unique<PipeServer>(pipe_name_, is_first);
+    // The data pipe is the one object the search package may reach (D089); the claim
+    // and stop events below are created separately and stay user-only.
+    auto pipe = std::make_unique<PipeServer>(pipe_name_, is_first, true);
     bool was_first = is_first;
     is_first = false;
     if (!pipe->create()) {

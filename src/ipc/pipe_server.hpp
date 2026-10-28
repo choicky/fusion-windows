@@ -17,7 +17,11 @@ namespace fusion::ipc {
 
 class PipeServer {
 public:
-  explicit PipeServer(std::wstring pipe_name, bool first_instance = false);
+  // `search_package_access` grants the taskbar search package's AppContainer SID the
+  // client rights on this pipe (D089). The Host passes true for its data pipe; the
+  // claim and stop events never go through here and stay user-only.
+  explicit PipeServer(std::wstring pipe_name, bool first_instance = false,
+                      bool search_package_access = false);
   ~PipeServer();
 
   PipeServer(const PipeServer &) = delete;
@@ -42,6 +46,7 @@ public:
 private:
   std::wstring pipe_name_;
   bool first_instance_;
+  bool search_package_access_;
   void *handle_ = reinterpret_cast<void *>(-1); // INVALID_HANDLE_VALUE
   // Owned by the serving thread, but also cleared from another thread when
   // HostServer::stop() disconnects the client.

@@ -12,8 +12,9 @@
 
 namespace fusion::ipc {
 
-PipeServer::PipeServer(std::wstring pipe_name, bool first_instance)
-    : pipe_name_(std::move(pipe_name)), first_instance_(first_instance) {}
+PipeServer::PipeServer(std::wstring pipe_name, bool first_instance, bool search_package_access)
+    : pipe_name_(std::move(pipe_name)), first_instance_(first_instance),
+      search_package_access_(search_package_access) {}
 
 PipeServer::~PipeServer() {
   disconnect_client();
@@ -26,7 +27,7 @@ PipeServer::~PipeServer() {
 
 bool PipeServer::create() {
   last_error_ = 0;
-  security_attrs_ = make_pipe_security();
+  security_attrs_ = make_data_pipe_security(search_package_access_);
   if (!security_attrs_.lpSecurityDescriptor)
     return false; // fail closed: security descriptor construction failed
   DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;

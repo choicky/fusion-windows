@@ -15,6 +15,53 @@
 #include <vector>
 
 namespace fusion::ipc {
+namespace {
+
+// The mandatory label's RID from a SACL, if the object carries one. `false` means the
+// object has no label, which reads as Medium.
+bool mandatory_label_rid(PACL sacl, DWORD &rid) {
+  if (sacl == nullptr)
+    return false;
+  for (WORD index = 0; index < sacl->AceCount; ++index) {
+    LPVOID ace = nullptr;
+    if (!GetAce(sacl, index, &ace))
+      continue;
+    const auto *header = static_cast<const ACE_HEADER *>(ace);
+    if (header->AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE)
+      continue;
+    auto *label = static_cast<SYSTEM_MANDATORY_LABEL_ACE *>(ace);
+    // This SDK spells the label's SID as SidStart: the SID structure begins there.
+    PSID label_sid = reinterpret_cast<PSID>(&label->SidStart);
+    if (!IsValidSid(label_sid))
+      return false;
+    const DWORD count = *GetSidSubAuthorityCount(label_sid);
+    if (count == 0)
+      return false;
+    rid = *GetSidSubAuthority(label_sid, count - 1);
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
+IdentityFailure judge_appcontainer_pipe(const AppContainerPipeFacts &facts) {
+  if (!facts.have_own_session || !facts.have_server_session)
+    return facts.have_own_session ? IdentityFailure::PipeServerSession
+                                  : IdentityFailure::TokenSession;
+  if (facts.own_session != facts.server_session)
+    return IdentityFailure::SessionMismatch;
+  if (facts.own_user == nullptr || facts.pipe_owner == nullptr)
+    return IdentityFailure::PipeOwner;
+  if (!EqualSid(facts.own_user, facts.pipe_owner))
+    return IdentityFailure::PipeOwnerMismatch;
+  // No label is Medium. Anything below Medium was created by a low-integrity or
+  // AppContainer process, which is what another package posing as the Host would be.
+  if (facts.have_label && facts.label_rid < SECURITY_MANDATORY_MEDIUM_RID)
+    return IdentityFailure::PipeIntegrityLow;
+  return IdentityFailure::None;
+}
+
 
 std::wstring compute_pipe_name() {
   HANDLE token = nullptr;
@@ -77,6 +124,82 @@ bool verify_server_identity(HANDLE pipe_handle, ConnectFailure *failure) {
     }
     return false;
   };
+
+  // Which check applies is a property of *this* token, and it has to be decided before
+  // anything touches the server process. An AppContainer client — the TIP inside the
+  // taskbar search host — cannot open the server process at all, so the process-based
+  // check below would fail on an access denial that says nothing about the peer. It
+  // reads the pipe object instead, and that check is only sound because the pipe grants
+  // the package client rights and not FILE_CREATE_PIPE_INSTANCE: another package cannot
+  // create this name, and a low-integrity object is refused by its label.
+  HANDLE own_token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &own_token))
+    return refuse(IdentityFailure::OpenToken, GetLastError());
+  BOOL appcontainer = FALSE;
+  DWORD token_length = 0;
+  if (!GetTokenInformation(own_token, TokenIsAppContainer, &appcontainer, sizeof(appcontainer),
+                           &token_length)) {
+    const unsigned long error = GetLastError();
+    CloseHandle(own_token);
+    return refuse(IdentityFailure::TokenIsAppContainer, error);
+  }
+
+  if (appcontainer) {
+    AppContainerPipeFacts facts;
+
+    std::vector<std::uint8_t> user_buffer;
+    DWORD user_length = 0;
+    GetTokenInformation(own_token, TokenUser, nullptr, 0, &user_length);
+    if (user_length == 0) {
+      const unsigned long error = GetLastError();
+      CloseHandle(own_token);
+      return refuse(IdentityFailure::TokenUser, error);
+    }
+    user_buffer.resize(user_length);
+    if (!GetTokenInformation(own_token, TokenUser, user_buffer.data(), user_length,
+                             &user_length)) {
+      const unsigned long error = GetLastError();
+      CloseHandle(own_token);
+      return refuse(IdentityFailure::TokenUser, error);
+    }
+    facts.own_user = reinterpret_cast<TOKEN_USER *>(user_buffer.data())->User.Sid;
+
+    DWORD own_session = 0;
+    if (GetTokenInformation(own_token, TokenSessionId, &own_session, sizeof(own_session),
+                            &token_length)) {
+      facts.have_own_session = true;
+      facts.own_session = own_session;
+    }
+    CloseHandle(own_token);
+
+    DWORD server_session = 0;
+    if (GetNamedPipeServerSessionId(pipe_handle, &server_session)) {
+      facts.have_server_session = true;
+      facts.server_session = server_session;
+    }
+
+    PSID owner = nullptr;
+    PACL sacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD security_status =
+        GetSecurityInfo(pipe_handle, SE_KERNEL_OBJECT,
+                        OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION, &owner, nullptr,
+                        nullptr, &sacl, &descriptor);
+    if (security_status != ERROR_SUCCESS) {
+      if (descriptor != nullptr)
+        LocalFree(descriptor);
+      return refuse(IdentityFailure::PipeOwner, security_status);
+    }
+    facts.pipe_owner = owner;
+    facts.have_label = mandatory_label_rid(sacl, facts.label_rid);
+
+    const IdentityFailure why = judge_appcontainer_pipe(facts);
+    LocalFree(descriptor);
+    if (why != IdentityFailure::None)
+      return refuse(why, 0);
+    return true;
+  }
+  CloseHandle(own_token);
 
   DWORD server_pid = 0;
   if (!GetNamedPipeServerProcessId(pipe_handle, &server_pid))
@@ -203,6 +326,15 @@ void free_pipe_security(SECURITY_ATTRIBUTES &sa) {
     if (GetSecurityDescriptorDacl(sa.lpSecurityDescriptor, &dacl_present, &dacl, &dacl_defaulted) &&
         dacl_present && dacl != nullptr) {
       LocalFree(dacl);
+    }
+    // The data-pipe descriptor sets the owner explicitly, and that SID is a copy this
+    // side allocated (see make_data_pipe_security). A descriptor that never set one
+    // reports none, so nothing else is freed here.
+    PSID owner = nullptr;
+    BOOL owner_defaulted = FALSE;
+    if (GetSecurityDescriptorOwner(sa.lpSecurityDescriptor, &owner, &owner_defaulted) &&
+        owner != nullptr) {
+      LocalFree(owner);
     }
     LocalFree(sa.lpSecurityDescriptor);
     sa.lpSecurityDescriptor = nullptr;
