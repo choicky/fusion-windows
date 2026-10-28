@@ -154,6 +154,14 @@ HRESULT RegisterServer(HMODULE module) {
     result = category_raw->RegisterCategory(CLSID_FusionTsfTextService,
                                             GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
                                             CLSID_FusionTsfTextService);
+  // R49/D089: the taskbar search box (SearchHost, an AppContainer) only asks a TIP to
+  // activate when it declares immersive support. That is the whole of what this category
+  // does here — the TIP still reaches the Host through the same pipe, and no other
+  // AppContainer or LPAC application is claimed to work.
+  if (SUCCEEDED(result))
+    result = category_raw->RegisterCategory(CLSID_FusionTsfTextService,
+                                            GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+                                            CLSID_FusionTsfTextService);
   category_raw->Release();
   profile_mgr_raw->Release();
   profiles_raw->Release();
@@ -192,6 +200,9 @@ HRESULT UnregisterServer() {
                                            CLSID_FusionTsfTextService));
   observe(category_raw->UnregisterCategory(
       CLSID_FusionTsfTextService, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, CLSID_FusionTsfTextService));
+  observe(category_raw->UnregisterCategory(CLSID_FusionTsfTextService,
+                                           GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+                                           CLSID_FusionTsfTextService));
   for (LANGID langid : installed_langids()) {
     observe(profile_mgr_raw->UnregisterProfile(CLSID_FusionTsfTextService, langid,
                                                GUID_FusionTsfProfile, 0));

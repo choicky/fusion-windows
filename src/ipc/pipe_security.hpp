@@ -46,21 +46,90 @@ std::wstring compute_pipe_name();
 // --pipe-name instead of silently using another endpoint.
 std::wstring logical_pipe_name(const std::wstring &endpoint);
 
+// The taskbar search host's package family. It is the one AppContainer principal the
+// data pipe admits (D089), and only with kDataPipeClientAccess.
+inline constexpr const wchar_t *search_package_family =
+    L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
+
+// The AppContainer SID that family name derives to. DeriveAppContainerSidFromAppContainerName()
+// is deterministic, and this is the answer on the Windows build this product ships on; a
+// derivation that disagrees with it means the constant and the OS disagree, and the
+// descriptor is then not built at all rather than granting the wrong principal.
+inline constexpr const wchar_t *search_package_sid =
+    L"S-1-15-2-283421221-3183566570-1718213290-751554359-3541592344-2312209569-3374928651";
+
+// The rights a client needs on the data pipe — and the exact mask the search package is
+// granted, so the two cannot drift apart: the client opens with this, the package ACE
+// carries it.
+//
+//   FILE_READ_DATA       read a frame
+//   FILE_WRITE_DATA      write a frame
+//   FILE_READ_ATTRIBUTES  GetNamedPipeServerProcessId / GetNamedPipeServerSessionId
+//   FILE_WRITE_ATTRIBUTES SetNamedPipeHandleState (byte mode)
+//   READ_CONTROL          GetSecurityInfo: the AppContainer owner and integrity check
+//   SYNCHRONIZE           the overlapped waits on the handle
+//
+// Deliberately absent: FILE_APPEND_DATA (which is FILE_CREATE_PIPE_INSTANCE for a named
+// pipe, so a grantee could create a second instance of this name and pose as the Host),
+// WRITE_DAC, WRITE_OWNER, DELETE, the extended-attribute rights, and every generic right.
+inline constexpr DWORD kDataPipeClientAccess = FILE_READ_DATA | FILE_WRITE_DATA |
+                                               FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES |
+                                               READ_CONTROL | SYNCHRONIZE;
+
 // Verify that the server process at the other end of the pipe has the same
 // user SID and session ID as the current process. Returns true only if both
 // match. `failure` (optional, diagnostics only) receives which step refused —
 // an API that failed, with its Win32 code, or a real mismatch.
+//
+// A client whose own token is an AppContainer token uses the pipe-object check
+// instead (see judge_appcontainer_pipe): it cannot open the server process at all,
+// and the object's owner, session and integrity label are what separate the real
+// Host from another package that created the same name.
 bool verify_server_identity(HANDLE pipe_handle, ConnectFailure *failure = nullptr);
+
+// What the AppContainer client read from the pipe object and its own token. Pure
+// input, so every branch is testable without a second process.
+struct AppContainerPipeFacts {
+  PSID own_user = nullptr;   // TokenUser of this process
+  PSID pipe_owner = nullptr; // OWNER_SECURITY_INFORMATION of the pipe object
+  bool have_own_session = false;
+  DWORD own_session = 0;
+  bool have_server_session = false;
+  DWORD server_session = 0;
+  // A pipe with no mandatory label reads as Medium: the absence of a label is the
+  // normal case for an object created by a medium-IL process.
+  bool have_label = false;
+  DWORD label_rid = 0;
+};
+
+// The decision, and the reason when it refuses. IdentityFailure::None means the pipe
+// may be trusted. Order: session, then owner, then integrity.
+IdentityFailure judge_appcontainer_pipe(const AppContainerPipeFacts &facts);
 
 // Build a SECURITY_ATTRIBUTES with a DACL granting read/write only to the
 // current user. Fails closed: if the DACL/SD cannot be built, the returned
 // SECURITY_ATTRIBUTES has a null lpSecurityDescriptor and the caller must
 // treat pipe creation as failed.
 //
+// This is the descriptor for the objects that stay user-only: the Host claim event and
+// the Host stop event. A packaged client that could signal the stop event could end the
+// Host, so neither is ever created with make_data_pipe_security().
+//
 // The caller must call free_pipe_security() when done.
 SECURITY_ATTRIBUTES make_pipe_security();
 
-// Free the security descriptor and DACL allocated by make_pipe_security().
+// The data pipe's descriptor. The user ACE keeps the rights it always had; with
+// `allow_search_package` one further ACE grants kDataPipeClientAccess to the search
+// package's AppContainer SID, and nothing else. The owner is set explicitly to this
+// process's TokenUser SID instead of being left to the token default.
+//
+// This lives in pipe_security_server.cpp because only the Host builds it: the client
+// half of this file must not gain a userenv import, which the TIP would then carry
+// into an AppContainer.
+SECURITY_ATTRIBUTES make_data_pipe_security(bool allow_search_package);
+
+// Free the security descriptor and DACL allocated by make_pipe_security() or
+// make_data_pipe_security().
 void free_pipe_security(SECURITY_ATTRIBUTES &sa);
 
 } // namespace fusion::ipc

@@ -32,7 +32,10 @@ bool PipeClient::connect(std::chrono::milliseconds timeout, ConnectFailure *fail
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
-    handle_ = CreateFileW(pipe_name_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+    // The same explicit rights the search package is granted, requested by every client:
+    // generic read/write would ask for FILE_APPEND_DATA, which on a named pipe is
+    // FILE_CREATE_PIPE_INSTANCE, and no client needs it.
+    handle_ = CreateFileW(pipe_name_.c_str(), kDataPipeClientAccess, 0, nullptr,
                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     if (handle_ != INVALID_HANDLE_VALUE) {
       DWORD mode = PIPE_READMODE_BYTE;

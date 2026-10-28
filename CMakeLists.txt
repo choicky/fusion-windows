@@ -77,7 +77,8 @@ if(WIN32 AND MSVC)
       src/host/host_server.cpp
       src/host/host_diag.cpp
       src/ipc/pipe_server.cpp
-      src/ipc/pipe_security.cpp)
+      src/ipc/pipe_security.cpp
+      src/ipc/pipe_security_server.cpp)
     target_include_directories(FusionHostExe PRIVATE include src)
     target_compile_features(FusionHostExe PRIVATE cxx_std_20)
     # Stage 6 WP4 A1: the packaged Host has no console window, so it is a Windows
@@ -88,7 +89,9 @@ if(WIN32 AND MSVC)
       WIN32_EXECUTABLE TRUE)
     target_compile_definitions(FusionHostExe PRIVATE FUSION_WITH_FCITX5 NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(FusionHostExe PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore shell32)
+    # userenv: DeriveAppContainerSidFromAppContainerName, for the search package's ACE.
+  # Only the server side needs it, which is why it is not linked into FusionTsf.
+  target_link_libraries(FusionHostExe PRIVATE FusionFcitxHost FusionCore shell32 userenv)
 
     # U7: the minimal per-user tray surface. Deliberately outside the Host (a
     # crashed Host cannot report itself) and outside the TSF DLL (one status
@@ -267,6 +270,7 @@ if(BUILD_TESTING)
       src/ipc/pipe_client.cpp
       src/ipc/pipe_server.cpp
       src/ipc/pipe_security.cpp
+      src/ipc/pipe_security_server.cpp
       src/ipc/ipc_backend.cpp
       src/host/host_server.cpp
       src/host/host_diag.cpp
@@ -277,7 +281,7 @@ if(BUILD_TESTING)
     # std::getenv in the integration mode; same convention as FusionFcitxHost.
     target_compile_definitions(stage4a PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(stage4a PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(stage4a PRIVATE MockBackend)
+    target_link_libraries(stage4a PRIVATE MockBackend userenv)
     add_executable(tray_settings_window tests/tray_settings_window.cpp src/tray/settings_window.cpp)
     target_include_directories(tray_settings_window PRIVATE include src)
     target_compile_features(tray_settings_window PRIVATE cxx_std_20)
@@ -289,6 +293,7 @@ if(BUILD_TESTING)
     add_test(NAME stage4a_ipc_protocol COMMAND stage4a protocol)
     add_test(NAME stage4a_ipc_pipeendpoint COMMAND stage4a pipeendpoint)
     add_test(NAME stage4a_ipc_connectfailure COMMAND stage4a connectfailure)
+    add_test(NAME stage4a_ipc_pipesecurity COMMAND stage4a pipesecurity)
     add_test(NAME stage4a_ipc_loopback COMMAND stage4a loopback)
     add_test(NAME stage4a_ipc_hostserver COMMAND stage4a hostserver)
     add_test(NAME stage4a_ipc_wp3singleton COMMAND stage4a wp3singleton)
@@ -321,6 +326,7 @@ if(BUILD_TESTING)
       src/ipc/pipe_client.cpp
       src/ipc/pipe_server.cpp
       src/ipc/pipe_security.cpp
+      src/ipc/pipe_security_server.cpp
       src/ipc/ipc_backend.cpp
       src/host/host_server.cpp
       src/host/host_diag.cpp
@@ -331,7 +337,7 @@ if(BUILD_TESTING)
     # std::getenv in the real-Host mode; same convention as stage4a.
     target_compile_definitions(stage4b PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(stage4b PRIVATE /W4 /WX /utf-8)
-    target_link_libraries(stage4b PRIVATE MockBackend)
+    target_link_libraries(stage4b PRIVATE MockBackend userenv)
     foreach(mode link failover cycles fencing contexts semantic)
       add_test(NAME stage4b_${mode} COMMAND stage4b ${mode})
     endforeach()

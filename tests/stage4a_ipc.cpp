@@ -46,6 +46,9 @@
 #endif
 #include <windows.h>
 
+#include <aclapi.h>
+#include <sddl.h>
+
 #include "fusion/backend.hpp"
 #include "fusion/ipc_protocol.hpp"
 #include "fusion/settings_protocol.hpp"
@@ -1309,6 +1312,227 @@ void test_connect_failure_codes() {
     // not the cancellation's.
     require(failure.win32_error == ERROR_PIPE_NOT_CONNECTED,
             "the mid-read close was not reported with the read's own code");
+  }
+}
+
+// The data pipe's grant, read back from the object the Host would create, and the
+// AppContainer decision that depends on it.
+//
+// The DACL is asserted from the created object rather than from the descriptor that was
+// passed in: what Windows stored is what the access check uses.
+namespace {
+
+PSID sid_from_text(const wchar_t *text) {
+  PSID sid = nullptr;
+  require(ConvertStringSidToSidW(text, &sid) != FALSE, "the test SID could not be created");
+  return sid;
+}
+
+std::wstring own_user_sid_text() {
+  HANDLE token = nullptr;
+  require(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE,
+          "this process's token could not be opened");
+  DWORD length = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &length);
+  require(length > 0, "this process's token user could not be measured");
+  std::vector<std::uint8_t> buffer(length);
+  require(GetTokenInformation(token, TokenUser, buffer.data(), length, &length) != FALSE,
+          "this process's token user could not be read");
+  CloseHandle(token);
+  LPWSTR text = nullptr;
+  require(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER *>(buffer.data())->User.Sid, &text) !=
+              FALSE,
+          "this process's token user could not be formatted");
+  std::wstring result(text);
+  LocalFree(text);
+  return result;
+}
+
+// One ACE's SID and mask, for the two forms the descriptor can produce.
+struct AceFacts {
+  std::wstring sid;
+  DWORD mask = 0;
+  bool allowed = false;
+};
+
+AceFacts ace_facts(PACL dacl, DWORD index) {
+  LPVOID raw = nullptr;
+  require(GetAce(dacl, index, &raw) != FALSE, "the DACL entry could not be read");
+  auto *header = static_cast<ACE_HEADER *>(raw);
+  AceFacts facts;
+  facts.allowed = header->AceType == ACCESS_ALLOWED_ACE_TYPE;
+  require(facts.allowed, "the data-pipe DACL carries an ACE that is not an allow");
+  auto *ace = static_cast<ACCESS_ALLOWED_ACE *>(raw);
+  PSID sid = reinterpret_cast<PSID>(&ace->SidStart);
+  LPWSTR text = nullptr;
+  require(ConvertSidToStringSidW(sid, &text) != FALSE, "an ACE SID could not be formatted");
+  facts.sid = text;
+  LocalFree(text);
+  facts.mask = ace->Mask;
+  return facts;
+}
+
+} // namespace
+
+void test_pipe_security() {
+  const std::wstring own_user = own_user_sid_text();
+  std::wprintf(L"[dacl] own user=%s\n", own_user.c_str());
+
+  // 1. The production descriptor: the user's own ACE unchanged, exactly one package ACE
+  //    carrying exactly the client rights, and an owner that is this process's user.
+  {
+    SECURITY_ATTRIBUTES sa = make_data_pipe_security(true);
+    require(sa.lpSecurityDescriptor != nullptr, "the data-pipe descriptor could not be built");
+    const std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-dacl";
+    HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096,
+                                   0, &sa);
+    free_pipe_security(sa);
+    require(pipe != INVALID_HANDLE_VALUE,
+            "a pipe with the production descriptor could not be created");
+
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(pipe, SE_KERNEL_OBJECT,
+                            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr,
+                            &dacl, nullptr, &descriptor) == ERROR_SUCCESS,
+            "the created pipe's security could not be read back");
+    require(owner != nullptr && dacl != nullptr, "the created pipe reports no owner or no DACL");
+
+    LPWSTR owner_text = nullptr;
+    require(ConvertSidToStringSidW(owner, &owner_text) != FALSE,
+            "the owner could not be formatted");
+    std::wprintf(L"[dacl] owner=%s\n", owner_text);
+    require(own_user == owner_text, "the pipe owner is not this process's user SID");
+    LocalFree(owner_text);
+
+    ACL_SIZE_INFORMATION size{};
+    require(GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) != FALSE,
+            "the DACL size could not be read");
+    std::printf("[dacl] aceCount=%lu\n", static_cast<unsigned long>(size.AceCount));
+    require(size.AceCount == 2, "the data-pipe DACL does not carry exactly two ACEs");
+
+    const AceFacts user_ace = ace_facts(dacl, 0);
+    const AceFacts package_ace = ace_facts(dacl, 1);
+    std::wprintf(L"[dacl] ace0=%s mask=0x%08lx\n", user_ace.sid.c_str(),
+                 static_cast<unsigned long>(user_ace.mask));
+    std::wprintf(L"[dacl] ace1=%s mask=0x%08lx\n", package_ace.sid.c_str(),
+                 static_cast<unsigned long>(package_ace.mask));
+
+    require(user_ace.sid == own_user, "the first ACE is not the user's own");
+    require(user_ace.mask == (FILE_GENERIC_READ | FILE_GENERIC_WRITE),
+            "the user's ACE no longer carries the rights it had");
+
+    require(package_ace.sid == search_package_sid,
+            "the second ACE is not the taskbar search package's AppContainer SID");
+    require(package_ace.mask == kDataPipeClientAccess,
+            "the package ACE is not exactly the client rights");
+    require((package_ace.mask & FILE_CREATE_PIPE_INSTANCE) == 0,
+            "the package ACE allows creating another instance of the pipe name");
+    require((package_ace.mask & (WRITE_DAC | WRITE_OWNER | DELETE)) == 0,
+            "the package ACE carries an administrative right");
+    require((package_ace.mask & (FILE_WRITE_EA | FILE_READ_EA)) == 0,
+            "the package ACE carries an extended-attribute right");
+    require((package_ace.mask &
+             (GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) == 0,
+            "the package ACE carries a generic right");
+
+    LocalFree(descriptor);
+    CloseHandle(pipe);
+  }
+
+  // 2. The descriptor the claim and stop events are created with: one ACE, the user's,
+  //    and nothing for the package. They are events rather than pipes, so the same
+  //    descriptor is inspected through a pipe — the DACL is the thing under test.
+  {
+    SECURITY_ATTRIBUTES sa = make_pipe_security();
+    require(sa.lpSecurityDescriptor != nullptr, "the user-only descriptor could not be built");
+    const std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-dacl-useronly";
+    HANDLE pipe = CreateNamedPipeW(pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096,
+                                   0, &sa);
+    free_pipe_security(sa);
+    require(pipe != INVALID_HANDLE_VALUE,
+            "a pipe with the user-only descriptor could not be created");
+
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(pipe, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                            &dacl, nullptr, &descriptor) == ERROR_SUCCESS,
+            "the user-only pipe's DACL could not be read back");
+    ACL_SIZE_INFORMATION size{};
+    require(GetAclInformation(dacl, &size, sizeof(size), AclSizeInformation) != FALSE,
+            "the user-only DACL size could not be read");
+    std::printf("[dacl] user-only aceCount=%lu\n", static_cast<unsigned long>(size.AceCount));
+    require(size.AceCount == 1, "the user-only DACL carries more than the user's ACE");
+    const AceFacts only = ace_facts(dacl, 0);
+    require(only.sid == own_user, "the user-only DACL's ACE is not the user's own");
+
+    LocalFree(descriptor);
+    CloseHandle(pipe);
+  }
+
+  // 3. The decision the AppContainer client makes, every branch, from synthetic inputs.
+  {
+    PSID own = sid_from_text(own_user.c_str());
+    PSID other = sid_from_text(L"S-1-5-21-1-2-3-1001");
+
+    AppContainerPipeFacts facts;
+    facts.own_user = own;
+    facts.pipe_owner = own;
+    facts.have_own_session = true;
+    facts.have_server_session = true;
+    facts.own_session = 3;
+    facts.server_session = 3;
+
+    const auto judge = [](const AppContainerPipeFacts &input) {
+      const auto why = judge_appcontainer_pipe(input);
+      std::printf("[identity] %s\n", identity_failure_name(why));
+      return why;
+    };
+
+    require(judge(facts) == IdentityFailure::None, "a matching pipe was refused");
+    facts.have_label = true;
+    facts.label_rid = SECURITY_MANDATORY_MEDIUM_RID;
+    require(judge(facts) == IdentityFailure::None, "a Medium-label pipe was refused");
+    facts.label_rid = SECURITY_MANDATORY_HIGH_RID;
+    require(judge(facts) == IdentityFailure::None, "a High-label pipe was refused");
+    facts.label_rid = SECURITY_MANDATORY_LOW_RID;
+    require(judge(facts) == IdentityFailure::PipeIntegrityLow, "a Low-label pipe was accepted");
+    facts.label_rid = SECURITY_MANDATORY_UNTRUSTED_RID;
+    require(judge(facts) == IdentityFailure::PipeIntegrityLow,
+            "an Untrusted-label pipe was accepted");
+    facts.have_label = false;
+
+    facts.pipe_owner = other;
+    require(judge(facts) == IdentityFailure::PipeOwnerMismatch,
+            "a pipe owned by another SID was accepted");
+    facts.pipe_owner = own;
+    facts.server_session = 4;
+    require(judge(facts) == IdentityFailure::SessionMismatch,
+            "a pipe from another session was accepted");
+    facts.pipe_owner = other;
+    require(judge(facts) == IdentityFailure::SessionMismatch,
+            "the session check does not come before the owner check");
+
+    facts.pipe_owner = own;
+    facts.server_session = 3;
+    facts.have_own_session = false;
+    require(judge(facts) == IdentityFailure::TokenSession, "a missing own session was accepted");
+    facts.have_own_session = true;
+    facts.have_server_session = false;
+    require(judge(facts) == IdentityFailure::PipeServerSession,
+            "a missing server session was accepted");
+    facts.have_server_session = true;
+    facts.pipe_owner = nullptr;
+    require(judge(facts) == IdentityFailure::PipeOwner, "a missing pipe owner was accepted");
+    facts.pipe_owner = own;
+    facts.own_user = nullptr;
+    require(judge(facts) == IdentityFailure::PipeOwner, "a missing own user was accepted");
+
+    LocalFree(own);
+    LocalFree(other);
   }
 }
 
@@ -2930,12 +3154,12 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|connectfailure|loopback|hostserver|wp3singleton|"
-                      "wp3shutdown|wp4stopevent|wp4sessionend|hostdiag|integration>\n";
+                      "<protocol|pipeendpoint|connectfailure|pipesecurity|loopback|hostserver|"
+                      "wp3singleton|wp3shutdown|wp4stopevent|wp4sessionend|hostdiag|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|connectfailure|loopback|hostserver|wp3singleton|"
-                      "wp3shutdown|wp4stopevent|wp4sessionend|hostdiag>\n";
+                      "<protocol|pipeendpoint|connectfailure|pipesecurity|loopback|hostserver|"
+                      "wp3singleton|wp3shutdown|wp4stopevent|wp4sessionend|hostdiag>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -2949,6 +3173,8 @@ int main(int argc, char *argv[]) {
       test_pipe_endpoint();
     else if (mode == "connectfailure")
       test_connect_failure_codes();
+    else if (mode == "pipesecurity")
+      test_pipe_security();
     else if (mode == "loopback")
       test_loopback();
     else if (mode == "hostserver")
