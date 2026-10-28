@@ -61,10 +61,65 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     /// <summary>
     /// What the window says while a save is waiting for the Host to be free. It says what is
-    /// true — nothing is on disk — and it does not name a cause, because the Host's
-    /// <c>Busy</c> covers both a live composition and another request in flight.
+    /// true — nothing is on disk — and it does not name a cause on its own, because the Host's
+    /// <c>Busy</c> covers both a live composition and another request in flight. When the wait
+    /// is for a live input the Host names which process holds it (<see cref="HostWaitClause"/>),
+    /// and that is added to this line rather than replacing it.
     /// </summary>
     public const string WaitingForHostText = "尚未保存，等待当前输入结束或 Host 空闲后自动重试。";
+
+    /// <summary>
+    /// The wait the Host names for itself: <c>holder pid=&lt;n&gt; why=&lt;preedit|pending-events&gt;
+    /// [exe=&lt;name&gt;] | &lt;sentence&gt;</c>. The head is machine-readable because the Host writes
+    /// its reasons in English and this window speaks Chinese; the two halves are the same fact.
+    /// <c>exe</c> is last because a file name may contain a space. Null when there is no head — a
+    /// Busy from another request in flight, an unknown process id, or a cause this window does not
+    /// recognise — which leaves <see cref="WaitingForHostText"/> alone, exactly as before.
+    /// </summary>
+    public static string? HostWaitClause(string? error)
+    {
+        if (error is null || !error.StartsWith("holder pid=", StringComparison.Ordinal))
+            return null;
+
+        var bar = error.IndexOf(" | ", StringComparison.Ordinal);
+        if (bar < 0)
+            return null;
+
+        var fields = error.Substring("holder ".Length, bar - "holder ".Length);
+        var whyStart = fields.IndexOf("why=", StringComparison.Ordinal);
+        var why = whyStart < 0
+            ? null
+            : FirstToken(fields.Substring(whyStart + "why=".Length));
+        var exeStart = fields.IndexOf(" exe=", StringComparison.Ordinal);
+        var exe = exeStart < 0 ? null : fields.Substring(exeStart + " exe=".Length).Trim();
+        var pidText = fields.StartsWith("pid=", StringComparison.Ordinal)
+            ? FirstToken(fields.Substring("pid=".Length))
+            : null;
+        var hasPid = uint.TryParse(pidText, out var pid) && pid != 0;
+
+        var waiting = why switch
+        {
+            "preedit" => "还有未完成的输入",
+            "pending-events" => "还有未处理完的按键",
+            _ => null,
+        };
+        if (waiting is null)
+            return null;
+
+        var who = hasPid ? (string.IsNullOrEmpty(exe) ? $"pid {pid} 的进程 " : $"{exe} (pid {pid}) ") : "";
+        return $"等待：{who}{waiting}";
+    }
+
+    /// <summary>Reads one space-delimited field of the Host's head.</summary>
+    private static string FirstToken(string text)
+    {
+        var space = text.IndexOf(' ');
+        return space < 0 ? text : text.Substring(0, space);
+    }
+
+    /// <summary>The waiting line, with the holder added when the Host named one.</summary>
+    private static string WaitingText(string? error) =>
+        HostWaitClause(error) is { } holder ? WaitingForHostText + holder : WaitingForHostText;
 
     /// <summary>How long one wait lasts before the next attempt.</summary>
     private static readonly TimeSpan HostRetryInterval = TimeSpan.FromMilliseconds(400);
@@ -876,14 +931,16 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
             case SettingsStatus.Busy:
                 // The Host wrote nothing, so this is a wait, not a failure: the caller retries
-                // this same draft when the Host is free again.
+                // this same draft when the Host is free again. When the wait is for an input the
+                // Host can name, that process goes on the same line the user is already reading.
                 Log($"save {uri}: busy ({result.HostIncarnation})");
+                var waiting = WaitingText(result.Error);
                 if (NoteBusyIncarnation(result.HostIncarnation))
                 {
-                    return new SaveOutcome($"{name}：{WaitingForHostText}", false);
+                    return new SaveOutcome($"{name}：{waiting}", false);
                 }
 
-                return new SaveOutcome($"{name}：{WaitingForHostText}", true);
+                return new SaveOutcome($"{name}：{waiting}", true);
 
             default:
                 Log($"save {uri}: {result.Status} {result.Error}");
@@ -958,10 +1015,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 Log($"save im-list: busy ({result.HostIncarnation})");
                 if (NoteBusyIncarnation(result.HostIncarnation))
                 {
-                    return new SaveOutcome($"输入方式列表：{WaitingForHostText}", false);
+                    return new SaveOutcome($"输入方式列表：{WaitingText(result.Error)}", false);
                 }
 
-                return new SaveOutcome($"输入方式列表：{WaitingForHostText}", true);
+                return new SaveOutcome($"输入方式列表：{WaitingText(result.Error)}", true);
 
             default:
                 Log($"save im-list: {result.Status} {result.Error}");

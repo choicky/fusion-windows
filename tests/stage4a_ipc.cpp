@@ -63,12 +63,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -1933,6 +1934,20 @@ public:
     return SettingsStatus::Ok;
   }
 
+  // R51: the Host hands over the process its pipe saw before it binds a context, because the
+  // refusal that later waits for that context arrives on another connection entirely — the
+  // settings window's own — which cannot see this one.
+  void note_context_owner(std::uint64_t context, std::uint32_t client_pid) override {
+    std::lock_guard lock(state_);
+    owners_[context] = client_pid;
+  }
+
+  std::uint32_t owner_of(std::uint64_t context) {
+    std::lock_guard lock(state_);
+    const auto owner = owners_.find(context);
+    return owner == owners_.end() ? 0 : owner->second;
+  }
+
   std::size_t bound_count() {
     std::lock_guard lock(state_);
     return contexts_.size();
@@ -1949,6 +1964,7 @@ private:
   std::mutex settings_mutex_;
   std::set<std::uint64_t> contexts_;
   std::vector<std::uint64_t> unbound_;
+  std::map<std::uint64_t, std::uint32_t> owners_;
 };
 
 // Two IpcBackend clients using the SAME client context id, binding and sending
@@ -2009,6 +2025,14 @@ void test_hostserver_multi_client() {
   // Disconnecting one client must unbind exactly that client's host context.
   const auto host_context_a = static_cast<std::uint64_t>(std::stoull(host_context1));
   const auto host_context_b = static_cast<std::uint64_t>(std::stoull(host_context2));
+  // R51: both connections come from this test process, and the Host read that from its own
+  // pipe before binding each context. It is the only way the refusal that later waits for one
+  // of these inputs — which arrives on the settings window's connection, not this one — can
+  // say whose input it is waiting for.
+  require(fake->owner_of(host_context_a) == GetCurrentProcessId(),
+          "the Host named the process behind the pipe for the first client's context");
+  require(fake->owner_of(host_context_b) == GetCurrentProcessId(),
+          "and for the second client's context");
   client1.reset(); // closing the pipe is what the Host observes as a disconnect
   require(wait_until([fake, host_context_a] { return fake->saw_unbind(host_context_a); }, kWait),
           "disconnected client's host context was unbound");

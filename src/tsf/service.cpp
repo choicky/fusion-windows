@@ -1,5 +1,6 @@
 #include "tsf/service.hpp"
 
+#include "tsf/anchor_probe.hpp"
 #include "tsf/build_identity.hpp"
 #include "tsf/diag.hpp"
 #include "tsf/observation.hpp"
@@ -497,6 +498,137 @@ private:
 // through the context's active view (ITfContext::GetActiveView) and records the
 // screen-space anchor on the entry. The popup itself is positioned outside the
 // session, where UI calls belong.
+//
+// The same function answers both paths that need an anchor: a key dispatch, and a layout
+// notification for a page that is already on screen (R46). `trigger` only decides how the
+// successful probe is reported; the calls, their order and their failure codes are
+// identical, so the two cannot drift apart.
+void probe_anchor(ContextEntry &entry, TfEditCookie ec, ProbeTrigger trigger) {
+  entry.candidate_anchor_valid = false;
+  // The authoritative live view is the context's active view: ITfContext is not
+  // queried for ITfContextView, it hands one out through GetActiveView. A
+  // failing HRESULT, a null view or no active view is a presentation failure
+  // only: the anchor stays invalid, the caller hides the page, and no engine
+  // semantic event is invented.
+  //
+  // R25: the popup is invisible in Firefox's contenteditable editor while it works
+  // in that browser's address bar and search field, so the anchor query is the
+  // suspect and it used to fail silently. These lines are content-free (stage,
+  // HRESULT, screen geometry) and appear only under FUSION_TSF_DIAGNOSTICS.
+  ComRef<ITfContextView> view;
+  const HRESULT view_hr = entry.context->GetActiveView(view.out());
+  // R49: the window the popup is owned by. The context's view reports the application
+  // window its text is in; with no view, or a view that reports no window, the thread focus
+  // is the window this UI thread is typing into. Resolved on every probe, including a probe
+  // that then fails: ownership is a fact about the context, not about the rectangle. It is
+  // stored per entry, so a popup whose owner changed or died is recreated rather than left
+  // under a window it no longer belongs to.
+  HWND owner = nullptr;
+  bool owner_from_view = false;
+  if (SUCCEEDED(view_hr) && view) {
+    HWND view_window = nullptr;
+    if (SUCCEEDED(view->GetWnd(&view_window)) && view_window != nullptr) {
+      owner = view_window;
+      owner_from_view = true;
+    }
+  }
+  if (owner == nullptr)
+    owner = GetFocus();
+  entry.candidate_owner = owner;
+  entry.candidate_owner_from_view = owner_from_view;
+  if (FAILED(view_hr) || !view) {
+    diagf("ANCHOR_PROBE", "stage=no-active-view hr=0x%08lX", static_cast<unsigned long>(view_hr));
+    return;
+  }
+  ComRef<ITfRange> range;
+  bool from_composition = false;
+  if (entry.composition != nullptr && SUCCEEDED(entry.composition->GetRange(range.out())) &&
+      range) {
+    // Composition range is the caret while preedit text is present.
+    from_composition = true;
+  } else {
+    TF_SELECTION selection{};
+    ULONG fetched = 0;
+    const HRESULT selection_hr =
+        entry.context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
+    if (FAILED(selection_hr) || fetched == 0 || selection.range == nullptr) {
+      diagf("ANCHOR_PROBE", "stage=no-range source=selection hr=0x%08lX fetched=%lu",
+            static_cast<unsigned long>(selection_hr), static_cast<unsigned long>(fetched));
+      return;
+    }
+    range = ComRef<ITfRange>(selection.range); // takes over the GetSelection reference
+  }
+  RECT rect{};
+  BOOL clipped = FALSE;
+  const char *source = from_composition ? "composition" : "selection";
+  HRESULT hr = view->GetTextExt(ec, range.get(), &rect, &clipped);
+  if (FAILED(hr) && from_composition) {
+    // R25 (measured 2026-10-20 in a local fixture): Firefox answers GetTextExt with
+    // TS_E_NOLAYOUT for the composition range on every keystroke, so the popup stayed
+    // hidden for the whole session while composition and commit worked. The same view
+    // answers the selection (caret) range with a valid rectangle from the second
+    // keystroke on, so fall back to the caret instead of hiding the page. A collapsed
+    // clone of the composition range fails the same way and is deliberately not tried.
+    TF_SELECTION caret{};
+    ULONG fetched = 0;
+    const HRESULT selection_hr =
+        entry.context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &caret, &fetched);
+    if (SUCCEEDED(selection_hr) && fetched > 0 && caret.range != nullptr) {
+      ComRef<ITfRange> caret_range(caret.range); // takes over the GetSelection reference
+      RECT caret_rect{};
+      BOOL caret_clipped = FALSE;
+      const HRESULT caret_hr = view->GetTextExt(ec, caret_range.get(), &caret_rect, &caret_clipped);
+      if (SUCCEEDED(caret_hr)) {
+        rect = caret_rect;
+        clipped = caret_clipped;
+        hr = caret_hr;
+        source = "composition-caret";
+      }
+    }
+  }
+  AnchorObservation obs;
+  obs.hr = hr;
+  obs.clipped = clipped;
+  obs.source = source;
+  if (SUCCEEDED(hr)) {
+    obs.has_rect = true;
+    obs.rect = rect;
+  }
+  const LastGoodAnchor last_good{entry.candidate_anchor_last, entry.candidate_anchor_last_valid};
+  const AnchorDecision decision = decide_anchor(obs, last_good, trigger);
+  if (!decision.placed) {
+    // A probe with no anchor to keep: the page defers, and this is the line the R46 report
+    // is read from (`stage=text-ext … hr=0x80040206`).
+    diagf("ANCHOR_PROBE", "stage=text-ext source=%s hr=0x%08lX", source,
+          static_cast<unsigned long>(hr));
+    return;
+  }
+  entry.candidate_anchor = decision.anchor;
+  entry.candidate_anchor_valid = true;
+  if (decision.becomes_last_good) {
+    entry.candidate_anchor_last = decision.anchor;
+    entry.candidate_anchor_last_valid = true;
+  }
+  if (decision.retained) {
+    // R46: there was no layout for this range right now, and the page stays at the place
+    // this context's text last had one. The failing code is kept in the line so the two
+    // cases — no layout yet, and no probe that ever succeeded — are told apart.
+    diagf("ANCHOR_PROBE", "stage=ok source=%s hr=0x%08lX anchor=%ld,%ld", decision.source,
+          static_cast<unsigned long>(hr), decision.anchor.x, decision.anchor.y);
+    return;
+  }
+  if (decision.range != nullptr) {
+    // R46: a layout notification's re-probe resolved a rectangle. `source` says which path
+    // produced it, `range` says which range it was measured on.
+    diagf("ANCHOR_PROBE", "stage=ok source=%s range=%s rect=%ld,%ld,%ld,%ld clipped=%d",
+          decision.source, decision.range, rect.left, rect.top, rect.right, rect.bottom,
+          clipped != FALSE ? 1 : 0);
+    return;
+  }
+  diagf("ANCHOR_PROBE", "stage=ok source=%s rect=%ld,%ld,%ld,%ld clipped=%d", decision.source,
+        rect.left, rect.top, rect.right, rect.bottom, clipped != FALSE ? 1 : 0);
+}
+
 class AnchorProbeSession final : public ITfEditSession {
 public:
   AnchorProbeSession(TextService &service, ContextEntry &entry)
@@ -531,84 +663,119 @@ public:
     ContextEntry *entry = service_->find_entry_alive(entry_, generation_);
     if (entry == nullptr)
       return S_OK;
-    entry->candidate_anchor_valid = false;
-    // The authoritative live view is the context's active view: ITfContext is not
-    // queried for ITfContextView, it hands one out through GetActiveView. A
-    // failing HRESULT, a null view or no active view is a presentation failure
-    // only: the anchor stays invalid, the caller hides the page, and no engine
-    // semantic event is invented.
-    //
-    // R25: the popup is invisible in Firefox's contenteditable editor while it works
-    // in that browser's address bar and search field, so the anchor query is the
-    // suspect and it used to fail silently. These lines are content-free (stage,
-    // HRESULT, screen geometry) and appear only under FUSION_TSF_DIAGNOSTICS.
-    ComRef<ITfContextView> view;
-    HRESULT hr = entry->context->GetActiveView(view.out());
-    if (FAILED(hr) || !view) {
-      diagf("ANCHOR_PROBE", "stage=no-active-view hr=0x%08lX", static_cast<unsigned long>(hr));
-      return S_OK;
-    }
-    ComRef<ITfRange> range;
-    bool from_composition = false;
-    if (entry->composition != nullptr && SUCCEEDED(entry->composition->GetRange(range.out())) &&
-        range) {
-      // Composition range is the caret while preedit text is present.
-      from_composition = true;
-    } else {
-      TF_SELECTION selection{};
-      ULONG fetched = 0;
-      hr = entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched);
-      if (FAILED(hr) || fetched == 0 || selection.range == nullptr) {
-        diagf("ANCHOR_PROBE", "stage=no-range source=selection hr=0x%08lX fetched=%lu",
-              static_cast<unsigned long>(hr), static_cast<unsigned long>(fetched));
-        return S_OK;
-      }
-      range = ComRef<ITfRange>(selection.range); // takes over the GetSelection reference
-    }
-    RECT rect{};
-    BOOL clipped = FALSE;
-    const char *source = from_composition ? "composition" : "selection";
-    hr = view->GetTextExt(ec, range.get(), &rect, &clipped);
-    if (FAILED(hr) && from_composition) {
-      // R25 (measured 2026-10-20 in a local fixture): Firefox answers GetTextExt with
-      // TS_E_NOLAYOUT for the composition range on every keystroke, so the popup stayed
-      // hidden for the whole session while composition and commit worked. The same view
-      // answers the selection (caret) range with a valid rectangle from the second
-      // keystroke on, so fall back to the caret instead of hiding the page. A collapsed
-      // clone of the composition range fails the same way and is deliberately not tried.
-      TF_SELECTION caret{};
-      ULONG fetched = 0;
-      const HRESULT selection_hr =
-          entry->context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &caret, &fetched);
-      if (SUCCEEDED(selection_hr) && fetched > 0 && caret.range != nullptr) {
-        ComRef<ITfRange> caret_range(caret.range); // takes over the GetSelection reference
-        RECT caret_rect{};
-        BOOL caret_clipped = FALSE;
-        const HRESULT caret_hr =
-            view->GetTextExt(ec, caret_range.get(), &caret_rect, &caret_clipped);
-        if (SUCCEEDED(caret_hr)) {
-          rect = caret_rect;
-          clipped = caret_clipped;
-          hr = caret_hr;
-          source = "composition-caret";
-        }
-      }
-    }
-    if (FAILED(hr)) {
-      diagf("ANCHOR_PROBE", "stage=text-ext source=%s hr=0x%08lX",
-            from_composition ? "composition" : "selection", static_cast<unsigned long>(hr));
-      return S_OK;
-    }
-    entry->candidate_anchor = POINT{rect.right, rect.bottom};
-    entry->candidate_anchor_valid = true;
-    diagf("ANCHOR_PROBE", "stage=ok source=%s rect=%ld,%ld,%ld,%ld clipped=%d", source, rect.left,
-          rect.top, rect.right, rect.bottom, clipped != FALSE ? 1 : 0);
+    probe_anchor(*entry, ec, ProbeTrigger::Key);
     return S_OK;
   }
 
 private:
   std::atomic<ULONG> ref_count_{1};
   std::shared_ptr<ContextEntry> hold_;
+  TextService *service_;
+  ContextEntry *entry_;
+  std::uint64_t generation_;
+};
+
+// R46: the re-probe a layout notification asks for. It is read-only, so it cannot touch the
+// application's text even by accident, and asynchronous, because the notification can arrive
+// while this thread is inside another context's edit. What it does *not* do is move the
+// window: a placement is a UI call, so the session posts the popup its own reposition
+// message and the message loop runs the move after the session has returned.
+class LayoutReprobeSession final : public ITfEditSession {
+public:
+  LayoutReprobeSession(TextService &service, ContextEntry &entry)
+      : service_(&service), entry_(&entry), generation_(entry.generation) {
+    hold_ = service.hold_entry(&entry);
+    service.AddRef();
+  }
+  ~LayoutReprobeSession() { service_->Release(); }
+  LayoutReprobeSession(const LayoutReprobeSession &) = delete;
+  LayoutReprobeSession &operator=(const LayoutReprobeSession &) = delete;
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfEditSession)) {
+      *ppv = static_cast<ITfEditSession *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0)
+      delete this;
+    return count;
+  }
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+    ContextEntry *entry = service_->find_entry_alive(entry_, generation_);
+    if (entry == nullptr)
+      return S_OK;
+    entry->layout_reprobe_pending = false;
+    probe_anchor(*entry, ec, ProbeTrigger::LayoutChange);
+    if (entry->candidate_anchor_valid && entry->candidates)
+      entry->candidates->request_reposition();
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> ref_count_{1};
+  std::shared_ptr<ContextEntry> hold_;
+  TextService *service_;
+  ContextEntry *entry_;
+  std::uint64_t generation_;
+};
+
+// R46: the sink TSF calls when a context's text layout changes. It carries the entry's
+// identity and generation instead of a reference, so a notification that arrives after the
+// context is gone runs into the same fence every other late callback uses. One per live
+// entry, advised through ITfSource on the context.
+class LayoutSink final : public ITfTextLayoutSink {
+public:
+  LayoutSink(TextService &service, ContextEntry &entry)
+      : service_(&service), entry_(&entry), generation_(entry.generation) {
+    service.AddRef();
+  }
+  ~LayoutSink() { service_->Release(); }
+  LayoutSink(const LayoutSink &) = delete;
+  LayoutSink &operator=(const LayoutSink &) = delete;
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfTextLayoutSink)) {
+      *ppv = static_cast<ITfTextLayoutSink *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0)
+      delete this;
+    return count;
+  }
+
+  // The one method of ITfTextLayoutSink (msctf.h): the context whose layout changed, the code
+  // (create / change / destroy) and the view it happened in. All three are facts about a
+  // notification this sink only ever receives for its own context, so the decision is made by
+  // what the entry holds — a page on screen, an anchor to re-read — and not by these arguments.
+  STDMETHODIMP OnLayoutChange(ITfContext *pic, TfLayoutCode lcode, ITfContextView *view) override {
+    (void)pic;
+    (void)lcode;
+    (void)view;
+    service_->note_layout_change(entry_, generation_);
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> ref_count_{1};
   TextService *service_;
   ContextEntry *entry_;
   std::uint64_t generation_;
@@ -1205,6 +1372,11 @@ STDMETHODIMP TextService::OnPushContext(ITfContext *pic) {
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                   [&](const auto &item) { return item.get() == entry; }),
                    entries_.end());
+  } else if (entry != nullptr) {
+    // The entry lives on, but a context first seen before this push was advised only when
+    // it was created. Push is the moment TSF says this context is being worked on, so it
+    // is the moment its layout notifications have to start arriving. Idempotent.
+    advise_layout_sink(*entry);
   }
   return S_OK;
 }
@@ -1221,6 +1393,11 @@ STDMETHODIMP TextService::OnPopContext(ITfContext *pic) {
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                   [&](const auto &item) { return item.get() == entry; }),
                    entries_.end());
+  } else if (entry != nullptr) {
+    // Popped but not torn down: this context is no longer the one being edited, so a
+    // layout change in it must not re-place a candidate window that belongs elsewhere.
+    // The next push re-advises. The erased path unadvises through the destructor.
+    entry->release_layout_sink();
   }
   return S_OK;
 }
@@ -1316,6 +1493,9 @@ ContextEntry *TextService::find_entry_alive(void *entry, std::uint64_t generatio
 
 ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
   if (ContextEntry *found = find_entry(pic)) {
+    // Idempotent, and cheap when already advised: an entry whose sink was released by a
+    // pop gets one back the first time it is used again.
+    advise_layout_sink(*found);
     return found;
   }
   if (!qi<IUnknown>(pic, IID_IUnknown) || entries_.size() >= kLedgerCapacity)
@@ -1352,6 +1532,7 @@ ContextEntry *TextService::resolve_or_create_entry(ITfContext *pic) {
   entries_.push_back(std::move(entry));
   diagf("ENTRY_CREATE", "cid=%" PRIu64 " ctx=%p dim=%p entries=%zu", raw->semantic.context_id(),
         static_cast<void *>(pic), static_cast<void *>(dim), entries_.size());
+  advise_layout_sink(*raw);
   return raw;
 }
 
@@ -1611,10 +1792,10 @@ fusion::EditResult TextService::apply_state_text(ContextEntry &entry, TfEditCook
     }
     // GetSelection addrefs the range; the ComRef takes over that reference.
     ComRef<ITfRange> anchor(selection.range);
-    if (FAILED(anchor->Collapse(ec, TF_ANCHOR_START))) {
-      diagf("STATE_REFUSED", "reason=collapse");
-      return fusion::EditResult::RefusedNoMutation;
-    }
+    // R50: the range goes to StartComposition exactly as selected, not collapsed to its
+    // start. A composition that spans the selection is what makes the first SetText
+    // replace the selected text; a collapsed range composes *after* it and leaves the
+    // selection in the document. An empty selection is the same range either way.
     ITfComposition *composition = nullptr;
     if (FAILED(composition_mgr->StartComposition(
             ec, anchor.get(), static_cast<ITfCompositionSink *>(this), &composition)) ||
@@ -1905,27 +2086,126 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
   }
   if (!entry.candidates)
     entry.candidates = std::make_unique<CandidateView>();
-  if (!entry.candidates->ensure_created(this, &entry, entry.generation)) {
-    diagf("CANDIDATE_VIEW", "create-failed cid=%" PRIu64, entry.semantic.context_id());
-    return;
-  }
-  // Resolve the caret through a read-only session; position the popup after the
-  // session returns (UI calls belong outside the edit session).
+  // Resolve the caret and the owning application window through a read-only session, then
+  // make and position the window. The owner has to be known before the window is created,
+  // because Windows picks the relationship at creation (R49). UI calls belong outside the
+  // edit session, so this is the order the session's results are used in.
   auto *session = new AnchorProbeSession(*this, entry);
   HRESULT outer = E_FAIL, inner = E_FAIL;
   request_readonly_sync(entry, session, outer, inner);
   session->Release();
-  if (entry.candidate_anchor_valid)
-    entry.candidates->show(*page, entry.candidate_anchor);
-  else {
-    // R25: the page existed but could not be placed, so it is hidden. The anchor probe
-    // line above names the failing stage; this one records the consequence.
+  if (!entry.candidate_anchor_valid) {
+    // The page existed but could not be placed, so it is hidden — after R46 only when this
+    // context has no anchor to keep. The anchor probe line above names the failing stage;
+    // this one records the consequence.
     diagf("CANDIDATE_VIEW", "hidden reason=no-anchor cid=%" PRIu64, entry.semantic.context_id());
     entry.candidates->hide(); // never show a page we cannot place near its text
+    return;
   }
+  if (entry.candidate_owner == nullptr) {
+    // No view window and no thread focus: an unowned popup is exactly the R49 failure, so
+    // the page waits for the next probe instead of landing on the desktop again.
+    diagf("CANDIDATE_VIEW", "hidden reason=no-owner cid=%" PRIu64, entry.semantic.context_id());
+    entry.candidates->hide();
+    return;
+  }
+  if (!entry.candidates->ensure_created(this, &entry, entry.generation, entry.candidate_owner,
+                                        entry.candidate_owner_from_view)) {
+    diagf("CANDIDATE_VIEW", "create-failed cid=%" PRIu64, entry.semantic.context_id());
+    return;
+  }
+  entry.candidates->show(*page, entry.candidate_anchor);
   // The window has just measured itself, so it now knows how many rows fit. The next key
   // carries that number to the Host, which groups scroll pages by it.
   entry.semantic.set_window_rows(entry.candidates->row_capacity());
+}
+
+void TextService::advise_layout_sink(ContextEntry &entry) {
+  if (entry.context == nullptr || entry.layout_sink_cookie != 0)
+    return;
+  auto source = qi<ITfSource>(entry.context, IID_ITfSource);
+  if (!source)
+    return;
+  auto *sink = new LayoutSink(*this, entry);
+  DWORD cookie = 0;
+  const HRESULT hr =
+      source->AdviseSink(IID_ITfTextLayoutSink, static_cast<IUnknown *>(sink), &cookie);
+  // AdviseSink took its own reference for the registration, so this thread's creation
+  // reference is no longer needed either way: the sink's lifetime is TSF's from here on, and
+  // unadvising is what deletes it.
+  sink->Release();
+  if (FAILED(hr) || cookie == 0) {
+    // Presentation support only. Without the sink an application that reports no layout
+    // information still keeps the page at its last good anchor (R46); it is only not
+    // re-probed when the layout finally arrives. No key path and no ownership decision
+    // depends on this call succeeding.
+    diagf("LAYOUT_SINK", "advise-failed hr=0x%08lX cid=%" PRIu64, static_cast<unsigned long>(hr),
+          entry.semantic.context_id());
+    return;
+  }
+  entry.layout_sink_cookie = cookie;
+}
+
+void ContextEntry::release_layout_sink() {
+  if (layout_sink_cookie == 0)
+    return;
+  const DWORD cookie = layout_sink_cookie;
+  layout_sink_cookie = 0;
+  layout_reprobe_pending = false;
+  if (context == nullptr)
+    return;
+  ITfSource *source = nullptr;
+  if (SUCCEEDED(context->QueryInterface(IID_ITfSource, reinterpret_cast<void **>(&source))) &&
+      source != nullptr) {
+    source->UnadviseSink(cookie);
+    source->Release();
+  }
+}
+
+void TextService::note_layout_change(void *entry, std::uint64_t generation) {
+  ContextEntry *target = find_entry_alive(entry, generation);
+  if (target == nullptr) {
+    diagf("FENCE", "kind=layout-change stale-entry gen=%" PRIu64, generation);
+    return;
+  }
+  // Only a page that is actually on screen has anything re-placed by a layout change; the
+  // next key path decides for a page that is not displayed.
+  if (!target->semantic.real_frontend() || target->candidates == nullptr ||
+      !target->candidates->visible() || !target->semantic.displayed_page())
+    return;
+  if (target->layout_reprobe_pending || target->context == nullptr)
+    return;
+  auto *session = new LayoutReprobeSession(*this, *target);
+  HRESULT inner = E_FAIL;
+  const HRESULT outer =
+      target->context->RequestEditSession(client_id_, session, TF_ES_ASYNC | TF_ES_READ, &inner);
+  session->Release();
+  if (async_admitted(outer, inner)) {
+    target->layout_reprobe_pending = true;
+    diagf("LAYOUT_CHANGE", "reprobe=admitted cid=%" PRIu64, target->semantic.context_id());
+  } else {
+    diagf("LAYOUT_CHANGE", "reprobe=refused outer=0x%08lX inner=0x%08lX cid=%" PRIu64,
+          static_cast<unsigned long>(outer), static_cast<unsigned long>(inner),
+          target->semantic.context_id());
+  }
+}
+
+void TextService::place_candidate_from_anchor(void *entry, std::uint64_t generation) {
+  ContextEntry *target = find_entry_alive(entry, generation);
+  if (target == nullptr) {
+    diagf("FENCE", "kind=reposition stale-entry gen=%" PRIu64, generation);
+    return;
+  }
+  if (target->candidates == nullptr)
+    return;
+  // An anchor that went missing between the re-probe and here is not a reason to move or
+  // remove a visible page; the next key path re-decides it through sync_candidate_view.
+  if (!target->candidate_anchor_valid)
+    return;
+  const auto page = target->semantic.displayed_page();
+  if (!page)
+    return;
+  target->candidates->show(*page, target->candidate_anchor);
 }
 
 void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,

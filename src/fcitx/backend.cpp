@@ -40,6 +40,11 @@
 #include <thread>
 #include <utility>
 #include <windows.h>
+// R51: this header brings <windows.h> with it, so it belongs below the Fcitx and LibIME headers
+// and not with the repo's own includes above: PinyinFinal has a member named `IN`, which the
+// Windows headers define as a macro, and including Windows first breaks that enum
+// (measured: pinyinencoder.h(142) error C2143).
+#include "busy_holder.hpp"
 
 namespace fcitx {
 extern FCITXUTILS_EXPORT HINSTANCE mainInstanceHandle;
@@ -752,6 +757,13 @@ public:
         return false;
       context->lifecycle = true;
       contexts_.erase(binding.context);
+      owners_.erase(binding.context);
+      return true;
+    });
+  }
+  void note_context_owner(std::uint64_t context, std::uint32_t client_pid) override {
+    (void)invoke([this, context, client_pid] {
+      owners_[context] = client_pid;
       return true;
     });
   }
@@ -940,13 +952,14 @@ public:
           if (liveCurrent == method) {
             return selection_on_loop(*result, taskError);
           }
-          if (has_active_composition_on_loop()) {
+          if (const auto holder = composition_holder_on_loop(); holder.busy) {
             // Same reason as the list below: the switch is `setGroup`, which deactivates the
             // engine of every composing context.
-            taskError =
-                "Switching the input method deactivates the engine of every context that is "
-                "still composing, and the switch is stored by that same official call, so it "
-                "cannot be applied while a buffer is live. Nothing was written.";
+            taskError = busy_holder(holder) +
+                        "Switching the input method deactivates the engine of every context "
+                        "that is still composing, and the switch is stored by that same "
+                        "official call, so it cannot be applied while a buffer is live. "
+                        "Nothing was written.";
             return SettingsStatus::Busy;
           }
           auto group = liveGroup;
@@ -1580,18 +1593,35 @@ private:
   // two engine setters below actually destroy is the preedit, and what the ordered barrier
   // protects is work the frontend is still waiting for, so those are the two questions asked
   // here. Anything that ends a real composition ends its preedit first.
-  bool has_active_composition_on_loop() const {
+  //
+  // R51: "is somebody still typing" is not the whole answer the user needs; which of the two
+  // questions above is true, and in which process, is what makes the wait actionable. `busy` is
+  // exactly what this function used to return, so the gate itself does not change.
+  composition_holder composition_holder_on_loop() const {
+    composition_holder holder;
     for (const auto &[id, context] : contexts_) {
-      (void)id;
       if (!context->inputPanel().clientPreedit().empty() ||
           !context->inputPanel().preedit().empty()) {
-        return true;
+        holder.busy = true;
+        holder.condition = "preedit";
+        holder.pid = owner_of(id);
+        break;
       }
       if (context->hasPendingEventsStrictOrder()) {
-        return true;
+        holder.busy = true;
+        holder.condition = "pending-events";
+        holder.pid = owner_of(id);
+        break;
       }
     }
-    return false;
+    return holder;
+  }
+
+  bool has_active_composition_on_loop() const { return composition_holder_on_loop().busy; }
+
+  std::uint32_t owner_of(std::uint64_t context) const {
+    const auto owner = owners_.find(context);
+    return owner == owners_.end() ? 0 : owner->second;
   }
 
   SettingsStatus read_global_settings_on_loop(SettingsSnapshot &snapshot, std::string &error) {
@@ -1835,8 +1865,9 @@ private:
     // that persists this configuration without publishing it, and holding the submitted tree
     // in Host memory instead would be neither the official store nor a save. So the request
     // is refused while a composition is live, with the reason named rather than "busy".
-    if (has_active_composition_on_loop()) {
-      error = "This Pinyin/Shuangpin setting can only be stored by the engine's own setter, "
+    if (const auto holder = composition_holder_on_loop(); holder.busy) {
+      error = busy_holder(holder) +
+              "This Pinyin/Shuangpin setting can only be stored by the engine's own setter, "
               "which clears every composing context, and there is no official way to store it "
               "without applying it. Nothing was written.";
       return SettingsStatus::Busy;
@@ -1961,8 +1992,9 @@ private:
     // for Pinyin is `reset`. The group and the profile are written by that same call
     // (`setGroup` then `save`), so there is no order in which the list is stored without the
     // switch happening.
-    if (has_active_composition_on_loop()) {
-      error = "Changing the input-method list switches the method a composing context uses, "
+    if (const auto holder = composition_holder_on_loop(); holder.busy) {
+      error = busy_holder(holder) +
+              "Changing the input-method list switches the method a composing context uses, "
               "which ends its composition, and the list is stored by that same official call. "
               "Nothing was written.";
       return SettingsStatus::Busy;
@@ -2314,6 +2346,10 @@ private:
   std::thread thread_;
   fcitx::Instance *instance_ = nullptr; // dispatch_ protects publication; worker owns it
   std::map<std::uint64_t, std::unique_ptr<InputContext>> contexts_;
+  // R51: the process id of the client that bound each live context, reported by the Host's
+  // pipe. Used only to name the holder of a busy input in the refusal that waits for it; it
+  // decides nothing, and a context bound without a pipe transport is simply absent here.
+  std::map<std::uint64_t, std::uint32_t> owners_;
   // The Windows candidate-presentation configuration is the Host's single authoritative
   // store for presentation, read from Fcitx's per-user directory at startup and written
   // only through the settings path below. candidate_preference_ mirrors its layout value

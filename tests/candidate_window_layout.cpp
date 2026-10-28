@@ -20,7 +20,10 @@
 //     with the label and the slot's inset added on top;
 //   - a larger configured font really produces a taller panel, and a font family that does
 //     not exist still draws (GDI substitution) instead of failing;
-//   - the metrics scale with DPI in one place, so 192 dpi is exactly twice 96 dpi.
+//   - the metrics scale with DPI in one place, so 192 dpi is exactly twice 96 dpi;
+//   - R49: the popup is owned by the application window it was given and topmost, a new owner
+//     re-creates it, its owner's destruction takes it away instead of leaving a dangling HWND,
+//     and a re-place request reaches the service through the popup's own window message.
 //
 // What it does NOT cover: a composition inside a real application reaching this popup.
 // That path (anchor, composition, TIP registration) is unchanged by this work and would
@@ -37,6 +40,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -294,7 +298,63 @@ bool slots_draw_their_text_whole(const fusion::tsf::CandidateView &view,
   return true;
 }
 
+// R49: an owner window is a real top-level window of the process that hosts the popup. The
+// product path takes it from the context view (or from the focus); here it is this test's own
+// window, because the ownership and the topmost order are properties of the window pair, not
+// of TSF.
+HWND make_owner_window() {
+  static const bool registered = [] {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FusionTestOwnerWindow";
+    return RegisterClassExW(&wc) != 0;
+  }();
+  if (!registered)
+    return nullptr;
+  return CreateWindowExW(0, L"FusionTestOwnerWindow", L"Fusion test owner", WS_POPUP, 10, 10, 20,
+                         20, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+// What the popup does when its window procedure is asked to re-place itself.
+int reposition_calls = 0;
+void *reposition_entry = nullptr;
+std::uint64_t reposition_generation = 0;
+
+// Drains this thread's messages until the recorded call arrives, so the posted request is
+// dispatched by the same path the application's own loop would use.
+void pump_until_repositioned(int expected) {
+  for (int i = 0; i < 2000 && reposition_calls < expected; ++i) {
+    MSG msg{};
+    const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+    if (got == 0 || got == -1)
+      return;
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+  }
+}
+
+// R49: the popup routes the re-position through a TextService pointer, so the check that drives
+// it needs a pointer of that type — but not a real service. Constructing a TextService here would
+// pull its whole COM vtable — every TSF override service.cpp defines — into a link that has none
+// of them, and the stub below never touches `this`. An object-sized block of storage is enough to
+// prove that the popup's own message reaches the service with the identity it was created for.
+alignas(std::max_align_t) unsigned char service_storage[sizeof(fusion::tsf::TextService)];
+fusion::tsf::TextService *const any_service =
+    reinterpret_cast<fusion::tsf::TextService *>(service_storage);
+
 } // namespace
+
+namespace fusion::tsf {
+
+void TextService::place_candidate_from_anchor(void *entry, std::uint64_t generation) {
+  ++reposition_calls;
+  reposition_entry = entry;
+  reposition_generation = generation;
+}
+
+} // namespace fusion::tsf
 
 int main() {
   constexpr int entries = 8;
@@ -302,7 +362,7 @@ int main() {
 
   // 1. The real popup window is created, and it is the non-activating tool window the
   //    Stage 5 surface was defined as: the presentation settings must not change that.
-  CHECK(view.ensure_created(nullptr, nullptr, 0));
+  CHECK(view.ensure_created(nullptr, nullptr, 0, nullptr, false));
   CHECK(view.window() != nullptr);
   if (view.window() == nullptr) {
     std::fprintf(stderr, "candidate_window_layout: the popup could not be created\n");
@@ -867,7 +927,7 @@ int main() {
       std::printf("per-monitor context: not available on this system\n");
     } else {
       fusion::tsf::CandidateView aware;
-      CHECK(aware.ensure_created(nullptr, nullptr, 0));
+      CHECK(aware.ensure_created(nullptr, nullptr, 0, nullptr, false));
       auto page = make_page(fusion::CandidateLayout::Vertical, 5);
       page.font.family = "Microsoft YaHei UI";
       page.font.size_pt = 11;
@@ -1732,6 +1792,74 @@ int main() {
       CHECK(numbered_width - unnumbered_width >= label_width - 1);
       CHECK(numbered_width - unnumbered_width <= label_width + 1);
     }
+  }
+
+  // 34. R49: the popup is owned by the application's own window and topmost. Owned means the
+  //     window follows the application it belongs to (a WS_POPUP with a parent is an owner, not
+  //     a child), and topmost is what keeps a candidate list above a window that never lets the
+  //     IME activate anything. Both are read back from the created window, and the two lifetime
+  //     cases are real: a new owner re-creates the popup, and destroying the owner takes it away
+  //     rather than leaving a window owned by a dead HWND.
+  {
+    const HWND owner = make_owner_window();
+    CHECK(owner != nullptr);
+    auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    fusion::tsf::CandidateView owned;
+    int marker = 0;
+    CHECK(owned.ensure_created(nullptr, &marker, 7, owner, true));
+    const HWND popup = owned.window();
+    CHECK(popup != nullptr);
+    CHECK(owned.owner() == owner);
+    CHECK(owned.owner_from_view());
+    CHECK(GetWindow(popup, GW_OWNER) == owner);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    owned.show(page, POINT{140, 140});
+    CHECK(owned.visible());
+    // A show re-asserts the order instead of relying on the style alone: the window still
+    // reports itself topmost afterwards, and it still belongs to the same owner.
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    CHECK(GetWindow(popup, GW_OWNER) == owner);
+
+    // The same context with a different owner window gets a popup owned by the new one: the
+    // service decides the owner per context, so a second document window is never served by a
+    // window owned by the first.
+    const HWND second = make_owner_window();
+    CHECK(second != nullptr);
+    CHECK(owned.ensure_created(nullptr, &marker, 7, second, false));
+    CHECK(owned.window() != nullptr);
+    CHECK(owned.window() != popup);
+    CHECK(!IsWindow(popup));
+    CHECK(GetWindow(owned.window(), GW_OWNER) == second);
+    CHECK(!owned.owner_from_view());
+
+    // Destroying the owner destroys the popup it owns, and the next show creates a fresh one.
+    // This is the dangling-HWND case: after this the window list must hold a live window, not
+    // the one that died with its owner.
+    const HWND dying = owned.window();
+    CHECK(DestroyWindow(second) != 0);
+    CHECK(owned.window() == nullptr);
+    CHECK(!IsWindow(dying));
+    CHECK(owned.ensure_created(nullptr, &marker, 7, owner, true));
+    CHECK(owned.window() != nullptr);
+    CHECK(owned.window() != dying);
+    owned.show(page, POINT{160, 160});
+    CHECK(owned.visible());
+    CHECK(GetWindow(owned.window(), GW_OWNER) == owner);
+
+    // A layout change asks the popup's own thread to re-place it: the request travels as the
+    // window message the popup was given, and reaches the service with the identity the popup
+    // was created for. Nothing here moves a window from inside an edit session.
+    reposition_calls = 0;
+    reposition_entry = nullptr;
+    reposition_generation = 0;
+    CHECK(owned.ensure_created(any_service, &marker, 7, owner, true));
+    CHECK(PostMessageW(owned.window(), fusion::tsf::CandidateView::reposition_message, 0, 0) != 0);
+    pump_until_repositioned(1);
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_entry == &marker);
+    CHECK(reposition_generation == 7);
+    owned.destroy();
+    DestroyWindow(owner);
   }
 
   view.destroy();

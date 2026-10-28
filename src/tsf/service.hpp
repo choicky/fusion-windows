@@ -44,6 +44,7 @@ enum class InputScopeClass { Unknown, Ordinary, Sensitive };
 
 struct ContextEntry {
   ~ContextEntry() {
+    release_layout_sink(); // before the context reference goes: it is what to unadvise
     if (composition) {
       composition->Release();
     }
@@ -76,6 +77,11 @@ struct ContextEntry {
   ContextEntry(std::uint64_t context_id, std::size_t capacity, ServiceBackend &backend,
                ITfDocumentMgr *dim, ITfContext *pic);
 
+  // R46: drop this context's ITfTextLayoutSink registration. TSF holds the sink's only
+  // reference, so unadvising is also what releases it; a cookie of 0 means there is nothing
+  // to unadvise and the call does nothing.
+  void release_layout_sink();
+
   // Stage 5 candidate presentation. Real frontend only: the view is created
   // lazily when a non-empty page must be shown and hidden on an empty page or a
   // fenced projection. candidate_anchor remembers the last caret position the
@@ -83,6 +89,25 @@ struct ContextEntry {
   std::unique_ptr<CandidateView> candidates;
   POINT candidate_anchor{};
   bool candidate_anchor_valid = false;
+  // R46: the anchor of the last probe that resolved one in this context. A text store that
+  // answers TS_E_NOLAYOUT for the range it was asked about has not laid the text out yet;
+  // the page then stays where this context's text last had a place instead of disappearing
+  // for the rest of the word. Kept across compositions on purpose: R46 also fires on the
+  // first key, when this context has no composition range to ask.
+  POINT candidate_anchor_last{};
+  bool candidate_anchor_last_valid = false;
+  // R49: the application window the candidate popup is owned by, decided per entry — the
+  // context's view window (ITfContextView::GetWnd) or, when no view reports one, the thread
+  // focus. `candidate_owner_from_view` records which, for the one diagnostic line per show.
+  HWND candidate_owner = nullptr;
+  bool candidate_owner_from_view = false;
+  // R46: the layout-change sink advised on this context, so a layout that arrives after a
+  // TS_E_NOLAYOUT probe re-places the page that is already on screen. Cookie only.
+  DWORD layout_sink_cookie = 0;
+  // R46: one re-probe is enough for one layout. Set when a notification asks for the async
+  // session, cleared when that session runs, so a burst of notifications cannot stack a
+  // session per notification behind the same popup.
+  bool layout_reprobe_pending = false;
 };
 
 class TextService final : public ITfTextInputProcessor,
@@ -133,6 +158,19 @@ public:
   // edit sessions use, then dispatches the non-key action on the product path.
   void on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,
                         std::int32_t index);
+
+  // R46 (called by the per-context ITfTextLayoutSink): TSF says this context's text layout
+  // changed. For a context whose page is on screen but whose last probe had no layout to
+  // read, that is the signal to ask for the anchor again — through one read-only async
+  // session, never a text mutation. Anything else (no such entry, no displayed page, no
+  // popup) does nothing.
+  void note_layout_change(void *entry, std::uint64_t generation);
+
+  // R46 (called by the popup's own reposition message, so it runs on the message loop and
+  // not inside the session that probed): place the page this entry displays at the anchor
+  // the probe just resolved. Fenced by entry identity and generation like every other
+  // callback that arrives late.
+  void place_candidate_from_anchor(void *entry, std::uint64_t generation);
 
   // --- internal API used by the edit-session objects ---
   ContextEntry *find_entry(ITfContext *pic);
@@ -186,6 +224,11 @@ private:
   void settle_frontend_work(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
   // Show, reposition or hide the candidate surface from the controller projection.
   void sync_candidate_view(ContextEntry &entry);
+  // R46: advise this context's ITfTextLayoutSink (through ITfSource on ITfContext) while
+  // the entry is live, and stop when TSF pops the context. Idempotent in both directions:
+  // an entry that already has the registration is not advised twice, and a context that
+  // never had one is not unadvised.
+  void advise_layout_sink(ContextEntry &entry);
   bool request_readonly_sync(ContextEntry &entry, ITfEditSession *session, HRESULT &outer,
                              HRESULT &inner);
   void drain_prior_effect(ContextEntry &entry);

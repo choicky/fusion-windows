@@ -35,9 +35,11 @@ internal static class BusyWaitTests
 
     public static async Task RunAsync()
     {
+        NamesOnlyWhatTheHostSaid();
         await WaitsThenSavesAsync().ConfigureAwait(false);
         await DoesNotResubmitASavedPageAsync().ConfigureAwait(false);
         await CanBeStoppedAsync().ConfigureAwait(false);
+        await SaysWhichProcessItIsWaitingForAsync().ConfigureAwait(false);
         await DoesNotRetryOtherAnswersAsync().ConfigureAwait(false);
         foreach (var failure in new[] { SettingsStatus.Error, SettingsStatus.Invalid,
                                         SettingsStatus.Indeterminate })
@@ -46,6 +48,39 @@ internal static class BusyWaitTests
         }
 
         await DoesNotResubmitTheFailedGroupOfTheSharedDraftAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// R51: the clause the window adds to its waiting line, read straight from the head the Host
+    /// writes. Each check is one answer the Host can give, and what every one of them shares is
+    /// that nothing shows up which the Host did not say.
+    /// </summary>
+    private static void NamesOnlyWhatTheHostSaid()
+    {
+        Harness.Section("busy: the holder clause reads the Host's head and invents nothing");
+
+        Harness.CheckEqual("等待：SearchHost.exe (pid 16772) 还有未完成的输入",
+            SettingsWorkspace.HostWaitClause(
+                "holder pid=16772 why=preedit exe=SearchHost.exe | A buffer is live, " +
+                "so nothing was written."),
+            "a process holding a live preedit is named by both its name and its id");
+        Harness.CheckEqual("等待：ConEmu.exe (pid 4) 还有未处理完的按键",
+            SettingsWorkspace.HostWaitClause("holder pid=4 why=pending-events exe=ConEmu.exe | x"),
+            "and the other of the two conditions the gate can fail on says so");
+        Harness.CheckEqual("等待：pid 12 的进程 还有未完成的输入",
+            SettingsWorkspace.HostWaitClause("holder pid=12 why=preedit | x"),
+            "a process the Host could not name is still identified by its id");
+        Harness.CheckEqual("等待：还有未完成的输入",
+            SettingsWorkspace.HostWaitClause("holder pid=0 why=preedit | x"),
+            "a client the Host never saw is given no process at all");
+        Harness.Check(SettingsWorkspace.HostWaitClause("holder pid=7 why=something-else | x") is null,
+            "a cause this window does not recognise is not guessed at");
+        Harness.Check(SettingsWorkspace.HostWaitClause(
+            "A buffer is live, so nothing was written.") is null,
+            "a Busy from another request in flight carries no head, so it adds no clause");
+        Harness.Check(SettingsWorkspace.HostWaitClause("holder pid=7 why=preedit") is null,
+            "and a head with no sentence after it is not treated as one");
+        Harness.Check(SettingsWorkspace.HostWaitClause(null) is null, "no answer is no clause");
     }
 
     /// <summary>
@@ -247,6 +282,72 @@ internal static class BusyWaitTests
                 .ConfigureAwait(false),
             "a reload still works after a stopped wait");
         Harness.Check(!workspace.IsWaitingForHost, "and does not resume the wait");
+    }
+
+    /// <summary>
+    /// R51: a wait the owner can act on. The same line the bar already shows, with the process the
+    /// Host named added to it — and the head itself, which is for this window to read, is not left
+    /// on screen for the user.
+    /// </summary>
+    private static async Task SaysWhichProcessItIsWaitingForAsync()
+    {
+        Harness.Section("busy: the waiting line names the holder the Host reported");
+
+        var name = FakeHost.UniqueName();
+        await using var peer = FakeHost.StartScripted(name, (type, _) =>
+        {
+            switch (type)
+            {
+                case MessageType.SettingsGetConfigRequest:
+                    return SnapshotBody();
+                case MessageType.SettingsGetImListRequest:
+                    return ImListBody(OldOrder, OldOrder);
+                case MessageType.SettingsSetImListRequest:
+                    return StatusBody(SettingsStatus.Busy,
+                        "holder pid=16772 why=preedit exe=SearchHost.exe | A buffer is live, " +
+                        "so nothing was written.");
+                default:
+                    return null;
+            }
+        });
+
+        var workspace = new SettingsWorkspace(name);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        Harness.Check(await workspace.InitializeAsync(cancellation.Token).ConfigureAwait(false),
+            "the workspace loads");
+        Harness.Check(workspace.MoveMethod(0, 1), "the user reorders the list");
+
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnChanged(object? sender, PropertyChangedEventArgs args)
+        {
+            if (args.PropertyName == nameof(SettingsWorkspace.IsWaitingForHost) &&
+                workspace.IsWaitingForHost)
+            {
+                waiting.TrySetResult();
+            }
+        }
+
+        workspace.PropertyChanged += OnChanged;
+        Task save;
+        try
+        {
+            save = workspace.SaveAsync(cancellation.Token);
+            var reached = await Task.WhenAny(waiting.Task, save) == waiting.Task;
+            Harness.Check(reached, "the save reports that it is waiting for the Host");
+            Console.WriteLine($"   while waiting it said: {workspace.SaveSummary.Replace("\n", " / ")}");
+            Harness.Check(workspace.SaveSummary.Contains(
+                    "等待：SearchHost.exe (pid 16772) 还有未完成的输入", StringComparison.Ordinal),
+                "and says which process holds the input it is waiting for");
+            Harness.Check(!workspace.SaveSummary.Contains("holder pid=", StringComparison.Ordinal),
+                "the head the Host wrote for this window is not shown to the user as it was written");
+            workspace.StopWaiting();
+        }
+        finally
+        {
+            workspace.PropertyChanged -= OnChanged;
+        }
+
+        await save.ConfigureAwait(false);
     }
 
     /// <summary>
