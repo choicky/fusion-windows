@@ -46,12 +46,15 @@ public:
   void disconnect();
   bool connected() const;
 
-  WriteOutcome send_frame(const WireFrame &frame);
+  WriteOutcome send_frame(const WireFrame &frame, unsigned long *error = nullptr);
   // recv_timeout == 0 means block indefinitely (for idle wait on server side).
-  std::optional<WireFrame> recv_frame(std::chrono::milliseconds recv_timeout = kRequestTimeout);
+  std::optional<WireFrame> recv_frame(std::chrono::milliseconds recv_timeout = kRequestTimeout,
+                                      unsigned long *error = nullptr);
 
-  WriteOutcome send_request(MessageType type, const std::vector<std::uint8_t> &payload);
-  std::optional<WireFrame> recv_response(std::chrono::milliseconds timeout = kRequestTimeout);
+  WriteOutcome send_request(MessageType type, const std::vector<std::uint8_t> &payload,
+                            unsigned long *error = nullptr);
+  std::optional<WireFrame> recv_response(std::chrono::milliseconds timeout = kRequestTimeout,
+                                         unsigned long *error = nullptr);
 
   void *native_handle() const;
 
@@ -63,8 +66,14 @@ private:
   mutable win32::SrwMutex mutex_;
   bool connected_ = false;
 
-  WriteOutcome write_all(const void *data, std::size_t size);
-  bool read_all_overlapped(void *data, std::size_t size, std::chrono::milliseconds timeout);
+  // `error` (optional) receives the Win32 code of the call that failed, captured
+  // *before* CancelIoEx / GetOverlappedResult / CloseHandle run: those three leave
+  // their own codes in the thread's last-error slot, so a caller that asked
+  // GetLastError() afterwards reported the cleanup instead of the cause. A deadline
+  // expiry reports transport_timeout_error (see fusion/backend.hpp).
+  WriteOutcome write_all(const void *data, std::size_t size, unsigned long *error);
+  bool read_all_overlapped(void *data, std::size_t size, std::chrono::milliseconds timeout,
+                           unsigned long *error);
 };
 
 } // namespace fusion::ipc

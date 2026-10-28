@@ -27,10 +27,12 @@ bool IpcBackend::handshake(std::chrono::milliseconds timeout, ConnectFailure *fa
   // A transport failure and a protocol refusal are different facts: the first
   // says the bytes never moved, the second says the Host answered and the answer
   // was not acceptable. `failure` keeps them apart, and for a transport failure
-  // carries the last Win32 code the write/read path left behind.
-  const auto transport_failed = [failure](unsigned long error) {
+  // carries the Win32 code the read/write path captured at the call that failed —
+  // not GetLastError() here, which the transport's own cleanup has already
+  // overwritten by the time it returns.
+  const auto transport_failed = [failure](ConnectStage stage, unsigned long error) {
     if (failure) {
-      failure->stage = ConnectStage::HelloTransport;
+      failure->stage = stage;
       failure->win32_error = error;
     }
     return false;
@@ -46,11 +48,13 @@ bool IpcBackend::handshake(std::chrono::milliseconds timeout, ConnectFailure *fa
   std::vector<std::uint8_t> hello_payload;
   detail::write_u32(hello_payload, protocol_version);
 
-  if (client_.send_request(MessageType::HelloRequest, hello_payload) != WriteOutcome::Written)
-    return transport_failed(GetLastError());
-  auto response = client_.recv_response(timeout);
+  unsigned long io_error = 0;
+  if (client_.send_request(MessageType::HelloRequest, hello_payload, &io_error) !=
+      WriteOutcome::Written)
+    return transport_failed(ConnectStage::HelloWrite, io_error);
+  auto response = client_.recv_response(timeout, &io_error);
   if (!response)
-    return transport_failed(GetLastError());
+    return transport_failed(ConnectStage::HelloRead, io_error);
   if (response->type != MessageType::HelloResponse)
     return protocol_refused();
 

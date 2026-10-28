@@ -288,6 +288,26 @@ public:
     return write_all(wire.data(), wire.size());
   }
 
+  // Reads the Hello frame and answers with a deliberately truncated one, then drops
+  // the connection: the client is inside its reply read when the pipe goes away,
+  // which is the mid-frame failure the diagnostic has to name.
+  bool answer_hello_then_close_mid_reply(std::size_t bytes) {
+    std::uint8_t header[header_size];
+    if (!read_exact(header, header_size))
+      return false;
+    std::uint32_t length = 0;
+    std::memcpy(&length, header, sizeof(length));
+    if (length > max_message_payload)
+      return false;
+    std::vector<std::uint8_t> hello(length);
+    if (length > 0 && !read_exact(hello.data(), length))
+      return false;
+    const std::uint8_t partial[2] = {0x10, 0x00};
+    write_all(partial, bytes > sizeof(partial) ? sizeof(partial) : bytes);
+    abort_connection();
+    return true;
+  }
+
   // Bytes the client pushed that this server never consumed: a non-zero value
   // proves that part of a frame was accepted by the transport.
   DWORD peek_available() {
@@ -1212,6 +1232,83 @@ void test_pipe_endpoint() {
     require(wide_from_utf8("fusion-selftest-8f2c") == L"fusion-selftest-8f2c",
             "a UTF-8 endpoint converts to the same logical name");
     require(wide_from_utf8("\xff\xfe").empty(), "invalid UTF-8 is rejected");
+  }
+}
+
+// What the diagnostic reports when establishment fails after the transport is up.
+//
+// Both cases below used to be indistinguishable: the read path cancels the pending
+// I/O and closes its event before returning, so a caller that asked GetLastError()
+// reported the cleanup's ERROR_OPERATION_ABORTED (995) instead of the deadline or the
+// broken pipe. These assert the code the failing call actually produced.
+void test_connect_failure_codes() {
+  // 1. A server that accepts, reads the Hello and never answers: the reply read hits
+  //    its deadline, and the deadline has one documented code.
+  {
+    const std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hello-timeout";
+    PipeServer server(pipe_name);
+    require(server.create(), "the unanswered-handshake server could not be created");
+
+    std::atomic<bool> release{false};
+    std::thread serving([&] {
+      if (server.wait_for_client(std::chrono::milliseconds(5000))) {
+        server.recv_frame(std::chrono::milliseconds(2000));
+      }
+      while (!release.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      server.disconnect_client();
+    });
+
+    IpcBackend client(pipe_name);
+    const auto started = std::chrono::steady_clock::now();
+    const bool connected = client.connect(std::chrono::milliseconds(300));
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    const auto failure = client.last_connect_failure();
+    std::printf("[hello timeout] connected=%d stage=%s win32=%lu identity=%s elapsed=%lldms\n",
+                connected ? 1 : 0, connect_stage_name(failure.stage), failure.win32_error,
+                identity_failure_name(failure.identity), static_cast<long long>(elapsed.count()));
+
+    require(!connected, "a handshake the server never answers was reported as connected");
+    require(failure.stage == ConnectStage::HelloRead,
+            "the unanswered handshake did not stop at the reply read");
+    require(failure.identity == IdentityFailure::None,
+            "the unanswered handshake reported an identity failure");
+    require(failure.win32_error == transport_timeout_error,
+            "the deadline was not reported as the documented transport timeout code");
+    require(failure.win32_error != ERROR_OPERATION_ABORTED,
+            "the deadline was reported as the cancellation code (995)");
+    require(elapsed >= std::chrono::milliseconds(250),
+            "the reply read returned before its deadline");
+
+    release = true;
+    serving.join();
+  }
+
+  // 2. A server that answers with two bytes of a five-byte header and closes: the
+  //    client is mid-read, and the code is the broken pipe the read produced.
+  {
+    const std::wstring pipe_name = L"\\\\.\\pipe\\FusionHost-ipc-test-hello-truncated";
+    TinyBufferPipeServer server(pipe_name);
+    require(server.create(), "the truncated-reply server could not be created");
+    server.serve([&](TinyBufferPipeServer &s) { s.answer_hello_then_close_mid_reply(2); });
+
+    IpcBackend client(pipe_name);
+    const bool connected = client.connect(std::chrono::milliseconds(3000));
+    const auto failure = client.last_connect_failure();
+    std::printf("[truncated reply] connected=%d stage=%s win32=%lu\n", connected ? 1 : 0,
+                connect_stage_name(failure.stage), failure.win32_error);
+
+    require(!connected, "a truncated reply was accepted as a handshake");
+    require(failure.stage == ConnectStage::HelloRead,
+            "the truncated reply did not stop at the reply read");
+    // Observed on this machine, not assumed: the server drops the connection with
+    // DisconnectNamedPipe, so the client's pending read completes with
+    // ERROR_PIPE_NOT_CONNECTED (233). A client-side close surfaces as
+    // ERROR_BROKEN_PIPE (109) instead; what matters is that the code is the read's,
+    // not the cancellation's.
+    require(failure.win32_error == ERROR_PIPE_NOT_CONNECTED,
+            "the mid-read close was not reported with the read's own code");
   }
 }
 
@@ -2833,12 +2930,12 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
-                      "wp4stopevent|wp4sessionend|hostdiag|integration>\n";
+                      "<protocol|pipeendpoint|connectfailure|loopback|hostserver|wp3singleton|"
+                      "wp3shutdown|wp4stopevent|wp4sessionend|hostdiag|integration>\n";
 #else
   const char *usage = "Usage: stage4a "
-                      "<protocol|pipeendpoint|loopback|hostserver|wp3singleton|wp3shutdown|"
-                      "wp4stopevent|wp4sessionend|hostdiag>\n";
+                      "<protocol|pipeendpoint|connectfailure|loopback|hostserver|wp3singleton|"
+                      "wp3shutdown|wp4stopevent|wp4sessionend|hostdiag>\n";
 #endif
   if (argc < 2) {
     std::fprintf(stderr, "%s", usage);
@@ -2850,6 +2947,8 @@ int main(int argc, char *argv[]) {
       test_protocol();
     else if (mode == "pipeendpoint")
       test_pipe_endpoint();
+    else if (mode == "connectfailure")
+      test_connect_failure_codes();
     else if (mode == "loopback")
       test_loopback();
     else if (mode == "hostserver")

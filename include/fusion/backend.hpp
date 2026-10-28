@@ -40,12 +40,13 @@ struct LinkStatus {
 // to decide behaviour.
 enum class ConnectStage {
   None,
-  PipeName,       // the per-user pipe name could not be computed
-  Open,           // CreateFileW on the pipe failed
-  PipeMode,       // SetNamedPipeHandleState failed
-  Identity,       // verify_server_identity refused the server
-  HelloTransport, // the Hello could not be written, or no reply arrived
-  HelloProtocol,  // a reply arrived and was refused (payload or version)
+  PipeName,     // the per-user pipe name could not be computed
+  Open,         // CreateFileW on the pipe failed
+  PipeMode,     // SetNamedPipeHandleState failed
+  Identity,     // verify_server_identity refused the server
+  HelloWrite,   // the Hello could not be written
+  HelloRead,    // the Hello was written and no reply arrived
+  HelloProtocol, // a reply arrived and was refused (payload or version)
 };
 
 enum class IdentityFailure {
@@ -58,12 +59,31 @@ enum class IdentityFailure {
   OpenToken,       // OpenProcessToken(server) failed
   TokenUser,       // GetTokenInformation(TokenUser) failed on either side
   UserMismatch,    // both SIDs were read, and they differ
+  // The AppContainer path (see pipe_security.hpp): it reads the pipe object instead of
+  // the server process, so its failures name the object's properties.
+  TokenIsAppContainer, // GetTokenInformation(TokenIsAppContainer) failed
+  TokenSession,        // GetTokenInformation(TokenSessionId) failed
+  PipeServerSession,   // GetNamedPipeServerSessionId failed
+  PipeOwner,           // GetSecurityInfo(OWNER|LABEL) failed
+  PipeOwnerMismatch,   // the pipe's owner SID is not this process's user
+  PipeLabel,           // the mandatory label could not be read
+  PipeIntegrityLow,    // the pipe carries a label below Medium
 };
+
+// The Win32 code a deadline expiry reports in ConnectFailure::win32_error.
+//
+// A read or write that the transport never completed is reported as ERROR_TIMEOUT
+// (1460) and nothing else. It is not WAIT_TIMEOUT: that is the wait's own return
+// value, not an error code, and it is not the ERROR_OPERATION_ABORTED (995) that the
+// cancellation and handle cleanup on the way out would otherwise leave in the
+// thread's last-error slot — which is exactly the wrong answer the diagnostic used to
+// report. The value is spelled out so this header stays free of <windows.h>.
+inline constexpr unsigned long transport_timeout_error = 1460; // ERROR_TIMEOUT
 
 struct ConnectFailure {
   ConnectStage stage = ConnectStage::None;
   IdentityFailure identity = IdentityFailure::None;
-  unsigned long win32_error = 0; // GetLastError() at the failing call; 0 when none
+  unsigned long win32_error = 0; // captured at the failing call; 0 when none
 };
 
 inline const char *connect_stage_name(ConnectStage stage) {
@@ -78,8 +98,10 @@ inline const char *connect_stage_name(ConnectStage stage) {
     return "pipe_mode";
   case ConnectStage::Identity:
     return "identity";
-  case ConnectStage::HelloTransport:
-    return "hello_transport";
+  case ConnectStage::HelloWrite:
+    return "hello_write";
+  case ConnectStage::HelloRead:
+    return "hello_read";
   case ConnectStage::HelloProtocol:
     return "hello_protocol";
   }
@@ -106,6 +128,20 @@ inline const char *identity_failure_name(IdentityFailure why) {
     return "token_user";
   case IdentityFailure::UserMismatch:
     return "user_mismatch";
+  case IdentityFailure::TokenIsAppContainer:
+    return "token_is_appcontainer";
+  case IdentityFailure::TokenSession:
+    return "token_session";
+  case IdentityFailure::PipeServerSession:
+    return "pipe_server_session";
+  case IdentityFailure::PipeOwner:
+    return "pipe_owner";
+  case IdentityFailure::PipeOwnerMismatch:
+    return "pipe_owner_mismatch";
+  case IdentityFailure::PipeLabel:
+    return "pipe_label";
+  case IdentityFailure::PipeIntegrityLow:
+    return "pipe_integrity_low";
   }
   return "?";
 }
