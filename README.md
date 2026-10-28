@@ -575,8 +575,9 @@ Because there is no console, logoff/shutdown reaches the Host through a hidden *
 be cancelled after it (an application asks to save and the user cancels), so nothing stops there. Only
 `WM_ENDSESSION` with `wParam` TRUE — the session is really ending — requests the stop and waits, bounded (4 s, the
 same bound as the console path), for the ordered shutdown; `WM_ENDSESSION` with `wParam` FALSE does nothing. A named
-stop event (`Local\FusionHost-stop-<user SID>-<session id>`, the same user-only DACL as the pipe and the singleton
-claim) is the second non-console path: `install.ps1` / `uninstall.ps1` signal it instead of terminating the Host. All
+stop event (`Local\FusionHost-stop-<user SID>-<session id>`, the same user-only DACL as the singleton claim — the
+data pipe is the one object that also names the search package, R49/D089) is the second non-console path:
+`install.ps1` / `uninstall.ps1` signal it instead of terminating the Host. All
 paths only *request* the stop — `main()` remains the single thread that runs `stop()` → `shutdown_backend()` →
 Fcitx's own save on instance exit, and the singleton claim is held until the process exits.
 

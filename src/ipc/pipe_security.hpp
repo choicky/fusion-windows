@@ -111,6 +111,10 @@ IdentityFailure judge_appcontainer_pipe(const AppContainerPipeFacts &facts);
 // SECURITY_ATTRIBUTES has a null lpSecurityDescriptor and the caller must
 // treat pipe creation as failed.
 //
+// This is the descriptor for the objects that stay user-only: the Host claim event and
+// the Host stop event. A packaged client that could signal the stop event could end the
+// Host, so neither is ever created with make_data_pipe_security().
+//
 // The caller must call free_pipe_security() when done.
 SECURITY_ATTRIBUTES make_pipe_security();
 
