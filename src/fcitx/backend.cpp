@@ -707,8 +707,17 @@ public:
   std::uint64_t session_id() const override { return session_; }
   bool bind(Binding binding) override {
     return invoke([this, binding] {
-      if (contexts_.contains(binding.context) || contexts_.size() >= context_bound)
+      const bool live = contexts_.contains(binding.context);
+      if (live || contexts_.size() >= context_bound) {
+        // R51: the owner note is recorded before this call, because a context must never be
+        // live without the process that owns it. A bind that is refused must not leave that
+        // note behind, so a refusal on capacity forgets it. A context that is already bound
+        // keeps the owner it was bound with: that is a second claim on a live context, not a
+        // refused one.
+        if (!live)
+          owners_.erase(binding.context);
         return false;
+      }
       auto context =
           std::make_unique<InputContext>(*instance_, binding, candidate_preference_, candidate_font_);
       context->focusIn();

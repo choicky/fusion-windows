@@ -1862,6 +1862,29 @@ int main() {
     DestroyWindow(owner);
   }
 
+  // 34b. R49: no owner is not a reason to lose the page. An application can report no window
+  //      through its view and leave this thread with no focus window either; the popup is then
+  //      unowned, but it is still created, still topmost, and still shows the page. Hiding it
+  //      instead was a regression: the build before the owner work showed the popup in exactly
+  //      this case, and an unowned topmost window is what keeps the candidates reachable.
+  {
+    auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    fusion::tsf::CandidateView unowned;
+    int marker = 0;
+    CHECK(unowned.ensure_created(nullptr, &marker, 9, nullptr, false));
+    const HWND popup = unowned.window();
+    CHECK(popup != nullptr);
+    CHECK(unowned.owner() == nullptr);
+    CHECK(GetWindow(popup, GW_OWNER) == nullptr);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    unowned.show(page, POINT{200, 200});
+    CHECK(unowned.visible());
+    // Still unowned after a show: nothing invents an owner for a window that has none.
+    CHECK(GetWindow(popup, GW_OWNER) == nullptr);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    unowned.destroy();
+  }
+
   view.destroy();
   CHECK(view.window() == nullptr);
 

@@ -2081,6 +2081,7 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     // No displayed projection: an empty page (hide signal) or a fenced dispatch.
     if (entry.candidates)
       entry.candidates->hide();
+    entry.candidate_page_deferred = false;
     diagf("CANDIDATE_VIEW", "hidden reason=no-page cid=%" PRIu64, entry.semantic.context_id());
     return;
   }
@@ -2098,15 +2099,20 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     // The page existed but could not be placed, so it is hidden — after R46 only when this
     // context has no anchor to keep. The anchor probe line above names the failing stage;
     // this one records the consequence.
-    diagf("CANDIDATE_VIEW", "hidden reason=no-anchor cid=%" PRIu64, entry.semantic.context_id());
+    diagf("CANDIDATE_VIEW",
+          "hidden reason=no-anchor deferred=1 cid=%" PRIu64, entry.semantic.context_id());
     entry.candidates->hide(); // never show a page we cannot place near its text
-    return;
-  }
-  if (entry.candidate_owner == nullptr) {
-    // No view window and no thread focus: an unowned popup is exactly the R49 failure, so
-    // the page waits for the next probe instead of landing on the desktop again.
-    diagf("CANDIDATE_VIEW", "hidden reason=no-owner cid=%" PRIu64, entry.semantic.context_id());
-    entry.candidates->hide();
+    // A page deferred for want of an anchor is exactly the page a later layout change can
+    // place: the store had not laid the text out yet, and it says so when it has. That
+    // notification can only re-place a window that exists, and this page has never been
+    // shown, so the popup is created here — hidden, under the owner the probe resolved —
+    // and the flag is what lets the notification path re-probe for it. A window that could
+    // not be created leaves the flag clear: the next key tries the whole path again.
+    entry.candidate_page_deferred =
+        entry.candidates->ensure_created(this, &entry, entry.generation, entry.candidate_owner,
+                                         entry.candidate_owner_from_view);
+    if (!entry.candidate_page_deferred)
+      diagf("CANDIDATE_VIEW", "create-failed cid=%" PRIu64, entry.semantic.context_id());
     return;
   }
   if (!entry.candidates->ensure_created(this, &entry, entry.generation, entry.candidate_owner,
@@ -2115,6 +2121,7 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     return;
   }
   entry.candidates->show(*page, entry.candidate_anchor);
+  entry.candidate_page_deferred = false;
   // The window has just measured itself, so it now knows how many rows fit. The next key
   // carries that number to the Host, which groups scroll pages by it.
   entry.semantic.set_window_rows(entry.candidates->row_capacity());
@@ -2147,11 +2154,15 @@ void TextService::advise_layout_sink(ContextEntry &entry) {
 }
 
 void ContextEntry::release_layout_sink() {
+  // The layout relationship is over, so nothing in this entry waits for a layout change any
+  // more — including a page deferred for want of an anchor. Cleared before the cookie test,
+  // because the flag can be set on a context whose sink was never advised.
+  layout_reprobe_pending = false;
+  candidate_page_deferred = false;
   if (layout_sink_cookie == 0)
     return;
   const DWORD cookie = layout_sink_cookie;
   layout_sink_cookie = 0;
-  layout_reprobe_pending = false;
   if (context == nullptr)
     return;
   ITfSource *source = nullptr;
@@ -2168,10 +2179,13 @@ void TextService::note_layout_change(void *entry, std::uint64_t generation) {
     diagf("FENCE", "kind=layout-change stale-entry gen=%" PRIu64, generation);
     return;
   }
-  // Only a page that is actually on screen has anything re-placed by a layout change; the
-  // next key path decides for a page that is not displayed.
+  // A page on screen has its placement re-read; a page deferred for want of an anchor has
+  // nothing on screen *because* that anchor was missing, and this notification is what can
+  // supply it. Both cases have a window for the reposition message: the deferred page's
+  // popup was created hidden at defer time for exactly this.
   if (!target->semantic.real_frontend() || target->candidates == nullptr ||
-      !target->candidates->visible() || !target->semantic.displayed_page())
+      !target->semantic.displayed_page() ||
+      (!target->candidates->visible() && !target->candidate_page_deferred))
     return;
   if (target->layout_reprobe_pending || target->context == nullptr)
     return;
@@ -2203,9 +2217,16 @@ void TextService::place_candidate_from_anchor(void *entry, std::uint64_t generat
   if (!target->candidate_anchor_valid)
     return;
   const auto page = target->semantic.displayed_page();
-  if (!page)
+  if (!page) {
+    // The page went away between the notification and here (a commit, a fenced dispatch):
+    // there is nothing left to place, and nothing left to wait for either.
+    target->candidate_page_deferred = false;
     return;
+  }
   target->candidates->show(*page, target->candidate_anchor);
+  // Whether this window was already on screen or is the deferred page being placed for the
+  // first time, it is now showing the current page at a resolved anchor.
+  target->candidate_page_deferred = false;
 }
 
 void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,

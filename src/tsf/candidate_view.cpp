@@ -382,10 +382,17 @@ void CandidateView::note_shown() {
       tim_ex->Release();
     }
   }
+  // Three answers, not two: `view` is the application window the context reported, `focus`
+  // is the thread's focus window standing in for it, and `none` is a page shown with no
+  // owner at all — the application reported no window and this thread has no focus to fall
+  // back to. That page is still shown (unowned but topmost): losing the owner is not a
+  // reason to lose the candidates, and the line says which case a report is looking at.
+  const char *owner_source =
+      owner_ == nullptr ? "none" : (owner_from_view_ ? "view" : "focus");
   diagf("CANDIDATE_VIEW",
         "shown owner=%p owner-source=%s rect=%ld,%ld,%ld,%ld topmost=1 immersive=%d",
-        static_cast<void *>(owner_), owner_from_view_ ? "view" : "focus", rect.left, rect.top,
-        rect.right, rect.bottom, immersive);
+        static_cast<void *>(owner_), owner_source, rect.left, rect.top, rect.right, rect.bottom,
+        immersive);
 }
 
 void CandidateView::place_and_paint() {
@@ -936,15 +943,21 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
     // now. Clearing the user data only at the very end (WM_DESTROY would be soon enough to
     // route the rest of this destruction through DefWindowProc) is what lets this handler
     // run at all.
+    //
+    // The message then goes on to DefWindowProcW, which is what tears down the rest of the
+    // system's own NCDESTROY work — the window's properties, its menu and scroll bars, and
+    // the thread's window list entry. Answering 0 here would skip all of it and leave the
+    // system half-way through destroying a window.
     {
       const HWND dying = hwnd_;
       hwnd_ = nullptr;
       owner_ = nullptr;
       owner_from_view_ = false;
-      if (dying != nullptr)
-        SetWindowLongPtrW(dying, GWLP_USERDATA, 0);
+      if (dying == nullptr)
+        return 0;
+      SetWindowLongPtrW(dying, GWLP_USERDATA, 0);
+      return DefWindowProcW(dying, message, wparam, lparam);
     }
-    return 0;
   default:
     return DefWindowProcW(hwnd_, message, wparam, lparam);
   }

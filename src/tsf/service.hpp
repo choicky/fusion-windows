@@ -108,6 +108,11 @@ struct ContextEntry {
   // session, cleared when that session runs, so a burst of notifications cannot stack a
   // session per notification behind the same popup.
   bool layout_reprobe_pending = false;
+  // R46: a page exists but had no anchor to be placed at, so it is off screen waiting for a
+  // layout change to supply one. Without the flag that page could never be re-placed: the
+  // notification path only looked at a *visible* popup, and this one has nothing on screen.
+  // Cleared by any show, any hide, an empty page, and the teardown of the layout relationship.
+  bool candidate_page_deferred = false;
 };
 
 class TextService final : public ITfTextInputProcessor,

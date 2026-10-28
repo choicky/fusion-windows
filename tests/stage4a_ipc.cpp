@@ -1820,8 +1820,16 @@ public:
       return false;
     }
     std::lock_guard lock(state_);
-    if (contexts_.count(binding.context))
-      return false; // duplicate context
+    const bool live = contexts_.count(binding.context) != 0;
+    if (live || contexts_.size() >= max_contexts) {
+      // The product refuses a bind past its context bound and forgets the owner note it was
+      // handed first (R51); the fake refuses and forgets the same way, so the Host's own
+      // sequencing is what the check below observes. A context that is already bound keeps
+      // the owner it was bound with — that is a second claim, not a refused context.
+      if (!live)
+        owners_.erase(binding.context);
+      return false;
+    }
     contexts_.insert(binding.context);
     return true;
   }
@@ -1953,12 +1961,29 @@ public:
     return contexts_.size();
   }
 
+  // The product's context bound, for the check that needs a bind to be refused.
+  void limit_contexts(std::size_t count) {
+    std::lock_guard lock(state_);
+    max_contexts = count;
+  }
+
+  // R51: how many contexts the backend is holding a process for. A refused bind must not
+  // add one, and an unbound context must not keep one.
+  std::size_t owner_count() {
+    std::lock_guard lock(state_);
+    return owners_.size();
+  }
+
   bool saw_unbind(std::uint64_t context) {
     std::lock_guard lock(state_);
     return std::find(unbound_.begin(), unbound_.end(), context) != unbound_.end();
   }
 
 private:
+  // FcitxBackend refuses a bind past its own context bound; the fake models the same refusal
+  // so the owner bookkeeping can be checked for a refused context. Large enough that the
+  // other checks never reach it.
+  std::size_t max_contexts = 64;
   std::mutex admission_; // FcitxBackend admission lock: try_lock, never wait
   std::mutex state_;
   std::mutex settings_mutex_;
@@ -2044,6 +2069,45 @@ void test_hostserver_multi_client() {
 
   host.stop_and_join();
   require(fake->contention_count == 0, "no admission contention during shutdown");
+
+  // R51: the Host hands the backend the process behind the pipe *before* it binds, so a bind
+  // that is refused must not leave that note behind — the Host would be holding a process for
+  // a context that never became live, and a later refusal could name a window that has
+  // nothing to do with the input. The fake refuses past its context bound where FcitxBackend
+  // refuses past `context_bound`; what this drives is the Host's own note-then-bind sequence.
+  {
+    const auto refused_pipe = test_pipe_name(L"hostserver-refused-bind");
+    auto refused_backend = std::make_unique<FcitxLikeBackend>();
+    FcitxLikeBackend *limited = refused_backend.get();
+    limited->limit_contexts(1);
+    RunningHost limited_host(std::move(refused_backend), refused_pipe);
+    require(limited_host.start(), "refused-bind host start");
+
+    auto accepted = connect_client(refused_pipe);
+    require(accepted != nullptr, "refused-bind: the accepted client connects");
+    const Binding accepted_binding{21, 1, 1};
+    require(accepted->bind(accepted_binding), "refused-bind: the first bind is accepted");
+    const BackendBatch served = accepted->send(character_stimulus(accepted_binding, 1, 'a'));
+    require(served.disposition == BackendBatch::Disposition::Consumed &&
+                served.operations.size() == 1,
+            "refused-bind: the accepted context serves a key");
+    const auto live_context = static_cast<std::uint64_t>(std::stoull(served.operations[0].text));
+    require(limited->owner_of(live_context) == GetCurrentProcessId(),
+            "refused-bind: the live context names the process behind its pipe");
+
+    auto refused = connect_client(refused_pipe);
+    require(refused != nullptr, "refused-bind: the second client connects");
+    require(!refused->bind(Binding{22, 1, 1}), "refused-bind: the second bind is refused");
+    require(limited->bound_count() == 1, "refused-bind: the refused context was not added");
+    require(limited->owner_count() == 1,
+            "refused-bind: a refused bind leaves no owner note behind");
+    require(limited->owner_of(live_context) == GetCurrentProcessId(),
+            "refused-bind: the refusal did not touch the live context's owner");
+
+    refused.reset();
+    accepted.reset();
+    limited_host.stop_and_join();
+  }
 }
 
 // Transport failure classification: a definitely-not-written request (never

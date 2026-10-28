@@ -39,11 +39,15 @@ inline std::string client_process_name(std::uint32_t pid) {
   HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
   if (process == nullptr)
     return {};
-  wchar_t buffer[32768];
-  DWORD characters = static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0]));
+  // On the heap, not on the stack: this runs on the Fcitx loop thread, whose stack is also
+  // the engine's own call chain, and a 32 KiB array there buys nothing — the name that comes
+  // out is a leaf of at most MAX_PATH characters. The buffer size is the documented maximum
+  // for the call, so nothing about the answer changes.
+  std::wstring buffer(32768, L'\0');
+  DWORD characters = static_cast<DWORD>(buffer.size());
   std::string name;
-  if (QueryFullProcessImageNameW(process, 0, buffer, &characters) != 0) {
-    const std::wstring path(buffer, characters);
+  if (QueryFullProcessImageNameW(process, 0, buffer.data(), &characters) != 0) {
+    const std::wstring path(buffer.data(), characters);
     const auto separator = path.find_last_of(L"\\/");
     const std::wstring leaf = separator == std::wstring::npos ? path : path.substr(separator + 1);
     std::string utf8;

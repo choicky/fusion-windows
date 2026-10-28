@@ -129,6 +129,40 @@ void the_caret_fallback_is_a_source_like_any_other() {
   CHECK(decision.anchor.x == 12 && decision.anchor.y == 20);
 }
 
+// R46, the case that had no answer before: the first composition in a context. The store has
+// not laid the text out yet and there is no previous place, so the page is deferred — and the
+// layout notification that follows is the one event that can still place it. The decision layer
+// holds no memory of having given up: it answers the second probe on that probe's own evidence.
+void deferred_then_a_layout_change_places_it() {
+  LastGoodAnchor last_good{};
+  const auto deferred = decide_anchor(failed(kNoLayout, "selection"), last_good, ProbeTrigger::Key);
+  CHECK(!deferred.placed);
+  CHECK(deferred.no_layout);
+  CHECK(!deferred.becomes_last_good);
+  // Nothing was invented on the way out: a deferral is not a stored anchor, so the next probe
+  // is judged as if it were the first.
+  CHECK(!last_good.valid);
+
+  const auto placed =
+      decide_anchor(with_rect(20, 40, 60, 64, "composition"), last_good, ProbeTrigger::LayoutChange);
+  CHECK(placed.placed);
+  CHECK(placed.anchor.x == 60 && placed.anchor.y == 64);
+  CHECK(placed.becomes_last_good);
+  CHECK(!placed.retained);
+  // The line that records this placement names both halves: it was a layout change, and the
+  // rectangle came from the composition range.
+  CHECK(std::string(placed.source) == "layout-change");
+  CHECK(std::string(placed.range) == "composition");
+
+  // A layout change that still cannot resolve places nothing: the deferral survives, and the
+  // next notification (or the next key) gets the same answer rather than a guess.
+  const auto still =
+      decide_anchor(failed(kNoLayout, "composition"), last_good, ProbeTrigger::LayoutChange);
+  CHECK(!still.placed);
+  CHECK(still.no_layout);
+  CHECK(!still.retained);
+}
+
 void an_empty_rect_still_places_at_its_corner() {
   // The probe's own guarantee is a resolved rectangle; a zero-width range at the start of an
   // empty line is real, and the popup opens below it like anywhere else.
@@ -149,6 +183,7 @@ int main() {
   another_failure_code_is_not_the_missing_layout_case();
   a_layout_change_names_itself_and_its_range();
   the_caret_fallback_is_a_source_like_any_other();
+  deferred_then_a_layout_change_places_it();
   an_empty_rect_still_places_at_its_corner();
   if (failures == 0)
     std::printf("tsf_anchor_probe: ok\n");
