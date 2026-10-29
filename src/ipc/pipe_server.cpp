@@ -90,6 +90,11 @@ bool PipeServer::wait_for_client(std::chrono::milliseconds timeout) {
   }
   CloseHandle(ov.hEvent);
   client_connected_ = true;
+  // R51: the process on the other end, for naming the holder of a busy resource in a
+  // refusal. A failure to ask is not a connection failure: the pipe works, the Host just
+  // cannot say who is on it, and the refusal then reports an unknown holder.
+  DWORD pid = 0;
+  client_pid_ = GetNamedPipeClientProcessId(handle_, &pid) != 0 ? pid : 0;
   return true;
 }
 
@@ -101,6 +106,7 @@ void PipeServer::disconnect_client() {
   CancelIoEx(handle_, nullptr);
   DisconnectNamedPipe(handle_);
   client_connected_ = false;
+  client_pid_ = 0;
 }
 
 bool PipeServer::client_connected() const { return client_connected_; }

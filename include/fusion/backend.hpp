@@ -396,6 +396,16 @@ public:
   // without a transport has nothing to report and keeps the default.
   virtual ConnectFailure last_connect_failure() const { return {}; }
 
+  // R51: which process the Host's pipe saw when this context was asked for, 0 when it has no
+  // pipe or the pipe would not say. A refusal that later waits for that context to go idle
+  // names it, so the user can see which window to return to. Naming only: no bind decision,
+  // no key and no composition reads it back, and a backend that does not hold contexts keeps
+  // the default.
+  virtual void note_context_owner(std::uint64_t context, std::uint32_t client_pid) {
+    (void)context;
+    (void)client_pid;
+  }
+
   // Settings control calls are separate from the input stimulus path. Production
   // FcitxBackend implementations execute them on the Fcitx event loop and keep
   // settings admission separate from key admission so opening the UI never

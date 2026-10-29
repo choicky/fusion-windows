@@ -1,0 +1,216 @@
+// R46: the anchor decision on its own.
+//
+// The candidate page has to be placed at the text it belongs to, and a text store can refuse to
+// say where that is (TS_E_NOLAYOUT) for a range it has not laid out yet — measured twice, in
+// Firefox's contenteditable editor and in the taskbar search box, where it happened on every
+// keystroke while composition and commit worked. Hiding the page for that one answer is what
+// made the window vanish mid-word. The rule the fix rests on is small enough to test without
+// TSF: a rectangle wins, a refusal with a previous good place keeps that place, and anything
+// else defers. This check feeds the decision the shapes the probe produces and reads the
+// consequences back; the TSF shell that calls it is unchanged arithmetic around these answers.
+// The same holds for the fence a re-place request reads when it is delivered: which page a
+// request may act on is a question about the two flags the entry carries, and the three sites
+// that ask it (the notification, the session it admits, the message that session posts) ask
+// this one function. What a real window does when it is delivered to is candidate_window_layout.
+//
+// What it does NOT cover: which call produced each observation (that is the probe's own
+// plumbing, and the owner checklist reads its log lines), and a real application's layout
+// notification arriving at the right moment.
+
+#include "tsf/anchor_probe.hpp"
+
+#include <cstdio>
+#include <string>
+
+namespace {
+
+int failures = 0;
+#define CHECK(cond)                                                                                \
+  do {                                                                                             \
+    if (!(cond)) {                                                                                 \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                         \
+      ++failures;                                                                                  \
+    }                                                                                              \
+  } while (0)
+
+fusion::tsf::AnchorObservation with_rect(LONG left, LONG top, LONG right, LONG bottom,
+                                         const char *source, BOOL clipped = FALSE) {
+  fusion::tsf::AnchorObservation obs;
+  obs.rect = RECT{left, top, right, bottom};
+  obs.has_rect = true;
+  obs.source = source;
+  obs.clipped = clipped;
+  return obs;
+}
+
+fusion::tsf::AnchorObservation failed(HRESULT hr, const char *source) {
+  fusion::tsf::AnchorObservation obs;
+  obs.hr = hr;
+  obs.source = source;
+  return obs;
+}
+
+using fusion::tsf::decide_anchor;
+using fusion::tsf::LastGoodAnchor;
+using fusion::tsf::popup_may_be_placed;
+using fusion::tsf::ProbeTrigger;
+
+// The value Firefox and the search box return, spelled from the same constant the probe
+// compares against: a test that wrote its own number could drift from the code under test.
+constexpr HRESULT kNoLayout = fusion::tsf::kTsENoLayout;
+
+void rect_wins_and_becomes_last_good() {
+  const auto obs = with_rect(100, 200, 140, 224, "selection");
+  const auto decision = decide_anchor(obs, LastGoodAnchor{}, ProbeTrigger::Key);
+  CHECK(decision.placed);
+  CHECK(decision.anchor.x == 140 && decision.anchor.y == 224);
+  CHECK(decision.becomes_last_good);
+  CHECK(!decision.retained);
+  CHECK(!decision.no_layout);
+  // A key-path rectangle reports the range it came from, and says nothing else.
+  CHECK(std::string(decision.source) == "selection");
+  CHECK(decision.range == nullptr);
+}
+
+void a_refusal_without_a_previous_place_defers() {
+  const auto decision =
+      decide_anchor(failed(kNoLayout, "selection"), LastGoodAnchor{}, ProbeTrigger::Key);
+  // Nothing is invented: no anchor means the caller hides the page, which is the behaviour
+  // before this context ever had a place.
+  CHECK(!decision.placed);
+  CHECK(decision.no_layout);
+  CHECK(!decision.retained);
+  CHECK(!decision.becomes_last_good);
+  // The code that failed is reported, so a log line can tell R46 from any other refusal.
+  CHECK(decision.source[0] == '\0');
+}
+
+void a_refusal_with_a_previous_place_keeps_it() {
+  const LastGoodAnchor last_good{POINT{300, 410}, true};
+  const auto decision = decide_anchor(failed(kNoLayout, "selection"), last_good, ProbeTrigger::Key);
+  CHECK(decision.placed);
+  CHECK(decision.anchor.x == 300 && decision.anchor.y == 410);
+  CHECK(decision.retained);
+  CHECK(std::string(decision.source) == "last-good");
+  // The retained point is not a measurement, so it must not overwrite the last-good anchor:
+  // a context that fails twice in a row still sits at the one place that was real.
+  CHECK(!decision.becomes_last_good);
+  CHECK(decision.no_layout);
+}
+
+void another_failure_code_is_not_the_missing_layout_case() {
+  const LastGoodAnchor last_good{POINT{300, 410}, true};
+  const auto decision = decide_anchor(failed(E_FAIL, "selection"), last_good, ProbeTrigger::Key);
+  // The R46 rule is about a store that has not laid the text out yet. Any other failure stays
+  // exactly as it was: the page is deferred, not placed on a stored guess.
+  CHECK(!decision.placed);
+  CHECK(!decision.no_layout);
+  CHECK(!decision.retained);
+}
+
+void a_layout_change_names_itself_and_its_range() {
+  const auto obs = with_rect(50, 60, 90, 82, "composition", TRUE);
+  const auto decision = decide_anchor(obs, LastGoodAnchor{}, ProbeTrigger::LayoutChange);
+  CHECK(decision.placed);
+  CHECK(decision.anchor.x == 90 && decision.anchor.y == 82);
+  // Two words, because two things are true: the notification re-probed, and the rectangle came
+  // from the composition range rather than the selection.
+  CHECK(std::string(decision.source) == "layout-change");
+  CHECK(std::string(decision.range) == "composition");
+  CHECK(decision.becomes_last_good);
+  CHECK(!decision.retained);
+  CHECK(obs.clipped == TRUE);
+}
+
+void the_caret_fallback_is_a_source_like_any_other() {
+  // R25's fallback range, after the selection and the composition both failed to resolve.
+  const auto obs = with_rect(0, 0, 12, 20, "composition-caret");
+  const auto decision =
+      decide_anchor(obs, LastGoodAnchor{POINT{999, 999}, true}, ProbeTrigger::Key);
+  CHECK(decision.placed);
+  CHECK(std::string(decision.source) == "composition-caret");
+  // A fresh rectangle outranks a stored anchor even when a stored anchor exists.
+  CHECK(!decision.retained);
+  CHECK(decision.anchor.x == 12 && decision.anchor.y == 20);
+}
+
+// R46, the case that had no answer before: the first composition in a context. The store has
+// not laid the text out yet and there is no previous place, so the page is deferred — and the
+// layout notification that follows is the one event that can still place it. The decision layer
+// holds no memory of having given up: it answers the second probe on that probe's own evidence.
+void deferred_then_a_layout_change_places_it() {
+  LastGoodAnchor last_good{};
+  const auto deferred = decide_anchor(failed(kNoLayout, "selection"), last_good, ProbeTrigger::Key);
+  CHECK(!deferred.placed);
+  CHECK(deferred.no_layout);
+  CHECK(!deferred.becomes_last_good);
+  // Nothing was invented on the way out: a deferral is not a stored anchor, so the next probe
+  // is judged as if it were the first.
+  CHECK(!last_good.valid);
+
+  const auto placed =
+      decide_anchor(with_rect(20, 40, 60, 64, "composition"), last_good, ProbeTrigger::LayoutChange);
+  CHECK(placed.placed);
+  CHECK(placed.anchor.x == 60 && placed.anchor.y == 64);
+  CHECK(placed.becomes_last_good);
+  CHECK(!placed.retained);
+  // The line that records this placement names both halves: it was a layout change, and the
+  // rectangle came from the composition range.
+  CHECK(std::string(placed.source) == "layout-change");
+  CHECK(std::string(placed.range) == "composition");
+
+  // A layout change that still cannot resolve places nothing: the deferral survives, and the
+  // next notification (or the next key) gets the same answer rather than a guess.
+  const auto still =
+      decide_anchor(failed(kNoLayout, "composition"), last_good, ProbeTrigger::LayoutChange);
+  CHECK(!still.placed);
+  CHECK(still.no_layout);
+  CHECK(!still.retained);
+}
+
+void an_empty_rect_still_places_at_its_corner() {
+  // The probe's own guarantee is a resolved rectangle; a zero-width range at the start of an
+  // empty line is real, and the popup opens below it like anywhere else.
+  const auto decision =
+      decide_anchor(with_rect(77, 88, 77, 88, "selection"), LastGoodAnchor{}, ProbeTrigger::Key);
+  CHECK(decision.placed);
+  CHECK(decision.anchor.x == 77 && decision.anchor.y == 88);
+}
+
+void only_a_page_still_being_presented_may_be_re_placed() {
+  // The question a re-place request asks when it is delivered — and the same question the
+  // layout notification and the re-probe session ask, which is why they spell it once here
+  // instead of three times in the shell. A page is re-placed when it is on screen (the
+  // placement moved) or when it is off screen *because* this context had no anchor for it
+  // (the R46 page a layout change can place). Anything else was hidden on purpose: focus
+  // moved, the context was torn down, the composition ended, the projection emptied.
+  CHECK(popup_may_be_placed(true, false));
+  CHECK(popup_may_be_placed(false, true));
+  // A window on screen with the flag left set from an earlier probe is still a page the user
+  // is looking at: visibility answers first, so the stale flag cannot refuse it.
+  CHECK(popup_may_be_placed(true, true));
+  // The case the defect is: nothing on screen, nothing waiting.
+  CHECK(!popup_may_be_placed(false, false));
+}
+
+} // namespace
+
+int main() {
+  static_assert(kNoLayout == MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x0206),
+                "the code under test must be the documented TS_E_NOLAYOUT");
+  static_assert(popup_may_be_placed(false, false) == false,
+                "a hidden page that is not deferred must be refused, not re-shown");
+  rect_wins_and_becomes_last_good();
+  a_refusal_without_a_previous_place_defers();
+  a_refusal_with_a_previous_place_keeps_it();
+  another_failure_code_is_not_the_missing_layout_case();
+  a_layout_change_names_itself_and_its_range();
+  the_caret_fallback_is_a_source_like_any_other();
+  deferred_then_a_layout_change_places_it();
+  an_empty_rect_still_places_at_its_corner();
+  only_a_page_still_being_presented_may_be_re_placed();
+  if (failures == 0)
+    std::printf("tsf_anchor_probe: ok\n");
+  std::fprintf(stderr, "tsf_anchor_probe: %d check(s) failed\n", failures);
+  return failures == 0 ? 0 : 1;
+}

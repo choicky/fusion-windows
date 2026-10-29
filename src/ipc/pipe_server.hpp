@@ -43,6 +43,11 @@ public:
   // diagnostic log; it never changes behaviour.
   std::uint32_t last_error() const { return last_error_.load(); }
 
+  // R51: the process id of the client on the current connection, 0 when none is connected
+  // or the system would not say. The Host uses it only to name, in a refusal it already
+  // made, which process holds the thing being waited for; it decides nothing else.
+  std::uint32_t client_pid() const { return client_pid_.load(); }
+
 private:
   std::wstring pipe_name_;
   bool first_instance_;
@@ -52,6 +57,7 @@ private:
   // HostServer::stop() disconnects the client.
   std::atomic<bool> client_connected_{false};
   std::atomic<std::uint32_t> last_error_{0};
+  std::atomic<std::uint32_t> client_pid_{0};
   SECURITY_ATTRIBUTES security_attrs_{};
 
   bool write_all(const void *data, std::size_t size);

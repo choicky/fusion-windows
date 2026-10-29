@@ -37,6 +37,13 @@ class TextService;
 // serialized with key handling), so no private pump is needed. The back-pointer
 // to the service and the entry identity+generation are checked by the caller on
 // every routed action, reusing the stale-entry fence the edit sessions use.
+//
+// R49: the popup is *owned* by the application window the context's view reports and is
+// topmost. Created with no owner and raised with HWND_TOP it could sit behind the very
+// surface it belongs to — measured in the taskbar search box, where every anchor probe
+// succeeded and nothing was visible because the input flyout covered it. The owner is what
+// makes it follow that window (activation, minimisation, destruction) instead of drifting
+// on the desktop; topmost is what makes it appear above it. Same for every application.
 class CandidateView {
 public:
   CandidateView() = default;
@@ -44,9 +51,17 @@ public:
   CandidateView(const CandidateView &) = delete;
   CandidateView &operator=(const CandidateView &) = delete;
 
-  // Create the popup the first time a page must be shown. Ownership of the HWND
-  // stays with this object; DestroyWindow happens in destroy()/the destructor.
-  bool ensure_created(TextService *service, void *entry, std::uint64_t generation);
+  // Create the popup the first time a page must be shown, owned by `owner` (the
+  // application window this context's text is in — for a WS_POPUP the CreateWindowExW
+  // parent slot means owner, not parent). Ownership of the HWND stays with this object;
+  // DestroyWindow happens in destroy()/the destructor.
+  //
+  // An owner that changed since this window was made, or that is gone, is not reused: the
+  // window is recreated under the current owner. Windows destroys an owned popup together
+  // with its owner, so a closed application window arrives here as this window's own
+  // WM_NCDESTROY, and `hwnd_` goes with it — a dangling handle is never used.
+  bool ensure_created(TextService *service, void *entry, std::uint64_t generation, HWND owner,
+                      bool owner_from_view);
 
   // Replace the whole displayed panel (STATE projection): panel text rows and the
   // candidate page. A panel with nothing to display (panel_empty()) hides.
@@ -60,6 +75,19 @@ public:
   // re-deriving the geometry it is supposed to be verifying; nothing in the product
   // path uses it.
   HWND window() const { return hwnd_; }
+
+  // The owner this window was created under, and whether it came from the context's view
+  // (rather than the thread focus). Read by the owner-lifetime check for the same reason
+  // `window()` is; the product path never asks.
+  HWND owner() const { return owner_; }
+  bool owner_from_view() const { return owner_from_view_; }
+
+  // The message a layout notification leaves for the popup: re-place yourself from the
+  // anchor the last probe resolved. Posted, never sent, so the window call happens on the
+  // application's message loop and not inside an edit session. Public for the same reason
+  // `window()` is — a check can drive it without waiting for TSF to raise the change.
+  static constexpr UINT reposition_message = WM_APP + 1;
+  void request_reposition();
 
   // The measured text height the current font produces at the current DPI, and the
   // geometry that was laid out from it. Read by the geometry checks for the same reason
@@ -118,6 +146,16 @@ private:
   // -1 for "nothing to show".
   void update_tip(std::int32_t index);
   void destroy_tip();
+  // The accessibility announcements of a candidate surface: shown, hidden, or moved while
+  // shown. Screen readers and the focus-tracking machinery a modern application runs on
+  // listen for these; a popup that never raises them is invisible to them even when it is
+  // visible on screen.
+  void announce_shown(bool was_visible);
+  void announce_hidden();
+  // The one content-free line per show: owner, how the owner was found, the placed rect,
+  // and whether this thread is in TSF's immersive mode. The immersive flag is recorded and
+  // nothing is decided from it.
+  void note_shown();
   // The pointer leaving one of the two windows does not close the full text at once: it can
   // be on its way to the other one across the gap the placement leaves between them. A short
   // timer is armed instead, and the cursor's position decides what happens when it fires.
@@ -144,6 +182,11 @@ private:
   TextService *service_ = nullptr;
   void *entry_ = nullptr; // ContextEntry identity; validated by the service
   std::uint64_t generation_ = 0;
+  // The application window this popup belongs to, and whether the context's view reported
+  // it or the thread focus stood in. Cleared with the window: an owner that dies takes this
+  // popup with it, and the next show creates a window under the owner it has now.
+  HWND owner_ = nullptr;
+  bool owner_from_view_ = false;
   CandidatePage page_;
   // Geometry from layout_candidate_panel: slot rects aligned to page_.entries
   // indices (a placeholder keeps its index with an empty, non-hit rect, so

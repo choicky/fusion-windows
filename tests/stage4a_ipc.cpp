@@ -63,12 +63,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -1819,8 +1820,16 @@ public:
       return false;
     }
     std::lock_guard lock(state_);
-    if (contexts_.count(binding.context))
-      return false; // duplicate context
+    const bool live = contexts_.count(binding.context) != 0;
+    if (live || contexts_.size() >= max_contexts) {
+      // The product refuses a bind past its context bound and forgets the owner note it was
+      // handed first (R51); the fake refuses and forgets the same way, so the Host's own
+      // sequencing is what the check below observes. A context that is already bound keeps
+      // the owner it was bound with — that is a second claim, not a refused context.
+      if (!live)
+        owners_.erase(binding.context);
+      return false;
+    }
     contexts_.insert(binding.context);
     return true;
   }
@@ -1933,9 +1942,36 @@ public:
     return SettingsStatus::Ok;
   }
 
+  // R51: the Host hands over the process its pipe saw before it binds a context, because the
+  // refusal that later waits for that context arrives on another connection entirely — the
+  // settings window's own — which cannot see this one.
+  void note_context_owner(std::uint64_t context, std::uint32_t client_pid) override {
+    std::lock_guard lock(state_);
+    owners_[context] = client_pid;
+  }
+
+  std::uint32_t owner_of(std::uint64_t context) {
+    std::lock_guard lock(state_);
+    const auto owner = owners_.find(context);
+    return owner == owners_.end() ? 0 : owner->second;
+  }
+
   std::size_t bound_count() {
     std::lock_guard lock(state_);
     return contexts_.size();
+  }
+
+  // The product's context bound, for the check that needs a bind to be refused.
+  void limit_contexts(std::size_t count) {
+    std::lock_guard lock(state_);
+    max_contexts = count;
+  }
+
+  // R51: how many contexts the backend is holding a process for. A refused bind must not
+  // add one, and an unbound context must not keep one.
+  std::size_t owner_count() {
+    std::lock_guard lock(state_);
+    return owners_.size();
   }
 
   bool saw_unbind(std::uint64_t context) {
@@ -1944,11 +1980,16 @@ public:
   }
 
 private:
+  // FcitxBackend refuses a bind past its own context bound; the fake models the same refusal
+  // so the owner bookkeeping can be checked for a refused context. Large enough that the
+  // other checks never reach it.
+  std::size_t max_contexts = 64;
   std::mutex admission_; // FcitxBackend admission lock: try_lock, never wait
   std::mutex state_;
   std::mutex settings_mutex_;
   std::set<std::uint64_t> contexts_;
   std::vector<std::uint64_t> unbound_;
+  std::map<std::uint64_t, std::uint32_t> owners_;
 };
 
 // Two IpcBackend clients using the SAME client context id, binding and sending
@@ -2009,6 +2050,14 @@ void test_hostserver_multi_client() {
   // Disconnecting one client must unbind exactly that client's host context.
   const auto host_context_a = static_cast<std::uint64_t>(std::stoull(host_context1));
   const auto host_context_b = static_cast<std::uint64_t>(std::stoull(host_context2));
+  // R51: both connections come from this test process, and the Host read that from its own
+  // pipe before binding each context. It is the only way the refusal that later waits for one
+  // of these inputs — which arrives on the settings window's connection, not this one — can
+  // say whose input it is waiting for.
+  require(fake->owner_of(host_context_a) == GetCurrentProcessId(),
+          "the Host named the process behind the pipe for the first client's context");
+  require(fake->owner_of(host_context_b) == GetCurrentProcessId(),
+          "and for the second client's context");
   client1.reset(); // closing the pipe is what the Host observes as a disconnect
   require(wait_until([fake, host_context_a] { return fake->saw_unbind(host_context_a); }, kWait),
           "disconnected client's host context was unbound");
@@ -2020,6 +2069,45 @@ void test_hostserver_multi_client() {
 
   host.stop_and_join();
   require(fake->contention_count == 0, "no admission contention during shutdown");
+
+  // R51: the Host hands the backend the process behind the pipe *before* it binds, so a bind
+  // that is refused must not leave that note behind — the Host would be holding a process for
+  // a context that never became live, and a later refusal could name a window that has
+  // nothing to do with the input. The fake refuses past its context bound where FcitxBackend
+  // refuses past `context_bound`; what this drives is the Host's own note-then-bind sequence.
+  {
+    const auto refused_pipe = test_pipe_name(L"hostserver-refused-bind");
+    auto refused_backend = std::make_unique<FcitxLikeBackend>();
+    FcitxLikeBackend *limited = refused_backend.get();
+    limited->limit_contexts(1);
+    RunningHost limited_host(std::move(refused_backend), refused_pipe);
+    require(limited_host.start(), "refused-bind host start");
+
+    auto accepted = connect_client(refused_pipe);
+    require(accepted != nullptr, "refused-bind: the accepted client connects");
+    const Binding accepted_binding{21, 1, 1};
+    require(accepted->bind(accepted_binding), "refused-bind: the first bind is accepted");
+    const BackendBatch served = accepted->send(character_stimulus(accepted_binding, 1, 'a'));
+    require(served.disposition == BackendBatch::Disposition::Consumed &&
+                served.operations.size() == 1,
+            "refused-bind: the accepted context serves a key");
+    const auto live_context = static_cast<std::uint64_t>(std::stoull(served.operations[0].text));
+    require(limited->owner_of(live_context) == GetCurrentProcessId(),
+            "refused-bind: the live context names the process behind its pipe");
+
+    auto refused = connect_client(refused_pipe);
+    require(refused != nullptr, "refused-bind: the second client connects");
+    require(!refused->bind(Binding{22, 1, 1}), "refused-bind: the second bind is refused");
+    require(limited->bound_count() == 1, "refused-bind: the refused context was not added");
+    require(limited->owner_count() == 1,
+            "refused-bind: a refused bind leaves no owner note behind");
+    require(limited->owner_of(live_context) == GetCurrentProcessId(),
+            "refused-bind: the refusal did not touch the live context's owner");
+
+    refused.reset();
+    accepted.reset();
+    limited_host.stop_and_join();
+  }
 }
 
 // Transport failure classification: a definitely-not-written request (never

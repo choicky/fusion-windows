@@ -881,6 +881,11 @@ void HostServer::Connection::handle_bind(const std::vector<std::uint8_t> &payloa
   bool result = false;
   {
     std::lock_guard lock(backend_mutex);
+    // R51: the pipe knows which process asked for this context. The Host passes that to the
+    // backend, because the refusal that later waits for the context arrives on another
+    // connection — the settings window's own — which cannot see this one. Recorded first, so
+    // a context is never live without the process that owns it. 0 when the pipe would not say.
+    backend.note_context_owner(host_binding.context, pipe->client_pid());
     result = backend.bind(host_binding);
   }
   send_bool_response(MessageType::BindResponse, result);

@@ -468,6 +468,28 @@ if(BUILD_TESTING)
       target_compile_options(candidate_window_layout PRIVATE /W4 /WX /utf-8)
     endif()
     add_test(NAME candidate_window_layout COMMAND candidate_window_layout)
+    # R46: which anchor a page is placed at is a decision about data the probe already holds,
+    # so it is tested without TSF, a Host or an application. Windows-only because the result
+    # code and the rectangles it reasons about are Win32's.
+    add_executable(tsf_anchor_probe tests/tsf_anchor_probe.cpp)
+    target_include_directories(tsf_anchor_probe PRIVATE src)
+    target_compile_features(tsf_anchor_probe PRIVATE cxx_std_20)
+    target_compile_definitions(tsf_anchor_probe PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(tsf_anchor_probe PRIVATE /W4 /WX /utf-8)
+    endif()
+    add_test(NAME tsf_anchor_probe COMMAND tsf_anchor_probe)
+    # R51: the head a busy Host puts in front of its refusal is a string the settings window
+    # parses, and it needs only a process id — so it is checked on its own, with no Host, pipe or
+    # composition in sight. Windows-only, because the process name it resolves is a Win32 one.
+    add_executable(busy_holder tests/busy_holder.cpp)
+    target_include_directories(busy_holder PRIVATE src)
+    target_compile_features(busy_holder PRIVATE cxx_std_20)
+    target_compile_definitions(busy_holder PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+      target_compile_options(busy_holder PRIVATE /W4 /WX /utf-8)
+    endif()
+    add_test(NAME busy_holder COMMAND busy_holder)
   endif()
   # The projection outputFilter contract against the real Fcitx5 engine (system
   # libraries) on non-Windows builds, registered only when Fcitx5 development

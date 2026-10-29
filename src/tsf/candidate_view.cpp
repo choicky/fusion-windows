@@ -8,6 +8,8 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <string>
 #include <utility>
 
@@ -47,6 +49,17 @@ std::wstring to_wide(const std::string &text) {
                           result.data(), count) != count)
     return {};
   return result;
+}
+
+// One content-free structured line, formatted here because `diag::event` takes the finished
+// string.
+void diagf(const char *name, const char *fmt, ...) {
+  char buffer[512];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  diag::event(name, buffer);
 }
 
 RECT to_rect(const LayoutRect &rect) { return RECT{rect.left, rect.top, rect.right, rect.bottom}; }
@@ -142,7 +155,14 @@ CandidateView::~CandidateView() {
   font_owned_ = false;
 }
 
-bool CandidateView::ensure_created(TextService *service, void *entry, std::uint64_t generation) {
+bool CandidateView::ensure_created(TextService *service, void *entry, std::uint64_t generation,
+                                   HWND owner, bool owner_from_view) {
+  // A different owner, or an owner that is gone, means this window belongs to a relationship
+  // that no longer exists. Recreate it under the owner the entry has now: an owned popup
+  // follows its owner's lifetime, so reusing the old window would either tie the popup to a
+  // closed window or leave it floating unowned again.
+  if (hwnd_ != nullptr && (owner_ != owner || !IsWindow(hwnd_)))
+    destroy();
   service_ = service;
   entry_ = entry;
   generation_ = generation;
@@ -153,14 +173,20 @@ bool CandidateView::ensure_created(TextService *service, void *entry, std::uint6
   static const bool registered = register_window_class();
   if (!registered)
     return false;
-  const HWND hwnd =
-      CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kWindowClassName, L"Fusion", WS_POPUP, 0,
-                      0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  // WS_EX_TOPMOST, and `owner` in the parent slot: for a WS_POPUP window that slot is the
+  // owner, which is what makes the popup rise with the application window it describes
+  // instead of sitting wherever the desktop put it (R49 step 4: the anchor resolved, the
+  // window was placed, and the taskbar flyout still covered it).
+  const HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                    kWindowClassName, L"Fusion", WS_POPUP, 0, 0, 1, 1, owner,
+                                    nullptr, GetModuleHandleW(nullptr), nullptr);
   if (hwnd == nullptr)
     return false;
   // GWLP_USERDATA carries the CandidateView for the static window procedure.
   SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
   hwnd_ = hwnd;
+  owner_ = owner;
+  owner_from_view_ = owner != nullptr && owner_from_view;
   return true;
 }
 
@@ -219,6 +245,7 @@ void CandidateView::show(const CandidatePage &page, POINT anchor) {
   }
   if (hwnd_ == nullptr)
     return;
+  const bool was_visible = visible();
   cancel_tip_close();
   page_ = page;
   anchor_ = anchor;
@@ -241,6 +268,9 @@ void CandidateView::show(const CandidatePage &page, POINT anchor) {
     place_and_paint();
     in_dpi_change_ = false;
   }
+
+  announce_shown(was_visible);
+  note_shown();
 
   // The keyboard case: a highlighted candidate too long for its cell is offered in full
   // without the pointer having to find it. The pointer case replaces this on hover.
@@ -285,9 +315,12 @@ void CandidateView::reflow() {
 
 void CandidateView::hide() {
   cancel_tip_close();
+  const bool was_visible = visible();
   if (hwnd_ != nullptr && IsWindowVisible(hwnd_))
     ShowWindow(hwnd_, SW_HIDE);
   update_tip(-1);
+  if (was_visible)
+    announce_hidden();
 }
 
 void CandidateView::destroy() {
@@ -295,12 +328,71 @@ void CandidateView::destroy() {
   destroy_tip();
   if (hwnd_ != nullptr) {
     const HWND hwnd = hwnd_;
-    hwnd_ = nullptr; // WM_DESTROY clears the pointer too; guard re-entry.
+    hwnd_ = nullptr; // WM_NCDESTROY clears the pointer too; guard re-entry.
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     DestroyWindow(hwnd);
   }
+  owner_ = nullptr;
+  owner_from_view_ = false;
   service_ = nullptr;
   entry_ = nullptr;
+}
+
+void CandidateView::request_reposition() {
+  if (hwnd_ == nullptr)
+    return;
+  // Posted, not sent: the caller may be inside an edit session, and the window move is not
+  // text work. It runs on this thread's message loop, after the session has returned.
+  PostMessageW(hwnd_, reposition_message, 0, 0);
+}
+
+void CandidateView::announce_shown(bool was_visible) {
+  if (hwnd_ == nullptr)
+    return;
+  // EVENT_OBJECT_IME_CHANGE is what an already-visible surface that just moved or resized
+  // reports; SHOW is for the surface appearing. A client that tracks the candidate window by
+  // accessibility events only learns about it from these.
+  NotifyWinEvent(was_visible ? EVENT_OBJECT_IME_CHANGE : EVENT_OBJECT_IME_SHOW, hwnd_, OBJID_CLIENT,
+                 INDEXID_OBJECT);
+}
+
+void CandidateView::announce_hidden() {
+  if (hwnd_ == nullptr)
+    return;
+  NotifyWinEvent(EVENT_OBJECT_IME_HIDE, hwnd_, OBJID_CLIENT, INDEXID_OBJECT);
+}
+
+void CandidateView::note_shown() {
+  if (hwnd_ == nullptr)
+    return;
+  RECT rect{};
+  GetWindowRect(hwnd_, &rect);
+  // Recorded, never decided on: no behaviour in this surface depends on immersive mode, and
+  // the flag is here so a field report can say which mode the thread was in.
+  int immersive = -1; // no service (an isolated check) means no thread manager to ask
+  if (service_ != nullptr) {
+    ITfThreadMgr *tim = service_->thread_mgr();
+    ITfThreadMgrEx *tim_ex = nullptr;
+    if (tim != nullptr &&
+        SUCCEEDED(tim->QueryInterface(IID_ITfThreadMgrEx, reinterpret_cast<void **>(&tim_ex))) &&
+        tim_ex != nullptr) {
+      DWORD flags = 0;
+      immersive =
+          SUCCEEDED(tim_ex->GetActiveFlags(&flags)) && (flags & TF_TMF_IMMERSIVEMODE) != 0 ? 1 : 0;
+      tim_ex->Release();
+    }
+  }
+  // Three answers, not two: `view` is the application window the context reported, `focus`
+  // is the thread's focus window standing in for it, and `none` is a page shown with no
+  // owner at all — the application reported no window and this thread has no focus to fall
+  // back to. That page is still shown (unowned but topmost): losing the owner is not a
+  // reason to lose the candidates, and the line says which case a report is looking at.
+  const char *owner_source =
+      owner_ == nullptr ? "none" : (owner_from_view_ ? "view" : "focus");
+  diagf("CANDIDATE_VIEW",
+        "shown owner=%p owner-source=%s rect=%ld,%ld,%ld,%ld topmost=1 immersive=%d",
+        static_cast<void *>(owner_), owner_source, rect.left, rect.top, rect.right, rect.bottom,
+        immersive);
 }
 
 void CandidateView::place_and_paint() {
@@ -325,7 +417,11 @@ void CandidateView::place_and_paint() {
     if (y < work_area_.top)
       y = work_area_.top;
   }
-  SetWindowPos(hwnd_, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  // HWND_TOPMOST, not HWND_TOP: TOP only puts the popup above the windows of its own
+  // thread, and the surface that covers a candidate list is usually somebody else's — the
+  // taskbar flyout in R49 step 4. The window is created topmost for the same reason; this
+  // is what keeps it there across a re-place.
+  SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
   relayout_and_paint();
 }
 
@@ -451,9 +547,10 @@ void CandidateView::update_tip(std::int32_t index) {
     if (!registered)
       return;
     // Owned by the candidate popup and non-activating: it must never take focus, never
-    // take activation, and never outlive the panel it belongs to.
-    const HWND tip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kTipClassName,
-                                     L"Fusion", WS_POPUP, 0, 0, 1, 1, hwnd_, nullptr,
+    // take activation, and never outlive the panel it belongs to. Topmost too, because it
+    // describes a slot in that panel and is worthless behind it.
+    const HWND tip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                     kTipClassName, L"Fusion", WS_POPUP, 0, 0, 1, 1, hwnd_, nullptr,
                                      GetModuleHandleW(nullptr), nullptr);
     if (tip == nullptr)
       return;
@@ -556,14 +653,14 @@ void CandidateView::update_tip(std::int32_t index) {
   // while it is scrollable; one that fits stays fully transparent, so nothing about it can
   // intercept the pointer. Neither form can be activated, and a click on it is ignored.
   LONG_PTR style = GetWindowLongPtrW(tip_hwnd_, GWL_EXSTYLE);
-  style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+  style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
   if (tip_scroll_max_ > 0)
     style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
   else
     style |= WS_EX_TRANSPARENT;
   SetWindowLongPtrW(tip_hwnd_, GWL_EXSTYLE, style);
 
-  SetWindowPos(tip_hwnd_, HWND_TOP, bounds.left, bounds.top, placed_width, placed_height,
+  SetWindowPos(tip_hwnd_, HWND_TOPMOST, bounds.left, bounds.top, placed_width, placed_height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
   InvalidateRect(tip_hwnd_, nullptr, TRUE);
 }
@@ -808,6 +905,13 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     return DefWindowProcW(hwnd_, message, wparam, lparam);
+  case reposition_message:
+    // A layout notification resolved this context's anchor again and left the window move
+    // for the message loop. The service re-validates the entry identity first, so a context
+    // that went away between the probe and here is not moved.
+    if (service_ != nullptr)
+      service_->place_candidate_from_anchor(entry_, generation_);
+    return 0;
   case WM_LBUTTONUP: {
     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     int action = 0;
@@ -832,10 +936,28 @@ LRESULT CandidateView::on_message(UINT message, WPARAM wparam, LPARAM lparam) {
     return PA_NOACTIVATE;
   case WM_NCHITTEST:
     return HTCLIENT; // whole popup clickable, no resize border
-  case WM_DESTROY:
-    SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
-    hwnd_ = nullptr;
-    return 0;
+  case WM_NCDESTROY:
+    // The window is gone, and so is the relationship it was built on. This is also how a
+    // destroyed owner reaches the popup: Windows destroys an owned window with its owner,
+    // so the entry's next show finds no window here and makes one under the owner it has
+    // now. Clearing the user data only at the very end (WM_DESTROY would be soon enough to
+    // route the rest of this destruction through DefWindowProc) is what lets this handler
+    // run at all.
+    //
+    // The message then goes on to DefWindowProcW, which is what tears down the rest of the
+    // system's own NCDESTROY work — the window's properties, its menu and scroll bars, and
+    // the thread's window list entry. Answering 0 here would skip all of it and leave the
+    // system half-way through destroying a window.
+    {
+      const HWND dying = hwnd_;
+      hwnd_ = nullptr;
+      owner_ = nullptr;
+      owner_from_view_ = false;
+      if (dying == nullptr)
+        return 0;
+      SetWindowLongPtrW(dying, GWLP_USERDATA, 0);
+      return DefWindowProcW(dying, message, wparam, lparam);
+    }
   default:
     return DefWindowProcW(hwnd_, message, wparam, lparam);
   }

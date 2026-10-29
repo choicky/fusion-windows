@@ -20,7 +20,14 @@
 //     with the label and the slot's inset added on top;
 //   - a larger configured font really produces a taller panel, and a font family that does
 //     not exist still draws (GDI substitution) instead of failing;
-//   - the metrics scale with DPI in one place, so 192 dpi is exactly twice 96 dpi.
+//   - the metrics scale with DPI in one place, so 192 dpi is exactly twice 96 dpi;
+//   - R49: the popup is owned by the application window it was given and topmost, a new owner
+//     re-creates it, its owner's destruction takes it away instead of leaving a dangling HWND,
+//     and a re-place request reaches the service through the popup's own window message;
+//   - the fence that request reads when it is delivered: a page hidden after the request was
+//     made stays hidden (owned and topmost, so a late re-show would land above the application
+//     the user has moved to, clickable), a page deferred for want of an anchor is still placed,
+//     and the refusal is written to this process's own diagnostics log.
 //
 // What it does NOT cover: a composition inside a real application reaching this popup.
 // That path (anchor, composition, TIP registration) is unchanged by this work and would
@@ -31,14 +38,17 @@
 // It runs as an isolated process: no TIP is registered and no product installation is
 // used, so it can run on a machine whose product Host is in daily use.
 
+#include "tsf/candidate_presentation.hpp"
 #include "tsf/candidate_view.hpp"
 #include "tsf/service.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 
 namespace fusion::tsf {
@@ -294,15 +304,143 @@ bool slots_draw_their_text_whole(const fusion::tsf::CandidateView &view,
   return true;
 }
 
+// R49: an owner window is a real top-level window of the process that hosts the popup. The
+// product path takes it from the context view (or from the focus); here it is this test's own
+// window, because the ownership and the topmost order are properties of the window pair, not
+// of TSF.
+HWND make_owner_window() {
+  static const bool registered = [] {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FusionTestOwnerWindow";
+    return RegisterClassExW(&wc) != 0;
+  }();
+  if (!registered)
+    return nullptr;
+  return CreateWindowExW(0, L"FusionTestOwnerWindow", L"Fusion test owner", WS_POPUP, 10, 10, 20,
+                         20, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+// What the popup does when its window procedure is asked to re-place itself.
+int reposition_calls = 0;
+void *reposition_entry = nullptr;
+std::uint64_t reposition_generation = 0;
+
+// What a delivered re-place finds. A real service reads these from its `ContextEntry` and its
+// `SemanticController`; this process has no TSF context to build one from, so the check holds
+// the same five facts here and hands them to the product's own decision function. The popup is
+// the real window the message was posted to, so `visible()` is the window's answer and not a
+// value the check invented.
+fusion::tsf::CandidateView *reposition_popup = nullptr;
+bool reposition_deferred = false;
+bool reposition_anchor_valid = true;
+const fusion::CandidatePage *reposition_page = nullptr;
+POINT reposition_anchor{};
+std::uint64_t reposition_context_id = 0;
+std::optional<fusion::tsf::RepositionFence> reposition_outcome;
+
+// Drains this thread's messages until the recorded call arrives, so the posted request is
+// dispatched by the same path the application's own loop would use.
+void pump_until_repositioned(int expected) {
+  for (int i = 0; i < 2000 && reposition_calls < expected; ++i) {
+    MSG msg{};
+    const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+    if (got == 0 || got == -1)
+      return;
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+  }
+}
+
+// Post one re-place through the popup's own door and deliver it, the way the re-probe session
+// does. The count starts at zero for each delivery, so a check cannot pass on a previous case's
+// call arriving late.
+void deliver_reposition() {
+  reposition_calls = 0;
+  reposition_outcome = std::nullopt;
+  if (reposition_popup == nullptr)
+    return;
+  reposition_popup->request_reposition();
+  pump_until_repositioned(1);
+}
+
+// Where this process writes its diagnostics, and what has been written. The fence has to be
+// *seen* in the log rather than only returned: the refusal and its line are one unit in the
+// product, and a check that compared against a string the stub made up would be checking
+// itself. Both variables have to be set before the first line, because diag.cpp decides once.
+std::string fence_log_path() {
+  static std::string path = [] {
+    char base[MAX_PATH] = {};
+    const DWORD length = GetTempPathA(static_cast<DWORD>(sizeof(base)), base);
+    char full[MAX_PATH * 2] = {};
+    if (length == 0 || length >= sizeof(base))
+      return std::string("fusion-candidate-fence.log");
+    std::snprintf(full, sizeof(full), "%sfusion-candidate-fence-%lu.log", base,
+                  GetCurrentProcessId());
+    return std::string(full);
+  }();
+  return path;
+}
+
+bool fence_log_contains(const char *needle) {
+  const std::string &path = fence_log_path();
+  HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return false;
+  std::string text;
+  char chunk[4096];
+  DWORD got = 0;
+  while (ReadFile(file, chunk, sizeof(chunk), &got, 0) && got > 0)
+    text.append(chunk, got);
+  CloseHandle(file);
+  return text.find(needle) != std::string::npos;
+}
+
+// R49: the popup routes the re-position through a TextService pointer, so the check that drives
+// it needs a pointer of that type — but not a real service. Constructing a TextService here would
+// pull its whole COM vtable — every TSF override service.cpp defines — into a link that has none
+// of them, and the stub below never touches `this`. An object-sized block of storage is enough to
+// prove that the popup's own message reaches the service with the identity it was created for.
+alignas(std::max_align_t) unsigned char service_storage[sizeof(fusion::tsf::TextService)];
+fusion::tsf::TextService *const any_service =
+    reinterpret_cast<fusion::tsf::TextService *>(service_storage);
+
 } // namespace
 
+namespace fusion::tsf {
+
+void TextService::place_candidate_from_anchor(void *entry, std::uint64_t generation) {
+  ++reposition_calls;
+  reposition_entry = entry;
+  reposition_generation = generation;
+  // §35: the delivery runs the product's decision (tsf/candidate_presentation.hpp), not a copy
+  // of it — the fence, the show and the flag all come from the same code the TSF service calls.
+  // Only the entry's own state is supplied from above, because a ContextEntry needs a real
+  // context, which this process has none of.
+  if (reposition_popup != nullptr)
+    reposition_outcome =
+        place_candidate_popup(*reposition_popup, reposition_deferred, reposition_anchor_valid,
+                              reposition_page, reposition_anchor, reposition_context_id);
+}
+
+} // namespace fusion::tsf
+
 int main() {
+  // §35 reads the refusal out of the real diagnostics log, and diag.cpp decides whether it
+  // writes at all on the first line it is asked for. Both variables have to be set before
+  // anything shows a page.
+  _putenv_s("FUSION_TSF_DIAGNOSTICS", "1");
+  _putenv_s("FUSION_TSF_LOG", fence_log_path().c_str());
+
   constexpr int entries = 8;
   fusion::tsf::CandidateView view;
 
   // 1. The real popup window is created, and it is the non-activating tool window the
   //    Stage 5 surface was defined as: the presentation settings must not change that.
-  CHECK(view.ensure_created(nullptr, nullptr, 0));
+  CHECK(view.ensure_created(nullptr, nullptr, 0, nullptr, false));
   CHECK(view.window() != nullptr);
   if (view.window() == nullptr) {
     std::fprintf(stderr, "candidate_window_layout: the popup could not be created\n");
@@ -867,7 +1005,7 @@ int main() {
       std::printf("per-monitor context: not available on this system\n");
     } else {
       fusion::tsf::CandidateView aware;
-      CHECK(aware.ensure_created(nullptr, nullptr, 0));
+      CHECK(aware.ensure_created(nullptr, nullptr, 0, nullptr, false));
       auto page = make_page(fusion::CandidateLayout::Vertical, 5);
       page.font.family = "Microsoft YaHei UI";
       page.font.size_pt = 11;
@@ -1732,6 +1870,196 @@ int main() {
       CHECK(numbered_width - unnumbered_width >= label_width - 1);
       CHECK(numbered_width - unnumbered_width <= label_width + 1);
     }
+  }
+
+  // 34. R49: the popup is owned by the application's own window and topmost. Owned means the
+  //     window follows the application it belongs to (a WS_POPUP with a parent is an owner, not
+  //     a child), and topmost is what keeps a candidate list above a window that never lets the
+  //     IME activate anything. Both are read back from the created window, and the two lifetime
+  //     cases are real: a new owner re-creates the popup, and destroying the owner takes it away
+  //     rather than leaving a window owned by a dead HWND.
+  {
+    const HWND owner = make_owner_window();
+    CHECK(owner != nullptr);
+    auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    fusion::tsf::CandidateView owned;
+    int marker = 0;
+    CHECK(owned.ensure_created(nullptr, &marker, 7, owner, true));
+    const HWND popup = owned.window();
+    CHECK(popup != nullptr);
+    CHECK(owned.owner() == owner);
+    CHECK(owned.owner_from_view());
+    CHECK(GetWindow(popup, GW_OWNER) == owner);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    owned.show(page, POINT{140, 140});
+    CHECK(owned.visible());
+    // A show re-asserts the order instead of relying on the style alone: the window still
+    // reports itself topmost afterwards, and it still belongs to the same owner.
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    CHECK(GetWindow(popup, GW_OWNER) == owner);
+
+    // The same context with a different owner window gets a popup owned by the new one: the
+    // service decides the owner per context, so a second document window is never served by a
+    // window owned by the first.
+    const HWND second = make_owner_window();
+    CHECK(second != nullptr);
+    CHECK(owned.ensure_created(nullptr, &marker, 7, second, false));
+    CHECK(owned.window() != nullptr);
+    CHECK(owned.window() != popup);
+    CHECK(!IsWindow(popup));
+    CHECK(GetWindow(owned.window(), GW_OWNER) == second);
+    CHECK(!owned.owner_from_view());
+
+    // Destroying the owner destroys the popup it owns, and the next show creates a fresh one.
+    // This is the dangling-HWND case: after this the window list must hold a live window, not
+    // the one that died with its owner.
+    const HWND dying = owned.window();
+    CHECK(DestroyWindow(second) != 0);
+    CHECK(owned.window() == nullptr);
+    CHECK(!IsWindow(dying));
+    CHECK(owned.ensure_created(nullptr, &marker, 7, owner, true));
+    CHECK(owned.window() != nullptr);
+    CHECK(owned.window() != dying);
+    owned.show(page, POINT{160, 160});
+    CHECK(owned.visible());
+    CHECK(GetWindow(owned.window(), GW_OWNER) == owner);
+
+    // A layout change asks the popup's own thread to re-place it: the request travels as the
+    // window message the popup was given, and reaches the service with the identity the popup
+    // was created for. Nothing here moves a window from inside an edit session.
+    reposition_calls = 0;
+    reposition_entry = nullptr;
+    reposition_generation = 0;
+    CHECK(owned.ensure_created(any_service, &marker, 7, owner, true));
+    CHECK(PostMessageW(owned.window(), fusion::tsf::CandidateView::reposition_message, 0, 0) != 0);
+    pump_until_repositioned(1);
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_entry == &marker);
+    CHECK(reposition_generation == 7);
+    owned.destroy();
+    DestroyWindow(owner);
+  }
+
+  // 34b. R49: no owner is not a reason to lose the page. An application can report no window
+  //      through its view and leave this thread with no focus window either; the popup is then
+  //      unowned, but it is still created, still topmost, and still shows the page. Hiding it
+  //      instead was a regression: the build before the owner work showed the popup in exactly
+  //      this case, and an unowned topmost window is what keeps the candidates reachable.
+  {
+    auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    fusion::tsf::CandidateView unowned;
+    int marker = 0;
+    CHECK(unowned.ensure_created(nullptr, &marker, 9, nullptr, false));
+    const HWND popup = unowned.window();
+    CHECK(popup != nullptr);
+    CHECK(unowned.owner() == nullptr);
+    CHECK(GetWindow(popup, GW_OWNER) == nullptr);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    unowned.show(page, POINT{200, 200});
+    CHECK(unowned.visible());
+    // Still unowned after a show: nothing invents an owner for a window that has none.
+    CHECK(GetWindow(popup, GW_OWNER) == nullptr);
+    CHECK((GetWindowLongPtrW(popup, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0);
+    unowned.destroy();
+  }
+
+  // 35. The fence a delivered re-place reads. A layout notification never moves the popup: it
+  //     admits one read-only session, that session posts a message to the popup's own window,
+  //     and the message is delivered later, on the application's loop. Every one of those steps
+  //     can land after the page has been hidden for a reason of its own — the thread lost the
+  //     foreground, focus went to another document, the context was torn down, the composition
+  //     ended — and since R49 such a page comes back *owned and topmost*: above whatever the
+  //     user is working in now, clickable. Each case below drives the real posted message into a
+  //     real window and runs the product's own decision on delivery.
+  {
+    const HWND owner = make_owner_window();
+    CHECK(owner != nullptr);
+    const auto page = make_page(fusion::CandidateLayout::Vertical, entries);
+    fusion::tsf::CandidateView popup;
+    int marker = 0;
+    CHECK(popup.ensure_created(any_service, &marker, 21, owner, true));
+    reposition_popup = &popup;
+    reposition_anchor_valid = true;
+    reposition_page = &page;
+    reposition_context_id = 21;
+
+    // 35a. The positive the fence must not break: a page on screen when the message arrives is
+    //      re-placed where the anchor has moved to.
+    popup.show(page, POINT{400, 300});
+    CHECK(popup.visible());
+    const RECT first_place = window_rect(popup.window());
+    reposition_deferred = false;
+    reposition_anchor = POINT{400, 640};
+    deliver_reposition();
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kPlaced);
+    CHECK(popup.visible());
+    CHECK(!reposition_deferred);
+    const RECT placed = window_rect(popup.window());
+    CHECK(placed.top != first_place.top || placed.left != first_place.left);
+
+    // 35b. The defect: the request is posted while the page is on screen, the page is hidden
+    //      through the one door a focus change uses before the message is delivered, and the
+    //      delivery then has nothing it may show.
+    popup.show(page, POINT{400, 300});
+    CHECK(popup.visible());
+    CHECK(fusion::tsf::popup_may_be_placed(popup.visible(), reposition_deferred));
+    reposition_outcome = std::nullopt;
+    reposition_calls = 0;
+    popup.request_reposition(); // the re-probe session's own post
+    fusion::tsf::hide_candidate_popup(reposition_popup, reposition_deferred);
+    CHECK(!popup.visible());
+    pump_until_repositioned(1);
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kHidden);
+    // Nothing reappeared; the flag the fence waits on is gone, so a later layout change is
+    // refused the same question — which is also why no re-probe session is admitted for it.
+    CHECK(!popup.visible());
+    CHECK(!reposition_deferred);
+    CHECK(!fusion::tsf::popup_may_be_placed(popup.visible(), reposition_deferred));
+    CHECK(fence_log_contains("FENCE kind=reposition hidden cid=21"));
+
+    // 35c. The other positive the fence must not break: R46's deferred page. Nothing is on
+    //      screen, and this delivery is the first time the page gets an anchor — the case the
+    //      flag exists for.
+    reposition_deferred = true;
+    deliver_reposition();
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kPlaced);
+    CHECK(popup.visible());
+    CHECK(!reposition_deferred);
+
+    // 35d. A deferred page that is then hidden (the projection emptied, the composition ended,
+    //      the context went away) is waiting for nothing: the same delivery refuses it.
+    fusion::tsf::hide_candidate_popup(reposition_popup, reposition_deferred);
+    CHECK(!reposition_deferred);
+    CHECK(!popup.visible());
+    CHECK(!fusion::tsf::popup_may_be_placed(popup.visible(), reposition_deferred));
+    deliver_reposition();
+    CHECK(reposition_calls == 1);
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kHidden);
+    CHECK(!popup.visible());
+
+    // 35e. The two branches this fix moved rather than changed: no anchor means the page keeps
+    //      waiting for one, and a projection that has emptied leaves nothing to wait for.
+    popup.show(page, POINT{400, 300});
+    CHECK(popup.visible());
+    reposition_anchor_valid = false;
+    reposition_deferred = true;
+    deliver_reposition();
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kNoAnchor);
+    CHECK(reposition_deferred);
+    CHECK(popup.visible());
+    reposition_anchor_valid = true;
+    reposition_page = nullptr;
+    deliver_reposition();
+    CHECK(reposition_outcome == fusion::tsf::RepositionFence::kNoPage);
+    CHECK(!reposition_deferred);
+
+    reposition_popup = nullptr;
+    reposition_page = &page;
+    popup.destroy();
+    DestroyWindow(owner);
   }
 
   view.destroy();

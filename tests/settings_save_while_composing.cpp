@@ -87,6 +87,18 @@ std::string stored_scalar(const SettingsSnapshot &snapshot, const std::string &n
   return leaf != nullptr ? leaf->scalar : std::string();
 }
 
+// R51: a refusal that waits for a live input states which of the two waits it is, and whose,
+// in a machine-readable head ahead of the sentence the Host writes. This fixture binds a
+// context without a pipe transport in front of it, so the Host was never told a process id:
+// the head is still there, with pid 0 and no name invented for it.
+void require_holder_head(const std::string &error, const char *condition) {
+  const std::string expected = std::string("holder pid=0 why=") + condition + " | ";
+  require(error.rfind(expected, 0) == 0,
+          "the Busy reply names which condition it is waiting on, ahead of its sentence");
+  require(error.find("exe=") == std::string::npos,
+          "a client the pipe never identified is not given a process the Host does not know");
+}
+
 SettingsValue value_tree(const std::string &name, const std::string &scalar) {
   SettingsValue submitted = SettingsValue::object();
   submitted.entries[name] = SettingsValue::string(scalar);
@@ -257,6 +269,7 @@ void section_engine_page_during_composition(Driver &driver) {
           "the engine page is refused while a composition is live, not applied");
   require(error.find("Nothing was written") != std::string::npos,
           "a Busy answer says it wrote nothing, which is what makes a retry safe");
+  require_holder_head(error, "preedit");
 
   SettingsSnapshot after;
   require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", after,
@@ -304,6 +317,7 @@ void section_im_list_during_composition(Driver &driver) {
   std::printf("   saving the list with a live composition returned %d\n   reason: %s\n",
               static_cast<int>(status), error.c_str());
   require(status == SettingsStatus::Busy, "the list is refused while a composition is live");
+  require_holder_head(error, "preedit");
 
   ImList stored;
   require(driver.backend->settings_get_im_list(stored, error) == SettingsStatus::Ok,
