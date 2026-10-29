@@ -1945,15 +1945,24 @@ public:
   // R51: the Host hands over the process its pipe saw before it binds a context, because the
   // refusal that later waits for that context arrives on another connection entirely — the
   // settings window's own — which cannot see this one.
-  void note_context_owner(std::uint64_t context, std::uint32_t client_pid) override {
+  // R52: it hands over the id that client bound the context with too, which is the only id
+  // the TIP's own log can match an engine-state line against.
+  void note_context_owner(std::uint64_t context, std::uint64_t client_context,
+                          std::uint32_t client_pid) override {
     std::lock_guard lock(state_);
-    owners_[context] = client_pid;
+    owners_[context] = OwnerNote{client_context, client_pid};
   }
 
   std::uint32_t owner_of(std::uint64_t context) {
     std::lock_guard lock(state_);
     const auto owner = owners_.find(context);
-    return owner == owners_.end() ? 0 : owner->second;
+    return owner == owners_.end() ? 0 : owner->second.pid;
+  }
+
+  std::uint64_t client_context_of(std::uint64_t context) {
+    std::lock_guard lock(state_);
+    const auto owner = owners_.find(context);
+    return owner == owners_.end() ? 0 : owner->second.client_context;
   }
 
   std::size_t bound_count() {
@@ -1989,7 +1998,11 @@ private:
   std::mutex settings_mutex_;
   std::set<std::uint64_t> contexts_;
   std::vector<std::uint64_t> unbound_;
-  std::map<std::uint64_t, std::uint32_t> owners_;
+  struct OwnerNote {
+    std::uint64_t client_context = 0;
+    std::uint32_t pid = 0;
+  };
+  std::map<std::uint64_t, OwnerNote> owners_;
 };
 
 // Two IpcBackend clients using the SAME client context id, binding and sending
@@ -2058,6 +2071,12 @@ void test_hostserver_multi_client() {
           "the Host named the process behind the pipe for the first client's context");
   require(fake->owner_of(host_context_b) == GetCurrentProcessId(),
           "and for the second client's context");
+  // R52: the same note carries the id the client itself used. Both of these clients bound
+  // context 1, so each host context must remember that number — it is the only identifier a
+  // TIP log has, and an engine-state line written from the Host is worthless without it.
+  require(fake->client_context_of(host_context_a) == client_binding.context &&
+              fake->client_context_of(host_context_b) == client_binding.context,
+          "the Host named the client's own context id for each host context");
   client1.reset(); // closing the pipe is what the Host observes as a disconnect
   require(wait_until([fake, host_context_a] { return fake->saw_unbind(host_context_a); }, kWait),
           "disconnected client's host context was unbound");
@@ -3032,6 +3051,17 @@ void test_host_diag() {
           "a marker-bearing detail was not redacted");
   require(contents.find("vk=") == std::string::npos, "key data reached the Host log");
   std::cout << "PASS R30 host diag: privacy markers are redacted\n";
+
+  // R52: the engine-state line the Host adds for a context has to survive that same policy. It
+  // names an input method (configuration) and a context id, never what was typed, so writing it
+  // verbatim is what this check settles — and the line the TIP cannot produce is here, not in
+  // the TIP's own privacy test.
+  diag::event("ENGINE_STATE", "active=1 im=pinyin cid=7 owner=4000 after=mod-release");
+  contents = read_all(file);
+  require(contents.find("ENGINE_STATE active=1 im=pinyin cid=7 owner=4000 after=mod-release") !=
+              std::string::npos,
+          "the engine-state line was redacted or missing");
+  std::cout << "PASS R52 host diag: the engine-state line is written content-free\n";
 
   // 4. Size cap: the file is recreated empty once it reaches the bound.
   diag::event("before_cap", "x=1");

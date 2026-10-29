@@ -401,6 +401,14 @@ inline bool is_candidate_action(BackendStimulus::Type type) {
          type == BackendStimulus::Type::PageNext || type == BackendStimulus::Type::PagePrev ||
          type == BackendStimulus::Type::CursorPrev || type == BackendStimulus::Type::CursorNext;
 }
+// R52: the sample point an ENGINE_STATE change is reported from. A candidate action is not a key
+// event and has no place in the list of causes, so it reports `unknown` rather than borrowing a
+// cause it does not have.
+inline const char *engine_state_trigger(BackendStimulus::Type type) {
+  if (is_candidate_action(type))
+    return "unknown";
+  return type == BackendStimulus::Type::KeyRelease ? "mod-release" : "key";
+}
 // Whether a stimulus carries a character, i.e. is something an input method would compose
 // from. Everything else — function keys, bare modifiers, navigation and editing keys — is a
 // candidate for the engine's own global hotkeys and stays the engine's business even while
@@ -412,13 +420,31 @@ inline bool stimulus_carries_character(const BackendStimulus &stimulus) {
   return (stimulus.keysym >= 0x20 && stimulus.keysym < 0x7f) || stimulus.keysym >= 0x01000000u;
 }
 
+// R52: where an InputContext leaves the engine-state change it just observed. The backend owns
+// the queue, because the change is noticed on the Fcitx loop thread and read by the Host server
+// on the connection thread that caused it; the pair is reported once per move, never per key.
+struct EngineStateQueue {
+  std::mutex mutex;
+  std::vector<EngineStateChange> changes;
+};
+// R52: whose context this is, in the two ids that name it — the id the owning client bound it
+// with and that client's process id. Recorded once, at the bind that brought the context into
+// use, so a change reported from here is legible in the TIP's own log without the Host server
+// having to work out which connection it came from.
+struct EngineIdentity {
+  std::uint64_t client_context = 0;
+  std::uint32_t owner_pid = 0;
+};
+
 class InputContext final : public fcitx::InputContext {
 public:
   InputContext(fcitx::Instance &instance, Binding value,
                const std::atomic<CandidateLayoutPreference> &layout_preference,
-               const std::atomic<std::shared_ptr<const CandidateFont>> &font)
+               const std::atomic<std::shared_ptr<const CandidateFont>> &font,
+               EngineIdentity identity, EngineStateQueue &engine_states)
       : fcitx::InputContext(instance.inputContextManager(), "fusion-stage3b"), binding(value),
-        layout_preference_(layout_preference), font_(font) {
+        layout_preference_(layout_preference), font_(font), identity_(identity),
+        engine_states_(engine_states) {
     instance_ = &instance;
     setCapabilityFlags(fcitx::CapabilityFlag::Preedit);
     created();
@@ -475,7 +501,12 @@ public:
   // Record that the engine has been active here. Called after every dispatch, so the
   // transition is observed rather than predicted. Uses the same per-context query as
   // inactive_passthrough: an active context resolves to a name other than Items/0.
-  void note_engine_state() {
+  //
+  // R52: the same observation is the engine-state signal the Host has never reported. `trigger`
+  // names this sample point — the context entering use, a key, a modifier release, a page action
+  // — and nothing else: it is not a claim that this event caused the move. One line is queued
+  // only when the pair (active, name) actually differs from what was last seen here.
+  void note_engine_state(const char *trigger) {
     if (!instance_)
       return;
     const auto &group = instance_->inputMethodManager().currentGroup();
@@ -487,6 +518,16 @@ public:
     const auto im = instance_->inputMethod(this);
     if (!im.empty() && im != off_slot)
       ever_active_ = true;
+    const bool active = !im.empty() && im != off_slot;
+    if (state_observed_ && active == state_active_ && im == state_method_) {
+      return; // nothing moved since the last sample: report nothing
+    }
+    state_observed_ = true;
+    state_active_ = active;
+    state_method_ = std::string(im);
+    std::lock_guard lock(engine_states_.mutex);
+    engine_states_.changes.push_back(EngineStateChange{
+        identity_.client_context, identity_.owner_pid, active, state_method_, trigger});
   }
   void commitStringImpl(const std::string &text) override {
     observe({BackendOperation::Type::CommitText, text, {}});
@@ -678,6 +719,10 @@ public:
   // The font the same configuration carries, for the popup's drawing. Read once per
   // projected page; the backend publishes a new immutable value on a save.
   const std::atomic<std::shared_ptr<const CandidateFont>> &font_;
+  // R52: the two ids this context is named by in an engine-state report (see EngineIdentity).
+  const EngineIdentity identity_;
+  // R52: the backend's engine-state queue (see EngineStateQueue above).
+  EngineStateQueue &engine_states_;
   std::uint64_t last_stimulus = 0;
   BackendBatch *batch = nullptr;
   bool lifecycle = true;
@@ -689,6 +734,12 @@ public:
   // inactive_passthrough): a brand-new context's first key must reach the engine, because
   // reaching it is what activates the context.
   bool ever_active_ = false;
+  // R52: the engine-state pair last reported from here, so `note_engine_state` emits on a move
+  // rather than on every sample. `state_observed_` keeps the first sample of a new context from
+  // being skipped as "unchanged" against a default-constructed inactive pair.
+  bool state_observed_ = false;
+  bool state_active_ = false;
+  std::string state_method_;
 };
 
 class FcitxBackend final : public Backend {
@@ -718,8 +769,11 @@ public:
           owners_.erase(binding.context);
         return false;
       }
-      auto context =
-          std::make_unique<InputContext>(*instance_, binding, candidate_preference_, candidate_font_);
+      // R52: the ids an engine-state report for this context is named by are the ones the owner
+      // note recorded immediately before this bind: the client's own context id and its process.
+      const EngineIdentity identity{client_context_of(binding.context), owner_of(binding.context)};
+      auto context = std::make_unique<InputContext>(*instance_, binding, candidate_preference_,
+                                                    candidate_font_, identity, engine_states_);
       context->focusIn();
       // The profile decides the input method (U1): the bound context starts in the
       // group's current input method (Items/0) as Fcitx resolves it, never in a
@@ -741,7 +795,7 @@ public:
       // key that arrives before the first dispatch would otherwise be reported as "this
       // context was never active" and the character the engine declines for it would not be
       // delivered (the engine is already active — the first letter composes).
-      context->note_engine_state();
+      context->note_engine_state("focus");
       context->lifecycle = false;
       contexts_.emplace(binding.context, std::move(context));
       return true;
@@ -770,11 +824,20 @@ public:
       return true;
     });
   }
-  void note_context_owner(std::uint64_t context, std::uint32_t client_pid) override {
-    (void)invoke([this, context, client_pid] {
-      owners_[context] = client_pid;
+  void note_context_owner(std::uint64_t context, std::uint64_t client_context,
+                          std::uint32_t client_pid) override {
+    (void)invoke([this, context, client_context, client_pid] {
+      owners_[context] = ContextOwner{client_context, client_pid};
       return true;
     });
+  }
+  // R52: the engine-state changes the contexts recorded, oldest first. Taken without `invoke`:
+  // the queue is mutex-guarded precisely so that this read does not have to wait for the Fcitx
+  // event loop it was written on, and so a diagnostic drain can never add a loop round trip to
+  // the request that triggered it.
+  std::vector<EngineStateChange> take_engine_state_changes() override {
+    std::lock_guard lock(engine_states_.mutex);
+    return std::exchange(engine_states_.changes, {});
   }
   BackendBatch send(const BackendStimulus &stimulus) override {
     BackendBatch result{session_, stimulus.binding, stimulus.stimulus_id};
@@ -822,7 +885,7 @@ public:
               }
             }
             context->observe_candidate_page();
-            context->note_engine_state();
+            context->note_engine_state(engine_state_trigger(stimulus.type));
           } catch (...) {
             context->batch = nullptr;
             context->invalid = true;
@@ -1630,7 +1693,14 @@ private:
 
   std::uint32_t owner_of(std::uint64_t context) const {
     const auto owner = owners_.find(context);
-    return owner == owners_.end() ? 0 : owner->second;
+    return owner == owners_.end() ? 0 : owner->second.pid;
+  }
+  // R52: the id the owning client used for this context. The Host's own id is the one the client
+  // never sees, so an engine-state line has to carry the client's to be readable next to the TIP
+  // log; it is recorded once, at the bind that brought the context into use.
+  std::uint64_t client_context_of(std::uint64_t context) const {
+    const auto owner = owners_.find(context);
+    return owner == owners_.end() ? 0 : owner->second.client_context;
   }
 
   SettingsStatus read_global_settings_on_loop(SettingsSnapshot &snapshot, std::string &error) {
@@ -2358,7 +2428,16 @@ private:
   // R51: the process id of the client that bound each live context, reported by the Host's
   // pipe. Used only to name the holder of a busy input in the refusal that waits for it; it
   // decides nothing, and a context bound without a pipe transport is simply absent here.
-  std::map<std::uint64_t, std::uint32_t> owners_;
+  // R52 adds the id that client used, which is the one its own log names the same context by.
+  struct ContextOwner {
+    std::uint64_t client_context = 0;
+    std::uint32_t pid = 0;
+  };
+  std::map<std::uint64_t, ContextOwner> owners_;
+  // R52: the engine-state changes the contexts observed, waiting for the Host server to name the
+  // client context they belong to. Queued rather than logged here because the Fcitx runtime lives
+  // in its own module and the Host's diagnostic log is written by the Host server.
+  EngineStateQueue engine_states_;
   // The Windows candidate-presentation configuration is the Host's single authoritative
   // store for presentation, read from Fcitx's per-user directory at startup and written
   // only through the settings path below. candidate_preference_ mirrors its layout value

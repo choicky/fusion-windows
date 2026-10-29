@@ -263,6 +263,10 @@ private:
     void send_bool_response(MessageType type, bool value);
     void unbind_all();
     Binding remap_binding(const Binding &client_binding);
+    // R52: the engine state a request just moved is written from this connection's thread
+    // after the reply has gone, so the observation never delays the key. The backend holds
+    // the changes because an input-method name never reaches the TIP.
+    void log_engine_state_changes();
   };
 
   // One connection: its state, the thread that serves it, and the completion

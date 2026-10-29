@@ -21,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 23;
+constexpr int kExpectedSections = 25;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -154,6 +154,81 @@ void fallback() {
   forward.destroy();
   section("PASS callback fallback, watermark, uncertainty and original Forward contract");
 }
+
+// R51: a backend that counts the resets it is asked for. "Exactly once" is the whole promise
+// of the deferred reset, and a count is the only way to read it instead of inferring it.
+class CountingBackend final : public Backend {
+public:
+  int reset_calls = 0;
+  Binding last_reset{};
+  bool bind(Binding) override { return true; }
+  bool reset(Binding binding) override {
+    ++reset_calls;
+    last_reset = binding;
+    return true;
+  }
+  void unbind(Binding) override {}
+  bool healthy() const override { return true; }
+  std::uint64_t session_id() const override { return 42; }
+  BackendBatch send(const BackendStimulus &input) override {
+    BackendBatch batch;
+    batch.disposition = BackendBatch::Disposition::Consumed;
+    batch.backend_session_id = 42;
+    batch.binding = input.binding;
+    batch.stimulus_id = input.stimulus_id;
+    batch.operations = {{BackendOperation::Type::SetPreedit, "n"}};
+    return batch;
+  }
+};
+
+// A composition ended by the application rather than by a key. The shell may not reset the
+// Host inside the TSF callback that reported it — `Backend::reset` is a blocking round trip
+// and that callback holds an edit cookie — so the callback only arms the intent, and the
+// first boundary outside the session runs it. Both orders are checked, because the shell has
+// no way to know which one a real application will produce.
+void reset_after_external_termination() {
+  {
+    // The order the owner hit: focus left the document and this context never received another
+    // key. Nothing but a boundary can reset it, and only one boundary may.
+    CountingBackend backend;
+    SemanticController controller(1201, 64, backend);
+    Document doc;
+    type(controller, doc, "n");
+    require(backend.reset_calls == 0, "an ordinary key reset the Host context");
+    controller.note_composition_terminated();
+    require(controller.backend_reset_pending(), "the termination armed no reset intent");
+    require(backend.reset_calls == 0, "the termination reset the Host from inside the callback");
+    const auto flush = controller.flush_backend_reset(ResetSource::Terminated);
+    require(flush.issued && flush.ok, "the deferred reset did not run");
+    require(backend.reset_calls == 1 && backend.last_reset.context == 1201,
+            "the deferred reset was not exactly one reset of this context");
+    require(!controller.backend_reset_pending(), "the reset left the intent armed");
+    // Every later boundary for the same context sees an empty intent and issues nothing: focus
+    // -out, pop, teardown and deactivation all run on the way out of the one event.
+    const auto again = controller.flush_backend_reset(ResetSource::FocusOut);
+    require(!again.issued && backend.reset_calls == 1, "a second boundary reset it again");
+    controller.destroy();
+    section("PASS R51 a composition terminated by the application resets the Host exactly once");
+  }
+  {
+    // The other order: a key arrives before any boundary. The key path is a flush like any
+    // other, so the boundary that follows must not add a second reset.
+    CountingBackend backend;
+    SemanticController controller(1202, 64, backend);
+    Document doc;
+    type(controller, doc, "n");
+    controller.note_composition_terminated();
+    require(controller.backend_reset_pending(), "the termination armed no reset intent");
+    const auto decision = controller.begin_key(physical('h'), true);
+    doc.apply(controller, decision);
+    require(backend.reset_calls == 1 && backend.last_reset.context == 1202,
+            "the key that arrived first did not run the armed reset");
+    require(!controller.backend_reset_pending(), "the key path left the intent armed");
+    const auto later = controller.flush_backend_reset(ResetSource::Pop);
+    require(!later.issued && backend.reset_calls == 1, "the key and the boundary reset it twice");
+    section("PASS R51 a key that arrives first runs the armed reset and the boundary adds none");
+  }
+}
 int main() {
   _set_error_mode(_OUT_TO_STDERR);
   _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -164,6 +239,7 @@ int main() {
   SectionCoverage coverage;
   try {
     fallback();
+    reset_after_external_termination();
     auto backend = make_fcitx_backend();
     SemanticController controller(901, 64, *backend);
     Document doc;

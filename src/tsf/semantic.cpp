@@ -300,10 +300,8 @@ SemanticDecision SemanticController::begin_real_key(const KeyAction &action, boo
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
-  if (backend_reset_pending_) {
-    backend_ready_ = real_backend_->reset(core_.binding());
-    backend_reset_pending_ = false;
-  }
+  if (backend_reset_pending_)
+    flush_backend_reset(ResetSource::Key);
   if (!backend_ready_ || !real_backend_->healthy()) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
@@ -456,10 +454,8 @@ SemanticDecision SemanticController::begin_candidate_action(CandidateAction acti
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
   }
-  if (backend_reset_pending_) {
-    backend_ready_ = real_backend_->reset(core_.binding());
-    backend_reset_pending_ = false;
-  }
+  if (backend_reset_pending_)
+    flush_backend_reset(ResetSource::Key);
   if (!backend_ready_ || !real_backend_->healthy()) {
     decision.route = SemanticDecision::Route::FailOpen;
     return decision;
@@ -943,6 +939,26 @@ void SemanticController::retire_terminals() {
   for (const Key &key : retired) {
     (void)core_.acknowledge(key);
   }
+}
+
+ResetFlush SemanticController::flush_backend_reset(ResetSource source) {
+  // One door for the intent `note_composition_terminated()` arms. The answer is the flag, not
+  // the caller's memory of why it came: whoever gets here first runs the reset and clears it,
+  // and every later arrival — a deferred wake-up, a boundary that flushed on the way out, the
+  // next key — sees an empty intent and does nothing. That is what makes the deferral safe to
+  // duplicate, and why a context that has already moved on needs no cancelling.
+  if (!real_backend_ || !backend_reset_pending_)
+    return {};
+  // The same call the key path makes, and the same treatment of its answer: a reset the Host
+  // refused ends this context's readiness, and the next dispatch re-establishes it through
+  // `ensure_semantic_ready`. Not retried here, because the link-loss case that would need a
+  // retry destroys the Host contexts anyway (the disconnect unbinds every one of them, and a
+  // rebind creates a fresh input context), so a retry could only block the thread again.
+  const bool ok = real_backend_->reset(core_.binding());
+  backend_ready_ = ok;
+  backend_reset_pending_ = false;
+  (void)source; // the name is for the caller's one log line; nothing here branches on it
+  return ResetFlush{true, ok};
 }
 
 void SemanticController::note_composition_reset() {

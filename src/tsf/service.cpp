@@ -30,6 +30,11 @@ constexpr GUID kIidTfInputScope{
 constexpr GUID kGuidPropInputScope{
     0x1713dd5a, 0x68e7, 0x4a5b, {0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d}};
 
+// R51: the class of the message-only window that carries a deferred Host reset to this thread's
+// message loop. Process-unique and registered with the executable's instance, like the candidate
+// window classes, so a TIP unload cannot leave a class pointing at unloaded code.
+constexpr const wchar_t kDeferredResetClassName[] = L"FusionTsfDeferredReset";
+
 // QI helper: wraps the new reference (QI addref'd) in a ComRef.
 template <typename T> ComRef<T> qi(IUnknown *object, const IID &iid) {
   T *raw = nullptr;
@@ -132,7 +137,37 @@ const char *route_name(SemanticDecision::Route route) {
 }
 
 // --- development diagnostics for one key event's chain (requirement J) ---
-void diag_key_arrival(ITfContext *pic, WPARAM vk, std::uint64_t context_id) {
+
+// R52: which modifier a physical event is, read from the same lparam fields the key
+// translation uses — the scan code in bits 16-23, the extended flag in bit 24. Null for every
+// key that is not a modifier.
+const char *modifier_name(WPARAM wparam, LPARAM lparam) {
+  const auto raw = static_cast<std::uint32_t>(lparam);
+  return modifier_identity(static_cast<std::uint32_t>(wparam), (raw >> 16) & 0xff,
+                           (raw & 0x01000000u) != 0);
+}
+
+// R52: the answer the TIP gave the application for the physical key this dispatch produced.
+// `eaten` is ownership, `forward` is the deliberate hand-back, `pass` is no claim at all.
+const char *dispatch_result(const SemanticDecision &decision) {
+  if (decision.eaten)
+    return "eaten";
+  if (decision.forward)
+    return "forward";
+  return "pass";
+}
+
+void diag_key_arrival(ITfContext *pic, WPARAM vk, LPARAM lparam, std::uint64_t context_id) {
+  // A modifier's identity is a key position, not content, so it is the one key fact this log
+  // may name. It replaces `vk=` rather than riding alongside it: the privacy policy reduces a
+  // details string carrying `vk=` to a marker, and the point of the line is that the two
+  // Ctrl/Shift/Alt keys and their press/release half can be told apart afterwards. Every other
+  // key keeps the shape it has always had, and so the redaction it has always had.
+  if (const char *mod = modifier_name(vk, lparam)) {
+    diagf("KEY_ARRIVAL", "mod=%s down ctx=%p cid=%" PRIu64, mod, static_cast<void *>(pic),
+          context_id);
+    return;
+  }
   diagf("KEY_ARRIVAL", "vk=0x%03llX ctx=%p cid=%" PRIu64, static_cast<unsigned long long>(vk),
         static_cast<void *>(pic), context_id);
 }
@@ -384,6 +419,11 @@ public:
           !service_->end_composition(*entry, ec))
         return false;
       entry->semantic.note_composition_terminated();
+      // R51: this cleanup ends the composition from inside a session, which is exactly where a
+      // Host call may not run. Arm the reset and let the message loop answer it; without this
+      // the entry keeps an intent only a later key would ever flush, and the Host context keeps
+      // its preedit for as long as that process lives.
+      service_->request_backend_reset(*entry, ResetSource::Terminated);
       return true;
     });
     if (!result)
@@ -788,6 +828,73 @@ private:
   std::uint64_t generation_;
 };
 
+// The thread's keyboard open/close state, read through one rule. Three places ask it — the
+// open declaration, the hard-policy gate and the sink below — and a value that arrives as
+// I4, UI4 or BOOL must not answer differently depending on which one asked. Empty means this
+// compartment would not say (the read failed, or it holds a type none of the three); each
+// caller keeps its own policy for that, because the two existing policies are deliberately
+// not the same.
+std::optional<bool> read_openclose(ITfCompartment *compartment) {
+  if (compartment == nullptr)
+    return std::nullopt;
+  VARIANT value;
+  VariantInit(&value);
+  const HRESULT hr = compartment->GetValue(&value);
+  std::optional<bool> state;
+  if (SUCCEEDED(hr)) {
+    if (value.vt == VT_I4)
+      state = value.lVal != 0;
+    else if (value.vt == VT_UI4)
+      state = value.uintVal != 0;
+    else if (value.vt == VT_BOOL)
+      state = value.boolVal != VARIANT_FALSE;
+  }
+  VariantClear(&value);
+  return state;
+}
+
+// R52: one notification per write of this thread's GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+// whoever made it. TSF gives the sink only the compartment's GUID, so the new value is read
+// back and the previous one is what this service last saw. Presentation and privacy only: no
+// decision in this TIP is made from a notification, and the hard-policy gate keeps reading the
+// compartment itself when a key arrives.
+class CompartmentSink final : public ITfCompartmentEventSink {
+public:
+  explicit CompartmentSink(TextService &service) : service_(&service) { service.AddRef(); }
+  ~CompartmentSink() { service_->Release(); }
+  CompartmentSink(const CompartmentSink &) = delete;
+  CompartmentSink &operator=(const CompartmentSink &) = delete;
+
+  STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfCompartmentEventSink)) {
+      *ppv = static_cast<ITfCompartmentEventSink *>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0)
+      delete this;
+    return count;
+  }
+
+  STDMETHODIMP OnChange(REFGUID rguid) override {
+    (void)rguid; // registered on the open/close compartment alone
+    service_->note_openclose_change();
+    return S_OK;
+  }
+
+private:
+  std::atomic<ULONG> ref_count_{1};
+  TextService *service_;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -821,7 +928,13 @@ TextService::TextService() {
         module_path);
 }
 
-TextService::~TextService() { destroy_all_entries("destroy"); }
+TextService::~TextService() {
+  destroy_all_entries("destroy");
+  // TSF deactivates before releasing, so Deactivate has normally closed this window already.
+  // Closing it here too is what keeps a wake-up that arrived after the last entry went away from
+  // finding a pointer to this service in the window's USERDATA slot.
+  close_deferred_reset_window();
+}
 
 STDMETHODIMP TextService::QueryInterface(REFIID riid, void **ppv) {
   if (ppv == nullptr) {
@@ -917,6 +1030,10 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr *ptim, TfClientId tid) {
   // covers the thread as it is at activation; a document manager that appears later is
   // declared once in OnSetFocus, and no key path writes the compartment (see
   // declare_keyboard_open).
+  //
+  // R52: the sink is installed first, so this activation's own declaration is itself one
+  // logged change rather than a write that happened before anyone was listening.
+  advise_openclose_sink();
   declare_keyboard_open("activation");
   diagf("ACTIVATE", "tid=%lu", static_cast<unsigned long>(tid));
   return S_OK;
@@ -939,6 +1056,16 @@ STDMETHODIMP TextService::Deactivate() {
       thread_event_cookie_ = 0;
     }
   }
+  // R52: the notification goes before anything else this teardown does, so a compartment write
+  // made while the service is unloading cannot arrive at a sink whose service is halfway gone.
+  unadvise_openclose_sink();
+  // R51: the thread is losing its TSF activation, so a wake-up posted to it may never be
+  // delivered. Every entry still holding an armed reset is flushed here, on the thread that
+  // armed it, outside an edit session; the teardown door below is the backstop for entries
+  // destroyed after this point.
+  for (auto &entry : entries_)
+    flush_backend_reset(*entry, ResetSource::Deactivate);
+  close_deferred_reset_window();
   if (lifecycle_obligation(LifecycleEvent::Deactivate).end_context)
     destroy_all_entries("deactivate");
   client_id_ = TF_CLIENTID_NULL;
@@ -963,8 +1090,13 @@ void TextService::reconcile_context_teardown(ContextEntry &entry, const char *re
       summarize_teardown(entry.semantic.core().records(), entry.semantic.pending().size());
   const std::uint64_t context_id = entry.semantic.context_id();
   hide_candidate_page(entry); // no candidate page survives its context teardown
-  entry.semantic.destroy();   // unbind the Host context; Core::fence() -> explicit terminals
-  entry.generation++;         // late edit sessions / pumps can no longer match this entry
+  // R51: the last door this entry can still answer through. Flushing before `destroy()` means
+  // the Host context is reset while it still exists and then unbound, so no entry is ever
+  // dropped with a reset left armed. Outside an edit session, so the call runs here rather
+  // than being posted.
+  flush_backend_reset(entry, ResetSource::Pop);
+  entry.semantic.destroy(); // unbind the Host context; Core::fence() -> explicit terminals
+  entry.generation++;       // late edit sessions / pumps can no longer match this entry
   if (summary.needs_audit()) {
     ++unresolved_teardowns_;
     std::size_t fenced_uncertain = 0;
@@ -1030,7 +1162,6 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   // Return in Notepad-- 3.4; R37 the editing keys in WeChat). The gate is deliberately
   // narrow — the measured editing/navigation keys and Return — because a configured
   // Fcitx global hotkey is handled with no composition and must still arrive.
-  (void)lparam;
   if (pfEaten == nullptr)
     return E_INVALIDARG;
   *pfEaten = FALSE;
@@ -1052,7 +1183,14 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   bool mapped = entry->semantic.routes_key(action) && entry->semantic.engine_has_work_for(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
-  diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);
+  if (const char *mod = modifier_name(wparam, lparam)) {
+    // T answers eligibility and dispatches nothing, so the two fields a dispatch would answer
+    // are written here as the constants they are — the key was not sent and has no result.
+    // The dispatch half of the same press is the `BACKEND` line in OnKeyDown.
+    diagf("TEST_KEY", "mod=%s down eligible=%d sent=0 result=none", mod, *pfEaten ? 1 : 0);
+  } else {
+    diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);
+  }
   return S_OK;
 }
 
@@ -1077,8 +1215,14 @@ STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lpa
   // application's, exactly as before. The answer is the same predicate OnKeyUp uses, so T
   // never claims a release K would refuse.
   *pfEaten = release_admissible(*entry, action);
-  diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
-        *pfEaten);
+  if (const char *mod = modifier_name(wparam, lparam)) {
+    // As in T for a press: the release test claims or declines, it never dispatches. Whether
+    // the release reached the engine and what it answered is the `BACKEND` line in OnKeyUp.
+    diagf("TEST_KEY_UP", "mod=%s up eligible=%d sent=0 result=none", mod, *pfEaten ? 1 : 0);
+  } else {
+    diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
+          *pfEaten);
+  }
   return S_OK;
 }
 
@@ -1109,18 +1253,33 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam,
   // settled out of order — the engine's own ModifierOnlyKeyTimeout expires the press it
   // recorded.
   if (!release_admissible(*entry, action)) {
-    diagf("RELEASE_DECLINED", "vk=0x%03llX policy=%d cleanup=%d pending=%zu user=%d",
-          static_cast<unsigned long long>(wparam), hard_policy_allows(*entry) ? 1 : 0,
-          entry->cleanup.pending() ? 1 : 0, entry->semantic.pending().size(),
-          entry->semantic.pass_probe() != fusion::Pass::Clear ? 1 : 0);
+    if (const char *mod = modifier_name(wparam, lparam)) {
+      // A declined release is the event R52 needs: which modifier, and which of the three
+      // gates it stopped at. Same fields, one shape that survives the privacy policy.
+      diagf("RELEASE_DECLINED", "mod=%s up policy=%d cleanup=%d pending=%zu user=%d", mod,
+            hard_policy_allows(*entry) ? 1 : 0, entry->cleanup.pending() ? 1 : 0,
+            entry->semantic.pending().size(),
+            entry->semantic.pass_probe() != fusion::Pass::Clear ? 1 : 0);
+    } else {
+      diagf("RELEASE_DECLINED", "vk=0x%03llX policy=%d cleanup=%d pending=%zu user=%d",
+            static_cast<unsigned long long>(wparam), hard_policy_allows(*entry) ? 1 : 0,
+            entry->cleanup.pending() ? 1 : 0, entry->semantic.pending().size(),
+            entry->semantic.pass_probe() != fusion::Pass::Clear ? 1 : 0);
+    }
     return S_OK;
   }
   entry->semantic.retire_terminals();
   auto lifetime_guard = hold_entry(entry);
   handling_key_ = true;
   const SemanticDecision decision = entry->semantic.release_key(action);
-  diagf("BACKEND", "symbolic=%s route=%s eaten=%d ops=%zu", decision.symbolic.c_str(),
-        route_name(decision.route), decision.eaten ? 1 : 0, decision.frontend.size());
+  if (const char *mod = modifier_name(wparam, lparam)) {
+    diagf("BACKEND", "mod=%s up sent=%d result=%s route=%s ops=%zu", mod,
+          decision.backend_session_id != 0 ? 1 : 0, dispatch_result(decision),
+          route_name(decision.route), decision.frontend.size());
+  } else {
+    diagf("BACKEND", "symbolic=%s route=%s eaten=%d ops=%zu", decision.symbolic.c_str(),
+          route_name(decision.route), decision.eaten ? 1 : 0, decision.frontend.size());
+  }
   if (decision.route != SemanticDecision::Route::FailOpen &&
       decision.route != SemanticDecision::Route::CancelledRecovery) {
     // The engine answers a modifier-only release with the same ordered document work a
@@ -1151,7 +1310,6 @@ STDMETHODIMP TextService::OnPreservedKey(ITfContext *pic, REFGUID rguid, BOOL *p
 }
 
 STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lparam, BOOL *pfEaten) {
-  (void)lparam;
   if (pfEaten == nullptr) {
     return E_INVALIDARG;
   }
@@ -1186,7 +1344,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
   const bool win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
   const KeyAction action = physical_key(wparam, lparam);
-  diag_key_arrival(pic, wparam, entry->semantic.context_id());
+  diag_key_arrival(pic, wparam, lparam, entry->semantic.context_id());
   diagf("CLASSIFY", "type=%d policy=%d ctrl=%d alt=%d win=%d", static_cast<int>(action.type),
         policy_allows ? 1 : 0, ctrl ? 1 : 0, alt ? 1 : 0, win ? 1 : 0);
 
@@ -1206,8 +1364,14 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
     return S_OK;
   }
   const SemanticDecision decision = entry->semantic.begin_key(action, policy_allows);
-  diagf("BACKEND", "symbolic=%s intent=%d route=%s eaten=%d", decision.symbolic.c_str(),
-        static_cast<int>(decision.intent), route_name(decision.route), decision.eaten ? 1 : 0);
+  if (const char *mod = modifier_name(wparam, lparam)) {
+    diagf("BACKEND", "mod=%s down sent=%d result=%s route=%s", mod,
+          decision.backend_session_id != 0 ? 1 : 0, dispatch_result(decision),
+          route_name(decision.route));
+  } else {
+    diagf("BACKEND", "symbolic=%s intent=%d route=%s eaten=%d", decision.symbolic.c_str(),
+          static_cast<int>(decision.intent), route_name(decision.route), decision.eaten ? 1 : 0);
+  }
 
   if (entry->semantic.real_frontend()) {
     // Observability (D072 §21): disconnect / reconnect / incarnation / connection
@@ -1348,15 +1512,22 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
   }
   // Presentation only (D072 §9): a candidate page attached to the document that
   // just lost focus must not stay visible or actionable in the wrong focused
-  // context. Hiding is the complete obligation here: no Host unbind, no
+  // context. The page obligation here is presentation alone: no Host unbind, no
   // incarnation advance, no projection or semantic-state discard. When focus
   // returns, the next admitted dispatch re-presents through sync_candidate_view.
   if (pdimPrevFocus != nullptr && pdimPrevFocus != pdimFocus) {
     for (auto &entry : entries_) {
       const bool was_in_previous =
           entry->document_mgr == pdimPrevFocus || context_reports_document(*entry, pdimPrevFocus);
-      if (was_in_previous)
+      if (was_in_previous) {
         hide_candidate_page(*entry);
+        // R51: a separate, narrower obligation than the page above. Focus leaving the document
+        // is the application saying it is done with this input even when it never destroyed the
+        // composition, so a preedit the Host still shows would have no owner any more. This
+        // callback carries no edit cookie and is already on the thread the reset belongs to, so
+        // it runs directly rather than being posted.
+        flush_backend_reset(*entry, ResetSource::FocusOut);
+      }
     }
   }
   return S_OK;
@@ -1403,6 +1574,10 @@ STDMETHODIMP TextService::OnPopContext(ITfContext *pic) {
     // layout change in it must not re-place a candidate window that belongs elsewhere.
     // The next push re-advises. The erased path unadvises through the destructor.
     entry->release_layout_sink();
+    // R51: popped and still alive, but this context is no longer the one being edited, so a
+    // preedit it left behind on the Host must not stay up while another context takes over.
+    // No edit cookie here either: the reset runs directly.
+    flush_backend_reset(*entry, ResetSource::Pop);
   }
   return S_OK;
 }
@@ -1439,6 +1614,11 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
             entry->cleanup.reconciled();
           })) {
         diagf("COMPOSITION_SELF_END", "cid=%" PRIu64, entry->semantic.context_id());
+        // R51: this path re-arms the intent the cleanup session just armed, and if that wake-up
+        // has already been spent the re-arm would otherwise sit unanswered. Asking again is the
+        // idempotent move: while the wake-up is still queued the arm coalesces into it and
+        // nothing extra is posted, and the reset itself runs only while the intent is armed.
+        request_backend_reset(*entry, ResetSource::Terminated);
         return S_OK;
       }
       // External authority event (D072 §9): reconcile the projection; queued
@@ -1457,6 +1637,10 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
             "cid=%" PRIu64 " owned=%zu pending_effects=%zu uncertain=%zu queued=%zu remaining=%zu",
             entry->semantic.context_id(), before.records, before.pending_effects, before.uncertain,
             before.queued, entry->semantic.pending().size());
+      // R51: the app ended the composition, so the Host still holds a preedit for input that
+      // no longer exists. `ecWrite` is TSF's edit cookie, so this callback is the one place the
+      // reset may not be attempted: hand the wake-up to this thread's loop instead.
+      request_backend_reset(*entry, ResetSource::Terminated);
       break;
     }
   }
@@ -1672,32 +1856,98 @@ bool TextService::declare_keyboard_open(const char *reason) {
     diagf("KEYBOARD_OPEN", "declared reason=%s unavailable=1", reason);
     return false;
   }
-  VARIANT current;
-  VariantInit(&current);
-  bool open = false;
-  if (SUCCEEDED(compartment->GetValue(&current))) {
-    open = (current.vt == VT_I4 && current.lVal != 0) ||
-           (current.vt == VT_UI4 && current.uintVal != 0) ||
-           (current.vt == VT_BOOL && current.boolVal != VARIANT_FALSE);
-  }
-  VariantClear(&current);
-  const bool was_closed = !open;
+  const bool was_closed = !read_openclose(compartment.get()).value_or(false);
   if (was_closed) {
     VARIANT value;
     VariantInit(&value);
     value.vt = VT_I4;
     value.lVal = 1;
+    // R52: the change sink is registered on this same compartment, so this is the write whose
+    // notification the service may honestly call its own. The marker spans the call: TSF
+    // delivers OnChange while it runs, and anything still in flight afterwards is not claimed.
+    openclose_self_write_ = true;
     const HRESULT hr = compartment->SetValue(client_id_, &value);
+    openclose_self_write_ = false;
     VariantClear(&value);
     if (FAILED(hr)) {
       diagf("KEYBOARD_OPEN", "declared reason=%s set_failed=0x%08lX", reason,
             static_cast<unsigned long>(hr));
       return false;
     }
-    open = true;
   }
   diagf("KEYBOARD_OPEN", "declared reason=%s was_closed=%d", reason, was_closed ? 1 : 0);
-  return open;
+  // The compartment reads open on both routes that reach here: it already did, or this call
+  // just wrote it.
+  return true;
+}
+
+void TextService::advise_openclose_sink() {
+  if (openclose_sink_cookie_ != 0 || !thread_mgr_)
+    return;
+  auto compartments = qi<ITfCompartmentMgr>(thread_mgr_.get(), IID_ITfCompartmentMgr);
+  if (!compartments) {
+    diagf("OPENCLOSE", "sink=unavailable reason=no-compartment-mgr");
+    return;
+  }
+  if (FAILED(compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+                                          openclose_compartment_.out())) ||
+      !openclose_compartment_) {
+    diagf("OPENCLOSE", "sink=unavailable reason=no-compartment");
+    return;
+  }
+  auto source = qi<ITfSource>(openclose_compartment_.get(), IID_ITfSource);
+  if (!source) {
+    diagf("OPENCLOSE", "sink=unavailable reason=no-source");
+    openclose_compartment_.reset();
+    return;
+  }
+  auto *sink = new CompartmentSink(*this);
+  DWORD cookie = 0;
+  const HRESULT hr =
+      source->AdviseSink(IID_ITfCompartmentEventSink, static_cast<IUnknown *>(sink), &cookie);
+  // As with the layout sink: the registration holds its own reference, so unadvising is what
+  // deletes the sink and this thread's creation reference is dropped either way.
+  sink->Release();
+  if (FAILED(hr) || cookie == 0) {
+    diagf("OPENCLOSE", "sink=unavailable reason=advise-failed hr=0x%08lX",
+          static_cast<unsigned long>(hr));
+    openclose_compartment_.reset();
+    return;
+  }
+  openclose_sink_cookie_ = cookie;
+  // Seed what the compartment says now, so the first change this activation sees can name the
+  // state it changed from instead of reporting `old=unknown`.
+  if (const auto state = read_openclose(openclose_compartment_.get()))
+    openclose_state_ = *state ? 1 : 0;
+}
+
+void TextService::unadvise_openclose_sink() {
+  if (openclose_sink_cookie_ != 0 && openclose_compartment_) {
+    if (auto source = openclose_compartment_.as<ITfSource>(IID_ITfSource))
+      source->UnadviseSink(openclose_sink_cookie_);
+  }
+  openclose_sink_cookie_ = 0;
+  openclose_compartment_.reset();
+  openclose_state_ = -1;
+  openclose_self_write_ = false;
+}
+
+bool TextService::take_openclose_self_write() { return openclose_self_write_.exchange(false); }
+
+void TextService::note_openclose_change() {
+  // The value is read back because `OnChange` carries only the compartment's GUID. A
+  // compartment that would not say is still a notification, and the line reports it as unknown
+  // rather than inventing a state.
+  const auto state =
+      read_openclose(openclose_compartment_ ? openclose_compartment_.get() : nullptr);
+  const int previous = openclose_state_.load();
+  openclose_state_ = state ? (*state ? 1 : 0) : -1;
+  const char *old_state = previous < 0 ? "unknown" : (previous == 0 ? "closed" : "open");
+  const char *new_state = !state ? "unknown" : (*state ? "open" : "closed");
+  // No cid on this line: GUID_COMPARTMENT_KEYBOARD_OPENCLOSE is a *thread* compartment, so the
+  // identity that owns it is the thread, which every log line already carries as `tid=`.
+  diagf("OPENCLOSE", "old=%s new=%s source=%s", old_state, new_state,
+        take_openclose_self_write() ? "self" : "other");
 }
 
 bool TextService::release_admissible(ContextEntry &entry, const KeyAction &action) {
@@ -1727,17 +1977,11 @@ bool TextService::hard_policy_allows(ContextEntry &entry) {
       if (SUCCEEDED(compartments->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
                                                  compartment.out())) &&
           compartment) {
-        VARIANT value;
-        VariantInit(&value);
-        if (SUCCEEDED(compartment->GetValue(&value))) {
-          const bool closed = (value.vt == VT_I4 && value.lVal == 0) ||
-                              (value.vt == VT_UI4 && value.uintVal == 0) ||
-                              (value.vt == VT_BOOL && value.boolVal == VARIANT_FALSE);
-          VariantClear(&value);
-          if (closed) {
-            diagf("HARD_POLICY", "openclose=closed");
-            return false;
-          }
+        // An unreadable compartment is not a policy verdict: only a compartment that does say
+        // "closed" blocks the key, exactly as before this reading was shared with the sink.
+        if (const auto state = read_openclose(compartment.get()); state && !*state) {
+          diagf("HARD_POLICY", "openclose=closed");
+          return false;
         }
       }
     }
@@ -2088,6 +2332,132 @@ void TextService::hide_candidate_page(ContextEntry &entry) {
   // exists to prevent. It buys nothing either: the session that does run reads the same
   // predicate and posts nothing for a page that is neither on screen nor deferred.
   hide_candidate_popup(entry.candidates.get(), entry.candidate_page_deferred);
+}
+
+void TextService::flush_backend_reset(ContextEntry &entry, ResetSource source) {
+  const ResetFlush flush = entry.semantic.flush_backend_reset(source);
+  // One line per reset that ran outside the key path, and only when one ran: an arrival for an
+  // intent another boundary already settled issues nothing and prints nothing, so the log counts
+  // resets rather than chances a reset was asked for. It carries no key, no text and no engine
+  // state — the reason names the boundary, `ok` is the Host's answer.
+  if (flush.issued && reset_is_deferred(source))
+    diagf("BACKEND_RESET", "reason=%s cid=%" PRIu64 " ok=%d", reset_source_name(source),
+          entry.semantic.context_id(), flush.ok ? 1 : 0);
+}
+
+bool TextService::register_deferred_reset_class() {
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
+  wc.lpfnWndProc = TextService::deferred_reset_proc;
+  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.lpszClassName = kDeferredResetClassName;
+  return RegisterClassExW(&wc) != 0;
+}
+
+LRESULT CALLBACK TextService::deferred_reset_proc(HWND hwnd, UINT message, WPARAM wparam,
+                                                  LPARAM lparam) {
+  auto *service = reinterpret_cast<TextService *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (message == deferred_reset_message && service != nullptr) {
+    service->drain_deferred_resets();
+    return 0;
+  }
+  // WM_NCDESTROY is the point after which nothing may name this service any more; the window is
+  // destroyed with the activation, and clearing the pointer makes any later message inert.
+  if (message == WM_NCDESTROY)
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+  return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool TextService::ensure_deferred_reset_window() {
+  if (deferred_reset_window_ != nullptr)
+    return true;
+  // Registered exactly once per process, the way the candidate window class is: a second
+  // RegisterClassExW for the same name would fail, so it is never attempted.
+  static const bool registered = register_deferred_reset_class();
+  if (!registered) {
+    diagf("BACKEND_RESET", "window=class-unavailable deferred=unavailable");
+    return false;
+  }
+  // HWND_MESSAGE: a message-only window, so it has no surface, no z-order and nothing to place
+  // — it exists to give this thread's queue one thing to deliver the wake-up to. Created on the
+  // thread that arms it, which is the thread TSF calls this service back on.
+  const HWND window = CreateWindowExW(0, kDeferredResetClassName, L"Fusion", WS_POPUP, 0, 0, 0, 0,
+                                      HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (window == nullptr) {
+    diagf("BACKEND_RESET", "window=create-failed win32=%lu deferred=unavailable",
+          static_cast<unsigned long>(GetLastError()));
+    return false;
+  }
+  SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+  deferred_reset_window_ = window;
+  return true;
+}
+
+void TextService::close_deferred_reset_window() {
+  // Dropping the queued intents and the window are one step: the entries they name are released
+  // with the queue, so nothing can hold a context alive after its teardown door has run, and a
+  // wake-up that arrives afterwards has no window to be delivered to. DestroyWindow runs
+  // WM_NCDESTROY synchronously, which is what clears this service out of the window's USERDATA.
+  deferred_resets_.take_all();
+  if (deferred_reset_window_ == nullptr)
+    return;
+  DestroyWindow(deferred_reset_window_);
+  deferred_reset_window_ = nullptr;
+}
+
+bool TextService::post_deferred_reset_wakeup() {
+  const bool delivered =
+      ensure_deferred_reset_window() &&
+      PostMessageW(deferred_reset_window_, deferred_reset_message, 0, 0) != FALSE;
+  if (!delivered) {
+    if (deferred_reset_window_ != nullptr)
+      diagf("BACKEND_RESET", "post-failed win32=%lu", static_cast<unsigned long>(GetLastError()));
+    // The intents stay queued and the in-flight mark is released, so the next arm — of this
+    // same entry or any other — posts again. Until it does, each entry still carries its own
+    // intent, which is exactly the state the boundary doors read.
+    deferred_resets_.cancel_in_flight();
+  }
+  return delivered;
+}
+
+void TextService::request_backend_reset(ContextEntry &entry, ResetSource source) {
+  // Called with an edit cookie in hand, so nothing may be asked of the Host here: the call would
+  // re-enter the document that is mid-callback and would hold the session open for the length of
+  // a pipe round trip. Arm and hand the wake-up to this thread's message loop instead.
+  if (!entry.semantic.backend_reset_pending())
+    return; // nothing armed: the key path or a boundary already settled it
+  if (!deferred_resets_.request(hold_entry(&entry), entry.generation, source))
+    return; // a wake-up for this batch is already in flight
+  (void)post_deferred_reset_wakeup();
+}
+
+void TextService::drain_deferred_resets() {
+  const auto intents = deferred_resets_.take_all();
+  if (intents.empty())
+    return;
+  if (handling_key_) {
+    // A wake-up is not allowed to start a Host call in the middle of another key's ownership
+    // handling, which is the one thing that can make a reset land between a claim and its
+    // settlement. Put the batch back and let the loop deliver it again — and ask for the wake-up
+    // this time, because a batch that is only re-queued has no message carrying it and would
+    // otherwise sit until some other context happened to arm one.
+    if (deferred_resets_.requeue(intents))
+      (void)post_deferred_reset_wakeup();
+    return;
+  }
+  for (const auto &intent : intents) {
+    ContextEntry *entry = intent.item.get();
+    if (entry == nullptr)
+      continue;
+    if (entry->generation != intent.generation) {
+      // The entry this intent named was torn down and its generation moved; the teardown door
+      // ran the reset (and unbound the Host context) on the way out, so there is nothing left
+      // for this wake-up to do.
+      diagf("FENCE", "kind=deferred-reset stale-entry cid=%" PRIu64, entry->semantic.context_id());
+      continue;
+    }
+    flush_backend_reset(*entry, intent.source);
+  }
 }
 
 void TextService::sync_candidate_view(ContextEntry &entry) {

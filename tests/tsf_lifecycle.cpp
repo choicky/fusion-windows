@@ -3,18 +3,20 @@
 //
 // Usage: tsf_lifecycle <obligation|teardown_clean|teardown_unresolved|
 //                       composition_terminated|identity_across_focus|context_isolation|
-//                       open_declaration>
+//                       open_declaration|deferred_reset>
 //
 // These are the platform-free decisions the real TSF sinks apply. They assert
 // *transitions* (what ended, what was reconciled, what stayed current), never
 // merely that a callback ran.
 
 #include "mock.hpp"
+#include "tsf/deferred_reset.hpp"
 #include "tsf/lifecycle.hpp"
 #include "tsf/open_declaration.hpp"
 #include "tsf/semantic.hpp"
 
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -356,13 +358,108 @@ void open_declaration() {
   std::cout << "PASS open_declaration\n";
 }
 
+// R51: who is owed a wake-up, how often, and what becomes of a batch that could not be
+// delivered. The queue carries no authority — the controller's own flag decides whether a
+// reset runs — so these checks settle bookkeeping only. Bookkeeping is exactly where a reset
+// would be stranded and a context left owing one with nobody scheduled to run it.
+void deferred_reset() {
+  using Queue = DeferredResetQueue<std::shared_ptr<int>>;
+  Queue queue;
+  auto first = std::make_shared<int>(1);
+  auto second = std::make_shared<int>(2);
+
+  // Only the boundaries that arrive inside a TSF callback defer; the key path is the safe
+  // place to run the reset and names its own source per log line.
+  require(reset_is_deferred(ResetSource::Terminated) && reset_is_deferred(ResetSource::FocusOut) &&
+              reset_is_deferred(ResetSource::Pop) && reset_is_deferred(ResetSource::Deactivate),
+          "every non-key boundary defers");
+  require(!reset_is_deferred(ResetSource::Key), "the key path never defers");
+  require(std::string(reset_source_name(ResetSource::Key)) == "key" &&
+              std::string(reset_source_name(ResetSource::Terminated)) == "terminated" &&
+              std::string(reset_source_name(ResetSource::FocusOut)) == "focus-out" &&
+              std::string(reset_source_name(ResetSource::Pop)) == "pop" &&
+              std::string(reset_source_name(ResetSource::Deactivate)) == "deactivate",
+          "each boundary names its own log line");
+
+  // The first intent of a batch is the one that must post the wake-up message.
+  require(queue.request(first, 7, ResetSource::Terminated), "the first intent asks for a wake-up");
+  require(queue.in_flight(), "the batch is on its way");
+
+  // A repeat for the same context at the same generation is coalesced into the intent already
+  // queued, and the wake-up already in flight covers it: one message, therefore one reset.
+  require(!queue.request(first, 7, ResetSource::FocusOut), "a coalesced intent asks for nothing");
+  require(queue.size() == 1, "the repeat did not add a second intent");
+  // A different generation of the same entry is a different intent — the entry was re-bound or
+  // torn down in between — and it still rides the message already in flight.
+  require(!queue.request(first, 8, ResetSource::Terminated),
+          "a new generation rides the wake-up already in flight");
+  require(queue.size() == 2, "the new generation is its own intent");
+  require(!queue.request(second, 7, ResetSource::Pop), "a second context rides the same wake-up");
+  require(queue.size() == 3, "the whole batch waits on one message");
+
+  // Taking the batch is what releases the claim, so from here the drain owns the intents.
+  auto intents = queue.take_all();
+  require(intents.size() == 3 && !queue.in_flight() && queue.size() == 0,
+          "the drain takes the whole batch and the claim with it");
+  require(intents.front().source == ResetSource::Terminated && intents.front().generation == 7,
+          "a coalesced intent keeps the boundary that armed it first");
+
+  // A duplicated or spurious wake-up finds nothing, and a no-op asks for no new message.
+  auto none = queue.take_all();
+  require(none.empty(), "a second wake-up finds an empty batch");
+  require(!queue.requeue(std::move(none)), "an empty batch asks for no message");
+
+  // A drain that found the thread busy puts the whole batch back. Taking it released the
+  // claim, so nothing else will deliver it: the batch put back must be re-posted.
+  require(queue.requeue(std::move(intents)), "a batch put back asks for a new wake-up");
+  require(queue.size() == 3 && queue.in_flight(), "the batch is queued and claimed again");
+
+  // The copy of a batch that was taken by a drain still running cannot ask twice; and once a
+  // post has failed, the claim is released while the intents stay, so the next arm — even a
+  // repeat of an intent already queued — asks for the wake-up that was lost. This is the case
+  // the claim exists for: without it a repeat answered "nothing to do" and stranded the batch.
+  queue.cancel_in_flight();
+  require(!queue.in_flight(), "the failed post released the claim");
+  require(queue.request(first, 7, ResetSource::Terminated),
+          "a repeat asks for the wake-up a failed post lost");
+  require(!queue.request(first, 7, ResetSource::Terminated),
+          "the second repeat rides the wake-up just claimed");
+  require(queue.size() == 3, "neither repeat added an intent");
+
+  // The bound keeps a thread that never pumps from growing without limit, one wake-up still
+  // covers the whole batch, and a refusal is counted rather than quiet.
+  Queue bounded;
+  std::vector<std::shared_ptr<int>> held;
+  held.reserve(Queue::kCapacity);
+  for (std::size_t index = 0; index < Queue::kCapacity; ++index)
+    held.push_back(std::make_shared<int>(static_cast<int>(index)));
+  bool asked = false;
+  for (auto &item : held)
+    asked = bounded.request(item, 1, ResetSource::Terminated) || asked;
+  require(asked && bounded.size() == Queue::kCapacity && bounded.in_flight(),
+          "a full batch rides one wake-up");
+  require(!bounded.request(std::make_shared<int>(999), 1, ResetSource::Pop),
+          "past the bound a new intent is refused");
+  require(bounded.saturated() == 1, "the refusal is counted");
+  require(!bounded.request(held.front(), 1, ResetSource::FocusOut),
+          "an intent already queued past the bound is not a further refusal");
+  require(bounded.saturated() == 1 && bounded.size() == Queue::kCapacity,
+          "the bound holds and nothing already queued was forgotten");
+  // Even at the bound, a batch taken by a drain and put back gets its wake-up re-claimed:
+  // a refusal never means an already-owed reset has nobody scheduled to run it.
+  auto freed = bounded.take_all();
+  require(freed.size() == Queue::kCapacity, "the drain takes the full batch");
+  require(bounded.requeue(std::move(freed)), "the full batch put back asks for a wake-up");
+  std::cout << "PASS deferred_reset\n";
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     std::cerr << "Usage: tsf_lifecycle <obligation|teardown_clean|teardown_unresolved|"
                  "composition_terminated|identity_across_focus|context_isolation|"
-                 "open_declaration>\n";
+                 "open_declaration|deferred_reset>\n";
     return 1;
   }
   const std::string mode = argv[1];
@@ -381,6 +478,8 @@ int main(int argc, char *argv[]) {
       context_isolation();
     else if (mode == "open_declaration")
       open_declaration();
+    else if (mode == "deferred_reset")
+      deferred_reset();
     else {
       std::cerr << "Unknown mode: " << mode << "\n";
       return 1;
