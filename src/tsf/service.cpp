@@ -2,6 +2,7 @@
 
 #include "tsf/anchor_probe.hpp"
 #include "tsf/build_identity.hpp"
+#include "tsf/candidate_presentation.hpp"
 #include "tsf/diag.hpp"
 #include "tsf/observation.hpp"
 
@@ -14,6 +15,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cwchar>
+#include <optional>
 
 namespace fusion::tsf {
 
@@ -716,7 +718,12 @@ public:
       return S_OK;
     entry->layout_reprobe_pending = false;
     probe_anchor(*entry, ec, ProbeTrigger::LayoutChange);
-    if (entry->candidate_anchor_valid && entry->candidates)
+    // The same question the delivered reposition asks, asked here: a page hidden while this
+    // session was queued has no reason to be posted a re-show for. Posting it anyway would
+    // leave the two decisions one message apart, and the message is the part that could
+    // disagree.
+    if (entry->candidate_anchor_valid && entry->candidates &&
+        popup_may_be_placed(entry->candidates->visible(), entry->candidate_page_deferred))
       entry->candidates->request_reposition();
     return S_OK;
   }
@@ -955,8 +962,7 @@ void TextService::reconcile_context_teardown(ContextEntry &entry, const char *re
   const TeardownSummary summary =
       summarize_teardown(entry.semantic.core().records(), entry.semantic.pending().size());
   const std::uint64_t context_id = entry.semantic.context_id();
-  if (entry.candidates)
-    entry.candidates->hide(); // no candidate page survives its context teardown
+  hide_candidate_page(entry); // no candidate page survives its context teardown
   entry.semantic.destroy();   // unbind the Host context; Core::fence() -> explicit terminals
   entry.generation++;         // late edit sessions / pumps can no longer match this entry
   if (summary.needs_audit()) {
@@ -1006,8 +1012,7 @@ STDMETHODIMP TextService::OnSetFocus(BOOL fForeground) {
   const LifecycleObligation obligation = lifecycle_obligation(LifecycleEvent::ThreadForeground);
   if (!fForeground) {
     for (auto &entry : entries_)
-      if (entry->candidates)
-        entry->candidates->hide();
+      hide_candidate_page(*entry);
   }
   diagf("FOCUS_FOREGROUND", "fg=%d entries=%zu end_context=%d", fForeground ? 1 : 0,
         entries_.size(), obligation.end_context ? 1 : 0);
@@ -1350,8 +1355,8 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
     for (auto &entry : entries_) {
       const bool was_in_previous =
           entry->document_mgr == pdimPrevFocus || context_reports_document(*entry, pdimPrevFocus);
-      if (was_in_previous && entry->candidates)
-        entry->candidates->hide();
+      if (was_in_previous)
+        hide_candidate_page(*entry);
     }
   }
   return S_OK;
@@ -1447,8 +1452,7 @@ STDMETHODIMP TextService::OnCompositionTerminated(TfEditCookie ecWrite,
       }
       entry->composition->Release();
       entry->composition = nullptr;
-      if (entry->candidates)
-        entry->candidates->hide(); // the composition the candidates belonged to is gone
+      hide_candidate_page(*entry); // the composition the candidates belonged to is gone
       diagf("COMPOSITION_TERMINATED",
             "cid=%" PRIu64 " owned=%zu pending_effects=%zu uncertain=%zu queued=%zu remaining=%zu",
             entry->semantic.context_id(), before.records, before.pending_effects, before.uncertain,
@@ -2073,15 +2077,26 @@ bool TextService::request_readonly_sync(ContextEntry &entry, ITfEditSession *ses
   return SUCCEEDED(outer) && SUCCEEDED(inner);
 }
 
+void TextService::hide_candidate_page(ContextEntry &entry) {
+  // One door, so no caller can hide a page and leave the entry looking like a page still
+  // waiting for its anchor: `sync_candidate_view`'s no-anchor path is the only place the
+  // flag is set, and it sets it from a creation that just succeeded.
+  // `layout_reprobe_pending` is deliberately not cleared here. It records an async edit
+  // session TSF still owes this context, not a popup state, and only that session's own run
+  // or `release_layout_sink` may settle it; clearing it on a hide would let a burst of
+  // notifications queue a second session behind the first, which is the pile-up the flag
+  // exists to prevent. It buys nothing either: the session that does run reads the same
+  // predicate and posts nothing for a page that is neither on screen nor deferred.
+  hide_candidate_popup(entry.candidates.get(), entry.candidate_page_deferred);
+}
+
 void TextService::sync_candidate_view(ContextEntry &entry) {
   if (!entry.semantic.real_frontend())
     return;
   const auto page = entry.semantic.displayed_page();
   if (!page) {
     // No displayed projection: an empty page (hide signal) or a fenced dispatch.
-    if (entry.candidates)
-      entry.candidates->hide();
-    entry.candidate_page_deferred = false;
+    hide_candidate_page(entry);
     diagf("CANDIDATE_VIEW", "hidden reason=no-page cid=%" PRIu64, entry.semantic.context_id());
     return;
   }
@@ -2101,13 +2116,15 @@ void TextService::sync_candidate_view(ContextEntry &entry) {
     // this one records the consequence.
     diagf("CANDIDATE_VIEW",
           "hidden reason=no-anchor deferred=1 cid=%" PRIu64, entry.semantic.context_id());
-    entry.candidates->hide(); // never show a page we cannot place near its text
+    hide_candidate_page(entry); // never show a page we cannot place near its text
     // A page deferred for want of an anchor is exactly the page a later layout change can
     // place: the store had not laid the text out yet, and it says so when it has. That
     // notification can only re-place a window that exists, and this page has never been
     // shown, so the popup is created here — hidden, under the owner the probe resolved —
-    // and the flag is what lets the notification path re-probe for it. A window that could
-    // not be created leaves the flag clear: the next key tries the whole path again.
+    // and the flag the hide just cleared is what lets the notification path re-probe for it.
+    // It is the one place a hide is followed by setting the flag again, and it is set from
+    // the creation actually succeeding: a window that could not be created leaves the flag
+    // clear, and the next key tries the whole path again.
     entry.candidate_page_deferred =
         entry.candidates->ensure_created(this, &entry, entry.generation, entry.candidate_owner,
                                          entry.candidate_owner_from_view);
@@ -2182,10 +2199,11 @@ void TextService::note_layout_change(void *entry, std::uint64_t generation) {
   // A page on screen has its placement re-read; a page deferred for want of an anchor has
   // nothing on screen *because* that anchor was missing, and this notification is what can
   // supply it. Both cases have a window for the reposition message: the deferred page's
-  // popup was created hidden at defer time for exactly this.
+  // popup was created hidden at defer time for exactly this. A page hidden between the
+  // projection and here is in neither case, and asks for no session at all.
   if (!target->semantic.real_frontend() || target->candidates == nullptr ||
       !target->semantic.displayed_page() ||
-      (!target->candidates->visible() && !target->candidate_page_deferred))
+      !popup_may_be_placed(target->candidates->visible(), target->candidate_page_deferred))
     return;
   if (target->layout_reprobe_pending || target->context == nullptr)
     return;
@@ -2212,21 +2230,16 @@ void TextService::place_candidate_from_anchor(void *entry, std::uint64_t generat
   }
   if (target->candidates == nullptr)
     return;
-  // An anchor that went missing between the re-probe and here is not a reason to move or
-  // remove a visible page; the next key path re-decides it through sync_candidate_view.
-  if (!target->candidate_anchor_valid)
-    return;
-  const auto page = target->semantic.displayed_page();
-  if (!page) {
-    // The page went away between the notification and here (a commit, a fenced dispatch):
-    // there is nothing left to place, and nothing left to wait for either.
-    target->candidate_page_deferred = false;
-    return;
-  }
-  target->candidates->show(*page, target->candidate_anchor);
-  // Whether this window was already on screen or is the deferred page being placed for the
-  // first time, it is now showing the current page at a resolved anchor.
-  target->candidate_page_deferred = false;
+  // What the page was when the request was made says nothing about what it is now. The
+  // popup may have been hidden since — focus moved, the context was torn down, the
+  // composition ended — and every one of those hides is a decision of its own. Re-showing
+  // here would put the old context's owned, topmost window above the application the user
+  // is in now, where they could click it; so the delivery reads the window and the flag,
+  // and refuses when neither says this page is still being presented.
+  const std::optional<CandidatePage> &page = target->semantic.displayed_page();
+  place_candidate_popup(*target->candidates, target->candidate_page_deferred,
+                        target->candidate_anchor_valid, page ? &*page : nullptr,
+                        target->candidate_anchor, target->semantic.context_id());
 }
 
 void TextService::on_candidate_hit(void *entry, std::uint64_t generation, CandidateAction action,

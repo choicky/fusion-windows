@@ -67,6 +67,16 @@ struct AnchorDecision {
 // text it belongs to, which is what every placement in this surface assumes.
 inline POINT anchor_of(const RECT &rect) { return POINT{rect.right, rect.bottom}; }
 
+// Which presentation requests a popup may act on: one that is on screen, or one that is off
+// screen *because* this context's text had no anchor yet — the page R46 defers. A popup hidden
+// for any other reason (focus moved, the context was torn down, the composition ended, the
+// projection emptied) was hidden on purpose, and a request made before that hide is stale.
+// Three sites ask this one question — the layout notification, the re-probe session it admits,
+// and the reposition message that session posts — and they must not answer it differently.
+constexpr bool popup_may_be_placed(bool popup_visible, bool page_deferred) noexcept {
+  return popup_visible || page_deferred;
+}
+
 // The one rule: a resolved rectangle wins and becomes this context's last-good anchor;
 // TS_E_NOLAYOUT with a previous successful probe keeps the page at that anchor; anything
 // else defers it, and the caller hides the page rather than placing it on a guess.

@@ -111,7 +111,9 @@ struct ContextEntry {
   // R46: a page exists but had no anchor to be placed at, so it is off screen waiting for a
   // layout change to supply one. Without the flag that page could never be re-placed: the
   // notification path only looked at a *visible* popup, and this one has nothing on screen.
-  // Cleared by any show, any hide, an empty page, and the teardown of the layout relationship.
+  // Cleared by any show, any hide (every product-path hide goes through
+  // `TextService::hide_candidate_page`), an empty page, and the teardown of the layout
+  // relationship — so a page hidden because focus moved is never waiting for a layout.
   bool candidate_page_deferred = false;
 };
 
@@ -229,6 +231,15 @@ private:
   void settle_frontend_work(ContextEntry &entry, const SemanticDecision &decision, BOOL *pfEaten);
   // Show, reposition or hide the candidate surface from the controller projection.
   void sync_candidate_view(ContextEntry &entry);
+  // The one door every product-path hide goes through: the page leaves the screen and this
+  // context stops waiting for a layout to place it. Clearing the flag is what makes a hide
+  // final — `popup_may_be_placed` then refuses both a reposition that was queued while the
+  // page was on screen and a later layout notification — because R49 makes the popup owned and
+  // topmost, so a page that came back on its own would come back above whatever the user has
+  // focused now, and would be clickable. `layout_reprobe_pending` is not this door's business:
+  // it records an async session TSF still owes the context, and only that session's own run or
+  // `release_layout_sink` settles it.
+  void hide_candidate_page(ContextEntry &entry);
   // R46: advise this context's ITfTextLayoutSink (through ITfSource on ITfContext) while
   // the entry is live, and stop when TSF pops the context. Idempotent in both directions:
   // an entry that already has the registration is not advised twice, and a context that

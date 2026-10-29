@@ -8,6 +8,10 @@
 // TSF: a rectangle wins, a refusal with a previous good place keeps that place, and anything
 // else defers. This check feeds the decision the shapes the probe produces and reads the
 // consequences back; the TSF shell that calls it is unchanged arithmetic around these answers.
+// The same holds for the fence a re-place request reads when it is delivered: which page a
+// request may act on is a question about the two flags the entry carries, and the three sites
+// that ask it (the notification, the session it admits, the message that session posts) ask
+// this one function. What a real window does when it is delivered to is candidate_window_layout.
 //
 // What it does NOT cover: which call produced each observation (that is the probe's own
 // plumbing, and the owner checklist reads its log lines), and a real application's layout
@@ -48,6 +52,7 @@ fusion::tsf::AnchorObservation failed(HRESULT hr, const char *source) {
 
 using fusion::tsf::decide_anchor;
 using fusion::tsf::LastGoodAnchor;
+using fusion::tsf::popup_may_be_placed;
 using fusion::tsf::ProbeTrigger;
 
 // The value Firefox and the search box return, spelled from the same constant the probe
@@ -172,11 +177,29 @@ void an_empty_rect_still_places_at_its_corner() {
   CHECK(decision.anchor.x == 77 && decision.anchor.y == 88);
 }
 
+void only_a_page_still_being_presented_may_be_re_placed() {
+  // The question a re-place request asks when it is delivered — and the same question the
+  // layout notification and the re-probe session ask, which is why they spell it once here
+  // instead of three times in the shell. A page is re-placed when it is on screen (the
+  // placement moved) or when it is off screen *because* this context had no anchor for it
+  // (the R46 page a layout change can place). Anything else was hidden on purpose: focus
+  // moved, the context was torn down, the composition ended, the projection emptied.
+  CHECK(popup_may_be_placed(true, false));
+  CHECK(popup_may_be_placed(false, true));
+  // A window on screen with the flag left set from an earlier probe is still a page the user
+  // is looking at: visibility answers first, so the stale flag cannot refuse it.
+  CHECK(popup_may_be_placed(true, true));
+  // The case the defect is: nothing on screen, nothing waiting.
+  CHECK(!popup_may_be_placed(false, false));
+}
+
 } // namespace
 
 int main() {
   static_assert(kNoLayout == MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x0206),
                 "the code under test must be the documented TS_E_NOLAYOUT");
+  static_assert(popup_may_be_placed(false, false) == false,
+                "a hidden page that is not deferred must be refused, not re-shown");
   rect_wins_and_becomes_last_good();
   a_refusal_without_a_previous_place_defers();
   a_refusal_with_a_previous_place_keeps_it();
@@ -185,6 +208,7 @@ int main() {
   the_caret_fallback_is_a_source_like_any_other();
   deferred_then_a_layout_change_places_it();
   an_empty_rect_still_places_at_its_corner();
+  only_a_page_still_being_presented_may_be_re_placed();
   if (failures == 0)
     std::printf("tsf_anchor_probe: ok\n");
   std::fprintf(stderr, "tsf_anchor_probe: %d check(s) failed\n", failures);
