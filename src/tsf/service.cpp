@@ -1159,9 +1159,12 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   // hand back, which the application handles itself. A claim made here cannot be
   // retracted in K: the application routes the key to the TIP and does not deliver it
   // natively when K answers "not eaten", so an overstated claim loses the key (R36
-  // Return in Notepad-- 3.4; R37 the editing keys in WeChat). The gate is deliberately
-  // narrow — the measured editing/navigation keys and Return — because a configured
-  // Fcitx global hotkey is handled with no composition and must still arrive.
+  // Return in Notepad-- 3.4; R37 the editing keys in WeChat; R53 F2/F5 in Explorer, and
+  // every letter after the Shift toggle to English in Notepad++). The gate is the narrowest
+  // set engine_has_work_for can state honestly — the measured idle-forwarded keys, the keys
+  // whose engine handling needs a live composition, and the state the engine itself reported
+  // for this context — because a configured Fcitx hotkey on one of those keys is handled
+  // with no composition and would be swallowed by a wider rule.
   if (pfEaten == nullptr)
     return E_INVALIDARG;
   *pfEaten = FALSE;

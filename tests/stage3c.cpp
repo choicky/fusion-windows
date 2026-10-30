@@ -21,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 25;
+constexpr int kExpectedSections = 29;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -379,14 +379,16 @@ int main() {
     require(!denied.backend_session_id && !denied.eaten, "hard policy dispatched");
     controller.destroy();
     section("PASS real Backspace/Return and hard-policy gate");
-    // R37 control, the other half of the same rule: a configured Fcitx global hotkey is
-    // engine work with **nothing** composing, so the shell must keep claiming it. F6 is
-    // installed as this isolated instance's own "toggle input method" hotkey
-    // (Hotkey/TriggerKeys) — a global action this runtime has two methods for, so the
-    // engine really acts on it. The composition is committed first, so no composition, no
-    // candidate page and a clear pass barrier are in place when F6 arrives. Asserting
-    // only routes_key would prove nothing about the path — the point is that the engine
-    // acts on the key and that T lets it through.
+    // R37 control, the other half of the same rule, as R53 changed it: a configured Fcitx
+    // global hotkey is handled by the engine with **nothing** composing, and the shell used to
+    // keep claiming the key it was bound to. R53 rule 2 stops claiming the function row while
+    // idle, because Explorer — which honours OnTestKeyDown alone — then loses F2 and F5, and
+    // the shell cannot tell a bound F6 from an unbound one without asking Fcitx. What is
+    // still asserted is the other half: F6 is installed as this isolated instance's own
+    // "toggle input method" hotkey (Hotkey/TriggerKeys) and the engine really does act on it
+    // when the key reaches it, so the stopgap costs a user who binds one of these keys that
+    // binding in the applications that route the key from T, not the engine's ability to act.
+    // The full key matrix measures what replaces the rule.
     {
       auto hotkey_backend = make_fcitx_backend(FcitxBackendOptions{false, "F6"});
       require(hotkey_backend != nullptr, "global hotkey fixture backend");
@@ -401,8 +403,8 @@ int main() {
       const auto f6 = translate_key(0x75, false, false, false); // VK_F6
       require(f6.keysym == 0xffc3 && !f6.modified, "F6 translation");
       require(hotkey.routes_key(f6), "a configured global hotkey is still an engine key class");
-      require(hotkey.engine_has_work_for(f6),
-              "T must keep claiming a configured global hotkey with nothing composing");
+      require(!hotkey.engine_has_work_for(f6),
+              "R53 rule 2: T no longer claims an idle function key, even one Fcitx has bound");
       const auto global = hotkey.begin_key(f6, true);
       std::cout << "idle F6 eaten=" << (global.eaten ? 1 : 0)
                 << " forward=" << (global.forward ? 1 : 0)
@@ -413,10 +415,22 @@ int main() {
       require(hotkey.finish_pass(), "global hotkey barrier");
       // F6 turned the input method off. The same key has to turn it back on: a global key is
       // handled before any input method and does not need an active context, so the inactive
-      // state must still dispatch character-less keys and let the engine decide.
+      // state must still dispatch character-less keys and let the engine decide. The letter in
+      // between is claimed under the mode the F6 batch reported (on), the engine hands it back,
+      // and the shell delivers it once — R53's first-key fact reached through a different
+      // toggle, so it is asserted the same way.
+      const auto committed_before_english = hotkey_doc.committed;
       auto english = hotkey.begin_key(physical('n'), true);
-      require(english.forward && english.frontend.empty(),
-              "the inactive state still composed instead of passing the key through");
+      std::cout << "F6 off letter forward=" << (english.forward ? 1 : 0)
+                << " eaten=" << (english.eaten ? 1 : 0) << " ops=" << english.frontend.size()
+                << '\n';
+      require(!english.forward && english.eaten && english.frontend.size() == 1 &&
+                  english.frontend.front().operation.type == BackendOperation::Type::CommitText &&
+                  english.frontend.front().operation.text == "n",
+              "the letter after the F6 toggle was not delivered exactly once");
+      hotkey_doc.apply(hotkey, english);
+      require(hotkey_doc.committed == committed_before_english + "n",
+              "the letter after the F6 toggle did not appear exactly once");
       const auto reactivate = hotkey.begin_key(f6, true);
       std::cout << "inactive F6 eaten=" << (reactivate.eaten ? 1 : 0)
                 << " forward=" << (reactivate.forward ? 1 : 0)
@@ -487,8 +501,18 @@ int main() {
                 std::to_string(static_cast<int>(english.route)) +
                 " forward=" + std::to_string(english.forward ? 1 : 0) +
                 " ops=" + std::to_string(english.frontend.size()));
-        require(english.forward && english.frontend.empty(),
-                "English still fed the engine instead of passing the key through");
+        // R53 stopgap: the first key after the toggle is claimed under the mode the toggle's
+        // own batch reported (on), and the engine — now off — hands it back, so the shell
+        // delivers it once instead of dropping it in the applications that route the key from T.
+        const auto committed_before_english = d.committed;
+        require(!english.forward && english.eaten && english.frontend.size() == 1 &&
+                    english.frontend.front().operation.type ==
+                        BackendOperation::Type::CommitText &&
+                    english.frontend.front().operation.text == "n",
+                "the first English key after the toggle was not delivered exactly once");
+        d.apply(c, english);
+        require(d.committed == committed_before_english + "n",
+                "the first English key after the toggle did not appear exactly once");
         // While inactive the context resolves Items/0 — the other Pinyin scheme — and a
         // character-less key is still dispatched, because that is how a configured global
         // hotkey turns the input method back on. With nothing composing the off slot hands
@@ -567,7 +591,13 @@ int main() {
         d.apply(c, c.release_key(release));
         require(!c.routes_release(release), "a repeated release is not relayed twice");
         auto english = c.begin_key(physical('n'), true);
-        require(english.forward && english.frontend.empty(),
+        // One toggle means the engine is off, so the first key is handed back and delivered
+        // once; three toggles would leave it on and compose instead. The shape below is what
+        // separates those two, not the old "forwarded with nothing delivered".
+        require(!english.forward && english.eaten && english.frontend.size() == 1 &&
+                    english.frontend.front().operation.type ==
+                        BackendOperation::Type::CommitText &&
+                    english.frontend.front().operation.text == "n",
                 "repeated Shift presses toggled more than once");
         section("PASS repeated Shift press toggles once");
         c.destroy();
@@ -650,7 +680,10 @@ int main() {
         auto right_release = press_shift(c, kVkRShift, kScanShiftRight);
         d.apply(c, c.release_key(right_release));
         auto english = c.begin_key(physical('n'), true);
-        require(english.forward && english.frontend.empty(),
+        require(!english.forward && english.eaten && english.frontend.size() == 1 &&
+                    english.frontend.front().operation.type ==
+                        BackendOperation::Type::CommitText &&
+                    english.frontend.front().operation.text == "n",
                 "the configured Shift_R binding did not toggle");
         section("PASS the configured modifier-only key decides");
         c.destroy();
@@ -683,7 +716,8 @@ int main() {
       da.apply(a, a.release_key(a_release));
       require(da.preedit.empty(), "the toggle did not end A's composition");
       const auto a_english = a.begin_key(physical('n'), true);
-      require(a_english.forward && a_english.frontend.empty(),
+      require(!a_english.forward && a_english.eaten && a_english.frontend.size() == 1 &&
+                  a_english.frontend.front().operation.text == "n",
               "A did not pass through into English before B was bound");
       // Bind B and type into it. Its InputState is active; the instance's mostRecent is B.
       SemanticController b(981, 64, *two_backend);
@@ -735,7 +769,8 @@ int main() {
       require(off.eaten && !off.forward && off.frontend.empty(), "the F6 fixture did not turn A off");
       require(a.finish_pass(), "global hotkey barrier");
       const auto a_english = a.begin_key(physical('n'), true);
-      require(a_english.forward && a_english.frontend.empty(),
+      require(!a_english.forward && a_english.eaten && a_english.frontend.size() == 1 &&
+                  a_english.frontend.front().operation.text == "n",
               "A stayed composing instead of passing through after F6");
       SemanticController b(991, 64, *f6_backend);
       Document db;
@@ -1039,6 +1074,358 @@ int main() {
       }
       section("PASS symbols: every printable ASCII key reaches the document, the engine keeps "
               "the punctuation it maps, and a declined symbol is delivered by the shell");
+    }
+
+    // R53 rule 2: the character-less keys the owner reported lost in Explorer — F2 renames
+    // nothing, F5 refreshes nothing — measured here against the pinned engine with nothing
+    // composing, in its default configuration, reached by a real composition and a real
+    // commit so that "idle" is the engine's own state and not the absence of any state. Each
+    // line prints the engine's answer for the key and then the shell's new T answer for it.
+    {
+      auto idle_backend = make_fcitx_backend();
+      SemanticController idle_keys(980, 64, *idle_backend);
+      Document idle_doc;
+      type(idle_keys, idle_doc, "nihao");
+      const auto idle_commit =
+          idle_keys.begin_key(translate_key(kVkSpace, false, false, false), true);
+      require(idle_commit.eaten && !idle_commit.frontend.empty(), "R53 idle fixture commit");
+      idle_doc.apply(idle_keys, idle_commit);
+      require(idle_keys.finish_pass(), "R53 idle fixture commit barrier");
+      require(idle_keys.raw_buffer().empty() && !idle_keys.displayed_page().has_value() &&
+                  idle_keys.pass_probe() == fusion::Pass::Clear,
+              "the R53 idle case is not actually idle");
+      const std::pair<std::uint32_t, const char *> function_row[] = {
+          {0x70, "F1"}, {0x71, "F2"}, {0x74, "F5"}, {0x7b, "F12"}, {0x87, "F24"}};
+      for (const auto &[vk, name] : function_row) {
+        const auto action = translate_key(vk, false, false, false);
+        const bool claimed = idle_keys.engine_has_work_for(action);
+        std::cout << "idle " << name << " keysym=0x" << std::hex << action.keysym << std::dec
+                  << " eligible=" << (claimed ? 1 : 0) << '\n';
+        require(!claimed, "T still claims an idle function key the engine hands back");
+        const auto handed = idle_keys.begin_key(action, true);
+        std::cout << "idle " << name << " forward=" << (handed.forward ? 1 : 0)
+                  << " eaten=" << (handed.eaten ? 1 : 0)
+                  << " route=" << static_cast<int>(handed.route)
+                  << " ops=" << handed.frontend.size() << '\n';
+        require(handed.forward && !handed.eaten && handed.frontend.empty() &&
+                    handed.route == SemanticDecision::Route::Pass,
+                "the pinned engine did not hand this idle key back to the application");
+        require(idle_keys.finish_pass(), "idle R53 key barrier");
+      }
+      // The rest of rule 2's set carries no keysym in this shell's table, so the shell has
+      // never presented one of them to the engine: T refused them before the rule and refusing
+      // them again changes nothing on the product path. Measured, not assumed.
+      const std::pair<std::uint32_t, const char *> never_presented[] = {
+          {0x5d, "Apps"},        {0x2c, "PrintScreen"}, {0x13, "Pause"},
+          {0xa6, "BrowserBack"}, {0xad, "VolumeDown"},  {0xb3, "MediaPlayPause"},
+          {0xb7, "LaunchApp2"}};
+      for (const auto &[vk, name] : never_presented) {
+        const auto action = translate_key(vk, false, false, false);
+        std::cout << "idle " << name << " keysym=0x" << std::hex << action.keysym << std::dec
+                  << " presented=" << (idle_keys.routes_key(action) ? 1 : 0)
+                  << " eligible=" << (idle_keys.engine_has_work_for(action) ? 1 : 0) << '\n';
+        require(!idle_keys.routes_key(action),
+                "this shell presents an idle character-less key to the engine");
+        require(!idle_keys.engine_has_work_for(action),
+                "T claims an idle character-less key it never sends");
+      }
+      // Asked of the engine directly with their own X11 keysyms — the only way these keys reach
+      // it, and the shape the shell would send them in — the idle engine hands each one back,
+      // so its default configuration binds none of them. This is the evidence rule 2 rests on
+      // for keys the shell cannot otherwise present. A context of its own, because a dispatch
+      // that bypasses the controller advances the engine's stimulus ordering and no later key
+      // of this controller would be accepted.
+      {
+        auto ask_backend = make_fcitx_backend();
+        SemanticController asked_keys(982, 64, *ask_backend);
+        // One forwarded key binds the context, and binding is what activates it: after this
+        // line the engine is in its on state with nothing composing, which is the state rule 2
+        // is about.
+        const auto bind_key = asked_keys.begin_key(translate_key(0x70, false, false, false), true);
+        (void)asked_keys.finish_pass();
+        std::cout << "ask context bound raw_empty=" << (asked_keys.raw_buffer().empty() ? 1 : 0)
+                  << " page=" << (asked_keys.displayed_page().has_value() ? 1 : 0)
+                  << " forward=" << (bind_key.forward ? 1 : 0) << '\n';
+        require(asked_keys.raw_buffer().empty() && !asked_keys.displayed_page().has_value(),
+                "the direct-probe fixture is not idle");
+        const std::pair<std::uint32_t, const char *> engine_asked[] = {
+            {0xff13, "Pause"}, {0xff14, "ScrollLock"}, {0xff61, "Print"}, {0xff67, "Menu"}};
+        const Binding asked_binding{982, 1, 1};
+        std::uint64_t asked = 1000;
+        for (const auto &[keysym, name] : engine_asked) {
+          BackendStimulus probe{asked_binding, ++asked};
+          probe.type = BackendStimulus::Type::Return;
+          probe.keysym = keysym;
+          const auto answer = ask_backend->send(probe);
+          std::cout << "idle engine " << name << " handed_back="
+                    << (answer.disposition == BackendBatch::Disposition::Forward ? 1 : 0) << '\n';
+          require(answer.disposition == BackendBatch::Disposition::Forward,
+                  "the idle engine took this character-less key for itself");
+        }
+        asked_keys.destroy();
+      }
+      // ScrollLock is the key this rule got wrong the first time, and the correction is the case
+      // worth keeping. `VK_SCROLL` is **0x91** in winuser.h; 0x45 is the letter E. The earlier
+      // note read the two as one key, so rule 2 skipped ScrollLock for a collision that does not
+      // exist. The engine's own answer for it is in the probe above — `{0xff14, "ScrollLock"}`
+      // hands the key back — so the rule reaches it, and the letter E keeps the admission it
+      // always had: a stopgap does not trade a key the owner types for one nobody presses.
+      const auto scroll_lock = translate_key(kVkScroll, false, false, false);
+      const auto letter_e = translate_key(0x45, false, false, false, U'e');
+      std::cout << "idle scroll-lock vk=0x" << std::hex << scroll_lock.virtual_key << std::dec
+                << " type=" << static_cast<int>(scroll_lock.type)
+                << " eligible=" << (idle_keys.engine_has_work_for(scroll_lock) ? 1 : 0)
+                << " letter-e-eligible=" << (idle_keys.engine_has_work_for(letter_e) ? 1 : 0)
+                << '\n';
+      require(scroll_lock.virtual_key == 0x91 && scroll_lock.type == KeyAction::Type::Pass,
+              "VK_SCROLL is not 0x91, or it no longer classifies as a character-less key");
+      require(!idle_keys.engine_has_work_for(scroll_lock),
+              "rule 2 still claims ScrollLock while the engine is idle");
+      require(idle_keys.engine_has_work_for(letter_e), "rule 2 refused the letter E");
+      type(idle_keys, idle_doc, "e");
+      require(!idle_doc.preedit.empty(), "the letter E no longer starts a composition");
+      std::cout << "idle E preedit=[" << idle_doc.preedit << "]\n";
+      // The ordered records this composition produced have to be settled before the next one:
+      // the Cancel is a decision like any other, and its callbacks are the shell's to apply.
+      const auto cancel_e =
+          idle_keys.begin_key(translate_key(kVkEscape, false, false, false), true);
+      idle_doc.apply(idle_keys, cancel_e);
+      require(idle_keys.finish_pass(), "idle E barrier");
+      // Composing: the same keys keep exactly the answer they had before the rule, because a
+      // composition may have bound one of them and that is the engine's decision, not this
+      // shell's.
+      type(idle_keys, idle_doc, "nihao");
+      require(idle_keys.displayed_page().has_value(), "no page to compose with");
+      for (const auto &[vk, name] : {std::pair<std::uint32_t, const char *>{0x71, "F2"},
+                                     std::pair<std::uint32_t, const char *>{0x74, "F5"}}) {
+        const auto composing = translate_key(vk, false, false, false);
+        std::cout << "composing " << name
+                  << " eligible=" << (idle_keys.engine_has_work_for(composing) ? 1 : 0) << '\n';
+        require(idle_keys.engine_has_work_for(composing),
+                "a function key was gated while a composition was live");
+      }
+      const auto cancel_page =
+          idle_keys.begin_key(translate_key(kVkEscape, false, false, false), true);
+      idle_doc.apply(idle_keys, cancel_page);
+      (void)idle_keys.finish_pass();
+      idle_keys.destroy();
+      section("PASS R53 rule 2: the pinned engine hands every idle function and media key "
+              "back, and T stops claiming them while a live composition keeps its answer");
+    }
+
+    // R53 rule 1: with the engine in its off state T claims nothing but the bare Shift. The
+    // state is learned from the batch the engine itself answered, so the case is reached the
+    // way the owner reached it — type 你好, one lone Shift, type again — and the letters that
+    // follow are the Notepad++ case: they reach the engine, the engine is not composing, and
+    // an application that honours T alone never gets them back.
+    {
+      auto english_backend = make_fcitx_backend();
+      SemanticController english(981, 64, *english_backend);
+      Document english_doc;
+      const auto shift =
+          translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+      const auto letter = physical('n');
+      // Before any batch has answered, the shell keeps the admission it had: a state the
+      // engine never reported cannot refuse a key the engine may want.
+      require(english.engine_has_work_for(letter),
+              "an unreported engine state already refused a letter");
+      require(english.engine_has_work_for(shift), "the bare Shift is no longer admitted");
+      type(english, english_doc, "nihao");
+      auto release = shift;
+      const auto press = english.begin_key(release, true);
+      require(press.forward && press.frontend.empty(), "the engine did not hand the Shift back");
+      release.release = true;
+      require(english.routes_release(release), "a lone Shift release is relayed");
+      english_doc.apply(english, english.release_key(release));
+      require(english.raw_buffer().empty(), "the toggle left a projection");
+      // The first letter after the toggle is the one that carries the answer: the engine is now
+      // in its off state and hands the character back, while the cached mode still says the key
+      // was claimed under an active engine. That is R44's fact one batch later, so the shell
+      // delivers the character exactly once instead of dropping it (R53 stopgap).
+      const auto committed_before_first = english_doc.committed;
+      const auto first = english.begin_key(letter, true);
+      std::cout << "english first letter forward=" << (first.forward ? 1 : 0)
+                << " eaten=" << (first.eaten ? 1 : 0) << " route=" << static_cast<int>(first.route)
+                << " ops=" << first.frontend.size() << '\n';
+      require(!first.forward && first.eaten && first.frontend.size() == 1 &&
+                  first.frontend.front().operation.type == BackendOperation::Type::CommitText &&
+                  first.frontend.front().operation.text == "n",
+              "the first letter after the toggle was not delivered exactly once");
+      english_doc.apply(english, first);
+      require(english_doc.committed == committed_before_first + "n",
+              "the first letter after the toggle did not appear exactly once");
+      require(english.finish_pass(), "English letter barrier");
+      require(english.raw_buffer().empty() && !english.displayed_page().has_value(),
+              "the Host kept a preedit in the engine's off state");
+      std::cout << "english committed=[" << english_doc.committed << "]\n";
+      // The state has now been reported, and every key class the rule is about is refused —
+      // except the one key that can report the state back the other way.
+      const std::pair<KeyAction, const char *> refused[] = {
+          {physical('n'), "letter"},
+          {physical('5'), "digit"},
+          {physical(','), "punctuation"},
+          {translate_key(0x74, false, false, false), "F5"},
+          {translate_key(kVkReturn, false, false, false), "Return"},
+          {translate_key(kVkEscape, false, false, false), "Escape"},
+      };
+      for (const auto &[action, name] : refused) {
+        const bool claimed = english.engine_has_work_for(action);
+        std::cout << "inactive " << name << " keysym=0x" << std::hex << action.keysym << std::dec
+                  << " eligible=" << (claimed ? 1 : 0) << '\n';
+        require(!claimed, "T still claims a key while the engine reports its off state");
+      }
+      require(english.engine_has_work_for(shift),
+              "the bare Shift was refused, so the toggle back would be unreachable");
+      // And back: the press of the same key is dispatched while the engine is off, and its
+      // batch reports the engine active again, so the letters compose once more.
+      auto back_release = shift;
+      const auto press_back = english.begin_key(back_release, true);
+      require(press_back.frontend.empty(), "the returning Shift press produced callbacks");
+      back_release.release = true;
+      english_doc.apply(english, english.release_key(back_release));
+      require(english.engine_has_work_for(letter),
+              "the engine's on state was not learned back from its own batch");
+      const auto before = english_doc.committed.size();
+      type(english, english_doc, "nihao");
+      require(english_doc.committed.size() > before || !english_doc.preedit.empty(),
+              "the toggle back did not return to composing");
+      std::cout << "english back preedit=[" << english_doc.preedit << "]\n";
+      english.destroy();
+      section("PASS R53 rule 1: an engine that reports its off state leaves T every key but "
+              "the bare Shift, and the same Shift learns the on state back");
+    }
+    // R53 stopgap, the rest of the first-key case. A digit and punctuation are the same fact as
+    // a letter, but they reach the application by whichever of the two paths T leaves open: a
+    // digit is not claimed with no candidate page (so it never left), punctuation is claimed and
+    // the engine hands it back (so the fallback delivers it). Either way it appears exactly once,
+    // which is what the owner's "nothing lost, nothing doubled" means.
+    {
+      const std::pair<KeyAction, std::string> first_keys[] = {{physical('5'), "5"},
+                                                              {physical(','), ","}};
+      int context_id = 984;
+      for (const auto &[first_key, expected] : first_keys) {
+        auto first_backend = make_fcitx_backend();
+        SemanticController c(context_id++, 64, *first_backend);
+        Document d;
+        type(c, d, "nihao");
+        const auto shift =
+            translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        const auto press = c.begin_key(shift, true);
+        require(press.forward && press.frontend.empty(), "the engine did not hand the Shift back");
+        auto release = shift;
+        release.release = true;
+        require(c.routes_release(release), "a lone Shift release is relayed");
+        d.apply(c, c.release_key(release));
+        const auto claimed = c.engine_has_work_for(first_key);
+        const auto committed_before = d.committed;
+        std::cout << "first key [" << expected << "] claimed=" << (claimed ? 1 : 0) << '\n';
+        if (!claimed) {
+          // The application's key: nothing was dispatched, so it is delivered once, natively.
+          require(d.committed == committed_before && d.preedit.empty(),
+                  "a key T left alone still reached the document through the shell");
+        } else {
+          const auto answer = c.begin_key(first_key, true);
+          std::cout << "first key [" << expected << "] forward=" << (answer.forward ? 1 : 0)
+                    << " eaten=" << (answer.eaten ? 1 : 0) << " ops=" << answer.frontend.size()
+                    << '\n';
+          require(!answer.forward && answer.eaten && answer.frontend.size() == 1 &&
+                      answer.frontend.front().operation.type ==
+                          BackendOperation::Type::CommitText &&
+                      answer.frontend.front().operation.text == expected,
+                  "a first key after the toggle was not delivered exactly once");
+          d.apply(c, answer);
+          require(d.committed == committed_before + expected,
+                  "a first key after the toggle did not appear exactly once");
+          // The batch that delivered it also taught the shell the engine is off, so the keys
+          // after it are the application's. When T never claimed the key there was no batch to
+          // learn from, and the cached mode stays as it was — which the fallback then covers
+          // on the next key that is claimed.
+          require(!c.engine_has_work_for(physical('n')),
+                  "the key after the first one was still claimed in T");
+        }
+        c.destroy();
+      }
+      // Only a printable key is delivered this way. A key with no character keeps the route it
+      // had: there is nothing to deliver, and owning it would swallow it (R36's Return, R37's
+      // editing keys), so the fallback must leave it alone.
+      const std::pair<KeyAction, const char *> characterless[] = {
+          {translate_key(kVkReturn, false, false, false), "Return"},
+          {translate_key(kVkEscape, false, false, false), "Escape"},
+          {translate_key(0x09, false, false, false), "Tab"},
+          {translate_key(0x74, false, false, false), "F5"},
+      };
+      int characterless_id = 994;
+      for (const auto &[first_key, name] : characterless) {
+        auto cl_backend = make_fcitx_backend();
+        SemanticController c(characterless_id++, 64, *cl_backend);
+        Document d;
+        type(c, d, "nihao");
+        const auto shift =
+            translate_key(kVkLShift, false, false, false, 0, false, false, kScanShiftLeft);
+        (void)c.begin_key(shift, true);
+        auto release = shift;
+        release.release = true;
+        require(c.routes_release(release), "a lone Shift release is relayed");
+        d.apply(c, c.release_key(release));
+        const auto committed_before = d.committed;
+        const auto answer = c.begin_key(first_key, true);
+        std::cout << "first key " << name << " forward=" << (answer.forward ? 1 : 0)
+                  << " eaten=" << (answer.eaten ? 1 : 0) << " ops=" << answer.frontend.size()
+                  << '\n';
+        require(answer.forward && answer.frontend.empty() && d.committed == committed_before,
+                "a character-less first key was delivered instead of handed back");
+        c.destroy();
+      }
+      section("PASS R53 first key after the toggle: a digit and punctuation appear exactly once");
+    }
+
+    // R53 stopgap, Codex P1: a candidate action must not teach rule 1 the engine's mode. The
+    // Host's is_candidate_action branch has no key event to report from, so its batch carries
+    // `context_was_active` false whatever the engine is doing; recording that would make the
+    // next letter the application's and the owner would type English until pressing Shift.
+    {
+      // Compose, act on the list the way the popup does, then keep typing.
+      auto after = [](int context_id, const char *name, int rows, FcitxBackendOptions options,
+                      auto &&act) {
+        auto list_backend = make_fcitx_backend(std::move(options));
+        SemanticController c(context_id, 64, *list_backend);
+        Document d;
+        if (rows)
+          c.set_window_rows(rows);
+        type(c, d, "nihao");
+        require(c.displayed_page().has_value(), "no page to act on");
+        act(c, d);
+        require(c.finish_pass(), "candidate action barrier");
+        const auto letter = physical('n');
+        const bool claimed = c.engine_has_work_for(letter);
+        std::cout << "after " << name << " letter claimed=" << (claimed ? 1 : 0) << '\n';
+        require(claimed, "a candidate action made T refuse the next letter");
+        auto next = c.begin_key(letter, true);
+        require(next.eaten && !next.frontend.empty() &&
+                    next.route != SemanticDecision::Route::CancelledRecovery,
+                "the letter after a candidate action did not reach the engine");
+        d.apply(c, next);
+        require(!d.preedit.empty(), "the letter after a candidate action did not compose");
+        std::cout << "after " << name << " preedit=[" << d.preedit << "]\n";
+        c.destroy();
+      };
+      after(987, "a mouse selection", 0, {}, [](SemanticController &c, Document &d) {
+        const auto decision = c.begin_candidate_action(CandidateAction::Select, 0);
+        d.apply(c, decision);
+      });
+      after(988, "a page turn", 0, {}, [](SemanticController &c, Document &d) {
+        const auto decision = c.begin_candidate_action(CandidateAction::PageNext, 0);
+        d.apply(c, decision);
+      });
+      // The cursor move exists only in the scrolling arrangement, so this case asks for it.
+      FcitxBackendOptions scrolling;
+      scrolling.fixture_candidate_layout = "AutoScroll";
+      after(989, "a cursor move", 3, scrolling, [](SemanticController &c, Document &d) {
+        SemanticDecision decision;
+        require(c.begin_candidate_cursor(1, decision), "the scroll window refused a cursor move");
+        d.apply(c, decision);
+      });
+      section("PASS R53 P1: a candidate action leaves rule 1's cached mode alone");
     }
     return 0;
   } catch (const std::exception &e) {

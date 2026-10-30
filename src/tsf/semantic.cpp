@@ -62,6 +62,24 @@ std::optional<std::string> forwarded_character(const BackendStimulus &stimulus) 
   return text;
 }
 
+// R53: whether this stimulus is a key the engine evaluates — a press or a release. The
+// candidate actions (select, paging, cursor move) act on a list the engine already produced;
+// they carry no key identity, and the Host's is_candidate_action branch never reports a
+// context state for one, so a batch answering a candidate action says nothing about the mode.
+bool is_key_stimulus(BackendStimulus::Type type) {
+  switch (type) {
+  case BackendStimulus::Type::SelectCandidate:
+  case BackendStimulus::Type::SelectCandidateGlobal:
+  case BackendStimulus::Type::PageNext:
+  case BackendStimulus::Type::PagePrev:
+  case BackendStimulus::Type::CursorPrev:
+  case BackendStimulus::Type::CursorNext:
+    return false;
+  default:
+    return true;
+  }
+}
+
 } // namespace
 
 SemanticController::SemanticController(std::uint64_t context_id, std::size_t capacity,
@@ -222,6 +240,10 @@ void SemanticController::fence_previous_incarnation() {
   // A press the previous connection received is not one this one may settle.
   shift_forwarded_.reset();
   shift_pressed_keysym_ = 0;
+  // R53: the on/off state the previous connection reported is not this instance's answer.
+  // A new Host starts from the profile, so the shell is back to knowing nothing about this
+  // context until its first batch speaks for it.
+  last_context_active_.reset();
   // The previous incarnation's candidate page is not the new one's projection;
   // it must not be displayed or acted on after the link moved.
   clear_displayed_page();
@@ -617,6 +639,11 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   }
   const bool engine_declined =
       original_forward || batch.disposition == BackendBatch::Disposition::Forward;
+  // R53 rule 1's cached mode, as it stood *before* this batch. The engine answers with the
+  // state the context was in for the key it just handled, so this batch's answer is the next
+  // key's starting point — and the fallback below needs the state the key being answered was
+  // claimed under, not the state it left behind.
+  const std::optional<bool> context_was_active_before = last_context_active_;
   decision.forward = engine_declined;
   decision.eaten = !decision.forward;
   std::optional<CandidatePage> captured;
@@ -673,7 +700,19 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   // alone (a digit, an idle editing key) keeps the route it had, the key that first activates
   // a context stays the application's, and the inactive-context pass-through is not an engine
   // decision at all.
-  if (engine_declined && claimed_in_t && batch.context_was_active) {
+  //
+  // R53 stopgap, the first key after the toggle into English. The Shift that turns the engine
+  // off is answered while the engine was still on, so that batch reports `context_was_active`
+  // true and the cached mode stays true; the letter that follows is therefore claimed in T and
+  // the engine, now off, forwards it with `context_was_active` false. That is R44's own fact —
+  // a key T claimed and the engine handed back — one batch later, so it is delivered the same
+  // way, and the condition below adds exactly that case and no other. A silent Host death
+  // reaches the same shape — the reconnect's fresh context reports false while the cached mode
+  // still says true — so that first key is delivered once here too, and stage4b silentdeath
+  // records that as the contract (owner decision 2026-10-30).
+  const bool context_turned_off =
+      !batch.context_was_active && context_was_active_before == true;
+  if (engine_declined && claimed_in_t && (batch.context_was_active || context_turned_off)) {
     if (const auto text = forwarded_character(stimulus)) {
       if (auto key = core_.own(Kind::Effect, true)) {
         decision.frontend.push_back({{BackendOperation::Type::CommitText, *text, {}}, *key});
@@ -683,6 +722,16 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
       }
     }
   }
+  // R53 rule 1: record the mode, but only from a batch of key stimuli the Host itself
+  // evaluated. A candidate action never sets `context_was_active` — the Host's
+  // is_candidate_action branch has no key event to report from — so recording one would read
+  // "the engine said nothing" as "the engine is off", and rule 1 would then refuse every
+  // letter after a single mouse selection. A batch the transport never delivered is not a
+  // report either: that would turn a link failure into "the input method is off". A rejected
+  // batch returned above and records nothing.
+  if (is_key_stimulus(stimulus.type) &&
+      real_backend_->link_status().state == LinkState::Established)
+    last_context_active_ = batch.context_was_active;
   if (decision.frontend.empty()) {
     if (!decision.forward) {
       // Consumed without a document callback still receives an explicit terminal.
@@ -767,6 +816,14 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // Fcitx's decision, taken from its configuration; this shell keeps no state for it.
   if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR)
     return true;
+  // R53 rule 1, taken from chewing's OnTestKeyDown (windows-chewing-tsf,
+  // crates/chewing_tip_host/src/text_service/chewing.rs): an engine in its off state has no
+  // input method to compose with, so it is not the owner of any key except the modifier that
+  // turns it back on. This shell learns that state from the batch the engine itself answered
+  // (see last_context_active_), and before any batch has answered it keeps the admission it
+  // had: a state the engine never reported cannot refuse a key the engine may want.
+  if (last_context_active_ == false)
+    return false;
   // A digit is engine work only while the engine will select a candidate with it. Measured
   // on the pinned pinyin engine (stage3c): with no candidate page it answers a digit with
   // ForwardKey — there is nothing to select — while a page on screen makes the same key
@@ -775,6 +832,13 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // R36 and R37 fixed for Return and the editing keys.
   if (is_candidate_digit(action))
     return digit_selects_a_candidate(action);
+  // R53 rule 2, the same source and the same reason: with nothing composing, the pinned
+  // engine answers every key in idle_forwarded_noncharacter with ForwardKey under its default
+  // configuration, so a claim here is a claim the engine hands back — and Explorer, which
+  // honours T alone, then never renames or refreshes (R53). While something *is* composing
+  // these keys keep today's answer, because the composition may have bound one of them.
+  if (idle_forwarded_noncharacter(action) && !engine_has_composition_work())
+    return false;
   // Every key this shell admitted before R37 keeps its admission; only the keys whose
   // Fcitx handling needs a live composition are gated on the composition state.
   if (!editing_key_needs_composition(action))
@@ -820,6 +884,32 @@ bool SemanticController::editing_key_needs_composition(const KeyAction &action) 
   case kKeysymHome:
   case kKeysymEnd:
   case kKeysymReturn:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool SemanticController::idle_forwarded_noncharacter(const KeyAction &action) {
+  // A non-character key means one the shell classifies as carrying no composition text. The
+  // classification is the guard here rather than the virtual key alone, because a character key
+  // is engine text whatever its virtual key says; the virtual key then names the key classes
+  // below, which is how the rule stays legible against winuser.h.
+  if (action.type != KeyAction::Type::Pass)
+    return false;
+  // The virtual key, not the keysym: the function row is the only one of these the shell
+  // translates into a keysym at all, and a rule about which keys the *engine* owns is stated
+  // most honestly over the key the user physically pressed.
+  const std::uint32_t vk = action.virtual_key;
+  if (vk >= kVkF1 && vk <= kVkF24)
+    return true;
+  if (vk >= kVkBrowserBack && vk <= kVkLaunchApp2)
+    return true; // browser, volume, media and launch keys
+  switch (vk) {
+  case kVkPause:
+  case kVkSnapshot:
+  case kVkApps:
+  case kVkScroll:
     return true;
   default:
     return false;
