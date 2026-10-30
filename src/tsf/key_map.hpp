@@ -61,13 +61,13 @@ inline constexpr std::uint32_t kVkRWin = 0x5C;
 // nothing composes, so a claim made for one of them in T is a claim the engine hands back.
 // Named here so the admission rule, its tests and the key matrix cannot drift apart. The two
 // endpoints of the function-key row and of the browser/volume/media/launch block are Windows'
-// own: F1..F24 = 0x70..0x87, VK_BROWSER_BACK..VK_LAUNCH_APP2 = 0xA6..0xB7. ScrollLock is
-// deliberately absent: VK_SCROLL is 0x45, the same virtual key this shell classifies as the
-// letter E, so a rule that reached it would refuse E — and a stopgap must not trade away a key
-// the owner types for one nobody presses.
+// own: F1..F24 = 0x70..0x87, VK_BROWSER_BACK..VK_LAUNCH_APP2 = 0xA6..0xB7 (winuser.h).
+// ScrollLock is `VK_SCROLL` = 0x91 in winuser.h — 0x45 is the letter E — and it belongs to
+// this set for the same reason as the others: an idle engine forwards it.
 inline constexpr std::uint32_t kVkPause = 0x13;
 inline constexpr std::uint32_t kVkSnapshot = 0x2C;
 inline constexpr std::uint32_t kVkApps = 0x5D;
+inline constexpr std::uint32_t kVkScroll = 0x91; // VK_SCROLL, winuser.h
 inline constexpr std::uint32_t kVkF1 = 0x70;
 inline constexpr std::uint32_t kVkF24 = 0x87;
 inline constexpr std::uint32_t kVkBrowserBack = 0xA6;

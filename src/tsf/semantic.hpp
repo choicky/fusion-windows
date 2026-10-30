@@ -291,10 +291,11 @@ private:
   // so the development fixture keeps its previous routing.
   bool engine_has_composition_work() const;
   // R53 rule 2: the character-less keys the pinned engine forwards with nothing composing
-  // (the function row, Apps, PrintScreen, Pause and the browser/volume/media/launch block).
-  // Only a key the classification carries no character for is in the set: VK_SCROLL is 0x45,
-  // which is also the letter E here, so the type guard is what keeps E typable. Measured in
-  // stage3c under the engine's default configuration, not inferred from the key class.
+  // (the function row, Apps, PrintScreen, Pause, ScrollLock and the browser/volume/media/launch
+  // block). Only a key the classification carries no character for is in the set, so a letter
+  // is never refused by it — `VK_SCROLL` is 0x91 in winuser.h and has nothing to do with 0x45.
+  // Measured in stage3c under the engine's default configuration, not inferred from the key
+  // class.
   static bool idle_forwarded_noncharacter(const KeyAction &action);
   // Whether this key is engine work only while a composition has something for it: the
   // editing/navigation keys Fcitx handles inside its non-empty-input branch, plus Return
@@ -330,12 +331,19 @@ private:
   std::optional<CandidatePage> displayed_page_;
   PageFence displayed_fence_;
   bool page_present_ = false;
-  // R53 rule 1: whether the engine was in its on state for the key the last batch answered.
-  // This is the only shape the engine's mode reaches the TIP in — an input-method name never
-  // crosses the pipe — and it is per context, because Fcitx keeps the state per context.
-  // nullopt until a batch has answered: before the first dispatch this shell keeps the
-  // admission it had, because it has no fact to admit or refuse on.
+  // R53 rule 1: whether the engine was in its on state for the key the last **key** batch
+  // answered. This is the only shape the engine's mode reaches the TIP in — an input-method
+  // name never crosses the pipe — and it is per context, because Fcitx keeps the state per
+  // context. Only a press or a release records it: a candidate action's batch carries no key
+  // event, so its `context_was_active` is the field's default and not an answer. nullopt until
+  // a key batch has answered: before the first dispatch this shell keeps the admission it had,
+  // because it has no fact to admit or refuse on.
   std::optional<bool> last_context_active_;
+  // The backend session the cached mode above was learned from. A reconnect after a silent Host
+  // death starts a new session without moving the incarnation bookkeeping, and its context's
+  // answer is not a report about the mode the previous session left behind — so one batch of a
+  // new session teaches nothing, and nothing is delivered through it.
+  std::uint64_t last_dispatch_session_ = 0;
 };
 
 } // namespace fusion::tsf

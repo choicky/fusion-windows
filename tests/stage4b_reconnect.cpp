@@ -1404,21 +1404,25 @@ void test_silent_death_sequence() {
   const std::vector<KeyTrace> traces = trace_nihao_and_commit(*controller, visible);
   print_traces("silentdeath: type immediately after the restart", traces, visible);
 
-  // What the implementation actually does, stated as the regression contract:
-  // the first physical key cannot be proven to have reached any Host, so it stays
-  // caller-owned and is forwarded to the application (Stage 4A boundary); the
-  // following key reconnects to the new incarnation and is served from its fresh
-  // state. The resulting visible text is therefore the forwarded prefix plus the
-  // new incarnation's commit of the remaining keys.
-  require(!traces.empty() && traces.front().forward && !traces.front().eaten,
-          "the first key after a silent death is forwarded, not owned");
-  require(traces.front().committed.empty(), "the forwarded key commits nothing");
+  // What the implementation does, stated as the regression contract. It used to be that the
+  // first physical key could not be proven to have reached any Host, so it stayed caller-owned
+  // and was forwarded (Stage 4A boundary). That rule loses the key in exactly the applications
+  // this round is about: a window that honours OnTestKeyDown alone never delivers a key the
+  // shell claimed in T, so "hand it back" means "it never arrives" (R53, Notepad++). The shell
+  // therefore delivers the character itself — once, the same character the Linux frontend would
+  // have passed on — and the following key reconnects to the new incarnation and is served from
+  // its fresh state. Owner decision, 2026-10-30.
+  require(!traces.empty() && !traces.front().forward && traces.front().eaten,
+          "the first key after a silent death is delivered, not handed back");
+  require(traces.front().committed == "n", "the first printable key commits exactly its character");
   require(!traces[1].forward && traces[1].eaten, "the second key reaches the new incarnation");
   require(client.incarnation() != incarnation_before, "a new incarnation is established");
   require(client.link_status().connection_generation == generation_before + 1,
           "exactly one new connection generation");
   require(controller->semantic_ready(), "semantic readiness is re-established");
-  require(visible.rfind("n", 0) == 0, "the application received the forwarded prefix");
+  require(visible.rfind("n", 0) == 0, "the application received the delivered prefix");
+  require(visible.find("n", 1) == std::string::npos,
+          "the first key appears exactly once: no duplicate, no loss");
   require(visible.size() > 1, "the new incarnation committed the remaining input");
 
   // Phase 2: the operational sequence that actually re-establishes the link. A
@@ -1433,7 +1437,11 @@ void test_silent_death_sequence() {
   const std::uint64_t incarnation_stale = client.incarnation();
   const std::uint64_t generation_stale = client.link_status().connection_generation;
 
-  const SemanticDecision detect = controller->begin_key(space_key(), true);
+  // A character-less key, deliberately: this phase is about the link lifecycle, and R53's
+  // delivery rule is about printable keys only — Phase 1 above is where that rule is asserted.
+  // Keeping this key character-less leaves every assertion below about detection alone.
+  const SemanticDecision detect =
+      controller->begin_key(translate_key(kVkReturn, false, false, false), true);
   std::printf("  [detection key] route=%d eaten=%d forward=%d ops=%zu link_state=%d\n",
               static_cast<int>(detect.route), detect.eaten ? 1 : 0, detect.forward ? 1 : 0,
               detect.operation_count, static_cast<int>(client.link_status().state));
@@ -1458,6 +1466,13 @@ void test_silent_death_sequence() {
           "exactly one new connection generation");
   require(controller->semantic_ready(), "semantic readiness is re-established");
   (void)settle_frontend(*controller, reestablish);
+
+  // This is the other restart shape: the incarnation moved before the key was typed, so
+  // fence_previous_incarnation() reset the cached mode and the shell has no fact to refuse on.
+  // The first key is therefore admitted, and the text below is the proof that it arrives
+  // exactly once — nothing lost, nothing doubled.
+  require(controller->engine_has_work_for(translate_key('n', false, false, false)),
+          "the first key after the cached mode was reset is refused");
 
   std::string visible_primed;
   const std::vector<KeyTrace> primed = trace_nihao_and_commit(*controller, visible_primed);

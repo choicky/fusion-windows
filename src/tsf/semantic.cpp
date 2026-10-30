@@ -62,6 +62,24 @@ std::optional<std::string> forwarded_character(const BackendStimulus &stimulus) 
   return text;
 }
 
+// R53: whether this stimulus is a key the engine evaluates — a press or a release. The
+// candidate actions (select, paging, cursor move) act on a list the engine already produced;
+// they carry no key identity, and the Host's is_candidate_action branch never reports a
+// context state for one, so a batch answering a candidate action says nothing about the mode.
+bool is_key_stimulus(BackendStimulus::Type type) {
+  switch (type) {
+  case BackendStimulus::Type::SelectCandidate:
+  case BackendStimulus::Type::SelectCandidateGlobal:
+  case BackendStimulus::Type::PageNext:
+  case BackendStimulus::Type::PagePrev:
+  case BackendStimulus::Type::CursorPrev:
+  case BackendStimulus::Type::CursorNext:
+    return false;
+  default:
+    return true;
+  }
+}
+
 } // namespace
 
 SemanticController::SemanticController(std::uint64_t context_id, std::size_t capacity,
@@ -621,12 +639,11 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   }
   const bool engine_declined =
       original_forward || batch.disposition == BackendBatch::Disposition::Forward;
-  // R53 rule 1: this is the engine reporting its own state for this context, and the only
-  // place that report reaches the TIP. A batch the transport never delivered is not a report
-  // — recording one would read "the Host could not be reached" as "the input method is off"
-  // and refuse every key because of a link failure.
-  if (real_backend_->link_status().state == LinkState::Established)
-    last_context_active_ = batch.context_was_active;
+  // R53 rule 1's cached mode, as it stood *before* this batch. The engine answers with the
+  // state the context was in for the key it just handled, so this batch's answer is the next
+  // key's starting point — and the fallback below needs the state the key being answered was
+  // claimed under, not the state it left behind.
+  const std::optional<bool> context_was_active_before = last_context_active_;
   decision.forward = engine_declined;
   decision.eaten = !decision.forward;
   std::optional<CandidatePage> captured;
@@ -683,7 +700,19 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   // alone (a digit, an idle editing key) keeps the route it had, the key that first activates
   // a context stays the application's, and the inactive-context pass-through is not an engine
   // decision at all.
-  if (engine_declined && claimed_in_t && batch.context_was_active) {
+  //
+  // R53 stopgap, the first key after the toggle into English. The Shift that turns the engine
+  // off is answered while the engine was still on, so that batch reports `context_was_active`
+  // true and the cached mode stays true; the letter that follows is therefore claimed in T and
+  // the engine, now off, forwards it with `context_was_active` false. That is R44's own fact —
+  // a key T claimed and the engine handed back — one batch later, so it is delivered the same
+  // way, and the condition below adds exactly that case and no other. A silent Host death
+  // reaches the same shape — the reconnect's fresh context reports false while the cached mode
+  // still says true — so that first key is delivered once here too, and stage4b silentdeath
+  // records that as the contract (owner decision 2026-10-30).
+  const bool context_turned_off =
+      !batch.context_was_active && context_was_active_before == true;
+  if (engine_declined && claimed_in_t && (batch.context_was_active || context_turned_off)) {
     if (const auto text = forwarded_character(stimulus)) {
       if (auto key = core_.own(Kind::Effect, true)) {
         decision.frontend.push_back({{BackendOperation::Type::CommitText, *text, {}}, *key});
@@ -693,6 +722,16 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
       }
     }
   }
+  // R53 rule 1: record the mode, but only from a batch of key stimuli the Host itself
+  // evaluated. A candidate action never sets `context_was_active` — the Host's
+  // is_candidate_action branch has no key event to report from — so recording one would read
+  // "the engine said nothing" as "the engine is off", and rule 1 would then refuse every
+  // letter after a single mouse selection. A batch the transport never delivered is not a
+  // report either: that would turn a link failure into "the input method is off". A rejected
+  // batch returned above and records nothing.
+  if (is_key_stimulus(stimulus.type) &&
+      real_backend_->link_status().state == LinkState::Established)
+    last_context_active_ = batch.context_was_active;
   if (decision.frontend.empty()) {
     if (!decision.forward) {
       // Consumed without a document callback still receives an explicit terminal.
@@ -853,8 +892,9 @@ bool SemanticController::editing_key_needs_composition(const KeyAction &action) 
 
 bool SemanticController::idle_forwarded_noncharacter(const KeyAction &action) {
   // A non-character key means one the shell classifies as carrying no composition text. The
-  // classification, not the virtual key, is the guard here because VK 0x45 is both the letter
-  // E and ScrollLock: a rule that reached past the type would refuse 0x45 and so refuse E.
+  // classification is the guard here rather than the virtual key alone, because a character key
+  // is engine text whatever its virtual key says; the virtual key then names the key classes
+  // below, which is how the rule stays legible against winuser.h.
   if (action.type != KeyAction::Type::Pass)
     return false;
   // The virtual key, not the keysym: the function row is the only one of these the shell
@@ -869,6 +909,7 @@ bool SemanticController::idle_forwarded_noncharacter(const KeyAction &action) {
   case kVkPause:
   case kVkSnapshot:
   case kVkApps:
+  case kVkScroll:
     return true;
   default:
     return false;
