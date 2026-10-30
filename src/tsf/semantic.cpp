@@ -222,6 +222,10 @@ void SemanticController::fence_previous_incarnation() {
   // A press the previous connection received is not one this one may settle.
   shift_forwarded_.reset();
   shift_pressed_keysym_ = 0;
+  // R53: the on/off state the previous connection reported is not this instance's answer.
+  // A new Host starts from the profile, so the shell is back to knowing nothing about this
+  // context until its first batch speaks for it.
+  last_context_active_.reset();
   // The previous incarnation's candidate page is not the new one's projection;
   // it must not be displayed or acted on after the link moved.
   clear_displayed_page();
@@ -617,6 +621,12 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   }
   const bool engine_declined =
       original_forward || batch.disposition == BackendBatch::Disposition::Forward;
+  // R53 rule 1: this is the engine reporting its own state for this context, and the only
+  // place that report reaches the TIP. A batch the transport never delivered is not a report
+  // — recording one would read "the Host could not be reached" as "the input method is off"
+  // and refuse every key because of a link failure.
+  if (real_backend_->link_status().state == LinkState::Established)
+    last_context_active_ = batch.context_was_active;
   decision.forward = engine_declined;
   decision.eaten = !decision.forward;
   std::optional<CandidatePage> captured;
@@ -767,6 +777,14 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // Fcitx's decision, taken from its configuration; this shell keeps no state for it.
   if (action.keysym == kKeysymShiftL || action.keysym == kKeysymShiftR)
     return true;
+  // R53 rule 1, taken from chewing's OnTestKeyDown (windows-chewing-tsf,
+  // crates/chewing_tip_host/src/text_service/chewing.rs): an engine in its off state has no
+  // input method to compose with, so it is not the owner of any key except the modifier that
+  // turns it back on. This shell learns that state from the batch the engine itself answered
+  // (see last_context_active_), and before any batch has answered it keeps the admission it
+  // had: a state the engine never reported cannot refuse a key the engine may want.
+  if (last_context_active_ == false)
+    return false;
   // A digit is engine work only while the engine will select a candidate with it. Measured
   // on the pinned pinyin engine (stage3c): with no candidate page it answers a digit with
   // ForwardKey — there is nothing to select — while a page on screen makes the same key
@@ -775,6 +793,13 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // R36 and R37 fixed for Return and the editing keys.
   if (is_candidate_digit(action))
     return digit_selects_a_candidate(action);
+  // R53 rule 2, the same source and the same reason: with nothing composing, the pinned
+  // engine answers every key in idle_forwarded_noncharacter with ForwardKey under its default
+  // configuration, so a claim here is a claim the engine hands back — and Explorer, which
+  // honours T alone, then never renames or refreshes (R53). While something *is* composing
+  // these keys keep today's answer, because the composition may have bound one of them.
+  if (idle_forwarded_noncharacter(action) && !engine_has_composition_work())
+    return false;
   // Every key this shell admitted before R37 keeps its admission; only the keys whose
   // Fcitx handling needs a live composition are gated on the composition state.
   if (!editing_key_needs_composition(action))
@@ -820,6 +845,30 @@ bool SemanticController::editing_key_needs_composition(const KeyAction &action) 
   case kKeysymHome:
   case kKeysymEnd:
   case kKeysymReturn:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool SemanticController::idle_forwarded_noncharacter(const KeyAction &action) {
+  // A non-character key means one the shell classifies as carrying no composition text. The
+  // classification, not the virtual key, is the guard here because VK 0x45 is both the letter
+  // E and ScrollLock: a rule that reached past the type would refuse 0x45 and so refuse E.
+  if (action.type != KeyAction::Type::Pass)
+    return false;
+  // The virtual key, not the keysym: the function row is the only one of these the shell
+  // translates into a keysym at all, and a rule about which keys the *engine* owns is stated
+  // most honestly over the key the user physically pressed.
+  const std::uint32_t vk = action.virtual_key;
+  if (vk >= kVkF1 && vk <= kVkF24)
+    return true;
+  if (vk >= kVkBrowserBack && vk <= kVkLaunchApp2)
+    return true; // browser, volume, media and launch keys
+  switch (vk) {
+  case kVkPause:
+  case kVkSnapshot:
+  case kVkApps:
     return true;
   default:
     return false;

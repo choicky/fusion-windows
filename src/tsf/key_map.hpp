@@ -57,6 +57,22 @@ inline constexpr std::uint32_t kVkRMenu = 0xA5;
 inline constexpr std::uint32_t kVkLWin = 0x5B;
 inline constexpr std::uint32_t kVkRWin = 0x5C;
 
+// R53 stopgap rule 2: the character-less keys the pinned engine answers with ForwardKey when
+// nothing composes, so a claim made for one of them in T is a claim the engine hands back.
+// Named here so the admission rule, its tests and the key matrix cannot drift apart. The two
+// endpoints of the function-key row and of the browser/volume/media/launch block are Windows'
+// own: F1..F24 = 0x70..0x87, VK_BROWSER_BACK..VK_LAUNCH_APP2 = 0xA6..0xB7. ScrollLock is
+// deliberately absent: VK_SCROLL is 0x45, the same virtual key this shell classifies as the
+// letter E, so a rule that reached it would refuse E — and a stopgap must not trade away a key
+// the owner types for one nobody presses.
+inline constexpr std::uint32_t kVkPause = 0x13;
+inline constexpr std::uint32_t kVkSnapshot = 0x2C;
+inline constexpr std::uint32_t kVkApps = 0x5D;
+inline constexpr std::uint32_t kVkF1 = 0x70;
+inline constexpr std::uint32_t kVkF24 = 0x87;
+inline constexpr std::uint32_t kVkBrowserBack = 0xA6;
+inline constexpr std::uint32_t kVkLaunchApp2 = 0xB7;
+
 struct KeyAction {
   enum class Type {
     AppendChar, // append one raw character to the composition buffer (STATE input)
