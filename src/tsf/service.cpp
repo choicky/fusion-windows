@@ -1521,11 +1521,16 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pdimFocus, ITfDocumentMgr *
           entry->document_mgr == pdimPrevFocus || context_reports_document(*entry, pdimPrevFocus);
       if (was_in_previous) {
         hide_candidate_page(*entry);
-        // R51: a separate, narrower obligation than the page above. Focus leaving the document
-        // is the application saying it is done with this input even when it never destroyed the
-        // composition, so a preedit the Host still shows would have no owner any more. This
-        // callback carries no edit cookie and is already on the thread the reset belongs to, so
-        // it runs directly rather than being posted.
+        // R51: a separate, narrower obligation than the page above, and not what it looks
+        // like. Focus leaving the document is not the application ending this input: the
+        // composition may well live on behind the lost focus, and then nothing was armed, so
+        // this call issues no reset, logs nothing and changes nothing. What it does run is only
+        // the intent `note_composition_terminated()` already armed — `flush_backend_reset`
+        // answers that flag and clears it, so this door is here to keep an armed intent from
+        // outliving the typing that made it. It runs directly, rather than being posted,
+        // because this callback carries no edit cookie and is already on the thread the reset
+        // belongs to; when it gets there first, the wake-up it beat drains to an empty intent
+        // and the reset still happens exactly once.
         flush_backend_reset(*entry, ResetSource::FocusOut);
       }
     }
