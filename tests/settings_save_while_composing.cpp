@@ -1,6 +1,6 @@
 // Saving settings while the user is still typing.
 //
-// Two product promises are measured here, both against the real pinned engine and the real
+// Three product promises are measured here, all against the real pinned engine and the real
 // Fcitx configuration files:
 //
 //   1. A page whose value only reaches the *next* projected page — the candidate layout and
@@ -10,6 +10,9 @@
 //      instead of being applied and losing the user's buffer.
 //   2. A save the filesystem refuses leaves the stored file, what GetConfig reports and the
 //      live configuration in agreement, so the identical retry really writes.
+//   3. The refusal a live preedit causes names the process whose preedit it is, and the reset
+//      the TIP runs when a composition ends outside a key is what makes the same save
+//      admitted — the wait does not have to be ended by closing the application.
 //
 // The second is the regression for the global apply path, which used to load the live object
 // before writing it: a refused write then left the Host reporting a value it never persisted,
@@ -411,9 +414,86 @@ void section_refused_global_write(Driver &driver, const std::filesystem::path &c
   require(read_file(config_file) == after, "and touches no file");
 }
 
-// The five sections above must all run: a guard that skipped one silently would leave the
+// 6. R51: the wait that only closing the application used to end.
+//
+// The owner's run (Firefox, 2026-10-28) had 设置 answer Busy for a Pinyin save and name
+// `exe=firefox.exe` as the holder, and went on waiting until Firefox exited: the composition had
+// long ended, but the Host context still held the preedit nobody had taken back, because the only
+// path that ran the armed reset was a later key. Both halves of what the fix promised are
+// measured here against the real engine — that a live preedit really is what holds the save and
+// the refusal really names whose it is, and that the reset the TIP now runs when a composition
+// ends outside a key really is what makes the identical save admitted and written. Neither the
+// gate nor the reset is stubbed: `composition_holder_on_loop` is the question the settings path
+// asks, and `Backend::reset` is the call the deferred wake-up makes.
+void section_reset_clears_the_wait(Driver &driver) {
+  std::printf("[reset] the wait a live preedit causes ends with the reset, not with the app\n");
+  // The process the refusal names is the one the Host was told. In the product the pipe reports
+  // it; this fixture hands it over directly, so the holder it names is a real process — this one.
+  const auto pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+  driver.backend->note_context_owner(driver.binding.context, driver.binding.context, pid);
+
+  SettingsSnapshot current;
+  std::string error;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", current,
+                                              error) == SettingsStatus::Ok,
+          "the Pinyin configuration can be read");
+  const std::string before = stored_scalar(current, "PageSize");
+  require(!before.empty(), "the page-size option is in the schema");
+  const std::string wanted = before == "9" ? "8" : "9";
+
+  driver.type("nihao");
+  require(!driver.page.entries.empty(), "the engine produced no candidates");
+
+  SettingsSnapshot refused;
+  const auto status = driver.backend->settings_set_config(
+      "fcitx://config/inputmethod/pinyin", value_tree("PageSize", wanted), refused, error);
+  std::printf("   with a live preedit: %d\n   reason: %s\n", static_cast<int>(status),
+              error.c_str());
+  require(status == SettingsStatus::Busy, "the live preedit, not the candidate list, is the hold");
+  require(error.rfind("holder pid=" + std::to_string(pid) + " why=preedit", 0) == 0,
+          "the refusal names which condition it waits on and whose process holds it");
+  const std::string own_name = "settings_save_while_composing.exe";
+  const auto image = error.find(" exe=");
+  require(image != std::string::npos &&
+              lower(error.substr(image + 5, own_name.size())) == lower(own_name),
+          "the holder's image name is the one that belongs to the process the Host was told");
+  require(error.find("Pinyin/Shuangpin setting") != std::string::npos &&
+              error.find("Nothing was written") != std::string::npos,
+          "the refusal still gives the engine's own reason and says it wrote nothing");
+
+  SettingsSnapshot held;
+  require(driver.backend->settings_get_config("fcitx://config/inputmethod/pinyin", held, error) ==
+              SettingsStatus::Ok,
+          "the Pinyin configuration can still be read");
+  require(stored_scalar(held, "PageSize") == before, "the refused change was not stored");
+
+  // The R51 flush, exactly as the deferred wake-up runs it: the Host context is put back to the
+  // state a fresh input starts from, which is the state the gate above asks about.
+  require(driver.backend->reset(driver.binding), "the Host reset the context");
+  // The boundary that already flushed and the wake-up that arrives again both end here: a second
+  // reset on a clean context is answered, not refused, so an idempotent repeat costs nothing.
+  require(driver.backend->reset(driver.binding), "a repeat reset on a clean context costs nothing");
+
+  SettingsSnapshot applied;
+  const auto retried = driver.backend->settings_set_config(
+      "fcitx://config/inputmethod/pinyin", value_tree("PageSize", wanted), applied, error);
+  std::printf("   after the reset: %d%s%s\n", static_cast<int>(retried), error.empty() ? "" : ": ",
+              error.c_str());
+  require(retried == SettingsStatus::Ok,
+          "the identical save is admitted once the preedit the reset cleared is gone");
+  require(stored_scalar(applied, "PageSize") == wanted,
+          "and the value the user asked for is what the engine now holds");
+
+  SettingsSnapshot restored;
+  require(driver.backend->settings_set_config("fcitx://config/inputmethod/pinyin",
+                                              value_tree("PageSize", before), restored,
+                                              error) == SettingsStatus::Ok,
+          "the original value is put back so the profile is left as it was found");
+}
+
+// The sections above must all run: a guard that skipped one silently would leave the
 // promise it covers unmeasured while the process still exited 0.
-constexpr int expected_sections = 5;
+constexpr int expected_sections = 6;
 
 // The configuration file the Host's global apply writes, found under the throwaway profile
 // rather than assembled from the layout Fcitx happens to use: `config/fcitx5/config` is
@@ -454,6 +534,11 @@ void run() {
   std::printf("   profile file: %s\n",
               std::filesystem::weakly_canonical(config_file).string().c_str());
   section_refused_global_write(driver, config_file);
+  ++sections;
+
+  // Last, because it clears the buffer the way the product does rather than by committing, and
+  // it is the only section that measures a Host-side reset.
+  section_reset_clears_the_wait(driver);
   ++sections;
 
   require(sections == expected_sections,

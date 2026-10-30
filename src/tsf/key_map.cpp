@@ -103,4 +103,40 @@ KeyAction translate_key(std::uint32_t vk, bool ctrl, bool alt, bool win, char32_
   return action;
 }
 
+const char *modifier_identity(std::uint32_t vk, std::uint32_t scan_code, bool extended) {
+  switch (vk) {
+  case kVkLShift:
+    return "lshift";
+  case kVkRShift:
+    return "rshift";
+  case kVkShift:
+    // The generic VK_SHIFT is either key. Their scan codes are distinct, so the scan field
+    // decides; the extended flag is the fallback when a sender left the field empty.
+    if (scan_code == kScanShiftRight)
+      return "rshift";
+    if (scan_code == kScanShiftLeft)
+      return "lshift";
+    return extended ? "rshift" : "lshift";
+  case kVkLControl:
+    return "lctrl";
+  case kVkRControl:
+    return "rctrl";
+  case kVkControl:
+    // Right Ctrl reports the same scan code as the left one; only the flag separates them.
+    return extended ? "rctrl" : "lctrl";
+  case kVkLMenu:
+    return "lalt";
+  case kVkRMenu:
+    return "ralt";
+  case kVkMenu:
+    return extended ? "ralt" : "lalt";
+  case kVkLWin:
+    return "lwin";
+  case kVkRWin:
+    return "rwin";
+  default:
+    return nullptr;
+  }
+}
+
 } // namespace fusion::tsf

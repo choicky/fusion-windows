@@ -361,7 +361,7 @@ if(BUILD_TESTING)
   target_link_libraries(rg0 PRIVATE FusionMock)
 
   if(WIN32 AND MSVC)
-    add_executable(diag_policy tests/diag_policy.cpp src/tsf/diag.cpp)
+    add_executable(diag_policy tests/diag_policy.cpp src/tsf/diag.cpp src/tsf/key_map.cpp)
     target_include_directories(diag_policy PRIVATE src)
     target_compile_features(diag_policy PRIVATE cxx_std_20)
     target_compile_options(diag_policy PRIVATE /W4 /WX /utf-8)
@@ -409,7 +409,7 @@ if(BUILD_TESTING)
     target_compile_options(tsf_lifecycle PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
   foreach(test obligation teardown_clean teardown_unresolved composition_terminated
-               identity_across_focus context_isolation open_declaration)
+               identity_across_focus context_isolation open_declaration deferred_reset)
     add_test(NAME tsf_lifecycle_${test} COMMAND tsf_lifecycle ${test})
   endforeach()
   # Stage 6 WP3 input-method selection is a platform-free decision (no Fcitx

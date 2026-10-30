@@ -382,6 +382,19 @@ struct BackendBatch {
   bool context_was_active = false;
   std::vector<BackendOperation> operations;
 };
+// R52: one observed move of a context's engine state — which input method the engine resolves
+// for it, and whether that answer is an active one rather than the group's off slot. The Host
+// reports it, because an input-method name never reaches the TIP: what crosses the pipe is the
+// single `context_was_active` flag above, and the name stays in the engine. `trigger` names the
+// Host's own sample point (a context entering use, a key, a modifier release, a page action),
+// not a claim about what caused the move.
+struct EngineStateChange {
+  std::uint64_t client_context = 0; // the id the owning client bound this context with, so the
+  std::uint32_t owner_pid = 0;      // TIP log and the Host log join on it; 0 when no pipe said
+  bool active = false;
+  std::string input_method;
+  const char *trigger = "unknown";
+};
 class Backend {
 public:
   virtual ~Backend() = default;
@@ -396,13 +409,22 @@ public:
   // without a transport has nothing to report and keeps the default.
   virtual ConnectFailure last_connect_failure() const { return {}; }
 
+  // Diagnostics only: the engine-state changes observed since the last call, oldest first. The
+  // Host server drains it after the request that produced them and writes one diagnostic line per
+  // change: that is where the Host's own log is, while the pair itself only exists inside the
+  // engine. A backend that runs no engine keeps the default, which costs one empty vector.
+  virtual std::vector<EngineStateChange> take_engine_state_changes() { return {}; }
+
   // R51: which process the Host's pipe saw when this context was asked for, 0 when it has no
-  // pipe or the pipe would not say. A refusal that later waits for that context to go idle
-  // names it, so the user can see which window to return to. Naming only: no bind decision,
-  // no key and no composition reads it back, and a backend that does not hold contexts keeps
-  // the default.
-  virtual void note_context_owner(std::uint64_t context, std::uint32_t client_pid) {
+  // pipe or the pipe would not say. A refusal that later waits for that context names it, so the
+  // user can see which window to return to. R52 adds the id the *client* used for the same
+  // context: the two logs are joined on it, because the Host's own id is the one the client never
+  // sees. Naming only: no bind decision, no key and no composition reads it back, and a backend
+  // that does not hold contexts keeps the default.
+  virtual void note_context_owner(std::uint64_t context, std::uint64_t client_context,
+                                  std::uint32_t client_pid) {
     (void)context;
+    (void)client_context;
     (void)client_pid;
   }
 

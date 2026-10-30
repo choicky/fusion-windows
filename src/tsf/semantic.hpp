@@ -20,6 +20,7 @@
 #include "fusion/core.hpp"
 #include "fusion/host.hpp"
 #include "mock_backend.hpp"
+#include "tsf/deferred_reset.hpp"
 #include "tsf/key_map.hpp"
 
 #include <cstdint>
@@ -85,6 +86,14 @@ struct PendingWork {
   // Real frontend SetPreedit only: the displayed preedit's segments/format and
   // engine cursor (fcitx::Text contract). Absent = plain text, caret at end.
   std::optional<FormattedPreedit> preedit;
+};
+
+// What a call to `flush_backend_reset` actually did. `issued` is the only honest answer to
+// "did this boundary reset the Host context": a second arrival for an intent someone else
+// already ran issues nothing. `ok` is the Host's own answer, reported, never acted on here.
+struct ResetFlush {
+  bool issued = false;
+  bool ok = false;
 };
 
 class SemanticController {
@@ -199,6 +208,17 @@ public:
   // External composition termination (app-side): projection resets; queued
   // work is explicitly settled (cancel), never silently dropped.
   void note_composition_terminated();
+  // Run the reset that termination armed, on the Host context this controller is bound to.
+  // The single door for it: the same `Backend::reset` the key path makes, and nothing else may
+  // clear the intent. Idempotent by construction — an empty intent issues nothing and reports
+  // `issued=false` — so a deferred wake-up, a boundary that flushed first, and the next key cannot
+  // reset the same context twice. `ResetSource::Key` logs nothing (that path already has its
+  // own lines); every other source logs one content-free `BACKEND_RESET` line, because a reset
+  // that runs outside the key path is worth seeing in the log.
+  ResetFlush flush_backend_reset(ResetSource source);
+  // Whether a reset is armed. Observability only: the flush answers the flag itself, so no
+  // caller needs to read it first to stay correct.
+  bool backend_reset_pending() const { return backend_reset_pending_; }
   const std::string &raw_buffer() const { return buffer_; }
 
   // The panel snapshot (candidate page + panel rows) the last admitted dispatch

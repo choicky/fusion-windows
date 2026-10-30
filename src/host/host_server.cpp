@@ -885,10 +885,11 @@ void HostServer::Connection::handle_bind(const std::vector<std::uint8_t> &payloa
     // backend, because the refusal that later waits for the context arrives on another
     // connection — the settings window's own — which cannot see this one. Recorded first, so
     // a context is never live without the process that owns it. 0 when the pipe would not say.
-    backend.note_context_owner(host_binding.context, pipe->client_pid());
+    backend.note_context_owner(host_binding.context, client_binding->context, pipe->client_pid());
     result = backend.bind(host_binding);
   }
   send_bool_response(MessageType::BindResponse, result);
+  log_engine_state_changes();
 }
 
 void HostServer::Connection::handle_reset(const std::vector<std::uint8_t> &payload) {
@@ -966,6 +967,7 @@ void HostServer::Connection::handle_send(const std::vector<std::uint8_t> &payloa
   std::vector<std::uint8_t> response_payload;
   serialize(response_payload, batch);
   send_response(MessageType::SendResponse, response_payload);
+  log_engine_state_changes();
 }
 
 void HostServer::Connection::send_response(MessageType type,
@@ -1007,6 +1009,34 @@ Binding HostServer::Connection::remap_binding(const Binding &client_binding) {
                        client_binding.epoch};
   context_map[client_binding.context] = host_binding;
   return host_binding;
+}
+
+void HostServer::Connection::log_engine_state_changes() {
+  // R52: the active state and the input-method name live only inside the engine, so this is
+  // the half of the observation the TIP cannot write. Each change carries the id its owning
+  // client bound the context with and that client's pid, which is what the TIP's own `cid=`
+  // and log file name match on — the two logs join without a wire field.
+  //
+  // Drained after the reply, never inside the request that produced the change: a key's
+  // latency cannot depend on the log. The queue is the backend's, so this drain also carries
+  // changes observed on another connection's contexts; each is stamped with its own owner,
+  // and taking the whole vector means a change is written exactly once.
+  std::vector<EngineStateChange> changes;
+  {
+    std::lock_guard lock(backend_mutex);
+    changes = backend.take_engine_state_changes();
+  }
+  for (const auto &change : changes) {
+    char details[256];
+    const int length =
+        std::snprintf(details, sizeof(details), "active=%d im=%.64s cid=%llu owner=%lu after=%s",
+                      change.active ? 1 : 0, change.input_method.c_str(),
+                      static_cast<unsigned long long>(change.client_context),
+                      static_cast<unsigned long>(change.owner_pid), change.trigger);
+    if (length > 0) {
+      fusion::host::diag::event("ENGINE_STATE", details);
+    }
+  }
 }
 
 } // namespace fusion::ipc

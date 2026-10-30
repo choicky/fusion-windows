@@ -173,11 +173,29 @@ public:
   // popup) does nothing.
   void note_layout_change(void *entry, std::uint64_t generation);
 
+  // R52 (called by the compartment sink this service advises on activation): one notification
+  // that this thread's keyboard open/close compartment was written. The sink reads the new
+  // value itself, because `OnChange` carries nothing but the compartment's GUID.
+  void note_openclose_change();
+  // R52: answers the sink with "this notification is the one my own write caused", once. The
+  // marker is set around `SetValue` and taken here, so a write this process did not make is
+  // reported as another's; a notification TSF delivered later than the write it follows loses
+  // the attribution and is reported as `other`.
+  bool take_openclose_self_write();
+
   // R46 (called by the popup's own reposition message, so it runs on the message loop and
   // not inside the session that probed): place the page this entry displays at the anchor
   // the probe just resolved. Fenced by entry identity and generation like every other
   // callback that arrives late.
   void place_candidate_from_anchor(void *entry, std::uint64_t generation);
+
+  // R51 (called from inside the callback or session that ended a composition): arm the Host reset
+  // that termination needs and hand this thread's message loop the wake-up, because
+  // `Backend::reset` is a blocking pipe call and may not run here. The intent, not the message,
+  // is the truth: `flush_backend_reset` answers it and clears it, so a duplicate arm, a late
+  // wake-up and a boundary that got there first all reset at most once. Called by the edit
+  // sessions, like the seam above.
+  void request_backend_reset(ContextEntry &entry, ResetSource source);
 
   // --- internal API used by the edit-session objects ---
   ContextEntry *find_entry(ITfContext *pic);
@@ -240,11 +258,34 @@ private:
   // it records an async session TSF still owes the context, and only that session's own run or
   // `release_layout_sink` settles it.
   void hide_candidate_page(ContextEntry &entry);
+  // R51: run a reset the key path has not reached, from a boundary that is outside every edit
+  // session (document focus moving away, a context popped, a context torn down, deactivation),
+  // and log the one `BACKEND_RESET reason=` line that says which. Nothing else may clear the
+  // intent, so these boundaries and the deferred drain share one door and one answer.
+  void flush_backend_reset(ContextEntry &entry, ResetSource source);
+  // The window procedure of the wake-up message and its window, created on the TSF thread at the
+  // first deferred arm and destroyed with the activation. `drain_deferred_resets` re-queues
+  // instead of resetting while a key is being handled, so a wake-up never runs inside key
+  // handling either.
+  bool ensure_deferred_reset_window();
+  // Hand one wake-up to this thread's message loop. False means no wake-up is outstanding: the
+  // queued intents stay, and the in-flight mark is released so the next arm asks again.
+  bool post_deferred_reset_wakeup();
+  void close_deferred_reset_window();
+  void drain_deferred_resets();
+  static constexpr UINT deferred_reset_message = WM_APP + 2;
+  static LRESULT CALLBACK deferred_reset_proc(HWND, UINT, WPARAM, LPARAM);
+  static bool register_deferred_reset_class();
   // R46: advise this context's ITfTextLayoutSink (through ITfSource on ITfContext) while
   // the entry is live, and stop when TSF pops the context. Idempotent in both directions:
   // an entry that already has the registration is not advised twice, and a context that
   // never had one is not unadvised.
   void advise_layout_sink(ContextEntry &entry);
+  // R52: the open/close notification is installed on the thread's own compartment object, so
+  // it is one registration for the whole activation — advised once in `Activate`, unadvised
+  // once in `Deactivate`, and idempotent in both directions like the layout sink.
+  void advise_openclose_sink();
+  void unadvise_openclose_sink();
   bool request_readonly_sync(ContextEntry &entry, ITfEditSession *session, HRESULT &outer,
                              HRESULT &inner);
   void drain_prior_effect(ContextEntry &entry);
@@ -265,6 +306,16 @@ private:
   ComRef<ITfThreadMgr> thread_mgr_;
   TfClientId client_id_ = TF_CLIENTID_NULL;
   DWORD thread_event_cookie_ = 0;
+  // R52: the thread's keyboard open/close compartment, held for the length of the activation
+  // because it is both the object the sink is registered on and the object the new value is
+  // read back from. `openclose_state_` is the last value this service saw (-1 before the first
+  // read) and `openclose_self_write_` marks the notification its own `SetValue` causes. All
+  // three are read and written from whatever thread TSF delivers on, so they carry no lock
+  // and take no dependency on which thread asked.
+  ComRef<ITfCompartment> openclose_compartment_;
+  DWORD openclose_sink_cookie_ = 0;
+  std::atomic<int> openclose_state_{-1};
+  std::atomic<bool> openclose_self_write_{false};
   DisplayAttributeAtoms display_atoms_; // registered on Activate
 #ifdef FUSION_WITH_FCITX5
   std::unique_ptr<Backend> backend_;
@@ -277,6 +328,15 @@ private:
   // identity counts as new; the set is cleared on Deactivate and bounded without
   // forgetting a known window (see tsf/open_declaration.hpp).
   OpenDeclarationTracker open_declarations_;
+  // R51: reset intents armed while an edit session owned the thread, waiting for this thread's
+  // message loop. Coalesced per entry+generation, so at most one wake-up is in flight and the
+  // batch it carries is whatever had armed by the time it runs.
+  DeferredResetQueue<std::shared_ptr<ContextEntry>> deferred_resets_;
+  // Message-only window carrying the wake-up: created on the TSF thread at the first deferred
+  // arm, destroyed before the activation ends. `GWLP_USERDATA` is this service, so the window is
+  // never left alive with a pointer to a released one (DestroyWindow also drops its posted
+  // messages). 0 while no deferred work has ever been armed on this activation.
+  HWND deferred_reset_window_ = nullptr;
   std::uint64_t next_context_id_ = 1;
   std::uint64_t next_generation_ = 1;
   bool handling_key_ = false; // reentrancy guard (D072 §7.5)

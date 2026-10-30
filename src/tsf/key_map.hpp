@@ -44,6 +44,19 @@ inline constexpr std::uint32_t kKeysymShiftR = 0xffe2;
 inline constexpr std::uint32_t kScanShiftLeft = 0x2A;
 inline constexpr std::uint32_t kScanShiftRight = 0x36;
 
+// The modifier groups: the generic virtual key Windows reports for some layouts and injectors
+// plus the left and right keys each of them stands for. R52 names one of these eight in a
+// diagnostic line, and only these — every other key keeps the redaction it has always had.
+inline constexpr std::uint32_t kVkShift = 0x10;
+inline constexpr std::uint32_t kVkControl = 0x11;
+inline constexpr std::uint32_t kVkMenu = 0x12;
+inline constexpr std::uint32_t kVkLControl = 0xA2;
+inline constexpr std::uint32_t kVkRControl = 0xA3;
+inline constexpr std::uint32_t kVkLMenu = 0xA4;
+inline constexpr std::uint32_t kVkRMenu = 0xA5;
+inline constexpr std::uint32_t kVkLWin = 0x5B;
+inline constexpr std::uint32_t kVkRWin = 0x5C;
+
 struct KeyAction {
   enum class Type {
     AppendChar, // append one raw character to the composition buffer (STATE input)
@@ -74,5 +87,12 @@ KeyAction classify_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win)
 KeyAction translate_key(std::uint32_t virtual_key, bool ctrl, bool alt, bool win,
                         char32_t character = 0, bool shift = false, bool caps = false,
                         std::uint32_t scan_code = 0);
+
+// R52: which modifier a physical key event is, named for the diagnostic log, or nullptr for
+// every other key. `scan_code` is the low byte of the lparam scan field and `extended` its
+// extended flag. The two Shift keys have distinct scan codes; the right Ctrl and right Alt
+// share the left one and differ only by that flag, so a generic VK_CONTROL/VK_MENU is decided
+// by the flag alone. The left/right virtual keys need neither.
+const char *modifier_identity(std::uint32_t virtual_key, std::uint32_t scan_code, bool extended);
 
 } // namespace fusion::tsf
