@@ -1404,21 +1404,25 @@ void test_silent_death_sequence() {
   const std::vector<KeyTrace> traces = trace_nihao_and_commit(*controller, visible);
   print_traces("silentdeath: type immediately after the restart", traces, visible);
 
-  // What the implementation actually does, stated as the regression contract:
-  // the first physical key cannot be proven to have reached any Host, so it stays
-  // caller-owned and is forwarded to the application (Stage 4A boundary); the
-  // following key reconnects to the new incarnation and is served from its fresh
-  // state. The resulting visible text is therefore the forwarded prefix plus the
-  // new incarnation's commit of the remaining keys.
-  require(!traces.empty() && traces.front().forward && !traces.front().eaten,
-          "the first key after a silent death is forwarded, not owned");
-  require(traces.front().committed.empty(), "the forwarded key commits nothing");
+  // What the implementation does, stated as the regression contract. It used to be that the
+  // first physical key could not be proven to have reached any Host, so it stayed caller-owned
+  // and was forwarded (Stage 4A boundary). That rule loses the key in exactly the applications
+  // this round is about: a window that honours OnTestKeyDown alone never delivers a key the
+  // shell claimed in T, so "hand it back" means "it never arrives" (R53, Notepad++). The shell
+  // therefore delivers the character itself — once, the same character the Linux frontend would
+  // have passed on — and the following key reconnects to the new incarnation and is served from
+  // its fresh state. Owner decision, 2026-10-30.
+  require(!traces.empty() && !traces.front().forward && traces.front().eaten,
+          "the first key after a silent death is delivered, not handed back");
+  require(traces.front().committed == "n", "the first printable key commits exactly its character");
   require(!traces[1].forward && traces[1].eaten, "the second key reaches the new incarnation");
   require(client.incarnation() != incarnation_before, "a new incarnation is established");
   require(client.link_status().connection_generation == generation_before + 1,
           "exactly one new connection generation");
   require(controller->semantic_ready(), "semantic readiness is re-established");
-  require(visible.rfind("n", 0) == 0, "the application received the forwarded prefix");
+  require(visible.rfind("n", 0) == 0, "the application received the delivered prefix");
+  require(visible.find("n", 1) == std::string::npos,
+          "the first key appears exactly once: no duplicate, no loss");
   require(visible.size() > 1, "the new incarnation committed the remaining input");
 
   // Phase 2: the operational sequence that actually re-establishes the link. A
@@ -1433,7 +1437,11 @@ void test_silent_death_sequence() {
   const std::uint64_t incarnation_stale = client.incarnation();
   const std::uint64_t generation_stale = client.link_status().connection_generation;
 
-  const SemanticDecision detect = controller->begin_key(space_key(), true);
+  // A character-less key, deliberately: this phase is about the link lifecycle, and R53's
+  // delivery rule is about printable keys only — Phase 1 above is where that rule is asserted.
+  // Keeping this key character-less leaves every assertion below about detection alone.
+  const SemanticDecision detect =
+      controller->begin_key(translate_key(kVkReturn, false, false, false), true);
   std::printf("  [detection key] route=%d eaten=%d forward=%d ops=%zu link_state=%d\n",
               static_cast<int>(detect.route), detect.eaten ? 1 : 0, detect.forward ? 1 : 0,
               detect.operation_count, static_cast<int>(client.link_status().state));
@@ -1459,6 +1467,13 @@ void test_silent_death_sequence() {
   require(controller->semantic_ready(), "semantic readiness is re-established");
   (void)settle_frontend(*controller, reestablish);
 
+  // This is the other restart shape: the incarnation moved before the key was typed, so
+  // fence_previous_incarnation() reset the cached mode and the shell has no fact to refuse on.
+  // The first key is therefore admitted, and the text below is the proof that it arrives
+  // exactly once — nothing lost, nothing doubled.
+  require(controller->engine_has_work_for(translate_key('n', false, false, false)),
+          "the first key after the cached mode was reset is refused");
+
   std::string visible_primed;
   const std::vector<KeyTrace> primed = trace_nihao_and_commit(*controller, visible_primed);
   print_traces("silentdeath: detected, then re-established, then type", primed, visible_primed);
@@ -1468,6 +1483,90 @@ void test_silent_death_sequence() {
 
   host.kill();
   std::printf("PASS stage4b silentdeath (traced, see the per-key paths above)\n");
+}
+
+// Codex P2, the integration half: the Host restarts, a *second* context reconnects the shared
+// backend to the new incarnation, and the first context — which never dispatched in between and
+// therefore never reached fence_previous_incarnation() — must keep working. The discriminating
+// case (a context that cached "off" from the old Host) cannot be produced here: this Host runs
+// without a user profile, so it has no lone-Shift binding, and a modified toggle key is refused
+// by routes_key before it is dispatched. That case is the unit test in stage3c, which moves the
+// link identity under a controllable backend.
+void test_stale_cache_across_host_change() {
+  if (std::getenv("FUSION_STAGE4B_SKIP_HOST_PROCESS")) {
+    std::printf("SKIP stage4b stalecache (FUSION_STAGE4B_SKIP_HOST_PROCESS set)\n");
+    return;
+  }
+  const std::wstring executable = executable_directory() + L"\\FusionHost.exe";
+  if (GetFileAttributesW(executable.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::printf("SKIP stage4b stalecache (FusionHost.exe not built next to the test)\n");
+    return;
+  }
+
+  const auto name = pipe_name(L"stale-cache-real");
+  IpcBackend client(name);
+  HostProcess host(executable, name);
+  require(host.start(), "stalecache host started");
+  require(wait_for_host_pipe(name, kWait), "stalecache host listens");
+  require(connect_with_retry(client, kWait), "stalecache connect");
+  const Binding binding_a{34, 1, 1};
+  require(client.bind(binding_a), "stalecache bind A");
+  SemanticController a(914, 65, client, 1);
+  require(a.semantic_ready(), "stalecache readiness A");
+  std::string a_text;
+  (void)trace_nihao_and_commit(a, a_text);
+  require(a_text == "你好", "stalecache baseline commit A");
+
+  const std::uint64_t incarnation_before = client.incarnation();
+  const std::uint64_t generation_before = client.link_status().connection_generation;
+
+  // The Host restarts. Context B is the one that reconnects the shared backend to the new
+  // incarnation — A never dispatches in between, so nothing clears what it learned.
+  host.kill();
+  require(wait_until([&] { return !host.running(); }, kWait), "stalecache host terminated");
+  require(host.start(), "stalecache host restarted");
+  require(wait_for_host_pipe(name, kWait), "the restarted stalecache host listens");
+  SemanticController b(915, 65, client, 1);
+  std::string b_text;
+  (void)trace_nihao_and_commit(b, b_text);
+  require(b_text == "你好", "the second context reconnected to the new Host");
+  require(client.incarnation() != incarnation_before, "the restart is a new incarnation");
+  require(client.link_status().connection_generation != generation_before,
+          "the restart is a new connection generation");
+
+  // Back in A, on a link that moved without it: the key is claimed, reaches the new engine and
+  // the word composes with it, so nothing is lost or doubled.
+  const auto letter = physical('n');
+  const bool claimed = a.engine_has_work_for(letter);
+  std::printf("  [stale cache] A letter claimed=%d (incarnation %llu -> %llu, generation %llu -> "
+              "%llu)\n",
+              claimed ? 1 : 0, static_cast<unsigned long long>(incarnation_before),
+              static_cast<unsigned long long>(client.incarnation()),
+              static_cast<unsigned long long>(generation_before),
+              static_cast<unsigned long long>(client.link_status().connection_generation));
+  require(claimed, "A refused a key after another context moved the link");
+
+  const SemanticDecision first = a.begin_key(letter, true);
+  require(first.eaten && !first.frontend.empty() &&
+              first.route != SemanticDecision::Route::CancelledRecovery,
+          "the key after the Host change did not reach the new engine");
+  require(settle_frontend(a, first).empty(), "the first key after the Host change committed text");
+
+  std::string composed;
+  for (char character : std::string("ihao")) {
+    const SemanticDecision decision = a.begin_key(physical(character), true);
+    require(decision.route != SemanticDecision::Route::CancelledRecovery,
+            "the rest of the word did not reach the engine");
+    composed += settle_frontend(a, decision);
+  }
+  const SemanticDecision commit = a.begin_key(space_key(), true);
+  require(commit.route != SemanticDecision::Route::CancelledRecovery, "the commit key");
+  composed += settle_frontend(a, commit);
+  std::printf("  [stale cache] A composed=[%s]\n", composed.c_str());
+  require(composed == "你好", "the word after the Host change is not exactly 你好");
+
+  host.kill();
+  std::printf("PASS stage4b stalecache\n");
 }
 
 #endif // FUSION_WITH_FCITX5
@@ -1483,7 +1582,8 @@ int main(int argc, char *argv[]) {
 #endif
 #ifdef FUSION_WITH_FCITX5
   const char *usage =
-      "Usage: stage4b <link|failover|cycles|fencing|contexts|semantic|hostprocess|silentdeath>\n";
+      "Usage: stage4b "
+      "<link|failover|cycles|fencing|contexts|semantic|hostprocess|silentdeath|stalecache>\n";
 #else
   const char *usage = "Usage: stage4b <link|failover|cycles|fencing|contexts|semantic>\n";
 #endif
@@ -1517,6 +1617,13 @@ int main(int argc, char *argv[]) {
       test_silent_death_sequence();
 #else
       std::fprintf(stderr, "silentdeath mode requires the FUSION_WITH_FCITX5 build\n");
+      return 1;
+#endif
+    } else if (mode == "stalecache") {
+#ifdef FUSION_WITH_FCITX5
+      test_stale_cache_across_host_change();
+#else
+      std::fprintf(stderr, "stalecache mode requires the FUSION_WITH_FCITX5 build\n");
       return 1;
 #endif
     } else {

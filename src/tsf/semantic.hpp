@@ -167,15 +167,24 @@ public:
 
   // Whether the TSF shell may claim this key in OnTestKeyDown right now.
   //
-  // Only the editing/navigation keys whose engine handling needs a live composition are
-  // gated (Backspace, Delete, the four arrows, Home/End, and Return — see
-  // editing_key_needs_composition); every other key keeps exactly the admission this
-  // shell had before R37. That narrowness matters in both directions: with nothing
-  // composing the engine can only forward a gated key, so a claim made in T cannot be
-  // retracted in K and an application that honours only T loses it (Notepad-- 3.4 lost
-  // Return, R36; WeChat lost the editing keys, R37); but a configured Fcitx global
-  // hotkey (for example its own toggle-input-method action on F6) is handled with no
-  // composition at all, so filtering every character-less key would swallow it.
+  // Three gates, each of them a measured answer from the pinned engine rather than a key
+  // class:
+  //   * the bare Shift keys are always admitted (R39): they are the modifier-only binding
+  //     Fcitx toggles its own input method with, and an application that consults T skips K
+  //     after a FALSE, so refusing them would strand the toggle in that application;
+  //   * while the engine answers that this context is inactive, nothing else is admitted
+  //     (R53 rule 1) — the off state has no input method to compose with, so every key in it
+  //     is the application's;
+  //   * with nothing composing, the character-less keys Fcitx only forwards are refused
+  //     (R53 rule 2), and the editing/navigation keys whose engine handling sits inside its
+  //     non-empty-input branch are refused the same way (R36, R37: Backspace, Delete, the
+  //     four arrows, Home/End, Return — see editing_key_needs_composition).
+  // Every other key keeps exactly the admission this shell had before these rules. The
+  // narrowness matters in both directions: a claim made in T cannot be retracted in K, so an
+  // application that honours only T loses a key the engine handed back (Notepad-- 3.4 lost
+  // Return, R36; WeChat lost the editing keys, R37; Explorer lost F2 and F5, R53). What a
+  // rule gives up is a configured Fcitx binding on one of those keys, which the stopgap
+  // accepts and the full key matrix is measuring.
   bool engine_has_work_for(const KeyAction &action) const;
 
   // The unresolved effect to drain synchronously before allowing PASS, if any.
@@ -281,6 +290,13 @@ private:
   // page, queued frontend work, an unresolved pass barrier. The Mock Backend answers true
   // so the development fixture keeps its previous routing.
   bool engine_has_composition_work() const;
+  // R53 rule 2: the character-less keys the pinned engine forwards with nothing composing
+  // (the function row, Apps, PrintScreen, Pause, ScrollLock and the browser/volume/media/launch
+  // block). Only a key the classification carries no character for is in the set, so a letter
+  // is never refused by it — `VK_SCROLL` is 0x91 in winuser.h and has nothing to do with 0x45.
+  // Measured in stage3c under the engine's default configuration, not inferred from the key
+  // class.
+  static bool idle_forwarded_noncharacter(const KeyAction &action);
   // Whether this key is engine work only while a composition has something for it: the
   // editing/navigation keys Fcitx handles inside its non-empty-input branch, plus Return
   // (R36). Measured against the pinned engine in stage3c, not inferred from the key class.
@@ -315,6 +331,26 @@ private:
   std::optional<CandidatePage> displayed_page_;
   PageFence displayed_fence_;
   bool page_present_ = false;
+  // R53 rule 1: the engine's on/off answer for this context, and the Host that gave it. This is
+  // the only shape the engine's mode reaches the TIP in — an input-method name never crosses the
+  // pipe — and it is per context, because Fcitx keeps the state per context. Only a press or a
+  // release records it: a candidate action's batch carries no key event, so its
+  // `context_was_active` is the field's default and not an answer.
+  //
+  // The answer belongs to the Host that reported it. A restart leaves this shell holding a fact
+  // about a context that no longer exists, and another context on the shared backend can
+  // reconnect it without this one ever reaching fence_previous_incarnation() — so the link
+  // identity travels with the answer, and a mismatch means "unknown", i.e. today's admission.
+  struct CachedMode {
+    std::optional<bool> active;
+    std::uint64_t host_incarnation = 0;
+    std::uint64_t connection_generation = 0;
+  };
+  CachedMode cached_mode_;
+
+  // Whether `cached_mode_` was learned under the Host the link is talking to now. False when
+  // nothing has been learned yet, when there is no real backend, and when the link has moved.
+  bool cached_mode_is_current() const;
 };
 
 } // namespace fusion::tsf
