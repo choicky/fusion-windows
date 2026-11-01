@@ -838,7 +838,14 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // used while the link is still the one that gave it — a restarted Host leaves a fact about a
   // context that no longer exists, and a context that never dispatches again would otherwise
   // never clear it (Codex P2).
-  if (cached_mode_is_current() && cached_mode_.active == false)
+  //
+  // It is also only used while that link is **up**. `drop_link()` deliberately keeps the
+  // incarnation and the generation, so the identity alone cannot tell a live link from a
+  // disconnected one — and rule 1 refuses in T, where K never runs, so a context that kept
+  // refusing could never start the reconnect by typing (Codex P2 on 46191e7). A link that is
+  // down or reconnecting reads as unknown: the next key goes through K and reconnects.
+  if (real_backend_ != nullptr && real_backend_->link_status().state == LinkState::Established &&
+      cached_mode_is_current() && cached_mode_.active == false)
     return false;
   // A digit is engine work only while the engine will select a candidate with it. Measured
   // on the pinned pinyin engine (stage3c): with no candidate page it answers a digit with

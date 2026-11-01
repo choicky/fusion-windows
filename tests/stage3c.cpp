@@ -21,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 30;
+constexpr int kExpectedSections = 31;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -1473,6 +1473,45 @@ int main() {
               "the key after the Host change did not compose its character");
       c.destroy();
       section("PASS R53 P2: a cached mode belongs to the Host that reported it");
+    }
+
+    // R53 / Codex P2 on 46191e7: a cached "off" must not outlive the connection that reported it.
+    // `drop_link()` keeps the incarnation and the generation, so the identity alone cannot tell a
+    // disconnected link from a live one — and rule 1 refuses in T, where K never runs, so a
+    // context that kept refusing could never start the reconnect by typing.
+    {
+      CallbackBackend fake_backend;
+      fake_backend.link = LinkStatus{LinkState::Established, 0x3333u, 9};
+      SemanticController c(997, 64, fake_backend);
+      const auto return_key = translate_key(kVkReturn, false, false, false);
+      fake_backend.next.disposition = BackendBatch::Disposition::Forward;
+      fake_backend.next.context_was_active = false;
+      (void)c.begin_key(return_key, true);
+      const auto letter = physical('n');
+      require(!c.engine_has_work_for(letter), "the off answer was not cached for a live link");
+
+      // Same identity, link down: the answer belongs to a connection that is gone.
+      fake_backend.link.state = LinkState::Disconnected;
+      const bool claimed = c.engine_has_work_for(letter);
+      std::cout << "stale cache: claims while disconnected=" << (claimed ? 1 : 0) << '\n';
+      require(claimed, "a disconnected link still refused the key");
+
+      // Re-established on a new identity, the letter reaches the engine and composes.
+      fake_backend.link = LinkStatus{LinkState::Established, 0x4444u, 10};
+      fake_backend.next.disposition = BackendBatch::Disposition::Consumed;
+      fake_backend.next.context_was_active = true;
+      fake_backend.next.operations = {{BackendOperation::Type::SetPreedit, "n"}};
+      const auto answer = c.begin_key(letter, true);
+      std::cout << "stale cache: after the reconnect route=" << static_cast<int>(answer.route)
+                << " eaten=" << (answer.eaten ? 1 : 0) << " ops=" << answer.frontend.size()
+                << '\n';
+      require(answer.eaten && !answer.frontend.empty() &&
+                  answer.route != SemanticDecision::Route::CancelledRecovery,
+              "the key after the reconnect did not reach the engine");
+      require(answer.frontend.front().operation.text == "n",
+              "the key after the reconnect did not compose its character");
+      c.destroy();
+      section("PASS R53 P2b: a disconnected link does not apply the cached mode");
     }
     return 0;
   } catch (const std::exception &e) {
