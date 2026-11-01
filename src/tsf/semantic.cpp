@@ -243,7 +243,7 @@ void SemanticController::fence_previous_incarnation() {
   // R53: the on/off state the previous connection reported is not this instance's answer.
   // A new Host starts from the profile, so the shell is back to knowing nothing about this
   // context until its first batch speaks for it.
-  last_context_active_.reset();
+  cached_mode_ = CachedMode{};
   // The previous incarnation's candidate page is not the new one's projection;
   // it must not be displayed or acted on after the link moved.
   clear_displayed_page();
@@ -643,7 +643,8 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   // state the context was in for the key it just handled, so this batch's answer is the next
   // key's starting point — and the fallback below needs the state the key being answered was
   // claimed under, not the state it left behind.
-  const std::optional<bool> context_was_active_before = last_context_active_;
+  const std::optional<bool> context_was_active_before =
+      cached_mode_is_current() ? cached_mode_.active : std::nullopt;
   decision.forward = engine_declined;
   decision.eaten = !decision.forward;
   std::optional<CandidatePage> captured;
@@ -729,9 +730,12 @@ void SemanticController::dispatch_real(const BackendStimulus &stimulus,
   // letter after a single mouse selection. A batch the transport never delivered is not a
   // report either: that would turn a link failure into "the input method is off". A rejected
   // batch returned above and records nothing.
-  if (is_key_stimulus(stimulus.type) &&
-      real_backend_->link_status().state == LinkState::Established)
-    last_context_active_ = batch.context_was_active;
+  if (is_key_stimulus(stimulus.type)) {
+    const LinkStatus link = real_backend_->link_status();
+    if (link.state == LinkState::Established)
+      cached_mode_ = CachedMode{batch.context_was_active, link.host_incarnation,
+                                link.connection_generation};
+  }
   if (decision.frontend.empty()) {
     if (!decision.forward) {
       // Consumed without a document callback still receives an explicit terminal.
@@ -807,6 +811,15 @@ bool SemanticController::engine_has_composition_work() const {
   return !buffer_.empty() || page_present_ || !pending_.empty() || pass_probe() != Pass::Clear;
 }
 
+bool SemanticController::cached_mode_is_current() const {
+  // No real backend means no engine state was ever reported, and no cache to trust.
+  if (real_backend_ == nullptr || !cached_mode_.active)
+    return false;
+  const LinkStatus link = real_backend_->link_status();
+  return link.host_incarnation == cached_mode_.host_incarnation &&
+         link.connection_generation == cached_mode_.connection_generation;
+}
+
 bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // A lone Shift may be one of the engine's own modifier-only bindings
   // (Hotkey/AltTriggerKeys), which it settles from the press/release pair with nothing
@@ -820,9 +833,12 @@ bool SemanticController::engine_has_work_for(const KeyAction &action) const {
   // crates/chewing_tip_host/src/text_service/chewing.rs): an engine in its off state has no
   // input method to compose with, so it is not the owner of any key except the modifier that
   // turns it back on. This shell learns that state from the batch the engine itself answered
-  // (see last_context_active_), and before any batch has answered it keeps the admission it
-  // had: a state the engine never reported cannot refuse a key the engine may want.
-  if (last_context_active_ == false)
+  // (see cached_mode_), and before any batch has answered it keeps the admission it had: a
+  // state the engine never reported cannot refuse a key the engine may want. The answer is only
+  // used while the link is still the one that gave it — a restarted Host leaves a fact about a
+  // context that no longer exists, and a context that never dispatches again would otherwise
+  // never clear it (Codex P2).
+  if (cached_mode_is_current() && cached_mode_.active == false)
     return false;
   // A digit is engine work only while the engine will select a candidate with it. Measured
   // on the pinned pinyin engine (stage3c): with no candidate page it answers a digit with

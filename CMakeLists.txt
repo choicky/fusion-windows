@@ -348,9 +348,12 @@ if(BUILD_TESTING)
       target_link_libraries(stage4b PRIVATE FusionFcitxHost)
       add_test(NAME stage4b_hostprocess COMMAND stage4b hostprocess)
       add_test(NAME stage4b_silentdeath COMMAND stage4b silentdeath)
+      # Codex P2: a cached engine mode belongs to the Host that reported it. Two contexts on one
+      # backend, a restart, and a key typed in the context that never reconnected.
+      add_test(NAME stage4b_stalecache COMMAND stage4b stalecache)
       # These modes spawn the product Host; keep it off the real per-user path
       # (Stage 6 WP3 A2).
-      set_tests_properties(stage4b_hostprocess stage4b_silentdeath PROPERTIES
+      set_tests_properties(stage4b_hostprocess stage4b_silentdeath stage4b_stalecache PROPERTIES
         ENVIRONMENT "FUSION_FCITX_SKIP_USER_PATH=1")
     endif()
   endif()

@@ -21,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 29;
+constexpr int kExpectedSections = 30;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -88,10 +88,14 @@ void type(SemanticController &controller, Document &doc, const std::string &text
 class CallbackBackend final : public Backend {
 public:
   BackendBatch next;
+  // The link identity this fake reports. R53's cached mode travels with it, so a test can move
+  // the "Host" under a controller without a real process.
+  LinkStatus link{LinkState::Established, 0, 0};
   bool bind(Binding) override { return true; }
   bool reset(Binding) override { return true; }
   void unbind(Binding) override {}
   bool healthy() const override { return true; }
+  LinkStatus link_status() const override { return link; }
   std::uint64_t session_id() const override { return 42; }
   BackendBatch send(const BackendStimulus &input) override {
     auto batch = next;
@@ -1426,6 +1430,49 @@ int main() {
         d.apply(c, decision);
       });
       section("PASS R53 P1: a candidate action leaves rule 1's cached mode alone");
+    }
+    // R53 / Codex P2: the cached mode belongs to the Host that reported it. A context that
+    // learned "off" from one Host must not keep refusing keys once the link has moved to
+    // another — reachable in the product when a different context reconnects the shared backend
+    // and this one never dispatches again, so nothing clears the cache.
+    {
+      CallbackBackend fake_backend;
+      fake_backend.link = LinkStatus{LinkState::Established, 0x1111u, 7};
+      SemanticController c(996, 64, fake_backend);
+      // Two batches teach the mode: "on", then "off". A character-less key carries nothing to
+      // deliver, so both are pure mode reports with no callbacks to settle.
+      const auto return_key = translate_key(kVkReturn, false, false, false);
+      fake_backend.next.disposition = BackendBatch::Disposition::Forward;
+      fake_backend.next.context_was_active = true;
+      (void)c.begin_key(return_key, true);
+      fake_backend.next.context_was_active = false;
+      (void)c.begin_key(return_key, true);
+      const auto letter = physical('n');
+      std::cout << "stale cache: claims after off=" << (c.engine_has_work_for(letter) ? 1 : 0)
+                << '\n';
+      require(!c.engine_has_work_for(letter), "the off answer was not cached for this Host");
+
+      // The same backend, a different Host: that answer described a context that is gone.
+      fake_backend.link = LinkStatus{LinkState::Established, 0x2222u, 8};
+      const bool claimed = c.engine_has_work_for(letter);
+      std::cout << "stale cache: claims after the Host changed=" << (claimed ? 1 : 0) << '\n';
+      require(claimed, "a cached mode from the previous Host still refused the key");
+
+      // And the key really reaches the engine: it composes under the new Host.
+      fake_backend.next.disposition = BackendBatch::Disposition::Consumed;
+      fake_backend.next.context_was_active = true;
+      fake_backend.next.operations = {{BackendOperation::Type::SetPreedit, "n"}};
+      const auto answer = c.begin_key(letter, true);
+      std::cout << "stale cache: after the Host changed route="
+                << static_cast<int>(answer.route) << " eaten=" << (answer.eaten ? 1 : 0)
+                << " ops=" << answer.frontend.size() << '\n';
+      require(answer.eaten && !answer.frontend.empty() &&
+                  answer.route != SemanticDecision::Route::CancelledRecovery,
+              "the key after the Host change did not reach the engine");
+      require(answer.frontend.front().operation.text == "n",
+              "the key after the Host change did not compose its character");
+      c.destroy();
+      section("PASS R53 P2: a cached mode belongs to the Host that reported it");
     }
     return 0;
   } catch (const std::exception &e) {

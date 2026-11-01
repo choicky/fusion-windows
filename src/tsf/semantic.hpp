@@ -331,19 +331,26 @@ private:
   std::optional<CandidatePage> displayed_page_;
   PageFence displayed_fence_;
   bool page_present_ = false;
-  // R53 rule 1: whether the engine was in its on state for the key the last **key** batch
-  // answered. This is the only shape the engine's mode reaches the TIP in — an input-method
-  // name never crosses the pipe — and it is per context, because Fcitx keeps the state per
-  // context. Only a press or a release records it: a candidate action's batch carries no key
-  // event, so its `context_was_active` is the field's default and not an answer. nullopt until
-  // a key batch has answered: before the first dispatch this shell keeps the admission it had,
-  // because it has no fact to admit or refuse on.
-  std::optional<bool> last_context_active_;
-  // The backend session the cached mode above was learned from. A reconnect after a silent Host
-  // death starts a new session without moving the incarnation bookkeeping, and its context's
-  // answer is not a report about the mode the previous session left behind — so one batch of a
-  // new session teaches nothing, and nothing is delivered through it.
-  std::uint64_t last_dispatch_session_ = 0;
+  // R53 rule 1: the engine's on/off answer for this context, and the Host that gave it. This is
+  // the only shape the engine's mode reaches the TIP in — an input-method name never crosses the
+  // pipe — and it is per context, because Fcitx keeps the state per context. Only a press or a
+  // release records it: a candidate action's batch carries no key event, so its
+  // `context_was_active` is the field's default and not an answer.
+  //
+  // The answer belongs to the Host that reported it. A restart leaves this shell holding a fact
+  // about a context that no longer exists, and another context on the shared backend can
+  // reconnect it without this one ever reaching fence_previous_incarnation() — so the link
+  // identity travels with the answer, and a mismatch means "unknown", i.e. today's admission.
+  struct CachedMode {
+    std::optional<bool> active;
+    std::uint64_t host_incarnation = 0;
+    std::uint64_t connection_generation = 0;
+  };
+  CachedMode cached_mode_;
+
+  // Whether `cached_mode_` was learned under the Host the link is talking to now. False when
+  // nothing has been learned yet, when there is no real backend, and when the link has moved.
+  bool cached_mode_is_current() const;
 };
 
 } // namespace fusion::tsf
