@@ -103,9 +103,21 @@ int main(int argc, char **argv) {
     fusion::tsf::diag::event("TECHNICAL", "hr=0x0 count=2");
     // R52: the shape a key diagnostic takes once the key is a modifier. It is written verbatim
     // because it names a position, not a character — the line the shell writes for Shift.
-    fusion::tsf::diag::event("TEST_KEY", "mod=lshift down eligible=1 sent=0 result=none");
-    fusion::tsf::diag::event("KEY_ARRIVAL", "mod=rctrl down ctx=0000000000000000 cid=7");
-    fusion::tsf::diag::event("TEST_KEY_UP", "mod=rctrl up eligible=1 sent=0 result=none");
+    fusion::tsf::diag::event("TEST_KEY",
+                             "mod=lshift down eligible=1 seq=12 sent=0 result=none");
+    fusion::tsf::diag::event("KEY_ARRIVAL",
+                             "mod=rctrl down ctx=0000000000000000 cid=7 seq=13");
+    fusion::tsf::diag::event("TEST_KEY_UP",
+                             "mod=rctrl up eligible=1 seq=13 sent=0 result=none");
+    // R53: the shape the shell writes for every key that is not a modifier. It carries the
+    // sequence number and the eligibility answer and nothing else — no virtual key, no scan
+    // code, no character — so it is written verbatim as well. The pairing counters join the
+    // lines by `seq`, which is why the line does not need the key at all.
+    fusion::tsf::diag::event("TEST_KEY", "seq=14 eligible=1 sent=0 result=none");
+    fusion::tsf::diag::event("KEY_ARRIVAL", "seq=14 ctx=0000000000000000 cid=7");
+    fusion::tsf::diag::event("KEY_PAIRING",
+                             "t=200 t_true=67 k=200 t_true_without_k=1 t_repeated=0 "
+                             "k_without_t=0 async_effects=3");
     // The open/close line the compartment sink writes. It carries no cid: the compartment
     // belongs to the thread, and every line here already names the thread.
     fusion::tsf::diag::event("OPENCLOSE", "old=closed new=open source=self");
@@ -115,13 +127,22 @@ int main(int argc, char **argv) {
             "prohibited fields were not redacted");
     require(contents.find("TECHNICAL hr=0x0 count=2") != std::string::npos,
             "technical opt-in event missing");
-    require(contents.find("TEST_KEY mod=lshift down eligible=1 sent=0 result=none") !=
+    require(contents.find("TEST_KEY mod=lshift down eligible=1 seq=12 sent=0 result=none") !=
                 std::string::npos,
             "a modifier press was not recorded");
     require(contents.find("KEY_ARRIVAL mod=rctrl down") != std::string::npos,
             "a modifier arrival was not recorded");
     require(contents.find("TEST_KEY_UP mod=rctrl up") != std::string::npos,
             "a modifier release was not recorded");
+    // R53: an ordinary key's line carries the sequence number and the eligibility answer, and
+    // the pairing summary carries the counters — both verbatim, because neither names a key.
+    require(contents.find("TEST_KEY seq=14 eligible=1 sent=0 result=none") != std::string::npos,
+            "an ordinary key's test line was not recorded");
+    require(contents.find("KEY_ARRIVAL seq=14 ctx=") != std::string::npos,
+            "an ordinary key's arrival line was not recorded");
+    require(contents.find("KEY_PAIRING t=200 t_true=67 k=200 t_true_without_k=1 t_repeated=0 "
+                          "k_without_t=0 async_effects=3") != std::string::npos,
+            "the pairing summary was not recorded");
     require(contents.find("OPENCLOSE old=closed new=open source=self") != std::string::npos,
             "the open/close compartment change was not recorded");
     require(contents.find("vk=") == std::string::npos && contents.find("text=") == std::string::npos,

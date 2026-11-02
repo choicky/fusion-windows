@@ -4,6 +4,7 @@
 #include "tsf/build_identity.hpp"
 #include "tsf/candidate_presentation.hpp"
 #include "tsf/diag.hpp"
+#include "tsf/key_pairing.hpp"
 #include "tsf/observation.hpp"
 
 #ifdef FUSION_WITH_FCITX5
@@ -147,6 +148,24 @@ const char *modifier_name(WPARAM wparam, LPARAM lparam) {
                            (raw & 0x01000000u) != 0);
 }
 
+// R53 measurement: the T/K pairing counters, one set per thread. TSF delivers T and K on the
+// thread that owns the context, so a per-thread counter is the per-context one.
+KeyPairing &key_pairing() {
+  thread_local KeyPairing pairing;
+  return pairing;
+}
+
+// The identity a key may be named by without naming it: its scan code and the message time of
+// the event carrying it. Both are already redacted for every key that could carry content, and
+// neither is content. An injected key can arrive with message time 0, in which case two presses
+// of the same key are indistinguishable — the counters then see a repeat, which is reported as
+// such rather than guessed away.
+KeyEventId key_event_id(WPARAM wparam, LPARAM lparam) {
+  (void)wparam;
+  const auto raw = static_cast<std::uint32_t>(lparam);
+  return KeyEventId{(raw >> 16) & 0xff, static_cast<std::uint32_t>(GetMessageTime())};
+}
+
 // R52: the answer the TIP gave the application for the physical key this dispatch produced.
 // `eaten` is ownership, `forward` is the deliberate hand-back, `pass` is no claim at all.
 const char *dispatch_result(const SemanticDecision &decision) {
@@ -157,19 +176,20 @@ const char *dispatch_result(const SemanticDecision &decision) {
   return "pass";
 }
 
-void diag_key_arrival(ITfContext *pic, WPARAM vk, LPARAM lparam, std::uint64_t context_id) {
+void diag_key_arrival(ITfContext *pic, WPARAM vk, LPARAM lparam, std::uint64_t context_id,
+                      std::uint64_t seq) {
   // A modifier's identity is a key position, not content, so it is the one key fact this log
-  // may name. It replaces `vk=` rather than riding alongside it: the privacy policy reduces a
-  // details string carrying `vk=` to a marker, and the point of the line is that the two
-  // Ctrl/Shift/Alt keys and their press/release half can be told apart afterwards. Every other
-  // key keeps the shape it has always had, and so the redaction it has always had.
+  // may name. Every other key is named by its sequence number alone: the pairing counters join
+  // the lines, so the line no longer needs the virtual key — and dropping it is what lets the
+  // line carry `seq` at all, because the privacy policy reduces a details string carrying `vk=`
+  // to a marker.
   if (const char *mod = modifier_name(vk, lparam)) {
-    diagf("KEY_ARRIVAL", "mod=%s down ctx=%p cid=%" PRIu64, mod, static_cast<void *>(pic),
-          context_id);
+    diagf("KEY_ARRIVAL", "mod=%s down ctx=%p cid=%" PRIu64 " seq=%" PRIu64, mod,
+          static_cast<void *>(pic), context_id, seq);
     return;
   }
-  diagf("KEY_ARRIVAL", "vk=0x%03llX ctx=%p cid=%" PRIu64, static_cast<unsigned long long>(vk),
-        static_cast<void *>(pic), context_id);
+  diagf("KEY_ARRIVAL", "seq=%" PRIu64 " ctx=%p cid=%" PRIu64, seq, static_cast<void *>(pic),
+        context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +511,8 @@ public:
     }
     if (entry->semantic.real_frontend()) {
       const bool progress = service_->apply_frontend(*entry, ec);
+      if (progress)
+        key_pairing().on_async_effect(); // a document write in an asynchronously granted session
       service_->note_async_done(*entry, progress);
       return S_OK;
     }
@@ -1069,6 +1091,10 @@ STDMETHODIMP TextService::Deactivate() {
   if (lifecycle_obligation(LifecycleEvent::Deactivate).end_context)
     destroy_all_entries("deactivate");
   client_id_ = TF_CLIENTID_NULL;
+  // R53 measurement: the last key may still be waiting for its K, and a T that answered TRUE
+  // with no K is only knowable at the next key — or here, where the thread stops receiving them.
+  key_pairing().flush();
+  diagf("KEY_PAIRING", "%s", key_pairing().summary().c_str());
   // TSF contract: release the thread manager before returning.
   thread_mgr_.reset();
   return S_OK;
@@ -1186,13 +1212,18 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   bool mapped = entry->semantic.routes_key(action) && entry->semantic.engine_has_work_for(action);
   *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear ||
              (mapped && hard_policy_allows(*entry));
+  // R53 measurement: the sequence number is what pairs this line with the `KEY_ARRIVAL` and
+  // `BACKEND` lines of the same physical key, so the log can answer "did T and K pair" without
+  // the log ever naming the key.
+  const std::uint64_t seq = key_pairing().on_test_key(key_event_id(wparam, lparam), *pfEaten);
   if (const char *mod = modifier_name(wparam, lparam)) {
     // T answers eligibility and dispatches nothing, so the two fields a dispatch would answer
     // are written here as the constants they are — the key was not sent and has no result.
     // The dispatch half of the same press is the `BACKEND` line in OnKeyDown.
-    diagf("TEST_KEY", "mod=%s down eligible=%d sent=0 result=none", mod, *pfEaten ? 1 : 0);
+    diagf("TEST_KEY", "mod=%s down eligible=%d seq=%" PRIu64 " sent=0 result=none", mod,
+          *pfEaten ? 1 : 0, seq);
   } else {
-    diagf("TEST_KEY", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam), *pfEaten);
+    diagf("TEST_KEY", "seq=%" PRIu64 " eligible=%d sent=0 result=none", seq, *pfEaten ? 1 : 0);
   }
   return S_OK;
 }
@@ -1218,13 +1249,14 @@ STDMETHODIMP TextService::OnTestKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lpa
   // application's, exactly as before. The answer is the same predicate OnKeyUp uses, so T
   // never claims a release K would refuse.
   *pfEaten = release_admissible(*entry, action);
+  const std::uint64_t seq = key_pairing().on_test_key_up(key_event_id(wparam, lparam));
   if (const char *mod = modifier_name(wparam, lparam)) {
     // As in T for a press: the release test claims or declines, it never dispatches. Whether
     // the release reached the engine and what it answered is the `BACKEND` line in OnKeyUp.
-    diagf("TEST_KEY_UP", "mod=%s up eligible=%d sent=0 result=none", mod, *pfEaten ? 1 : 0);
+    diagf("TEST_KEY_UP", "mod=%s up eligible=%d seq=%" PRIu64 " sent=0 result=none", mod,
+          *pfEaten ? 1 : 0, seq);
   } else {
-    diagf("TEST_KEY_UP", "vk=0x%03llX eligible=%d", static_cast<unsigned long long>(wparam),
-          *pfEaten);
+    diagf("TEST_KEY_UP", "seq=%" PRIu64 " eligible=%d sent=0 result=none", seq, *pfEaten ? 1 : 0);
   }
   return S_OK;
 }
@@ -1274,11 +1306,12 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext *pic, WPARAM wparam, LPARAM lparam,
   entry->semantic.retire_terminals();
   auto lifetime_guard = hold_entry(entry);
   handling_key_ = true;
+  const std::uint64_t seq = key_pairing().on_key_up(key_event_id(wparam, lparam));
   const SemanticDecision decision = entry->semantic.release_key(action);
   if (const char *mod = modifier_name(wparam, lparam)) {
-    diagf("BACKEND", "mod=%s up sent=%d result=%s route=%s ops=%zu", mod,
+    diagf("BACKEND", "mod=%s up sent=%d result=%s route=%s ops=%zu seq=%" PRIu64, mod,
           decision.backend_session_id != 0 ? 1 : 0, dispatch_result(decision),
-          route_name(decision.route), decision.frontend.size());
+          route_name(decision.route), decision.frontend.size(), seq);
   } else {
     diagf("BACKEND", "symbolic=%s route=%s eaten=%d ops=%zu", decision.symbolic.c_str(),
           route_name(decision.route), decision.eaten ? 1 : 0, decision.frontend.size());
@@ -1320,6 +1353,11 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   if (pic == nullptr) {
     return S_OK;
   }
+  // R53 measurement: every K is counted, including the ones this service refuses, because the
+  // counters answer "did the host call T and K for the same key" and a refusal is still a K.
+  const std::uint64_t seq = key_pairing().on_key_down(key_event_id(wparam, lparam));
+  if (key_pairing().summary_due())
+    diagf("KEY_PAIRING", "%s", key_pairing().summary().c_str());
   if (handling_key_) {
     // D072 §7.5: key-callback reentrancy is not assumed impossible; refuse to
     // nest ownership handling.
@@ -1347,7 +1385,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext *pic, WPARAM wparam, LPARAM lpara
   const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
   const bool win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
   const KeyAction action = physical_key(wparam, lparam);
-  diag_key_arrival(pic, wparam, lparam, entry->semantic.context_id());
+  diag_key_arrival(pic, wparam, lparam, entry->semantic.context_id(), seq);
   diagf("CLASSIFY", "type=%d policy=%d ctrl=%d alt=%d win=%d", static_cast<int>(action.type),
         policy_allows ? 1 : 0, ctrl ? 1 : 0, alt ? 1 : 0, win ? 1 : 0);
 

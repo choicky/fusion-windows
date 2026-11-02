@@ -46,6 +46,7 @@ if(WIN32 AND MSVC)
     src/tsf/guids.cpp
     src/tsf/key_map.cpp
     src/tsf/diag.cpp
+    src/tsf/key_pairing.cpp
     src/tsf/semantic.cpp
     src/tsf/candidate_view.cpp
     src/tsf/display_attribute.cpp
@@ -160,6 +161,30 @@ if(BUILD_TESTING)
     target_compile_options(stage3c PRIVATE /W4 /WX /utf-8)
     target_link_libraries(stage3c PRIVATE FusionFcitxHost MockBackend)
     add_test(NAME stage3c_faithful_frontend COMMAND stage3c)
+
+    # R53 measurement: the full keyboard matrix against the real pinned engine. The full run is
+    # a manual measurement (`key_matrix <outdir>`); the suite runs the subset the known cases
+    # need, so a regression in what the stopgap claims fails here.
+    # R53 measurement: a long-run soak of the real Host on a throwaway profile. Not a ctest
+    # entry — it runs for hours and measures rather than asserts.
+    add_executable(soak
+      tests/soak.cpp
+      src/ipc/pipe_client.cpp
+      src/ipc/pipe_security.cpp
+      src/ipc/ipc_backend.cpp
+      src/tsf/key_map.cpp
+      src/tsf/semantic.cpp)
+    target_include_directories(soak PRIVATE src)
+    target_compile_features(soak PRIVATE cxx_std_20)
+    target_compile_options(soak PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(soak PRIVATE MockBackend psapi)
+
+    add_executable(key_matrix tests/key_matrix.cpp src/tsf/key_map.cpp src/tsf/semantic.cpp)
+    target_include_directories(key_matrix PRIVATE src)
+    target_compile_definitions(key_matrix PRIVATE FUSION_WITH_FCITX5)
+    target_compile_options(key_matrix PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(key_matrix PRIVATE FusionFcitxHost MockBackend)
+    add_test(NAME key_matrix_known_cases COMMAND key_matrix "${CMAKE_BINARY_DIR}" --quick)
 
     # U7: the tray's transition rules (no window, no desktop session needed).
     add_executable(tray_state tests/tray_state.cpp)
@@ -364,6 +389,13 @@ if(BUILD_TESTING)
   target_link_libraries(rg0 PRIVATE FusionMock)
 
   if(WIN32 AND MSVC)
+  # R53 measurement: the T/K pairing counters, a pure state machine with no TSF in it.
+  add_executable(key_pairing tests/key_pairing.cpp src/tsf/key_pairing.cpp)
+  target_include_directories(key_pairing PRIVATE src)
+  target_compile_features(key_pairing PRIVATE cxx_std_20)
+  target_compile_options(key_pairing PRIVATE /W4 /WX /utf-8)
+  add_test(NAME key_pairing_counters COMMAND key_pairing)
+
     add_executable(diag_policy tests/diag_policy.cpp src/tsf/diag.cpp src/tsf/key_map.cpp)
     target_include_directories(diag_policy PRIVATE src)
     target_compile_features(diag_policy PRIVATE cxx_std_20)
