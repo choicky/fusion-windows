@@ -65,8 +65,9 @@ struct KeyDef {
   const char *klass;
   std::uint32_t keysym; // 0: `translate_key` decides, or the shell sends nothing
   std::uint32_t scan;
-  bool numpad;
-  bool text; // the key carries a character on a US layout
+  bool numpad;      // a keypad key measured with NumLock on
+  bool text;        // the key carries a character on a US layout
+  bool numlock_off; // the same key measured with NumLock off
 };
 
 constexpr std::uint32_t kNoKeysym = 0;
@@ -182,6 +183,29 @@ const KeyDef kKeys[] = {
     {0x6D, "NumpadSubtract", "numpad", 0xffad, 0x4A, true, true},
     {0x6E, "NumpadDecimal", "numpad", 0xffae, 0x53, true, true},
     {0x6F, "NumpadDivide", "numpad", 0xffaf, 0x35, true, true},
+    // The same fifteen keys with NumLock off. Windows reports the same virtual key and
+    // `ToUnicodeEx` returns no character. For the five operators that leaves nothing to send, so
+    // the shell never presents them and the probe asks the engine with the keypad keysym. For the
+    // ten digits it is worse than that: `classify_key` maps the keypad range to a digit whatever
+    // the NumLock state, the keysym is empty, and the Host falls back to the stimulus's symbolic
+    // name — so a keypad digit with NumLock off is presented as the top-row digit. Measured: it
+    // types "0".."9" through the engine where the application would have seen End/Down/… .
+    // Without these cells the matrix would be claiming coverage it does not have.
+    {0x60, "Numpad0-NumLockOff", "numpad", 0xffb0, 0x52, false, false, true},
+    {0x61, "Numpad1-NumLockOff", "numpad", 0xffb1, 0x4F, false, false, true},
+    {0x62, "Numpad2-NumLockOff", "numpad", 0xffb2, 0x50, false, false, true},
+    {0x63, "Numpad3-NumLockOff", "numpad", 0xffb3, 0x51, false, false, true},
+    {0x64, "Numpad4-NumLockOff", "numpad", 0xffb4, 0x4B, false, false, true},
+    {0x65, "Numpad5-NumLockOff", "numpad", 0xffb5, 0x4C, false, false, true},
+    {0x66, "Numpad6-NumLockOff", "numpad", 0xffb6, 0x4D, false, false, true},
+    {0x67, "Numpad7-NumLockOff", "numpad", 0xffb7, 0x47, false, false, true},
+    {0x68, "Numpad8-NumLockOff", "numpad", 0xffb8, 0x48, false, false, true},
+    {0x69, "Numpad9-NumLockOff", "numpad", 0xffb9, 0x49, false, false, true},
+    {0x6A, "NumpadMultiply-NumLockOff", "numpad", 0xffaa, 0x37, false, false, true},
+    {0x6B, "NumpadAdd-NumLockOff", "numpad", 0xffab, 0x4E, false, false, true},
+    {0x6D, "NumpadSubtract-NumLockOff", "numpad", 0xffad, 0x4A, false, false, true},
+    {0x6E, "NumpadDecimal-NumLockOff", "numpad", 0xffae, 0x53, false, false, true},
+    {0x6F, "NumpadDivide-NumLockOff", "numpad", 0xffaf, 0x35, false, false, true},
     // Locks and system keys.
     {0x14, "CapsLock", "lock", 0xffe5, 0x3A, false, false},
     {0x90, "NumLock", "lock", 0xff7f, 0x45, false, false},
@@ -581,7 +605,7 @@ Cell measure_cell(Fixture &fixture, const KeyDef &key, State state, const Modifi
     return cell;
   }
 
-  const bool numlock = key.numpad; // the keypad cells are measured with NumLock on
+  const bool numlock = key.numpad && !key.numlock_off;
   const char32_t character = key.text ? character_for(key, modifier.shift, numlock) : 0;
   const KeyAction action = action_for(key, modifier, numlock);
   // The keysym the key carries on its own. `translate_key` returns before its keysym table for
