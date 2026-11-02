@@ -450,8 +450,12 @@ bool reach_state(SemanticController &controller, State state, Document &doc, std
     // and it has to be one an active engine would compose — a character-less key is forwarded
     // by both states and would teach nothing.
     (void)press(translate_key(0x58, false, false, false, U'x'));
-    if (controller.engine_has_work_for(translate_key(0x4E, false, false, false, U'n'))) {
-      why = "the fixture did not reach the engine's off state";
+    // The check is the engine's, not the shell's: an active engine would have started a
+    // composition on that letter, and the off slot forwards it. Asking the shell's own predicate
+    // would make the fixture depend on the very rule it is measuring — and would make the same
+    // file unusable against a build from before that rule existed.
+    if (!doc.preedit.empty()) {
+      why = "the fixture did not reach the engine's off state (the letter composed)";
       return false;
     }
     return true;
