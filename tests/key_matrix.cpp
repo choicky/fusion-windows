@@ -65,12 +65,47 @@ struct KeyDef {
   const char *klass;
   std::uint32_t keysym; // 0: `translate_key` decides, or the shell sends nothing
   std::uint32_t scan;
-  bool numpad;      // a keypad key measured with NumLock on
+  bool numpad;      // a keypad key
   bool text;        // the key carries a character on a US layout
-  bool numlock_off; // the same key measured with NumLock off
+  bool numlock_off; // ... measured in the NumLock-off state, where it is not a digit key
 };
 
 constexpr std::uint32_t kNoKeysym = 0;
+
+// The extended flag the physical event carries. Windows sets it for the E0-prefixed keys — the
+// dedicated navigation cluster, PrintScreen, Apps, the keypad's Divide, right Ctrl/Alt, the Win
+// keys and the browser/media block — and clears it for the keypad's own keys, including the
+// navigation keys a NumLock-off keypad produces. Recorded because those last cells differ from
+// the dedicated keys in exactly this bit; Fusion reads it only in `modifier_identity`.
+bool physical_extended(const KeyDef &key) {
+  if (key.vk == 0x6F)
+    return !key.numlock_off; // the keypad's Divide is E0 35
+  if (key.numpad || key.numlock_off)
+    return false; // the keypad's own keys never carry E0
+  if (key.vk >= 0xA6 && key.vk <= 0xB7)
+    return true; // browser / volume / media / launch
+  switch (key.vk) {
+  case 0x21: // PageUp
+  case 0x22: // PageDown
+  case 0x23: // End
+  case 0x24: // Home
+  case 0x25: // Left
+  case 0x26: // Up
+  case 0x27: // Right
+  case 0x28: // Down
+  case 0x2C: // PrintScreen
+  case 0x2D: // Insert
+  case 0x2E: // Delete
+  case 0x5B: // LWin
+  case 0x5C: // RWin
+  case 0x5D: // Apps
+  case 0xA3: // RCtrl
+  case 0xA5: // RAlt
+    return true;
+  default:
+    return false;
+  }
+}
 
 const KeyDef kKeys[] = {
     // Letters.
@@ -183,29 +218,31 @@ const KeyDef kKeys[] = {
     {0x6D, "NumpadSubtract", "numpad", 0xffad, 0x4A, true, true},
     {0x6E, "NumpadDecimal", "numpad", 0xffae, 0x53, true, true},
     {0x6F, "NumpadDivide", "numpad", 0xffaf, 0x35, true, true},
-    // The same fifteen keys with NumLock off. Windows reports the same virtual key and
-    // `ToUnicodeEx` returns no character. For the five operators that leaves nothing to send, so
-    // the shell never presents them and the probe asks the engine with the keypad keysym. For the
-    // ten digits it is worse than that: `classify_key` maps the keypad range to a digit whatever
-    // the NumLock state, the keysym is empty, and the Host falls back to the stimulus's symbolic
-    // name — so a keypad digit with NumLock off is presented as the top-row digit. Measured: it
-    // types "0".."9" through the engine where the application would have seen End/Down/… .
-    // Without these cells the matrix would be claiming coverage it does not have.
-    {0x60, "Numpad0-NumLockOff", "numpad", 0xffb0, 0x52, false, false, true},
-    {0x61, "Numpad1-NumLockOff", "numpad", 0xffb1, 0x4F, false, false, true},
-    {0x62, "Numpad2-NumLockOff", "numpad", 0xffb2, 0x50, false, false, true},
-    {0x63, "Numpad3-NumLockOff", "numpad", 0xffb3, 0x51, false, false, true},
-    {0x64, "Numpad4-NumLockOff", "numpad", 0xffb4, 0x4B, false, false, true},
-    {0x65, "Numpad5-NumLockOff", "numpad", 0xffb5, 0x4C, false, false, true},
-    {0x66, "Numpad6-NumLockOff", "numpad", 0xffb6, 0x4D, false, false, true},
-    {0x67, "Numpad7-NumLockOff", "numpad", 0xffb7, 0x47, false, false, true},
-    {0x68, "Numpad8-NumLockOff", "numpad", 0xffb8, 0x48, false, false, true},
-    {0x69, "Numpad9-NumLockOff", "numpad", 0xffb9, 0x49, false, false, true},
-    {0x6A, "NumpadMultiply-NumLockOff", "numpad", 0xffaa, 0x37, false, false, true},
-    {0x6B, "NumpadAdd-NumLockOff", "numpad", 0xffab, 0x4E, false, false, true},
-    {0x6D, "NumpadSubtract-NumLockOff", "numpad", 0xffad, 0x4A, false, false, true},
-    {0x6E, "NumpadDecimal-NumLockOff", "numpad", 0xffae, 0x53, false, false, true},
-    {0x6F, "NumpadDivide-NumLockOff", "numpad", 0xffaf, 0x35, false, false, true},
+    // The keypad with NumLock off. Windows does **not** deliver VK_NUMPAD0..9 (0x60..0x69) or
+    // VK_DECIMAL (0x6E) in that state: it delivers the navigation keys, with the keypad's own scan
+    // code and the extended flag clear. So each of these is the same virtual key and scan code as
+    // the dedicated key above and differs from it in exactly one bit, which Fusion never reads in
+    // `translate_key` — the flag reaches only `modifier_identity`, to name right-Ctrl and
+    // right-Alt. That is why the measured answer for each of them is the dedicated key's answer,
+    // and the pair being identical is the result, not a gap in coverage.
+    //
+    // VK_CLEAR (0x0C) is the one that has no dedicated counterpart: `translate_key` gives it no
+    // keysym, so `routes_key` refuses it before any dispatch and the application receives it.
+    //
+    // The four operators (/ * - +) report the same virtual key and the same character whatever
+    // the NumLock state, so they are the same cells as the NumLock-on rows above and are not
+    // duplicated here.
+    {0x2D, "Numpad0 (NumLock off) = Insert", "numpad-off", kNoKeysym, 0x52, true, false, true},
+    {0x23, "Numpad1 (NumLock off) = End", "numpad-off", kNoKeysym, 0x4F, true, false, true},
+    {0x28, "Numpad2 (NumLock off) = Down", "numpad-off", kNoKeysym, 0x50, true, false, true},
+    {0x22, "Numpad3 (NumLock off) = PgDn", "numpad-off", kNoKeysym, 0x51, true, false, true},
+    {0x25, "Numpad4 (NumLock off) = Left", "numpad-off", kNoKeysym, 0x4B, true, false, true},
+    {0x0C, "Numpad5 (NumLock off) = Clear", "numpad-off", kNoKeysym, 0x4C, true, false, true},
+    {0x27, "Numpad6 (NumLock off) = Right", "numpad-off", kNoKeysym, 0x4D, true, false, true},
+    {0x24, "Numpad7 (NumLock off) = Home", "numpad-off", kNoKeysym, 0x47, true, false, true},
+    {0x26, "Numpad8 (NumLock off) = Up", "numpad-off", kNoKeysym, 0x48, true, false, true},
+    {0x21, "Numpad9 (NumLock off) = PgUp", "numpad-off", kNoKeysym, 0x49, true, false, true},
+    {0x2E, "Numpad. (NumLock off) = Delete", "numpad-off", kNoKeysym, 0x53, true, false, true},
     // Locks and system keys.
     {0x14, "CapsLock", "lock", 0xffe5, 0x3A, false, false},
     {0x90, "NumLock", "lock", 0xff7f, 0x45, false, false},
@@ -313,6 +350,7 @@ struct Cell {
   std::string state;
   std::string modifier;
   std::uint32_t vk = 0;
+  bool extended = false;
   std::uint32_t keysym_sent = 0;
   std::uint32_t probe_keysym = 0;
   bool text_key = false;
@@ -585,6 +623,7 @@ Cell measure_cell(Fixture &fixture, const KeyDef &key, State state, const Modifi
   cell.state = state_name(state);
   cell.modifier = modifier.name;
   cell.vk = key.vk;
+  cell.extended = physical_extended(key);
   cell.text_key = key.text;
 
   Backend &backend = fixture.for_state(state);
@@ -702,12 +741,14 @@ Cell measure_cell(Fixture &fixture, const KeyDef &key, State state, const Modifi
 void write_csv(const std::string &path, const std::vector<Cell> &cells) {
   std::ofstream out(path, std::ios::binary);
   require(out.good(), "cannot open the CSV output");
-  out << "key,key_class,state,modifier,vk,keysym_sent,probe_keysym,text_key,t_answer,k_dispatched,"
+  out << "key,key_class,state,modifier,vk,extended,keysym_sent,probe_keysym,text_key,t_answer,"
+         "k_dispatched,"
          "k_route,k_eaten,k_forward,k_ops,k_fallback,k_committed,engine_consumed,engine_forwarded,"
          "engine_probed,verdict,note\r\n";
   for (const Cell &cell : cells) {
     out << csv_field(cell.key) << ',' << csv_field(cell.klass) << ',' << csv_field(cell.state)
-        << ',' << csv_field(cell.modifier) << ',' << cell.vk << ',' << cell.keysym_sent << ','
+        << ',' << csv_field(cell.modifier) << ',' << cell.vk << ','
+        << (cell.extended ? 1 : 0) << ',' << cell.keysym_sent << ','
         << cell.probe_keysym << ',' << (cell.text_key ? 1 : 0) << ',' << (cell.t_answer ? 1 : 0)
         << ',' << (cell.k_dispatched ? 1 : 0) << ',' << csv_field(cell.k_route) << ','
         << (cell.k_eaten ? 1 : 0) << ',' << (cell.k_forward ? 1 : 0) << ',' << cell.k_ops << ','
@@ -720,9 +761,9 @@ void write_csv(const std::string &path, const std::vector<Cell> &cells) {
 
 const char *const kStates[] = {"inactive", "idle",         "composing",
                                "composing-selection", "after-commit", "after-toggle"};
-const char *const kClasses[] = {"letter", "digit",      "oem",    "function", "editing",
-                                "navigation", "numpad", "lock",   "system",   "media",
-                                "modifier"};
+const char *const kClasses[] = {"letter",     "digit",  "oem",    "function",
+                                "editing",    "navigation", "numpad", "numpad-off",
+                                "lock",       "system", "media",  "modifier"};
 const char *const kModifierNames[] = {"none", "shift", "ctrl", "alt", "ctrl+shift", "ctrl+alt"};
 const char *const kVerdicts[] = {"ok", "LOST", "MISSED", "FALLBACK", "RECOVERY", "unreached"};
 
