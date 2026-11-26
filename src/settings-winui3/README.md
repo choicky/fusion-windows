@@ -169,7 +169,9 @@ The native `punctuation_editor` check drives the real engine, forces both halves
 atomic save (a directory that cannot take the temporary file, and a target held without delete
 sharing), and reads the live lookup map through the engine's own composition path after each
 outcome — the row a refused save carried must not be served, and the row an accepted save carried
-must be. It prints `PASS punctuation editor: official subconfig, checked save, one-press #,
+must be. The directory half is a denial written into that directory's DACL, so the check requires
+the DACL it replaced to be back afterwards, read from the object and compared byte for byte, before
+it goes on. It prints `PASS punctuation editor: official subconfig, checked save, one-press #,
 paired row, refused rows, failed write, failed replacement, live map, empty table and defaults`
 when `FUSION_TEST_PUNCTUATION_PROFILE` contains the directory Fcitx resolves its per-user data to.
 That directory is the file the check asserts, so the check asks Fcitx's own `StandardPaths` where
