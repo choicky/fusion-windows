@@ -162,6 +162,7 @@ public sealed partial class MainWindow : Window
                 "keys" => new KeysPage(),
                 "candidates" => new CandidatesPage(),
                 "dictionaries" => new DictionariesPage(),
+                "punctuation" => new PunctuationPage(),
                 "about" => new AboutPage(),
                 _ => (SettingsPageBase)new InputMethodsPage(),
             };

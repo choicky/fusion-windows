@@ -22,6 +22,11 @@ public enum SettingsTarget
     /// configuration that holds presentation only (today the layout direction).
     /// </summary>
     Presentation,
+
+    /// <summary>
+    /// The official Fcitx zh_CN punctuation subconfiguration, owned by the punctuation addon.
+    /// </summary>
+    Punctuation,
 }
 
 /// <summary>
@@ -58,6 +63,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// value; this window only edits it through the Host.
     /// </summary>
     public const string PresentationUri = "fcitx://config/candidate-presentation";
+
+    /// <summary>
+    /// The official sub-configuration URI used by Fcitx's own controller for the punctuation
+    /// addon's zh_CN profile. The Host serves the addon's schema and values unchanged.
+    /// </summary>
+    public const string PunctuationUri =
+        "fcitx://config/addon/punctuation/punctuationmap/zh_CN";
 
     /// <summary>
     /// What the window says while a save is waiting for the Host to be free. It says what is
@@ -273,11 +285,15 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public SettingsSnapshot? PresentationSnapshot { get; private set; }
 
+    public SettingsSnapshot? PunctuationSnapshot { get; private set; }
+
     public SettingsDraft? PinyinDraft { get; private set; }
 
     public SettingsDraft? GlobalDraft { get; private set; }
 
     public SettingsDraft? PresentationDraft { get; private set; }
+
+    public SettingsDraft? PunctuationDraft { get; private set; }
 
     public ImListDraft? Methods { get; private set; }
 
@@ -296,6 +312,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         SettingsTarget.Shuangpin => ShuangpinSnapshot,
         SettingsTarget.Global => GlobalSnapshot,
         SettingsTarget.Presentation => PresentationSnapshot,
+        SettingsTarget.Punctuation => PunctuationSnapshot,
         _ => null,
     };
 
@@ -303,6 +320,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     {
         SettingsTarget.Global => GlobalDraft,
         SettingsTarget.Presentation => PresentationDraft,
+        SettingsTarget.Punctuation => PunctuationDraft,
         SettingsTarget.Pinyin => PinyinDraft,
         SettingsTarget.Shuangpin => PinyinDraft,
         _ => null,
@@ -310,7 +328,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public bool HasChanges =>
         (PinyinDraft?.HasChanges ?? false) || (GlobalDraft?.HasChanges ?? false) ||
-        (PresentationDraft?.HasChanges ?? false) || (Methods?.HasChanges ?? false);
+        (PresentationDraft?.HasChanges ?? false) || (PunctuationDraft?.HasChanges ?? false) ||
+        (Methods?.HasChanges ?? false);
 
     public IReadOnlyList<string> Diagnostics => _log;
 
@@ -416,6 +435,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return Fail(presentation.Status, presentation.Error);
             }
 
+            var punctuation = await _client.GetConfigAsync(PunctuationUri, cancellationToken)
+                .ConfigureAwait(true);
+            if (!punctuation.IsOk)
+            {
+                return Fail(punctuation.Status, punctuation.Error);
+            }
+
             var methods = await _client.GetImListAsync(cancellationToken).ConfigureAwait(true);
             if (!methods.IsOk)
             {
@@ -427,6 +453,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             var incarnation = pinyin.HostIncarnation;
             if (shuangpin.HostIncarnation != incarnation || global.HostIncarnation != incarnation ||
                 presentation.HostIncarnation != incarnation ||
+                punctuation.HostIncarnation != incarnation ||
                 methods.HostIncarnation != incarnation)
             {
                 Log("load rejected: replies came from different Host incarnations");
@@ -441,6 +468,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             ShuangpinSnapshot = shuangpin.Value;
             GlobalSnapshot = global.Value;
             PresentationSnapshot = presentation.Value;
+            PunctuationSnapshot = punctuation.Value;
 
             if (recreateDrafts)
             {
@@ -448,6 +476,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 GlobalDraft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(GlobalUri), global.Value!);
                 PresentationDraft = SettingsDraft.FromSnapshot(
                     ConfigIdentity.ForUri(PresentationUri), presentation.Value!);
+                PunctuationDraft = SettingsDraft.FromSnapshot(
+                    ConfigIdentity.ForUri(PunctuationUri), punctuation.Value!);
                 Methods = new ImListDraft(methods.Value!);
             }
             else
@@ -458,6 +488,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 PinyinDraft?.RefreshBaseline(pinyin.Value!);
                 GlobalDraft?.RefreshBaseline(global.Value!);
                 PresentationDraft?.RefreshBaseline(presentation.Value!);
+                PunctuationDraft?.RefreshBaseline(punctuation.Value!);
                 MergeMethods(methods.Value!);
             }
 
@@ -764,6 +795,15 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 cancellationToken).ConfigureAwait(true));
         }
 
+        if (Wants(only, SavePage.Punctuation) &&
+            PunctuationDraft is { HasChanges: true } punctuationDraft)
+        {
+            Record(reports, busy, SavePage.Punctuation, await SaveConfigurationAsync(
+                PunctuationUri, SettingsTarget.Punctuation, punctuationDraft.BuildChangeSet(),
+                punctuationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "标点映射",
+                cancellationToken).ConfigureAwait(true));
+        }
+
         if (Wants(only, SavePage.Methods) && Methods is { HasChanges: true } methods)
         {
             Record(reports, busy, SavePage.Methods,
@@ -964,6 +1004,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             case SettingsTarget.Presentation:
                 PresentationSnapshot = snapshot;
                 break;
+            case SettingsTarget.Punctuation:
+                PunctuationSnapshot = snapshot;
+                break;
             case SettingsTarget.Global:
                 GlobalSnapshot = snapshot;
                 break;
@@ -1138,6 +1181,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         public const string Shuangpin = "双拼";
         public const string Global = "全局配置";
         public const string Presentation = "候选窗口";
+        public const string Punctuation = "标点映射";
         public const string Methods = "输入方式列表";
 
         /// <summary>Fields no view's schema describes. Reported once, never submitted.</summary>

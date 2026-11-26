@@ -106,6 +106,23 @@ internal static class TestSchema
         return SettingsValue.Map(entries);
     }
 
+    /// <summary>The zh_CN punctuation subconfiguration: an ordered list of row objects.</summary>
+    public static SettingsSnapshot PunctuationSnapshot()
+    {
+        var entries = PunctuationMap.Value(new[]
+        {
+            new PunctuationRow("#", "#", string.Empty),
+            new PunctuationRow("#", "＃", string.Empty),
+            new PunctuationRow("\"", "“", "”"),
+        });
+        var values = SettingsValue.Map((PunctuationMap.Entries, entries));
+        var option = new OptionDescription(
+            "Entries", "List|Entries$PunctuationMapEntryConfig", "Entries",
+            entries, SettingsValue.EmptyMap());
+        return new SettingsSnapshot(values,
+            new[] { new ConfigType("PunctuationMapConfig", new[] { option }) });
+    }
+
     public static SettingsSnapshot GlobalView()
     {
         var hotkey = new List<OptionDescription>

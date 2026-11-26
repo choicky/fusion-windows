@@ -234,6 +234,22 @@ if(BUILD_TESTING)
     set_tests_properties(settings_save_while_composing PROPERTIES
       SKIP_REGULAR_EXPRESSION "SKIP settings_save_while_composing")
 
+    # The zh_CN punctuation subconfiguration is served through the real Host settings
+    # transport, applied through the punctuation addon's official get/setSubConfig API, and
+    # checked against Fcitx's canonical data file as well as the Host readback. It also
+    # drives one press of # and a paired punctuation row through the real engine, so it needs
+    # the same throwaway profile rule as the other file-backed settings checks.
+    add_executable(punctuation_editor tests/punctuation_editor.cpp)
+    target_include_directories(punctuation_editor PRIVATE include)
+    target_compile_features(punctuation_editor PRIVATE cxx_std_20)
+    target_compile_definitions(punctuation_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+      _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(punctuation_editor PRIVATE /W4 /WX /utf-8)
+    target_link_libraries(punctuation_editor PRIVATE FusionFcitxHost)
+    add_test(NAME punctuation_editor COMMAND punctuation_editor)
+    set_tests_properties(punctuation_editor PROPERTIES
+      SKIP_REGULAR_EXPRESSION "SKIP punctuation_editor")
+
     # The candidate/preedit/panel outputFilter contract against the real pinned
     # Fcitx5 core: same projection source FusionHost.exe compiles, built with the
     # Host's own compiler settings, driven with engine-side OutputFilter consumers.

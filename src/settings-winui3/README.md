@@ -11,7 +11,7 @@ new configuration path.
 |---|---|
 | `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models, and the workspace that routes edits, splits saves and reconciles uncertain writes |
 | `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe |
-| `FusionSettings.App/` | The WinUI 3 window: four pages, the key editor, the schema-driven option rows |
+| `FusionSettings.App/` | The WinUI 3 window: five pages, the key editor, the schema-driven option rows, and the zh_CN punctuation map editor |
 
 `FusionSettings.Core` targets `net10.0` and `net8.0`: the checks run on net10, the app on
 net8, which is the runtime it is published against.
@@ -31,8 +31,17 @@ These are the properties the presentation may rely on, each covered by a check:
 - **Only changed options are submitted**, and a no-change save sends no request at all.
 - **A list is written as an indexed map, empty or not.** The Host reads an empty list back as the
   empty scalar but refuses one on write, so `StringListValue` and `KeyBindingList.ToValue` emit a
-  map and an empty map for an empty list. An empty scalar, an empty list and a list holding an
+  map and an empty map for an empty list. An   empty scalar, an empty list and a list holding an
   empty positional entry stay three different values.
+- **The zh_CN punctuation map is Fcitx's own configuration.** The Host serves the official
+  `fcitx://config/addon/punctuation/punctuationmap/zh_CN` subconfiguration from the
+  punctuation addon; the window only edits the addon's own `Entries` rows through the same
+  draft/save bar as every other page. Repeated keys stay repeated, the row index is candidate
+  order, `AltMapping` stays on the paired row, and 恢复默认映射 reads the addon's schema
+  `DefaultValue` rather than a second table in this client. A successful save is reported only
+  when Fcitx's canonical `punctuation/punc.mb.zh_CN` contains the submitted bytes and the Host
+  reads the same rows back; an invalid or refused write leaves both the live addon and the file
+  at the previous map.
 - **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
   truncated, late or cancelled reply returns `Indeterminate` with
   `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
@@ -135,8 +144,16 @@ list, an import, the name conflict and its confirmed overwrite, a corrupt file t
 imported dictionary alone, enable/disable, reload and delete — each read back from the Host,
 with the learned dictionary compared before and after, and the whole chain again for a Chinese
 name, which is the case that travels as UTF-8 and has to come back unchanged. A third
-run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **3 checks**:
-the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
+run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **13 checks**:
+the saved global value, the two saved candidate-presentation values, and the punctuation restart chain — the removed
+full-width `＃` row survived the new Host process, then the shipped rows were restored from the schema and both `#`
+candidates came back. `--no-integration` skips the real-Host section.
+
+On this branch the no-Host half prints **608 checks** with no failure. The real-Host half prints **870 checks** with one
+failure in this environment: `the engine exposes AuxiliaryFilter`, a pre-existing runtime difference also recorded
+above; the punctuation section itself has no failures. The native `punctuation_editor` check separately drives the real
+engine and prints `PASS punctuation editor: official subconfig, file-backed save, one-press #, paired row, refused write
+and defaults` when `FUSION_TEST_PUNCTUATION_PROFILE` points at a throwaway profile and `APPDATA` is inside it.
 
 ### Running the real-Host checks
 
@@ -167,6 +184,11 @@ The Host prints where it resolved its paths; both lines must point inside `$prof
 [FusionHost] fcitx user data:   ...\fusion-settings-profile\User\AppData\Roaming\Fcitx5\data
 ```
 
+The Host build being tested must carry both `data/fcitx5/inputmethod/pinyin.conf` and
+`data/fcitx5/inputmethod/shuangpin.conf`. A build tree that has only `pinyin.conf` registers one
+input method; the workspace then stops at its first load with
+`The requested input-method configuration is unavailable.` before any punctuation check runs.
+
 Then point the checks at the same name (the logical name, without the device path) and at the
 profile root, so the no-change save can be checked against the files on disk:
 
@@ -176,12 +198,15 @@ $env:FUSION_SETTINGS_GLOBAL_PROFILE = $profileRoot
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
-The run ends by printing `GLOBAL_EXPECT=<option>=<value>`. Stop the Host with its stop event
-(signalling `Local\FusionHost-stop-<scope>` requests the orderly shutdown that saves state),
-start it again against the same profile, and confirm the value survived:
+The run ends by printing `GLOBAL_EXPECT=<option>=<value>`,
+`PRESENTATION_EXPECT=<option>=<value>;...` and `PUNCTUATION_EXPECT=hash=one`. Stop the Host with
+its stop event (signalling `Local\FusionHost-stop-<scope>` requests the orderly shutdown that
+saves state), start it again against the same profile, and confirm all three survived:
 
 ```powershell
 $env:FUSION_SETTINGS_GLOBAL_EXPECT = "DefaultPageSize=6"
+$env:FUSION_SETTINGS_PRESENTATION_EXPECT = "CandidateLayout=AutoScroll;FontSize=16"
+$env:FUSION_SETTINGS_PUNCTUATION_EXPECT = "hash=one"
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
@@ -192,6 +217,6 @@ dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 
 - Option coverage, per-item dispositions and the shared-configuration rule:
   `fusion-controller/docs/` → `evidence/settings-winui3-2026-10-21/migration-inventory.md`.
-- Decisions: D085 (partially superseded), D086 (licence scope), D087 (presentation).
+- Decisions: D085 (partially superseded), D086 (licence scope), D087 (presentation), D088 (no duplicate input-semantic store).
 - Client/Host boundary and the shared-state model: `windows-architecture.md`.
 - Per-level completion state: `windows-stage6-plan.md`.
