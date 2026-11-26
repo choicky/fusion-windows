@@ -1,9 +1,10 @@
 // Real-engine checks for the zh_CN punctuation subconfiguration exposed through the
-// settings transport. It needs a writable throwaway profile (FUSION_TEST_PUNCTUATION_PROFILE,
-// with APPDATA inside it); otherwise it prints SKIP and touches nothing. The product profile
-// is never used. Every change goes through Backend::settings_set_config, the same Host entry
-// point the WinUI client uses, and every assertion about a save also checks the canonical
-// Fcitx data file: an in-memory readback alone would not prove that anything was stored.
+// settings transport. It needs a writable throwaway profile (FUSION_TEST_PUNCTUATION_PROFILE
+// must contain the directory StandardPaths resolves Fcitx's per-user data to); otherwise it
+// prints SKIP, naming that directory, and touches nothing. Every change goes through
+// Backend::settings_set_config, the same Host entry point the WinUI client uses, and every
+// assertion about a save also checks the canonical Fcitx data file: an in-memory readback
+// alone would not prove that anything was stored.
 
 #include "fusion/backend.hpp"
 
@@ -20,6 +21,7 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include <fcitx-utils/standardpaths.h>
 
 using namespace fusion;
 
@@ -84,13 +86,27 @@ SettingsValue value_of(const std::vector<Row> &rows) {
   return root;
 }
 
-// Measured on this runtime: PunctuationProfile::save writes PkgData/punctuation/punc.mb.zh_CN
-// under %APPDATA%\Fcitx5, not under the Host's separate data directory. The test's own isolated
-// APPDATA is the authority here, so it cannot accidentally name the product profile.
+// The addon writes through StandardPaths, so the one authority to ask where the canonical file
+// is — and the only path the assertions may name — is that same StandardPaths. Redirecting
+// APPDATA alone is not enough on Windows: the roaming folder is resolved through the shell from
+// the user profile, so a throwaway APPDATA with the real USERPROFILE still lands in the product
+// profile, and the test would then assert one file while the engine wrote another.
 std::filesystem::path data_file() {
-  const char *appdata = std::getenv("APPDATA");
-  require(appdata != nullptr, "APPDATA is not set");
-  return std::filesystem::path(appdata) / "Fcitx5" / "punctuation" / "punc.mb.zh_CN";
+  return fcitx::StandardPaths::global().userDirectory(fcitx::StandardPathsType::PkgData) /
+         "punctuation" / "punc.mb.zh_CN";
+}
+
+bool inside(const std::filesystem::path &root, const std::filesystem::path &candidate) {
+  auto candidatePart = candidate.begin();
+  for (auto rootPart = root.begin(); rootPart != root.end(); ++rootPart, ++candidatePart) {
+    if (rootPart->empty() && rootPart == root.begin()) {
+      continue;
+    }
+    if (candidatePart == candidate.end() || *candidatePart != *rootPart) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::string file_text() {
@@ -391,11 +407,12 @@ void run(Backend &backend) {
 
 int main() {
   const char *profile = std::getenv("FUSION_TEST_PUNCTUATION_PROFILE");
-  const char *appdata = std::getenv("APPDATA");
-  if (!profile || !appdata || !std::filesystem::path(appdata).lexically_normal().string().starts_with(
-                                  std::filesystem::path(profile).lexically_normal().string())) {
-    std::cout << "SKIP punctuation_editor: set FUSION_TEST_PUNCTUATION_PROFILE and APPDATA inside "
-                 "it\n";
+  const auto canonical = data_file().lexically_normal();
+  if (!profile || !inside(std::filesystem::path(profile).lexically_normal(),
+                          canonical)) {
+    std::cout << "SKIP punctuation_editor: set FUSION_TEST_PUNCTUATION_PROFILE so that it "
+                 "contains "
+              << canonical.string() << '\n';
     return 0;
   }
   try {

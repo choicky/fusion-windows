@@ -242,14 +242,20 @@ if(BUILD_TESTING)
     # held without delete sharing), so it needs the same throwaway profile rule as the other
     # file-backed settings checks.
     add_executable(punctuation_editor tests/punctuation_editor.cpp)
-    target_include_directories(punctuation_editor PRIVATE include)
+    # The compat directory is the same shim the Host compiles against; it is needed here
+    # because the test includes Fcitx's own StandardPaths header to ask where the canonical
+    # file lives.
+    target_include_directories(punctuation_editor PRIVATE include cmake/fcitx-native/compat)
     target_compile_features(punctuation_editor PRIVATE cxx_std_20)
     target_compile_definitions(punctuation_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
       _CRT_SECURE_NO_WARNINGS)
     target_compile_options(punctuation_editor PRIVATE /W4 /WX /utf-8)
     # The ACL that denies "create files" for the failed-write case is applied with the
-    # Win32 security API, which is not reached through the Host module.
-    target_link_libraries(punctuation_editor PRIVATE FusionFcitxHost advapi32)
+    # Win32 security API, which is not reached through the Host module. Fcitx5::Utils is
+    # linked for one reason: the test asks StandardPaths where the addon's canonical file is
+    # instead of assuming it from an environment variable, so it can refuse to run when that
+    # directory is outside the throwaway profile.
+    target_link_libraries(punctuation_editor PRIVATE FusionFcitxHost advapi32 Fcitx5::Utils)
     add_test(NAME punctuation_editor COMMAND punctuation_editor)
     set_tests_properties(punctuation_editor PROPERTIES
       SKIP_REGULAR_EXPRESSION "SKIP punctuation_editor")

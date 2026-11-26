@@ -166,7 +166,12 @@ The native `punctuation_editor` check drives the real engine, forces both halves
 atomic save (a directory that cannot take the temporary file, and a target held without delete
 sharing) and prints `PASS punctuation editor: official subconfig, checked save, one-press #,
 paired row, refused rows, failed write, failed replacement, empty table and defaults` when
-`FUSION_TEST_PUNCTUATION_PROFILE` points at a throwaway profile and `APPDATA` is inside it.
+`FUSION_TEST_PUNCTUATION_PROFILE` contains the directory Fcitx resolves its per-user data to.
+That directory is the file the check asserts, so the check asks Fcitx's own `StandardPaths` where
+it is instead of deriving it from `APPDATA`: on Windows the roaming folder is resolved from the
+user profile, so a throwaway `APPDATA` with the real `USERPROFILE` still makes the engine write
+to the product profile. When the resolved directory is outside the profile, the check prints
+`SKIP` naming it and touches nothing.
 
 The real window was also driven through UI Automation against an isolated Host: open
 `候选与输入 → 更多工具 → 标点映射`, append an empty row, leave the page and come back (the row is
