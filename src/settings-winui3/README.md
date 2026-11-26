@@ -11,7 +11,7 @@ new configuration path.
 |---|---|
 | `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models, and the workspace that routes edits, splits saves and reconciles uncertain writes |
 | `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe |
-| `FusionSettings.App/` | The WinUI 3 window: four pages, the key editor, the schema-driven option rows |
+| `FusionSettings.App/` | The WinUI 3 window: five navigation pages, the key editor, the schema-driven option rows, and the zh_CN punctuation map editor reached from `候选与输入 → 更多工具` |
 
 `FusionSettings.Core` targets `net10.0` and `net8.0`: the checks run on net10, the app on
 net8, which is the runtime it is published against.
@@ -31,8 +31,23 @@ These are the properties the presentation may rely on, each covered by a check:
 - **Only changed options are submitted**, and a no-change save sends no request at all.
 - **A list is written as an indexed map, empty or not.** The Host reads an empty list back as the
   empty scalar but refuses one on write, so `StringListValue` and `KeyBindingList.ToValue` emit a
-  map and an empty map for an empty list. An empty scalar, an empty list and a list holding an
+  map and an empty map for an empty list. An   empty scalar, an empty list and a list holding an
   empty positional entry stay three different values.
+- **The zh_CN punctuation map is Fcitx's own configuration.** The Host serves the official
+  `fcitx://config/addon/punctuation/punctuationmap/zh_CN` subconfiguration from the
+  punctuation addon; the window only edits the addon's own `Entries` rows through the same
+  draft/save bar as every other page. Repeated keys stay repeated, the row index is candidate
+  order, `AltMapping` stays on the paired row, and 恢复默认映射 reads the addon's schema
+  `DefaultValue` rather than a second table in this client. The table itself lives in the
+  workspace, not in the page, so an incomplete row survives leaving the page and coming back,
+  and the table Save validates is the one on screen. A save is one call to the addon's checked
+  entry point, which builds the complete replacement — rows, lookup map and serialized bytes —
+  beside the live profile, validates it, persists it once through Fcitx's own serializer and
+  atomic save, and only then publishes it by exchanging containers, so nothing is re-parsed or
+  re-allocated after the file is committed: a row the canonical file cannot hold and a write
+  that did not complete are reported as two different failures, and both leave the file and the
+  live map at the previous table. Neither this client nor the Host serializes a row, opens the
+  canonical file, or writes a compensating rollback.
 - **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
   truncated, late or cancelled reply returns `Indeterminate` with
   `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
@@ -121,7 +136,8 @@ against that runtime the mixed-option section stopped at that assertion and the 
 **814** with exactly that one check failing — the option was not in the engine there, which is not a
 client defect. That 814 is what `b8a81aa` printed on this machine. `tools/fcitx/build-native.ps1` has since
 rebuilt the same pinned generation from the sources `cmake/settings-ui/versions.cmake` names — the addon
-now the maintained fork at `2145c4bf1cff8c62112b9c38db4e6032a190b280` — and against that runtime the suite
+at `2145c4bf1cff8c62112b9c38db4e6032a190b280` at that round, since moved to `3551b5d` for the checked
+save below — and against that runtime the suite
 prints **856 checks with nothing failing** at `e43ccad`; the no-Host half was not run
 separately there either, so no split figure is quoted for it, and neither the 821 nor the 846
 above covers the Chinese-name chain, which landed after both. The no-Host half also covers the
@@ -135,8 +151,42 @@ list, an import, the name conflict and its confirmed overwrite, a corrupt file t
 imported dictionary alone, enable/disable, reload and delete — each read back from the Host,
 with the learned dictionary compared before and after, and the whole chain again for a Chinese
 name, which is the case that travels as UTF-8 and has to come back unchanged. A third
-run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **3 checks**:
-the saved global value and the two saved candidate-presentation values. `--no-integration` skips the real-Host section.
+run, pointed at the same profile after the Host has been stopped through its stop event and restarted, printed **13 checks** at that round: the saved global value, the two saved candidate-presentation values, and the punctuation restart chain — the removed
+full-width `＃` row survived the new Host process, then the shipped rows were restored from the schema and both `#`
+candidates came back. `--no-integration` skips the real-Host section.
+
+On this branch, against the runtime `tools/fcitx/build-native.ps1` builds from the pins in
+`cmake/settings-ui/versions.cmake`, the no-Host half prints **610 checks**, the real-Host half
+prints **926 checks**, and the restart run prints **5 checks** — nothing failing in any of them.
+Those five are the punctuation section alone, because this round's restart set only
+`PUNCTUATION_EXPECT=empty`; the global and candidate-presentation restart sections above run only
+when their own expectations are set, so that total is not comparable with the 13 recorded there.
+The earlier `the engine exposes AuxiliaryFilter` failure was the pre-fork runtime described
+above, not this client: the pinned fork exposes the option and the assertion passes unchanged.
+`PUNCTUATION_EXPECT=empty` is what the first run prints, and the restart run reads the
+deliberately empty table back from the new Host process before restoring the schema defaults.
+The native `punctuation_editor` check drives the real engine, forces both halves of a failed
+atomic save (a directory that cannot take the temporary file, and a target held without delete
+sharing), and reads the live lookup map through the engine's own composition path after each
+outcome — the row a refused save carried must not be served, and the row an accepted save carried
+must be. The directory half is a denial written into that directory's DACL, so the check requires
+the DACL it replaced to be back afterwards, read from the object and compared byte for byte, before
+it goes on. It prints `PASS punctuation editor: official subconfig, checked save, one-press #,
+paired row, refused rows, failed write, failed replacement, live map, empty table and defaults`
+when `FUSION_TEST_PUNCTUATION_PROFILE` contains the directory Fcitx resolves its per-user data to.
+That directory is the file the check asserts, so the check asks Fcitx's own `StandardPaths` where
+it is instead of deriving it from `APPDATA`: on Windows the roaming folder is resolved from the
+user profile, so a throwaway `APPDATA` with the real `USERPROFILE` still makes the engine write
+to the product profile. When the resolved directory is outside the profile, the check prints
+`SKIP` naming it and touches nothing.
+
+The real window was also driven through UI Automation against an isolated Host: open
+`候选与输入 → 更多工具 → 标点映射`, append an empty row, leave the page and come back (the row is
+still there), save (refused, file untouched, save bar reports 未保存), complete the row and save
+(the canonical file gains exactly that row), then edit a cell and 放弃 (the cell returns to the
+stored value and the file is untouched). That run is what found the row-identity defect this
+revision also fixes: editing a second column of the same row used to be dropped, because the
+record had already been replaced and the control no longer recognised its own row.
 
 ### Running the real-Host checks
 
@@ -167,6 +217,11 @@ The Host prints where it resolved its paths; both lines must point inside `$prof
 [FusionHost] fcitx user data:   ...\fusion-settings-profile\User\AppData\Roaming\Fcitx5\data
 ```
 
+The Host build being tested must carry both `data/fcitx5/inputmethod/pinyin.conf` and
+`data/fcitx5/inputmethod/shuangpin.conf`. A build tree that has only `pinyin.conf` registers one
+input method; the workspace then stops at its first load with
+`The requested input-method configuration is unavailable.` before any punctuation check runs.
+
 Then point the checks at the same name (the logical name, without the device path) and at the
 profile root, so the no-change save can be checked against the files on disk:
 
@@ -176,12 +231,15 @@ $env:FUSION_SETTINGS_GLOBAL_PROFILE = $profileRoot
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
-The run ends by printing `GLOBAL_EXPECT=<option>=<value>`. Stop the Host with its stop event
-(signalling `Local\FusionHost-stop-<scope>` requests the orderly shutdown that saves state),
-start it again against the same profile, and confirm the value survived:
+The run ends by printing `GLOBAL_EXPECT=<option>=<value>`,
+`PRESENTATION_EXPECT=<option>=<value>;...` and `PUNCTUATION_EXPECT=hash=one`. Stop the Host with
+its stop event (signalling `Local\FusionHost-stop-<scope>` requests the orderly shutdown that
+saves state), start it again against the same profile, and confirm all three survived:
 
 ```powershell
 $env:FUSION_SETTINGS_GLOBAL_EXPECT = "DefaultPageSize=6"
+$env:FUSION_SETTINGS_PRESENTATION_EXPECT = "CandidateLayout=AutoScroll;FontSize=16"
+$env:FUSION_SETTINGS_PUNCTUATION_EXPECT = "hash=one"
 dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 ```
 
@@ -192,6 +250,6 @@ dotnet run --project src/settings-winui3/FusionSettings.Core.Tests
 
 - Option coverage, per-item dispositions and the shared-configuration rule:
   `fusion-controller/docs/` → `evidence/settings-winui3-2026-10-21/migration-inventory.md`.
-- Decisions: D085 (partially superseded), D086 (licence scope), D087 (presentation).
+- Decisions: D085 (partially superseded), D086 (licence scope), D087 (presentation), D088 (no duplicate input-semantic store).
 - Client/Host boundary and the shared-state model: `windows-architecture.md`.
 - Per-level completion state: `windows-stage6-plan.md`.

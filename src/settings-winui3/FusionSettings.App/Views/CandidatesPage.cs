@@ -195,6 +195,16 @@ public sealed class CandidatesPage : SettingsPageBase
         var rows = new List<FrameworkElement>();
         foreach (var option in snapshot.Types[0].Options.Where(option => option.IsExternal))
         {
+            // The punctuation map is an official Fcitx subconfiguration, so the entry opens
+            // this window's editor over the same Host transport rather than an upstream tool.
+            if (string.Equals(option.ExternalUri, SettingsWorkspace.PunctuationUri,
+                                  StringComparison.Ordinal))
+            {
+                rows.Add(ExternalToolEntry("标点映射", "编辑拼音/双拼共用的 zh_CN 标点表。", "打开",
+                                           NavigateToPunctuation));
+                continue;
+            }
+
             // 词库管理 is implemented here rather than by the upstream tool, so its row opens
             // this window's own page instead of reporting a missing tool.
             if (string.Equals(option.Name, "DictManager", StringComparison.Ordinal))
@@ -223,12 +233,14 @@ public sealed class CandidatesPage : SettingsPageBase
             rows.Add(stack);
         }
 
-        PageChrome.AddSection(body, "外部工具",
-            "这些是 Fcitx 上游的独立工具页面。本安装包没有提供它们，因此这里只说明状态，不提供入口。",
+        PageChrome.AddSection(body, "更多工具",
+            "Fcitx 的独立配置页面在此提供入口；本安装包未提供的工具仍只说明状态。",
             rows);
     }
 
     private void NavigateToDictionaries() => NavigateRequested?.Invoke("dictionaries");
+
+    private void NavigateToPunctuation() => NavigateRequested?.Invoke("punctuation");
 
     /// <summary>One external-tool row that is actually available, with the action that opens it.</summary>
     private static FrameworkElement ExternalToolEntry(string title, string description, string action,

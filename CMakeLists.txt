@@ -234,6 +234,32 @@ if(BUILD_TESTING)
     set_tests_properties(settings_save_while_composing PROPERTIES
       SKIP_REGULAR_EXPRESSION "SKIP settings_save_while_composing")
 
+    # The zh_CN punctuation subconfiguration is served through the real Host settings
+    # transport, saved through the punctuation addon's own checked entry point, and checked
+    # against Fcitx's canonical data file as well as the Host readback. It also drives one
+    # press of # and a paired punctuation row through the real engine, and forces both halves
+    # of a failed atomic save (a directory that cannot take the temporary file, and a target
+    # held without delete sharing), so it needs the same throwaway profile rule as the other
+    # file-backed settings checks.
+    add_executable(punctuation_editor tests/punctuation_editor.cpp)
+    # The compat directory is the same shim the Host compiles against; it is needed here
+    # because the test includes Fcitx's own StandardPaths header to ask where the canonical
+    # file lives.
+    target_include_directories(punctuation_editor PRIVATE include cmake/fcitx-native/compat)
+    target_compile_features(punctuation_editor PRIVATE cxx_std_20)
+    target_compile_definitions(punctuation_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+      _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(punctuation_editor PRIVATE /W4 /WX /utf-8)
+    # The ACL that denies "create files" for the failed-write case is applied with the
+    # Win32 security API, which is not reached through the Host module. Fcitx5::Utils is
+    # linked for one reason: the test asks StandardPaths where the addon's canonical file is
+    # instead of assuming it from an environment variable, so it can refuse to run when that
+    # directory is outside the throwaway profile.
+    target_link_libraries(punctuation_editor PRIVATE FusionFcitxHost advapi32 Fcitx5::Utils)
+    add_test(NAME punctuation_editor COMMAND punctuation_editor)
+    set_tests_properties(punctuation_editor PROPERTIES
+      SKIP_REGULAR_EXPRESSION "SKIP punctuation_editor")
+
     # The candidate/preedit/panel outputFilter contract against the real pinned
     # Fcitx5 core: same projection source FusionHost.exe compiles, built with the
     # Host's own compiler settings, driven with engine-side OutputFilter consumers.

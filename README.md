@@ -58,7 +58,7 @@ repository entry point only.
 - `tests/stage5_real_projection.cpp` — Stage 5 closure against the real pinned pinyin engine (in-process `FusionFcitxHost`, `FUSION_WITH_FCITX5` build): preedit segments/format/cursor and their movement with Left/Right, partial selection and continued composition, stroke-filter and QuickPhrase auxUp, and the empty-panel hide signal.
 - `tests/fcitx_candidate_filter.cpp` — Stage 5 display outputFilter contract against the real Fcitx5 core (Windows `FUSION_WITH_FCITX5` build against the pinned runtime, and non-Windows builds with Fcitx5 dev libraries): candidate label/text/comment like classic-ui, the client preedit like the dbus frontend (segments, flags, cursor, engine password masking), and the panel rows like classic-ui.
 - `tools/tsf/*.ps1` — reversible development registration/unregistration/state check for the TSF service.
-- `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers), `walkthrough-assertions.ps1` (the argument formatter, the elevated launcher and the assertions on the installed TIP) and `verify-wp4.ps1` (the owner walkthrough).
+- `tools/package/` — Stage 6 WP4 owner-only test packaging: `build-package.ps1` (zip + manifest from a fresh Release build), `source-access.ps1` (writes the built addon revision into the shipped source-access text), `install.ps1` / `uninstall.ps1` (elevated; versioned install directory, logon task, orderly stop through the Host's stop event), `host-state.ps1` (shared read-only state/identity helpers), `walkthrough-assertions.ps1` (the argument formatter, the elevated launcher and the assertions on the installed TIP) and `verify-wp4.ps1` (the owner walkthrough).
 - `tools/installer/` — the single-EXE install entry point: `fusion-installer.nsi` (NSIS 3; unpacks the package, runs its own `install.ps1`/`uninstall.ps1`, and writes the "installed apps" entry) and `build-installer.ps1` (package zip → EXE, with the payload verified before it is compressed).
 - `CMakeLists.txt` — C++20 library plus CTest targets; the TSF DLL builds on WIN32+MSVC; FusionHost.exe builds when `FUSION_WITH_FCITX5=ON`.
 
@@ -89,14 +89,19 @@ but was measured not to change this installation's `cl.exe` banner, and is not w
 dependency tracking work.
 
 **The Chinese engine is the Android product's fork, not a Windows-only copy.**
-`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `2145c4b` beside the
+`tools/fcitx/build-native.ps1` pins `choicky/fcitx5-chinese-addons` at `3551b5d` beside the
 official Fcitx core (`a7f2528`) and LibIME (`171edcf`), so the MoQi auxiliary filter and the
-mixed Chinese/English pipeline have one implementation for both products. `2145c4b` is the tip
-of the fork's `fusion` branch — `a04bcd4` plus the mixed-slot fix below — and it contains the
-commit the Android **release** workflow pins (`0d0102b82b35debf4cf22ce192060c07f10e7b35`, 67
-commits behind) as well as the tip of the branch its test-APK workflow follows (`21eecda`, 65
-behind). Windows is therefore on the same feature line, a little further ahead — not on the
-same commit, and not on a different engine. The fix that pin brings: the bounded insertion
+mixed Chinese/English pipeline have one implementation for both products. That revision is not a
+second declaration of its own: `cmake/settings-ui/versions.cmake` pins the same value,
+`tools/package/build-package.ps1` refuses to package a runtime checkout that is not it, and both
+the packaged `SOURCE-ACCESS.txt` link and the `package.json` record are generated from it. The
+fork's `fusion` branch is the shared line: `3551b5d` contains the commit the Android **release**
+workflow pins (`0d0102b82b35debf4cf22ce192060c07f10e7b35`) and the tip of the branch its test-APK
+workflow follows (`21eecda`), and then adds this branch's checked save for the punctuation map —
+the write it prepares before committing and the map it then publishes without rebuilding either.
+The two products pin their own revisions, so one fork is not one commit: Windows currently builds
+ahead of the Android pins, and a Windows pin change moves Windows only. The mixed-slot fix this
+line carries since `2145c4b`: the bounded insertion
 class in `UnifiedRanker` accepted a canonical English word only at the **front** of the raw, so
 Ziranma `woxdmliphone` generated `我想买iPhone` and then buried it at index 127 behind the whole
 classical list (its `ip ho ne` tail also force-decodes to 蠢货呢); the class is now
@@ -584,7 +589,12 @@ Fcitx's own save on instance exit, and the singleton claim is held until the pro
 The package is a zip whose root maps onto the installed version directory `C:\Program Files\Fcitx5 Fusion\<version>\`:
 `bin\` (Host, TSF DLL, `FusionFcitxHost.dll`, every runtime DLL), `data\` (fcitx5 + libime data), `lib\libime\`
 (`zh_CN.lm`), `tools\` (the existing registration scripts), `install.ps1`, `uninstall.ps1` and `package.json`
-(version, source commit, runtime identity, SHA-256 of every file). Fcitx resolves its data from the parent of the
+(version, source commit, runtime identity, SHA-256 of every file). The shipped
+`licenses/settings-ui/SOURCE-ACCESS.txt` is rewritten while the package is staged: its addon link is
+filled in by `tools/package/source-access.ps1` from the `FUSION_SETTINGS_CHINESE_ADDONS_COMMIT` the
+runtime checkout was verified against, and packaging refuses a staged copy that still carries the
+token or does not link that revision, so the notice, the link and the manifest record cannot name
+three different commits. Fcitx resolves its data from the parent of the
 directory that holds `Fcitx5Utils.dll`, which must therefore be named `bin`; every DLL sits beside the executable, so
 nothing depends on `PATH`. `install.ps1` copies to the version directory, registers the TIP from there, creates or
 updates the per-user logon task (interactive token, limited run level, no execution time limit, no second instance)

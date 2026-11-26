@@ -18,9 +18,13 @@ internal static class Program
         var expectation = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_EXPECT");
         var presentationExpectation =
             Environment.GetEnvironmentVariable("FUSION_SETTINGS_PRESENTATION_EXPECT");
-        if (!string.IsNullOrWhiteSpace(expectation) || !string.IsNullOrWhiteSpace(presentationExpectation))
+        var punctuationExpectation =
+            Environment.GetEnvironmentVariable("FUSION_SETTINGS_PUNCTUATION_EXPECT");
+        if (!string.IsNullOrWhiteSpace(expectation) || !string.IsNullOrWhiteSpace(presentationExpectation) ||
+            !string.IsNullOrWhiteSpace(punctuationExpectation))
         {
-            return await VerifyPersistedAsync(expectation, presentationExpectation).ConfigureAwait(false);
+            return await VerifyPersistedAsync(expectation, presentationExpectation,
+                                              punctuationExpectation).ConfigureAwait(false);
         }
 
         WireTests.Run();
@@ -32,6 +36,7 @@ internal static class Program
         // per stored value. This reads the same table file the window compiles, so it needs
         // no Host.
         MixedOptionTests.RunTableChecks();
+        PunctuationMapTests.Run();
 
         // The two ends of the wire carry the protocol version as separate literals; nothing
         // else compares them, and a mismatch fails the handshake rather than degrading.
@@ -56,6 +61,9 @@ internal static class Program
 
         // The candidate-presentation save needs the same writable profile, for the same reason.
         await PresentationSaveSectionAsync().ConfigureAwait(false);
+
+        // The zh_CN punctuation map, including a file-backed save failure and an invalid row.
+        await PunctuationSaveSectionAsync().ConfigureAwait(false);
 
         // And the stored values behind 辅助筛选 and 混输空格, on the same profile.
         await MixedOptionSectionAsync().ConfigureAwait(false);
@@ -117,6 +125,24 @@ internal static class Program
         await PresentationSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
     }
 
+    private static async Task PunctuationSaveSectionAsync()
+    {
+        var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            Harness.Section("punctuation: SKIPPED (FUSION_SETTINGS_GLOBAL_PROFILE is not set)");
+            return;
+        }
+
+        if (!TryIsolatedEndpoint(out var endpoint))
+        {
+            return;
+        }
+
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await PunctuationSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
+    }
+
     private static async Task MixedOptionSectionAsync()
     {
         var profile = Environment.GetEnvironmentVariable("FUSION_SETTINGS_GLOBAL_PROFILE");
@@ -171,7 +197,9 @@ internal static class Program
         await PartialSaveTests.RunAsync(endpoint, profile, cancellation.Token).ConfigureAwait(false);
     }
 
-    private static async Task<int> VerifyPersistedAsync(string? expectation, string? presentationExpectation)
+    private static async Task<int> VerifyPersistedAsync(string? expectation,
+                                                       string? presentationExpectation,
+                                                       string? punctuationExpectation)
     {
         if (!TryIsolatedEndpoint(out var endpoint))
         {
@@ -188,6 +216,12 @@ internal static class Program
         if (!string.IsNullOrWhiteSpace(presentationExpectation))
         {
             await PresentationSaveTests.VerifyPersistedAsync(endpoint, presentationExpectation,
+                cancellation.Token).ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(punctuationExpectation))
+        {
+            await PunctuationSaveTests.VerifyPersistedAsync(endpoint, punctuationExpectation,
                 cancellation.Token).ConfigureAwait(false);
         }
 
