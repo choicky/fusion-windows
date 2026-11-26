@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Fusion.Settings.App.Controls;
 using Fusion.Settings.Model;
 using Fusion.Settings.Workspace;
 using Microsoft.UI.Xaml;
@@ -21,17 +22,33 @@ namespace Fusion.Settings.App.Views;
 /// the same ordered list.
 /// </para>
 /// <para>
-/// The editor refuses to write a row Fcitx would drop (an empty or multi-character key, an
-/// empty mapping, or whitespace inside a column). The visible row stays so it can be fixed,
-/// but it is not put into the draft until it is valid; the save bar therefore cannot send a
-/// map the addon would silently rewrite.
+/// The table lives in the workspace, not in this page. That is what preserves an incomplete
+/// row across navigation and refresh, and what makes the visible table — rather than an older
+/// valid draft — the thing Save validates.
 /// </para>
 /// </remarks>
 public sealed class PunctuationPage : SettingsPageBase
 {
+    /// <summary>
+    /// One row's identity for as long as the controls built from it exist.
+    /// </summary>
+    /// <remarks>
+    /// A record is a value: editing a row replaces it, so a control that captured the old value
+    /// can no longer recognise its own row and a second column of the same row would be dropped.
+    /// The slot keeps one identity per row while its value changes, and a rebuild discards the
+    /// slots — which is what makes a late LostFocus from a removed control a no-op instead of a
+    /// write into whichever row took its position.
+    /// </remarks>
+    private sealed class RowSlot
+    {
+        public RowSlot(PunctuationRow value) => Value = value;
+
+        public PunctuationRow Value { get; set; }
+    }
+
     private StackPanel _rows = null!;
     private TextBlock _notice = null!;
-    private List<PunctuationRow> _editing = new();
+    private List<RowSlot> _slots = new();
 
     protected override UIElement BuildContent()
     {
@@ -49,7 +66,6 @@ public sealed class PunctuationPage : SettingsPageBase
             return scroll;
         }
 
-        _editing = PunctuationMap.RowsFromOption(draft.Effective(PunctuationMap.Entries)).ToList();
         _rows = new StackPanel { Spacing = 8 };
         _notice = Note(string.Empty);
         _notice.Visibility = Visibility.Collapsed;
@@ -68,8 +84,13 @@ public sealed class PunctuationPage : SettingsPageBase
         var add = new Button { Content = "添加一行" };
         add.Click += (_, _) =>
         {
-            _editing.Add(new PunctuationRow(string.Empty, string.Empty, string.Empty));
-            Rebuild();
+            var candidate = Workspace.PunctuationRows
+                .Append(new PunctuationRow(string.Empty, string.Empty, string.Empty))
+                .ToList();
+            if (Workspace.SetPunctuationRows(candidate))
+            {
+                Rebuild();
+            }
         };
 
         var restore = new Button { Content = "恢复默认映射" };
@@ -81,13 +102,11 @@ public sealed class PunctuationPage : SettingsPageBase
                 Say("Host 没有给出默认表；没有改动任何内容。");
                 return;
             }
-            if (!Workspace.TrySet(SettingsTarget.Punctuation, PunctuationMap.Entries,
-                    PunctuationMap.Value(defaults)))
+            if (!Workspace.SetPunctuationRows(defaults))
             {
                 Say("默认映射无法写入草稿；没有改动任何内容。");
                 return;
             }
-            _editing = defaults.ToList();
             Rebuild();
             Say("已恢复 Fcitx 自带的 zh_CN 映射；点击“保存”写入配置。");
         };
@@ -134,14 +153,15 @@ public sealed class PunctuationPage : SettingsPageBase
     private void Rebuild()
     {
         _rows.Children.Clear();
-        for (var index = 0; index < _editing.Count; index++)
+        _slots = Workspace.PunctuationRows.Select(row => new RowSlot(row)).ToList();
+        for (var index = 0; index < _slots.Count; index++)
         {
-            _rows.Children.Add(Row(index, _editing[index]));
+            _rows.Children.Add(Row(index, _slots[index]));
         }
         UpdateNotice();
     }
 
-    private FrameworkElement Row(int index, PunctuationRow row)
+    private FrameworkElement Row(int index, RowSlot slot)
     {
         var grid = new Grid { ColumnSpacing = 8 };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(64) });
@@ -151,26 +171,35 @@ public sealed class PunctuationPage : SettingsPageBase
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        grid.Children.Add(Field("键", row.Key, index, "key", 0));
-        grid.Children.Add(Field("映射", row.Mapping, index, "mapping", 1));
-        grid.Children.Add(Field("备选", row.AltMapping, index, "alt", 2));
+        grid.Children.Add(Field("键", slot, "key", 0));
+        grid.Children.Add(Field("映射", slot, "mapping", 1));
+        grid.Children.Add(Field("备选", slot, "alt", 2));
         grid.Children.Add(Move(index, -1, "↑", 3));
         grid.Children.Add(Move(index, 1, "↓", 4));
         grid.Children.Add(Delete(index, 5));
         return grid;
     }
 
-    private TextBox Field(string name, string value, int index, string field, int column)
+    private TextBox Field(string name, RowSlot slot, string field, int column)
     {
+        var row = slot.Value;
         var box = new TextBox
         {
-            Text = value,
+            Text = field switch
+            {
+                "key" => row.Key,
+                "mapping" => row.Mapping,
+                _ => row.AltMapping,
+            },
             PlaceholderText = name,
             MinWidth = 80,
             MaxWidth = 180,
         };
         Grid.SetColumn(box, column);
-        box.LostFocus += (_, _) => Change(index, field, box.Text);
+        box.LostFocus += (_, _) => Change(slot, field, box.Text);
+        // Save commits the focused field before it reads the table. Returning true here means
+        // the control handed over its text; whether the table is valid is decided at save time.
+        PendingEdit.SetCommit(box, () => Change(slot, field, box.Text));
         return box;
     }
 
@@ -179,20 +208,22 @@ public sealed class PunctuationPage : SettingsPageBase
         var button = new Button
         {
             Content = glyph,
-            IsEnabled = index + delta >= 0 && index + delta < _editing.Count,
+            IsEnabled = index + delta >= 0 && index + delta < Workspace.PunctuationRows.Count,
         };
         Grid.SetColumn(button, column);
         button.Click += (_, _) =>
         {
+            var candidate = Workspace.PunctuationRows.ToList();
             var other = index + delta;
-            if (other < 0 || other >= _editing.Count)
+            if (other < 0 || other >= candidate.Count)
             {
                 return;
             }
-            var candidate = _editing.ToList();
             (candidate[index], candidate[other]) = (candidate[other], candidate[index]);
-            Commit(candidate);
-            Rebuild();
+            if (Workspace.SetPunctuationRows(candidate))
+            {
+                Rebuild();
+            }
         };
         return button;
     }
@@ -203,55 +234,61 @@ public sealed class PunctuationPage : SettingsPageBase
         Grid.SetColumn(button, column);
         button.Click += (_, _) =>
         {
-            var candidate = _editing.ToList();
+            var candidate = Workspace.PunctuationRows.ToList();
+            if (index < 0 || index >= candidate.Count)
+            {
+                return;
+            }
             candidate.RemoveAt(index);
-            Commit(candidate);
-            Rebuild();
+            if (Workspace.SetPunctuationRows(candidate))
+            {
+                Rebuild();
+            }
         };
         return button;
     }
 
-    private void Change(int index, string field, string text)
+    private bool Change(RowSlot slot, string field, string text)
     {
-        if (index >= _editing.Count)
+        var index = -1;
+        for (var i = 0; i < _slots.Count; i++)
         {
-            return;
+            if (ReferenceEquals(_slots[i], slot))
+            {
+                index = i;
+                break;
+            }
         }
-        var row = _editing[index];
-        var candidate = _editing.ToList();
+        // A rebuild replaces the slots. A late LostFocus from a removed control must not apply
+        // its old text to whichever row now occupies that position.
+        if (index < 0)
+        {
+            return true;
+        }
+
+        var candidate = _slots.Select(entry => entry.Value).ToList();
+        var row = candidate[index];
         candidate[index] = field switch
         {
             "key" => row with { Key = text },
             "mapping" => row with { Mapping = text },
             _ => row with { AltMapping = text },
         };
-        Commit(candidate);
-        UpdateNotice();
-    }
+        if (!Workspace.SetPunctuationRows(candidate))
+        {
+            return false;
+        }
 
-    // Only a completely valid list enters the draft. A partially typed row remains visible so
-    // the user can finish it, and the notice says why it has not been stored yet.
-    private void Commit(List<PunctuationRow> candidate)
-    {
-        _editing = candidate;
-        var reason = PunctuationMap.InvalidReason(candidate);
-        if (reason is not null)
-        {
-            Say(reason + " 修正后才会写入草稿。");
-            return;
-        }
-        if (!Workspace.TrySet(SettingsTarget.Punctuation, PunctuationMap.Entries,
-                PunctuationMap.Value(candidate)))
-        {
-            Say("标点映射当前不可编辑；修改没有写入草稿。");
-            return;
-        }
+        // The slot keeps its identity while its value moves on, so the other columns of this
+        // same row still find it.
+        slot.Value = candidate[index];
         UpdateNotice();
+        return true;
     }
 
     private void UpdateNotice()
     {
-        var reason = PunctuationMap.InvalidReason(_editing);
+        var reason = Workspace.PunctuationInvalidReason;
         if (reason is null)
         {
             _notice.Visibility = Visibility.Collapsed;

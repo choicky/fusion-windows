@@ -37,6 +37,12 @@ internal static class PunctuationMapTests
         Harness.Check(PunctuationMap.RowsFromOption(value)[2].AltMapping == "”",
             "the paired half stays on its row rather than becoming another row");
 
+        var empty = PunctuationMap.Value(Array.Empty<PunctuationRow>());
+        Harness.Check(empty.IsMap && empty.Children.Count == 0,
+            "an empty table is written as an empty map");
+        Harness.Check(PunctuationMap.RowsFromOption(empty).Count == 0,
+            "and reads back as no rows");
+
         Harness.Check(PunctuationMap.InvalidReason(rows) is null,
             "the shipped shape is accepted");
         Harness.Check(PunctuationMap.InvalidReason(new[] { new PunctuationRow("ab", "×", "") }) ==

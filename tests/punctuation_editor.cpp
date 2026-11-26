@@ -7,6 +7,7 @@
 
 #include "fusion/backend.hpp"
 
+#include <aclapi.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 using namespace fusion;
@@ -99,6 +101,82 @@ std::string file_text() {
   return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
+// Fcitx's atomic save leaves nothing behind when it fails, and a temporary file here would be
+// a second copy of a table that is not the stored one.
+std::size_t temp_leftovers() {
+  const auto directory = data_file().parent_path();
+  if (!std::filesystem::is_directory(directory)) {
+    return 0;
+  }
+  std::size_t count = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+    if (entry.path().filename().string().starts_with("punc.mb.zh_CN_")) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+// Denying "create files" on the punctuation directory makes Fcitx's atomic save fail before it
+// can create its temporary file — the write half of a failed save. Holding the target open
+// without delete sharing (below) fails later, at the atomic replacement, so both halves of
+// StandardPaths::safeSave are exercised. The previous DACL is restored on destruction.
+class DenyDirectoryWrites {
+public:
+  explicit DenyDirectoryWrites(const std::filesystem::path &directory) : directory_(directory) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL acl = nullptr;
+    require(::GetNamedSecurityInfoW(directory_.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                    nullptr, nullptr, &acl, nullptr,
+                                    &descriptor) == ERROR_SUCCESS,
+            "the punctuation directory's ACL is readable");
+    descriptor_.assign(static_cast<const unsigned char *>(descriptor),
+                       static_cast<const unsigned char *>(descriptor) +
+                           ::GetSecurityDescriptorLength(descriptor));
+    ::LocalFree(descriptor);
+
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD sidSize = sizeof(sid);
+    require(::CreateWellKnownSid(WinWorldSid, nullptr, sid, &sidSize) != FALSE,
+            "the Everyone SID is available");
+    EXPLICIT_ACCESSW entry{};
+    entry.grfAccessPermissions = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+    entry.grfAccessMode = DENY_ACCESS;
+    entry.grfInheritance = NO_INHERITANCE;
+    ::BuildTrusteeWithSidW(&entry.Trustee, sid);
+    PACL denied = nullptr;
+    require(::SetEntriesInAclW(1, &entry, acl, &denied) == ERROR_SUCCESS,
+            "the deny entry can be built");
+    const auto status = ::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()),
+                                                SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                                                nullptr, denied, nullptr);
+    ::LocalFree(denied);
+    require(status == ERROR_SUCCESS, "the deny entry can be applied");
+  }
+  ~DenyDirectoryWrites() { restore(); }
+  DenyDirectoryWrites(const DenyDirectoryWrites &) = delete;
+  DenyDirectoryWrites &operator=(const DenyDirectoryWrites &) = delete;
+
+  void restore() {
+    if (descriptor_.empty()) {
+      return;
+    }
+    PACL previous = nullptr;
+    BOOL present = FALSE;
+    BOOL defaulted = FALSE;
+    ::GetSecurityDescriptorDacl(reinterpret_cast<PSECURITY_DESCRIPTOR>(descriptor_.data()),
+                                &present, &previous, &defaulted);
+    ::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()), SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                            present != FALSE ? previous : nullptr, nullptr);
+    descriptor_.clear();
+  }
+
+private:
+  std::filesystem::path directory_;
+  std::vector<unsigned char> descriptor_;
+};
+
 std::string last_commit(const BackendBatch &batch) {
   std::string text;
   for (const auto &operation : batch.operations) {
@@ -177,6 +255,18 @@ void run(Backend &backend) {
           "the rejected write did not change the live map");
   require(file_text() == beforeInvalid, "and wrote no file");
 
+  // The addon refuses the rows it cannot store, so a successful answer always means every
+  // submitted row is in the file: a column holding a space cannot survive the space-separated
+  // file, and an empty mapping is a row set() would drop.
+  for (const auto &rejected : std::vector<Row>{{"、", "a b", ""}, {"。", "", ""}}) {
+    auto withRejected = rows;
+    withRejected.push_back(rejected);
+    require(backend.settings_set_config(uri, value_of(withRejected), snapshot, error) ==
+                SettingsStatus::Invalid && !error.empty(),
+            "a row the addon cannot store is rejected with a reason");
+    require(file_text() == beforeInvalid, "and the rejected row wrote nothing");
+  }
+
   // Remove only the full-width # row. Repeated keys and their order are preserved, so the
   // remaining ASCII row is the one the engine will use.
   rows.erase(std::remove_if(rows.begin(), rows.end(),
@@ -230,6 +320,7 @@ void run(Backend &backend) {
               rows_of(afterRefusal.values).size() == rows.size(),
           "the live map still holds the previous rows");
   require(file_text() == storedHash, "and the canonical file is byte-for-byte unchanged");
+  require(temp_leftovers() == 0, "and the failed replacement left no temporary file behind");
 
   // The same edit succeeds once the file can be replaced, which also proves the error was not
   // a rejected value.
@@ -238,6 +329,40 @@ void run(Backend &backend) {
           "the same edit succeeds after the lock is released");
   require(file_text().find("= ＝\n") != std::string::npos,
           "and the new row is on disk rather than only in memory");
+  rows = attempted;
+
+  // The other half of a failed atomic save: the directory cannot take the temporary file, so
+  // the write never starts. The previous file and the live map must still be exactly as they
+  // were, and Fcitx's own cleanup must leave no temporary file beside it.
+  const auto beforeUnwritable = file_text();
+  {
+    DenyDirectoryWrites denied(path.parent_path());
+    auto unwritable = rows;
+    unwritable.push_back({"；", "；", ""});
+    require(backend.settings_set_config(uri, value_of(unwritable), snapshot, error) ==
+                SettingsStatus::Error && !error.empty(),
+            "a write that cannot create its temporary file is reported as unsaved");
+    denied.restore();
+    require(file_text() == beforeUnwritable, "and the previous file is untouched");
+    require(temp_leftovers() == 0, "and no temporary file is left beside it");
+  }
+  SettingsSnapshot afterUnwritable;
+  require(backend.settings_get_config(uri, afterUnwritable, error) == SettingsStatus::Ok &&
+              rows_of(afterUnwritable.values) == rows,
+          "the live map still holds the previous rows after a failed write");
+
+  // A deliberately empty table is a table, not a missing one: the addon writes zero rows, the
+  // canonical file becomes empty, and the Host reports the empty list rather than the defaults.
+  require(backend.settings_set_config(uri, value_of({}), snapshot, error) == SettingsStatus::Ok,
+          "an explicitly empty table is accepted");
+  require(file_text().empty(), "the canonical file is empty after saving no rows");
+  SettingsSnapshot emptyState;
+  require(backend.settings_get_config(uri, emptyState, error) == SettingsStatus::Ok,
+          "the empty table can be read back");
+  const auto emptyEntries = emptyState.values.entries.find("Entries");
+  require(emptyEntries != emptyState.values.entries.end() && !emptyEntries->second.is_map &&
+              emptyEntries->second.scalar.empty(),
+          "and the Host reports it as the empty list Fcitx stores for no rows");
 
   // Restore defaults from the schema's DefaultValue: both # candidates and the pair return.
   SettingsValue restore = SettingsValue::object();
@@ -277,8 +402,8 @@ int main() {
     const auto backend = make_fcitx_backend(FcitxBackendOptions{/*user_path=*/true});
     require(backend->healthy(), "real backend not ready");
     run(*backend);
-    std::cout << "PASS punctuation editor: official subconfig, file-backed save, one-press #, "
-                 "paired row, refused write and defaults\n";
+    std::cout << "PASS punctuation editor: official subconfig, checked save, one-press #, paired "
+                 "row, refused rows, failed write, failed replacement, empty table and defaults\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL " << error.what() << '\n';

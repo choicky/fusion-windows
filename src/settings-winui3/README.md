@@ -11,7 +11,7 @@ new configuration path.
 |---|---|
 | `FusionSettings.Core/` | Transport, framing, codecs, endpoint naming, connection/handshake, draft/baseline model, key and input-method models, and the workspace that routes edits, splits saves and reconciles uncertain writes |
 | `FusionSettings.Core.Tests/` | Focused checks plus real-Host checks over an isolated pipe |
-| `FusionSettings.App/` | The WinUI 3 window: five pages, the key editor, the schema-driven option rows, and the zh_CN punctuation map editor |
+| `FusionSettings.App/` | The WinUI 3 window: five navigation pages, the key editor, the schema-driven option rows, and the zh_CN punctuation map editor reached from `候选与输入 → 更多工具` |
 
 `FusionSettings.Core` targets `net10.0` and `net8.0`: the checks run on net10, the app on
 net8, which is the runtime it is published against.
@@ -38,10 +38,14 @@ These are the properties the presentation may rely on, each covered by a check:
   punctuation addon; the window only edits the addon's own `Entries` rows through the same
   draft/save bar as every other page. Repeated keys stay repeated, the row index is candidate
   order, `AltMapping` stays on the paired row, and 恢复默认映射 reads the addon's schema
-  `DefaultValue` rather than a second table in this client. A successful save is reported only
-  when Fcitx's canonical `punctuation/punc.mb.zh_CN` contains the submitted bytes and the Host
-  reads the same rows back; an invalid or refused write leaves both the live addon and the file
-  at the previous map.
+  `DefaultValue` rather than a second table in this client. The table itself lives in the
+  workspace, not in the page, so an incomplete row survives leaving the page and coming back,
+  and the table Save validates is the one on screen. A save is one call to the addon's checked
+  entry point, which validates the complete replacement, persists it once through Fcitx's own
+  serializer and atomic save, and only then publishes it: a row the canonical file cannot hold
+  and a write that did not complete are reported as two different failures, and both leave the
+  file and the live map at the previous table. Neither this client nor the Host serializes a
+  row, opens the canonical file, or writes a compensating rollback.
 - **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
   truncated, late or cancelled reply returns `Indeterminate` with
   `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
@@ -149,11 +153,26 @@ the saved global value, the two saved candidate-presentation values, and the pun
 full-width `＃` row survived the new Host process, then the shipped rows were restored from the schema and both `#`
 candidates came back. `--no-integration` skips the real-Host section.
 
-On this branch the no-Host half prints **608 checks** with no failure. The real-Host half prints **870 checks** with one
-failure in this environment: `the engine exposes AuxiliaryFilter`, a pre-existing runtime difference also recorded
-above; the punctuation section itself has no failures. The native `punctuation_editor` check separately drives the real
-engine and prints `PASS punctuation editor: official subconfig, file-backed save, one-press #, paired row, refused write
-and defaults` when `FUSION_TEST_PUNCTUATION_PROFILE` points at a throwaway profile and `APPDATA` is inside it.
+On this branch, against the runtime `tools/fcitx/build-native.ps1` builds from the pins in
+`cmake/settings-ui/versions.cmake`, the no-Host half prints **610 checks**, the real-Host half
+prints **926 checks**, and the restart run prints **5 checks** — nothing failing in any of them.
+The earlier `the engine exposes AuxiliaryFilter` failure was the pre-fork runtime described
+above, not this client: the pinned fork exposes the option and the assertion passes unchanged.
+`PUNCTUATION_EXPECT=empty` is what the first run prints, and the restart run reads the
+deliberately empty table back from the new Host process before restoring the schema defaults.
+The native `punctuation_editor` check drives the real engine, forces both halves of a failed
+atomic save (a directory that cannot take the temporary file, and a target held without delete
+sharing) and prints `PASS punctuation editor: official subconfig, checked save, one-press #,
+paired row, refused rows, failed write, failed replacement, empty table and defaults` when
+`FUSION_TEST_PUNCTUATION_PROFILE` points at a throwaway profile and `APPDATA` is inside it.
+
+The real window was also driven through UI Automation against an isolated Host: open
+`候选与输入 → 更多工具 → 标点映射`, append an empty row, leave the page and come back (the row is
+still there), save (refused, file untouched, save bar reports 未保存), complete the row and save
+(the canonical file gains exactly that row), then edit a cell and 放弃 (the cell returns to the
+stored value and the file is untouched). That run is what found the row-identity defect this
+revision also fixes: editing a second column of the same row used to be dropped, because the
+record had already been replaced and the control no longer recognised its own row.
 
 ### Running the real-Host checks
 

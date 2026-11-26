@@ -89,7 +89,7 @@ $taskCore=Get-PinnedSource 'fcitx5' 'https://github.com/fcitx/fcitx5.git' 'a7f25
 # both products run one native implementation of the MoQi auxiliary filter and the mixed
 # Chinese/English input rather than two. The Fcitx core and LibIME stay at their official
 # pins above: the fork is based on the same core, and neither is moved for this.
-$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' '2145c4bf1cff8c62112b9c38db4e6032a190b280' $taskSourceRoot
+$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' '147983baa6f7cce931169e00cf219f591bf2e18c' $taskSourceRoot
 $taskLibime=Get-PinnedSource 'libime' 'https://github.com/fcitx/libime.git' '171edcf137001e8eb8274f53ec010058cda70b09' $taskSourceRoot
 Invoke-Native 'git' @('-C',$taskLibime,'submodule','update','--init','--depth','1')
 $taskLibimeDiff=& git -C $taskLibime status --porcelain
@@ -171,9 +171,13 @@ Invoke-Native 'cmake' (@('-S',(Join-Path $taskSupport 'chinese'),'-B',$taskChine
 Invoke-Native 'cmake' @('--build',$taskChineseBuild,'--parallel','8','--target','pinyin','pinyinhelper','punctuation','py-stroke-extract','py-table-extract','chinese/im/pinyin/pinyin-addon.conf','chinese/im/pinyin/pinyin.conf','chinese/im/pinyin/shuangpin.conf','chinese/modules/punctuation/punctuation.conf','chinese/modules/pinyinhelper/pinyinhelper.conf')
 Write-Output '[4/5] Assembling the runtime tree'
 $taskData=Join-Path $taskPrefix 'data\fcitx5'
-foreach($taskDirectory in @($taskData,(Join-Path $taskData 'addon'),(Join-Path $taskData 'inputmethod'),(Join-Path $taskData 'pinyin'),(Join-Path $taskData 'pinyinhelper'),(Join-Path $taskData 'punctuation'),(Join-Path $taskPrefix 'data\libime'),(Join-Path $taskPrefix 'lib\libime'))) {New-Item -ItemType Directory -Force $taskDirectory | Out-Null}
+foreach($taskDirectory in @($taskData,(Join-Path $taskData 'addon'),(Join-Path $taskData 'inputmethod'),(Join-Path $taskData 'pinyin'),(Join-Path $taskData 'pinyinhelper'),(Join-Path $taskData 'punctuation'),(Join-Path $taskPrefix 'data\libime'),(Join-Path $taskPrefix 'lib\libime'),(Join-Path $taskPrefix 'include\Fcitx5\Punctuation'))) {New-Item -ItemType Directory -Force $taskDirectory | Out-Null}
 Copy-Item (Join-Path $taskPrefix 'share\fcitx5\*') $taskData -Recurse -Force
 foreach($taskAddon in @('pinyin','pinyinhelper','punctuation')) {Copy-Item (Join-Path $taskChineseBuild ('lib\'+$taskAddon+'.lib')) (Join-Path $taskPrefix 'lib\fcitx5') -Force}
+# The punctuation addon exports one addon function beyond the Fcitx base interface: the
+# checked map save. Its declaration is staged next to the Fcitx5/Core headers so the Host
+# compiles against the exact signature of the .lib it links, instead of repeating it.
+Copy-Item (Join-Path $taskChinese 'modules\punctuation\punctuation_public.h') (Join-Path $taskPrefix 'include\Fcitx5\Punctuation') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin-addon.conf') (Join-Path $taskData 'addon\pinyin.conf') -Force
 Copy-Item (Join-Path $taskChineseBuild 'chinese\im\pinyin\pinyin.conf') (Join-Path $taskData 'inputmethod\pinyin.conf') -Force
 # Shuangpin is a second input method of the same pinyin addon (upstream installs both

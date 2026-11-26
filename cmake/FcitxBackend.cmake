@@ -15,6 +15,10 @@ find_package(PThreads4W CONFIG REQUIRED)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_library(FusionFcitxHost SHARED src/fcitx/backend.cpp src/fcitx/candidate_projection.cpp)
 target_include_directories(FusionFcitxHost PRIVATE include
+  # The pinned addon stages its public addon-function declarations here, next to the
+  # Fcitx5/Core and Fcitx5/Utils headers find_package already provides, so the punctuation
+  # checked-save entry point is compiled against the exact signature it is linked with.
+  "${FUSION_FCITX5_ROOT}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fcitx-native/compat"
   "${PThreads4W_INCLUDE_DIR}")
 target_compile_features(FusionFcitxHost PRIVATE cxx_std_20)
