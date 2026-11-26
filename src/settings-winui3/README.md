@@ -148,14 +148,16 @@ list, an import, the name conflict and its confirmed overwrite, a corrupt file t
 imported dictionary alone, enable/disable, reload and delete — each read back from the Host,
 with the learned dictionary compared before and after, and the whole chain again for a Chinese
 name, which is the case that travels as UTF-8 and has to come back unchanged. A third
-run, pointed at the same profile after the Host has been stopped through its stop event and restarted, prints **13 checks**:
-the saved global value, the two saved candidate-presentation values, and the punctuation restart chain — the removed
+run, pointed at the same profile after the Host has been stopped through its stop event and restarted, printed **13 checks** at that round: the saved global value, the two saved candidate-presentation values, and the punctuation restart chain — the removed
 full-width `＃` row survived the new Host process, then the shipped rows were restored from the schema and both `#`
 candidates came back. `--no-integration` skips the real-Host section.
 
 On this branch, against the runtime `tools/fcitx/build-native.ps1` builds from the pins in
 `cmake/settings-ui/versions.cmake`, the no-Host half prints **610 checks**, the real-Host half
 prints **926 checks**, and the restart run prints **5 checks** — nothing failing in any of them.
+Those five are the punctuation section alone, because this round's restart set only
+`PUNCTUATION_EXPECT=empty`; the global and candidate-presentation restart sections above run only
+when their own expectations are set, so that total is not comparable with the 13 recorded there.
 The earlier `the engine exposes AuxiliaryFilter` failure was the pre-fork runtime described
 above, not this client: the pinned fork exposes the option and the assertion passes unchanged.
 `PUNCTUATION_EXPECT=empty` is what the first run prints, and the restart run reads the
