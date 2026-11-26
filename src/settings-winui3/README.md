@@ -41,11 +41,13 @@ These are the properties the presentation may rely on, each covered by a check:
   `DefaultValue` rather than a second table in this client. The table itself lives in the
   workspace, not in the page, so an incomplete row survives leaving the page and coming back,
   and the table Save validates is the one on screen. A save is one call to the addon's checked
-  entry point, which validates the complete replacement, persists it once through Fcitx's own
-  serializer and atomic save, and only then publishes it: a row the canonical file cannot hold
-  and a write that did not complete are reported as two different failures, and both leave the
-  file and the live map at the previous table. Neither this client nor the Host serializes a
-  row, opens the canonical file, or writes a compensating rollback.
+  entry point, which builds the complete replacement — rows, lookup map and serialized bytes —
+  beside the live profile, validates it, persists it once through Fcitx's own serializer and
+  atomic save, and only then publishes it by exchanging containers, so nothing is re-parsed or
+  re-allocated after the file is committed: a row the canonical file cannot hold and a write
+  that did not complete are reported as two different failures, and both leave the file and the
+  live map at the previous table. Neither this client nor the Host serializes a row, opens the
+  canonical file, or writes a compensating rollback.
 - **A write whose outcome is unknown says so.** Once the request frame has started, a lost,
   truncated, late or cancelled reply returns `Indeterminate` with
   `MutationMayHaveBeenApplied` — never "nothing was written". A failure before the frame
@@ -134,7 +136,8 @@ against that runtime the mixed-option section stopped at that assertion and the 
 **814** with exactly that one check failing — the option was not in the engine there, which is not a
 client defect. That 814 is what `b8a81aa` printed on this machine. `tools/fcitx/build-native.ps1` has since
 rebuilt the same pinned generation from the sources `cmake/settings-ui/versions.cmake` names — the addon
-now the maintained fork at `2145c4bf1cff8c62112b9c38db4e6032a190b280` — and against that runtime the suite
+at `2145c4bf1cff8c62112b9c38db4e6032a190b280` at that round, since moved to `3551b5d` for the checked
+save below — and against that runtime the suite
 prints **856 checks with nothing failing** at `e43ccad`; the no-Host half was not run
 separately there either, so no split figure is quoted for it, and neither the 821 nor the 846
 above covers the Chinese-name chain, which landed after both. The no-Host half also covers the
@@ -164,9 +167,11 @@ above, not this client: the pinned fork exposes the option and the assertion pas
 deliberately empty table back from the new Host process before restoring the schema defaults.
 The native `punctuation_editor` check drives the real engine, forces both halves of a failed
 atomic save (a directory that cannot take the temporary file, and a target held without delete
-sharing) and prints `PASS punctuation editor: official subconfig, checked save, one-press #,
-paired row, refused rows, failed write, failed replacement, empty table and defaults` when
-`FUSION_TEST_PUNCTUATION_PROFILE` contains the directory Fcitx resolves its per-user data to.
+sharing), and reads the live lookup map through the engine's own composition path after each
+outcome — the row a refused save carried must not be served, and the row an accepted save carried
+must be. It prints `PASS punctuation editor: official subconfig, checked save, one-press #,
+paired row, refused rows, failed write, failed replacement, live map, empty table and defaults`
+when `FUSION_TEST_PUNCTUATION_PROFILE` contains the directory Fcitx resolves its per-user data to.
 That directory is the file the check asserts, so the check asks Fcitx's own `StandardPaths` where
 it is instead of deriving it from `APPDATA`: on Windows the roaming folder is resolved from the
 user profile, so a throwaway `APPDATA` with the real `USERPROFILE` still makes the engine write

@@ -337,6 +337,17 @@ void run(Backend &backend) {
           "the live map still holds the previous rows");
   require(file_text() == storedHash, "and the canonical file is byte-for-byte unchanged");
   require(temp_leftovers() == 0, "and the failed replacement left no temporary file behind");
+  {
+    // The live map is what the keystroke path reads, and it is not the copy the settings
+    // readback shows. A refused save must have left it at the previous table, so `=` — a row
+    // only the refused submission carried — still produces nothing, and `#` still produces
+    // what the last accepted save stored.
+    Scenario scenario(backend, 483);
+    require(last_commit(scenario.character('=')) != "＝",
+            "a refused save did not publish its rows to the live map");
+    require(last_commit(scenario.character('#')) == "#",
+            "and the live map still serves the previous table");
+  }
 
   // The same edit succeeds once the file can be replaced, which also proves the error was not
   // a rejected value.
@@ -345,6 +356,13 @@ void run(Backend &backend) {
           "the same edit succeeds after the lock is released");
   require(file_text().find("= ＝\n") != std::string::npos,
           "and the new row is on disk rather than only in memory");
+  {
+    // ... and that row is live: the map the keyboard reads was published from the preparation
+    // the write used, not rebuilt from a later parse.
+    Scenario scenario(backend, 484);
+    require(last_commit(scenario.character('=')) == "＝",
+            "the saved row is served by the live map");
+  }
   rows = attempted;
 
   // The other half of a failed atomic save: the directory cannot take the temporary file, so
@@ -366,6 +384,16 @@ void run(Backend &backend) {
   require(backend.settings_get_config(uri, afterUnwritable, error) == SettingsStatus::Ok &&
               rows_of(afterUnwritable.values) == rows,
           "the live map still holds the previous rows after a failed write");
+  {
+    // The half of safeSave that fails before its temporary file exists must leave the live
+    // lookup map alone too, not just the file and the settings readback: the rows the last
+    // accepted save published are still the ones the keyboard sees.
+    Scenario scenario(backend, 485);
+    require(last_commit(scenario.character('=')) == "＝",
+            "a failed write kept the previous rows live");
+    require(last_commit(scenario.character('#')) == "#",
+            "and the live map still serves the previous table");
+  }
 
   // A deliberately empty table is a table, not a missing one: the addon writes zero rows, the
   // canonical file becomes empty, and the Host reports the empty list rather than the defaults.
@@ -420,7 +448,8 @@ int main() {
     require(backend->healthy(), "real backend not ready");
     run(*backend);
     std::cout << "PASS punctuation editor: official subconfig, checked save, one-press #, paired "
-                 "row, refused rows, failed write, failed replacement, empty table and defaults\n";
+                 "row, refused rows, failed write, failed replacement, live map, empty table "
+                 "and defaults\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL " << error.what() << '\n';

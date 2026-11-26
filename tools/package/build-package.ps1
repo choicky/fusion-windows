@@ -163,7 +163,6 @@ try {
   }
   if ($UpstreamRoot) {
     New-Item -ItemType Directory -Force (Join-Path $stage 'licenses\runtime') | Out-Null
-    $sourceAccess = Join-Path $RepoRoot 'third_party\settings-ui\SOURCE-ACCESS.txt'
     foreach ($pair in @(@('fcitx5','fcitx5'),@('fcitx5-chinese-addons','fcitx5-chinese-addons'),@('libime','libime'))) {
       $source = Join-Path $UpstreamRoot "$($pair[0])"
       if (-not (Test-Path -LiteralPath (Join-Path $source '.git'))) { throw "Pinned runtime source is missing: $source" }
@@ -229,7 +228,8 @@ try {
   }
 
   # Ship scoped notices and the reproducible source patch inputs, not build binaries
-  # or the full upstream repositories. SourceAccess.txt names exact upstream revisions.
+  # or the full upstream repositories. SOURCE-ACCESS.txt names exact upstream revisions; the
+  # addon revision is written into the staged copy below from the pin the runtime was built at.
   $noticeRoot = Join-Path $RepoRoot 'third_party\settings-ui'
   if (-not (Test-Path -LiteralPath (Join-Path $noticeRoot 'SOURCE-ACCESS.txt'))) {
     throw "Settings source-access and license notices are missing: $noticeRoot"
@@ -303,6 +303,18 @@ try {
   }
 
   $files = @()
+  # The shipped source-access text has to name the addon revision this package built, and it
+  # must not keep a second copy of that value: the checked-in file carries a token, the value
+  # comes from cmake/settings-ui/versions.cmake, and the loop above has already required the
+  # built checkout to be exactly that revision. The staged copy is rewritten here, before it is
+  # hashed, so the manifest covers the text that actually ships.
+  $addonRevision = $runtime['fcitx5-chinese-addons']
+  $stagedSourceAccess = Join-Path $stage 'licenses\settings-ui\SOURCE-ACCESS.txt'
+  if (-not (Test-Path -LiteralPath $stagedSourceAccess)) {
+    throw "The staged source-access text is missing: $stagedSourceAccess"
+  }
+  & (Join-Path $PSScriptRoot 'source-access.ps1') -Template $stagedSourceAccess -AddonRevision $addonRevision
+
   foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName) {
     $relative = $file.FullName.Substring($stage.Length + 1) -replace '\\', '/'
     if ($relative -eq 'package.json') { continue }
@@ -358,6 +370,12 @@ try {
     files         = $files
   }
   $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'package.json') -Encoding UTF8
+  # The staged record and the shipped link name one revision, read back from the file that is
+  # about to be zipped rather than from the variables that produced it.
+  $stagedManifest = Get-Content -LiteralPath (Join-Path $stage 'package.json') -Raw | ConvertFrom-Json
+  if ($stagedManifest.runtime.'fcitx5-chinese-addons' -ne $addonRevision) {
+    throw "The staged package record does not name the addon revision $addonRevision used to build the runtime"
+  }
 
   $zip = Join-Path $OutDir ("fusion-$Version.zip")
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }

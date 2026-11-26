@@ -85,11 +85,15 @@ function Get-PinnedDownload([string]$Name,[string]$Url,[string]$Sha256) {
 $taskSourceRoot=Join-Path $WorkRoot 'upstream'
 New-Item -ItemType Directory -Force $taskSourceRoot | Out-Null
 $taskCore=Get-PinnedSource 'fcitx5' 'https://github.com/fcitx/fcitx5.git' 'a7f2528773ebfec98a20c49b6eea2333110b1c88' $taskSourceRoot
-# The Chinese engine is the fork the Android build uses, pinned to the same commit, so
-# both products run one native implementation of the MoQi auxiliary filter and the mixed
-# Chinese/English input rather than two. The Fcitx core and LibIME stay at their official
-# pins above: the fork is based on the same core, and neither is moved for this.
-$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' '147983baa6f7cce931169e00cf219f591bf2e18c' $taskSourceRoot
+# The Chinese engine is the owner-maintained fork, from the same `fusion` line the Android
+# product builds. This revision and the one in cmake/settings-ui/versions.cmake are the same
+# pin — build-package.ps1 refuses to package a runtime checkout that disagrees, and the
+# packaged source-access link and manifest record are generated from that value — so the two
+# declarations cannot silently diverge. The products still pin their own revisions: sharing a
+# fork is not sharing a commit, and this literal moves Windows only.
+# The Fcitx core and LibIME stay at their official pins above: the fork is based on the same
+# core, and neither is moved for this.
+$taskChinese=Get-PinnedSource 'fcitx5-chinese-addons' 'https://github.com/choicky/fcitx5-chinese-addons.git' '3551b5d097aa03d319ca40b401cdc6dc26b985b7' $taskSourceRoot
 $taskLibime=Get-PinnedSource 'libime' 'https://github.com/fcitx/libime.git' '171edcf137001e8eb8274f53ec010058cda70b09' $taskSourceRoot
 Invoke-Native 'git' @('-C',$taskLibime,'submodule','update','--init','--depth','1')
 $taskLibimeDiff=& git -C $taskLibime status --porcelain
