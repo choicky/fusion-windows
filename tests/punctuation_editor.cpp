@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -34,6 +35,30 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
   }
 }
+
+// A LocalAlloc block this file owns. GetNamedSecurityInfoW and SetEntriesInAclW each hand one
+// back, and require() throws, so ownership is taken at the call that made the block: every
+// path after it releases, including the throwing ones.
+class LocalBlock {
+public:
+  LocalBlock() = default;
+  explicit LocalBlock(void *block) : block_(block) {}
+  ~LocalBlock() { reset(); }
+  LocalBlock(const LocalBlock &) = delete;
+  LocalBlock &operator=(const LocalBlock &) = delete;
+
+  // Takes ownership of `block`, releasing whatever this already held.
+  void reset(void *block = nullptr) {
+    if (block_ != nullptr) {
+      ::LocalFree(block_);
+    }
+    block_ = block;
+  }
+  void *get() const { return block_; }
+
+private:
+  void *block_ = nullptr;
+};
 
 struct Row {
   std::string key;
@@ -146,10 +171,12 @@ public:
                                     nullptr, nullptr, &acl, nullptr,
                                     &descriptor) == ERROR_SUCCESS,
             "the punctuation directory's ACL is readable");
-    descriptor_.assign(static_cast<const unsigned char *>(descriptor),
-                       static_cast<const unsigned char *>(descriptor) +
-                           ::GetSecurityDescriptorLength(descriptor));
-    ::LocalFree(descriptor);
+    // The returned ACL is not a separate object: it points into the descriptor's one block, so
+    // that block has to outlive every read of `acl` — SetEntriesInAclW's here, and restore()'s
+    // later. The guard owns it for its whole lifetime rather than copying the bytes out.
+    saved_.reset(descriptor);
+    descriptor = nullptr;
+    saved_acl_ = acl;
 
     BYTE sid[SECURITY_MAX_SID_SIZE];
     DWORD sidSize = sizeof(sid);
@@ -161,36 +188,54 @@ public:
     entry.grfInheritance = NO_INHERITANCE;
     ::BuildTrusteeWithSidW(&entry.Trustee, sid);
     PACL denied = nullptr;
-    require(::SetEntriesInAclW(1, &entry, acl, &denied) == ERROR_SUCCESS,
+    require(::SetEntriesInAclW(1, &entry, saved_acl_, &denied) == ERROR_SUCCESS,
             "the deny entry can be built");
+    const LocalBlock denied_block(denied);
     const auto status = ::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()),
                                                 SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                                                 nullptr, denied, nullptr);
-    ::LocalFree(denied);
     require(status == ERROR_SUCCESS, "the deny entry can be applied");
   }
   ~DenyDirectoryWrites() { restore(); }
   DenyDirectoryWrites(const DenyDirectoryWrites &) = delete;
   DenyDirectoryWrites &operator=(const DenyDirectoryWrites &) = delete;
 
-  void restore() {
-    if (descriptor_.empty()) {
-      return;
-    }
-    PACL previous = nullptr;
-    BOOL present = FALSE;
-    BOOL defaulted = FALSE;
-    ::GetSecurityDescriptorDacl(reinterpret_cast<PSECURITY_DESCRIPTOR>(descriptor_.data()),
-                                &present, &previous, &defaulted);
-    ::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()), SE_FILE_OBJECT,
-                            DACL_SECURITY_INFORMATION, nullptr, nullptr,
-                            present != FALSE ? previous : nullptr, nullptr);
-    descriptor_.clear();
+  // Puts the DACL this guard replaced back, then reads the directory's DACL again to say
+  // whether that is what it now carries. A destructor cannot report, so the answer is returned
+  // for the test to assert; a repeated call is a no-op once the DACL has come back.
+  bool restore() {
+    if (restored_)
+      return true;
+    if (saved_.get() == nullptr)
+      return false;
+    if (::SetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()), SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION, nullptr, nullptr, saved_acl_,
+                                nullptr) != ERROR_SUCCESS)
+      return false;
+    restored_ = true;
+    return dacl_is_saved();
   }
 
 private:
+  // Whether the directory's DACL is byte-for-byte the one this guard replaced.
+  bool dacl_is_saved() const {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL current = nullptr;
+    if (::GetNamedSecurityInfoW(const_cast<LPWSTR>(directory_.c_str()), SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION, nullptr, nullptr, &current, nullptr,
+                                &descriptor) != ERROR_SUCCESS)
+      return false;
+    const LocalBlock readback(descriptor);
+    if (saved_acl_ == nullptr || current == nullptr)
+      return saved_acl_ == current;
+    return saved_acl_->AclSize == current->AclSize &&
+           std::memcmp(saved_acl_, current, saved_acl_->AclSize) == 0;
+  }
+
   std::filesystem::path directory_;
-  std::vector<unsigned char> descriptor_;
+  LocalBlock saved_;
+  PACL saved_acl_ = nullptr;
+  bool restored_ = false;
 };
 
 std::string last_commit(const BackendBatch &batch) {
@@ -376,7 +421,7 @@ void run(Backend &backend) {
     require(backend.settings_set_config(uri, value_of(unwritable), snapshot, error) ==
                 SettingsStatus::Error && !error.empty(),
             "a write that cannot create its temporary file is reported as unsaved");
-    denied.restore();
+    require(denied.restore(), "and the original DACL is back on the punctuation directory");
     require(file_text() == beforeUnwritable, "and the previous file is untouched");
     require(temp_leftovers() == 0, "and no temporary file is left beside it");
   }
