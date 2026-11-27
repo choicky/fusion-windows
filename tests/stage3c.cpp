@@ -21,7 +21,7 @@ namespace {
 // rather than a shorter log: an earlier round of this file silently returned after five of
 // its sections and still exited 0, which made "88/88 and unchanged oracles" look like
 // coverage it did not have.
-constexpr int kExpectedSections = 31;
+constexpr int kExpectedSections = 32;
 int sections_completed = 0;
 bool failure_reported = false;
 
@@ -1512,6 +1512,95 @@ int main() {
               "the key after the reconnect did not compose its character");
       c.destroy();
       section("PASS R53 P2b: a disconnected link does not apply the cached mode");
+    }
+
+    // R53 / Weasel's first failure mode: the Word word-loss. Weasel runs an asynchronously
+    // granted edit session and, when it finally runs, reads the *latest* server response from a
+    // single per-thread buffer — so a queued commit can be overwritten by the next key's answer.
+    // Fusion must not have that shape. Every callback is bound to the record of the key that
+    // produced it at dispatch time (`dispatch_real` owns one record per operation and copies the
+    // operation into the decision), the text travels with that record, and the queue is drained
+    // front to back. This case makes the difference observable: it defers *all* settlement the
+    // way an async-only host does, keeps typing so the engine's latest batch is a different one,
+    // and then runs the deferred session. If anything read "the latest response", the earlier
+    // words would come out wrong or twice.
+    {
+      FcitxBackendOptions options;
+      options.fixture_input_methods = {"shuangpin"};
+      options.fixture_default_method = "shuangpin";
+      auto burst_backend = make_fcitx_backend(options);
+      SemanticController c(998, 128, *burst_backend, 2);
+      // The queue an asynchronously granted session would find when it finally runs: exactly what
+      // `settle_frontend_work` puts there, and nothing else.
+      std::vector<std::pair<std::string, std::uint64_t>> queued_commits;
+      auto dispatch_deferred = [&](const KeyAction &action) {
+        const SemanticDecision decision = c.begin_key(action, true);
+        require(decision.route != SemanticDecision::Route::FailOpen &&
+                    decision.route != SemanticDecision::Route::CancelledRecovery,
+                "the burst key did not reach the engine");
+        for (const auto &work : decision.frontend) {
+          if (work.operation.type == BackendOperation::Type::CommitText) {
+            c.enqueue_effect(work.key, work.operation.text);
+            queued_commits.emplace_back(work.operation.text, work.key.sequence);
+          } else {
+            c.enqueue_state(work.key, work.operation.text, work.operation.preedit);
+          }
+        }
+      };
+      auto type_word = [&](const char *pinyin) {
+        for (const char *ch = pinyin; *ch; ++ch)
+          dispatch_deferred(physical(*ch));
+        dispatch_deferred(translate_key(kVkSpace, false, false, false));
+      };
+      type_word("nihao");
+      type_word("zhongwen");
+      type_word("shijie");
+      // Several further keys after the commits were queued: the engine's latest batch is now a
+      // live composition, which is the batch a "latest response" implementation would read back.
+      for (const char *ch = "women"; *ch; ++ch)
+        dispatch_deferred(physical(*ch));
+      require(queued_commits.size() >= 3, "the burst produced fewer than three commits");
+      std::cout << "deferred queue: " << c.pending().size() << " entries, "
+                << queued_commits.size() << " commits\n";
+      // The queue still holds the text each key produced. Nothing later overwrote it.
+      for (const auto &[text, sequence] : queued_commits) {
+        const auto found = std::find_if(c.pending().begin(), c.pending().end(),
+                                        [&](const PendingWork &work) {
+                                          return work.key.sequence == sequence;
+                                        });
+        require(found != c.pending().end() && found->text == text,
+                "a queued commit no longer carries the text its key produced");
+      }
+      // Now the deferred session runs: drain in order, exactly as `apply_frontend` does.
+      std::string document;
+      int drained = 0;
+      while (const auto work = c.drain_work()) {
+        if (work->kind == Kind::Effect) {
+          auto ticket = c.open_effect(work->key);
+          require(ticket.has_value(), "a deferred effect could not be opened in order");
+          document += work->text;
+          require(c.settle_effect(*ticket, EditResult::AppliedReadback) == Result::Accepted,
+                  "a deferred effect did not settle");
+        } else {
+          // `settle_front_state` is the door the async pump uses for a state: it settles the
+          // record and drops the queue entry, which is what makes the queue advance.
+          require(c.state_applicable(work->key), "a deferred state was applied out of order");
+          c.settle_front_state(work->key, EditResult::AppliedReadback);
+        }
+        ++drained;
+        if (drained > 64)
+          break; // a queue that never drains is a failure, not a long test
+      }
+      std::string expected;
+      for (const auto &[text, sequence] : queued_commits)
+        expected += text;
+      std::cout << "deferred document=[" << document << "] expected=[" << expected << "]\n";
+      require(document == expected,
+              "the deferred session did not write every commit exactly once, in order");
+      require(!expected.empty(), "the burst committed nothing");
+      require(c.finish_pass(), "the drained queue left a pass barrier up");
+      c.destroy();
+      section("PASS R53 Word burst: deferred commits are bound to their key and written in order");
     }
     return 0;
   } catch (const std::exception &e) {
