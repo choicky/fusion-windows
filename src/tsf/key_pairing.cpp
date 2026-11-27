@@ -8,9 +8,10 @@ std::uint64_t KeyPairing::touch(KeyEventId id) {
   if (!started_ || id != current_) {
     // The previous key is finished: a T that answered TRUE and never saw K was a claim the
     // host did not follow through, which is the one shape the Weasel model cannot tolerate.
-    if (pending_true_)
+    if (unmatched_true_)
       ++counters_.t_true_without_k;
-    pending_true_ = false;
+    unmatched_true_ = false;
+    latest_answer_ = false;
     seen_t_ = false;
     current_ = id;
     ++sequence_;
@@ -25,11 +26,13 @@ std::uint64_t KeyPairing::on_test_key(KeyEventId id, bool eligible) {
   if (seen_t_)
     ++counters_.t_repeated; // the same physical key asked twice
   seen_t_ = true;
+  // Record the latest answer, but do not erase an earlier unmatched TRUE: a host that tests
+  // the same key TRUE and then FALSE still made the claim, and if no K follows it is exactly
+  // the unmatched TRUE this counter exists to count.
+  latest_answer_ = eligible;
   if (eligible) {
     ++counters_.t_true;
-    pending_true_ = true;
-  } else {
-    pending_true_ = false;
+    unmatched_true_ = true;
   }
   return sequence;
 }
@@ -37,8 +40,8 @@ std::uint64_t KeyPairing::on_test_key(KeyEventId id, bool eligible) {
 std::uint64_t KeyPairing::on_key_down(KeyEventId id) {
   const std::uint64_t sequence = touch(id);
   ++counters_.k;
-  if (pending_true_) {
-    pending_true_ = false; // the pair completed
+  if (unmatched_true_) {
+    unmatched_true_ = false; // the earlier TRUE for this key is now paired
   } else if (!seen_t_) {
     ++counters_.k_without_t;
   }
@@ -52,10 +55,11 @@ std::uint64_t KeyPairing::on_key_up(KeyEventId id) { return touch(id); }
 void KeyPairing::on_async_effect() { ++counters_.async_effects; }
 
 void KeyPairing::flush() {
-  if (pending_true_) {
+  if (unmatched_true_) {
     ++counters_.t_true_without_k;
-    pending_true_ = false;
+    unmatched_true_ = false;
   }
+  latest_answer_ = false;
   seen_t_ = false;
   started_ = false;
 }
@@ -85,7 +89,8 @@ void KeyPairing::reset() {
   sequence_ = 0;
   started_ = false;
   seen_t_ = false;
-  pending_true_ = false;
+  unmatched_true_ = false;
+  latest_answer_ = false;
 }
 
 } // namespace fusion::tsf

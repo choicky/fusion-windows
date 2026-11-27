@@ -63,6 +63,9 @@ public:
   // `t=.. t_true=.. k=.. t_true_without_k=.. t_repeated=.. k_without_t=.. async_effects=..`
   std::string summary() const;
   const KeyPairingCounters &counters() const { return counters_; }
+  // The answer of the most recent T, held separately from whether an earlier TRUE is still
+  // unmatched: a repeated FALSE must not erase that earlier claim.
+  bool latest_answer() const { return latest_answer_; }
   void reset();
 
 private:
@@ -71,8 +74,9 @@ private:
   KeyEventId current_{};
   std::uint64_t sequence_ = 0;
   bool started_ = false;
-  bool seen_t_ = false;     // a T was seen for the current key
-  bool pending_true_ = false; // ... and it answered TRUE with no K since
+  bool seen_t_ = false;      // a T was seen for the current key
+  bool unmatched_true_ = false; // an earlier TRUE for this key has not seen a K yet
+  bool latest_answer_ = false;  // the answer of the most recent T for this key
 };
 
 } // namespace fusion::tsf

@@ -80,6 +80,39 @@ void check_pairing() {
   require(pairing.counters().async_effects == 2, "async effects were not counted");
 }
 
+void check_repeated_answers() {
+  // A re-entrant T for the same physical key is still a T and must be counted with the answer
+  // it actually gave, even when that answer changes between the two calls.
+  KeyPairing reentrant;
+  const std::uint64_t first = reentrant.on_test_key(id(0x35, 1000), false);
+  const std::uint64_t second = reentrant.on_test_key(id(0x35, 1000), true);
+  require(first == second, "a re-entrant T changed the physical key's number");
+  require(reentrant.counters().t == 2 && reentrant.counters().t_true == 1 &&
+              reentrant.counters().t_repeated == 1,
+          "a re-entrant T was not counted with its own answer");
+  require(reentrant.latest_answer(), "the latest T answer was not recorded separately");
+
+  // TRUE then FALSE for the same key with no K: the earlier unmatched TRUE survives the
+  // repeated FALSE, so the next key closes it exactly once.
+  KeyPairing unmatched;
+  (void)unmatched.on_test_key(id(0x36, 1100), true);
+  (void)unmatched.on_test_key(id(0x36, 1100), false);
+  require(unmatched.counters().t == 2 && unmatched.counters().t_true == 1,
+          "a repeated FALSE changed the T counts");
+  require(!unmatched.latest_answer(), "the latest answer was not updated by a FALSE T");
+  (void)unmatched.on_test_key(id(0x37, 1200), true);
+  require(unmatched.counters().t_true_without_k == 1,
+          "a repeated FALSE erased an unmatched TRUE");
+
+  // The same pair followed by K completes it: nothing is unmatched.
+  KeyPairing completed;
+  (void)completed.on_test_key(id(0x38, 1300), true);
+  (void)completed.on_test_key(id(0x38, 1300), false);
+  (void)completed.on_key_down(id(0x38, 1300));
+  require(completed.counters().t_true_without_k == 0 && completed.counters().k == 1,
+          "a K after a repeated FALSE did not complete the earlier TRUE");
+}
+
 void check_summary_shape() {
   KeyPairing pairing;
   for (std::uint32_t i = 0; i < 200; ++i) {
@@ -110,6 +143,7 @@ void check_summary_shape() {
 int main() {
   try {
     check_pairing();
+    check_repeated_answers();
     check_summary_shape();
     std::printf("PASS key pairing counters\n");
     return 0;

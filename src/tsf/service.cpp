@@ -1194,17 +1194,28 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   if (pfEaten == nullptr)
     return E_INVALIDARG;
   *pfEaten = FALSE;
-  if (!pic)
+  // R53 measurement: count every T with the answer it actually gave, on every return path —
+  // the re-entrant and refusal paths answer too, and omitting them invents an unmatched K.
+  // OnKeyDown counts every K before its own refusal paths; T is now the same.
+  auto record_test_key = [&]() {
+    return key_pairing().on_test_key(key_event_id(wparam, lparam), *pfEaten != FALSE);
+  };
+  if (!pic) {
+    (void)record_test_key();
     return S_OK;
+  }
   if (handling_key_) {
     // Preserve routing to K for explicit recovery; T itself takes no ownership.
     if (auto *entry = find_entry(pic))
       *pfEaten = entry->cleanup.pending() || entry->semantic.pass_probe() != fusion::Pass::Clear;
+    (void)record_test_key();
     return S_OK;
   }
   ContextEntry *entry = resolve_or_create_entry(pic);
-  if (!entry)
+  if (!entry) {
+    (void)record_test_key();
     return S_OK;
+  }
   const auto action = physical_key(wparam, lparam);
   // The application may deliver only T or only K, so both record the press a
   // modifier-only release could settle; a key-down of anything else ends it.
@@ -1215,7 +1226,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext *pic, WPARAM wparam, LPARAM l
   // R53 measurement: the sequence number is what pairs this line with the `KEY_ARRIVAL` and
   // `BACKEND` lines of the same physical key, so the log can answer "did T and K pair" without
   // the log ever naming the key.
-  const std::uint64_t seq = key_pairing().on_test_key(key_event_id(wparam, lparam), *pfEaten);
+  const std::uint64_t seq = record_test_key();
   if (const char *mod = modifier_name(wparam, lparam)) {
     // T answers eligibility and dispatches nothing, so the two fields a dispatch would answer
     // are written here as the constants they are — the key was not sent and has no result.

@@ -107,7 +107,13 @@ public:
     // the soak keeps it: that line is the proof the throwaway profile was used and the owner's
     // own data was not.
     if (log_file_ == INVALID_HANDLE_VALUE) {
-      log_file_ = CreateFileW(log_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+      // The child must actually inherit this handle: passing it as hStdOutput/hStdError with
+      // bInheritHandles=TRUE is not enough when CreateFileW was given null security attributes.
+      SECURITY_ATTRIBUTES security{};
+      security.nLength = sizeof(security);
+      security.bInheritHandle = TRUE;
+      security.lpSecurityDescriptor = nullptr;
+      log_file_ = CreateFileW(log_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, &security,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
     std::wstring command = L"\"" + executable_ + L"\" --pipe-name " + pipe_;
@@ -406,6 +412,9 @@ int main(int argc, char **argv) {
 
   g_start = GetTickCount64();
   std::atomic<bool> stop{false};
+  // A failed reconnect is a recorded outage, not a reason to lose the whole run. The typist
+  // skips dispatch until a controller exists again and counts the failure here.
+  std::atomic<unsigned long long> reconnect_failures{0};
   std::vector<std::thread> typists;
   for (int i = 0; i < clients; ++i) {
     typists.emplace_back([&, i] {
@@ -414,12 +423,20 @@ int main(int argc, char **argv) {
       const auto period = std::chrono::milliseconds(300 + i * 17);
       std::mt19937 jitter(static_cast<std::uint32_t>(i) + 91u);
       while (!stop.load()) {
-        if (!connections[static_cast<std::size_t>(i)]->healthy()) {
-          // A reconnect is part of the product's behaviour, not a failure of the soak.
-          connections[static_cast<std::size_t>(i)]->stop();
-          (void)connections[static_cast<std::size_t>(i)]->start();
+        Client &client = *connections[static_cast<std::size_t>(i)];
+        if (!client.healthy()) {
+          // A reconnect is part of the product's behaviour, not a failure of the soak. If the
+          // Host stays unavailable past the timeout, start() returns false with controller_
+          // cleared: typing here would dereference it and end the run. Count the outage and
+          // keep this client idle until a later attempt succeeds.
+          client.stop();
+          if (!client.start()) {
+            ++reconnect_failures;
+            std::this_thread::sleep_for(period + std::chrono::milliseconds(jitter() % 60));
+            continue;
+          }
         }
-        const double micros = connections[static_cast<std::size_t>(i)]->type_one_key();
+        const double micros = client.type_one_key();
         {
           std::lock_guard<std::mutex> guard(samples_mutex);
           samples.push_back(Sample{now_ms(), micros});
@@ -503,6 +520,7 @@ int main(int argc, char **argv) {
     client->stop();
   csv.close();
   host.kill();
-  std::printf("soak done: %d windows, CSV %s\n", window, csv_path.c_str());
+  std::printf("soak done: %d windows, reconnect failures=%llu, CSV %s\n", window,
+              reconnect_failures.load(), csv_path.c_str());
   return 0;
 }
