@@ -42,6 +42,12 @@ public sealed class ConfigIdentity : IEquatable<ConfigIdentity>
             // pinyin addon or with the global configuration, because it repeats no value
             // either of them owns (owner authorization 2026-10-22).
             ["fcitx://config/candidate-presentation"] = "presentation",
+
+            // The zh_CN punctuation map is one sub-configuration object owned by the
+            // punctuation addon. Its draft is distinct from the input-method drafts even though
+            // the Pinyin schema links to it, because it is stored and saved separately.
+            ["fcitx://config/addon/punctuation/punctuationmap/zh_CN"] =
+                "addon:punctuation:zh_CN",
         };
 
     private ConfigIdentity(string id, string publicUri)

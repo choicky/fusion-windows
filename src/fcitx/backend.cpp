@@ -7,6 +7,7 @@
 #include <fcitx-config/rawconfig.h>
 #include "startup_group.hpp"
 #include "im_list.hpp"
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -20,6 +21,8 @@
 #include <fcitx-utils/key.h>
 #include <fcitx-utils/standardpaths.h>
 #include <fcitx-utils/utf8.h>
+#include <Fcitx5/Punctuation/punctuation_public.h>
+#include <fcitx/addoninstance.h>
 #include <fcitx/addonloader.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
@@ -92,6 +95,13 @@ constexpr char global_config_uri[] = "fcitx://config/global";
 // per-user directory — not an additional configuration system. It holds presentation
 // only: no Pinyin/Shuangpin value and no global value is repeated here.
 constexpr char candidate_presentation_uri[] = "fcitx://config/candidate-presentation";
+// The official D-Bus controller's sub-configuration URI for the punctuation addon's zh_CN
+// profile (dbusmodule.cpp's fcitx://config/addon/<addon>/<subpath> form). The addon remains
+// the only owner of the map: this Host serves the same getSubConfig/setSubConfig/dumpDescription
+// path the controller serves, using the existing GetConfig/SetConfig transport.
+constexpr char punctuation_config_uri[] =
+    "fcitx://config/addon/punctuation/punctuationmap/zh_CN";
+constexpr char punctuation_sub_path[] = "punctuationmap/zh_CN";
 
 bool parse_supported_input_method_uri(const std::string &uri, std::string &name) {
   const std::string prefix = input_method_config_prefix;
@@ -106,6 +116,10 @@ bool is_global_config_uri(const std::string &uri) { return uri == global_config_
 
 bool is_candidate_presentation_uri(const std::string &uri) {
   return uri == candidate_presentation_uri;
+}
+
+bool is_punctuation_config_uri(const std::string &uri) {
+  return uri == punctuation_config_uri;
 }
 
 // The stored preference and the transport enum are two vocabularies for one decision: the
@@ -226,6 +240,50 @@ const SettingsConfigType *find_config_type(const std::vector<SettingsConfigType>
     return type.name == name;
   });
   return found == types.end() ? nullptr : &*found;
+}
+
+// RawConfig reads an empty list back as an empty scalar, while the client writes it as an
+// empty map. Normalize only that one representation at the schema-defined List boundary, so a
+// deliberate empty list compares equal to its readback without turning a missing value, a
+// malformed scalar, or a non-empty list into something else. This is the same distinction
+// SettingsDraft.SameStoredValue makes on the client.
+SettingsValue normalize_empty_list_values(const std::vector<SettingsConfigType> &types,
+                                          const std::string &typeName,
+                                          const SettingsValue &value) {
+  if (!value.is_map) {
+    return value;
+  }
+  const auto *type = find_config_type(types, typeName);
+  if (!type) {
+    return value;
+  }
+  SettingsValue result = value;
+  for (auto &[name, child] : result.entries) {
+    const auto option = std::find_if(type->options.begin(), type->options.end(),
+                                     [&name](const auto &candidate) {
+                                       return candidate.name == name;
+                                     });
+    if (option == type->options.end()) {
+      continue;
+    }
+    if (option->type.starts_with("List|")) {
+      if (child.is_map && child.entries.empty()) {
+        child = SettingsValue::string("");
+        continue;
+      }
+      const std::string elementType = option->type.substr(std::string("List|").size());
+      if (child.is_map && find_config_type(types, elementType)) {
+        for (auto &[index, item] : child.entries) {
+          item = normalize_empty_list_values(types, elementType, item);
+        }
+      }
+      continue;
+    }
+    if (find_config_type(types, option->type)) {
+      child = normalize_empty_list_values(types, option->type, child);
+    }
+  }
+  return result;
 }
 
 // ConfigWidget serializes only options it knows. Merge at schema-defined paths
@@ -924,10 +982,22 @@ public:
       }
       return status;
     }
+    if (is_punctuation_config_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, result](std::string &taskError) {
+                            return read_punctuation_settings_on_loop(*result, taskError);
+                          },
+                          error, SettingsStatus::Timeout);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
     std::string method;
     if (!parse_supported_input_method_uri(uri, method)) {
-      error = "Only the Global, candidate-presentation and Pinyin/Shuangpin input-method "
-              "settings are available.";
+      error = "Only the Global, candidate-presentation, zh_CN punctuation and "
+              "Pinyin/Shuangpin input-method settings are available.";
       return SettingsStatus::Invalid;
     }
     auto result = std::make_shared<SettingsSnapshot>();
@@ -965,6 +1035,19 @@ public:
       const auto status =
           invoke_settings([this, submitted, result](std::string &taskError) {
                             return apply_presentation_settings_on_loop(submitted, *result,
+                                                                      taskError);
+                          },
+                          error, SettingsStatus::Indeterminate);
+      if (status == SettingsStatus::Ok) {
+        snapshot = std::move(*result);
+      }
+      return status;
+    }
+    if (is_punctuation_config_uri(uri)) {
+      auto result = std::make_shared<SettingsSnapshot>();
+      const auto status =
+          invoke_settings([this, submitted, result](std::string &taskError) {
+                            return apply_punctuation_settings_on_loop(submitted, *result,
                                                                       taskError);
                           },
                           error, SettingsStatus::Indeterminate);
@@ -1890,6 +1973,114 @@ private:
         presentation_config_.layout.value());
     candidate_font_.store(candidate_font_for(presentation_config_));
     return read_presentation_settings_on_loop(snapshot, error);
+  }
+
+  // The zh_CN punctuation map is an official addon sub-configuration, not a Fusion file. The
+  // D-Bus controller reaches it with getSubConfig/setSubConfig; the Host reads it the same way
+  // and saves it through the addon's checked entry point, which is the only place a map is
+  // validated, serialized and written. The schema's DefaultValue is the shipped punc.mb.zh_CN
+  // table, which is what "restore defaults" submits — no second copy of the table is kept in
+  // this repository.
+  SettingsStatus read_punctuation_settings_on_loop(SettingsSnapshot &snapshot,
+                                                   std::string &error) {
+    auto *addon = instance_->addonManager().addon("punctuation", true);
+    if (!addon) {
+      error = "The Fcitx punctuation addon is not available.";
+      return SettingsStatus::Unsupported;
+    }
+    const auto *config = addon->getSubConfig(punctuation_sub_path);
+    if (!config) {
+      error = "The Fcitx zh_CN punctuation map is not available.";
+      return SettingsStatus::Unsupported;
+    }
+    fcitx::RawConfig values;
+    config->save(values);
+    snapshot.values = raw_config_to_settings_value(values);
+    snapshot.types = dump_settings_description(*config);
+    return SettingsStatus::Ok;
+  }
+
+  // The wire shape is an indexed map of {Key, Mapping, AltMapping} rows. Fcitx writes the
+  // same order and keeps repeated keys, so neither sorting nor de-duplication belongs here.
+  // Everything else about the table — whether a row can be stored at all, how a row becomes a
+  // line, and when the canonical file is replaced — belongs to the addon. This file therefore
+  // holds no punctuation serializer, no canonical path and no rollback: it shapes and merges
+  // the submitted value, then asks the addon for one checked save.
+  SettingsStatus apply_punctuation_settings_on_loop(const SettingsValue &submitted,
+                                                    SettingsSnapshot &snapshot,
+                                                    std::string &error) {
+    SettingsSnapshot current;
+    if (const auto status = read_punctuation_settings_on_loop(current, error);
+        status != SettingsStatus::Ok) {
+      return status;
+    }
+    if (current.types.empty()) {
+      error = "Fcitx returned no schema for the zh_CN punctuation map.";
+      return SettingsStatus::Error;
+    }
+    SettingsValue merged = current.values;
+    if (!merge_schema_values(current.types, current.types.front().name, submitted, merged,
+                             error)) {
+      return SettingsStatus::Invalid;
+    }
+    // Compare through the schema's list boundary. This is what lets a deliberately empty
+    // Entries list be saved: the written value is an empty map, the Host reads back the empty
+    // scalar Fcitx uses for the same table, and only these two forms are treated as equal.
+    const auto comparable =
+        normalize_empty_list_values(current.types, current.types.front().name, merged);
+    if (comparable == current.values) {
+      snapshot = std::move(current);
+      return SettingsStatus::Ok;
+    }
+    fcitx::RawConfig raw;
+    if (!settings_value_fill_raw_config(merged, raw)) {
+      error = "The zh_CN punctuation settings value tree is malformed.";
+      return SettingsStatus::Invalid;
+    }
+    auto *addon = instance_->addonManager().addon("punctuation", true);
+    if (!addon) {
+      error = "The Fcitx punctuation addon is not available.";
+      return SettingsStatus::Unsupported;
+    }
+    // One checked call. The addon prepares the complete replacement beside the live profile,
+    // refuses a map whose rows it cannot store, persists once through its own serializer and
+    // Fcitx's atomic save, and only then publishes the live map. Its answer separates "this
+    // map cannot be stored" from "Fcitx could not write it", and in both cases the canonical
+    // file and the live map still hold the previous table — which is why nothing here needs
+    // to read the canonical file or send a previous table back.
+    const auto saved =
+        addon->call<fcitx::IPunctuation::setSubConfigChecked>(punctuation_sub_path, raw);
+    switch (saved) {
+      case fcitx::PunctuationMapSaveResult::Ok:
+        break;
+      case fcitx::PunctuationMapSaveResult::Invalid:
+        error = "Fcitx cannot store a row in the zh_CN punctuation map: a key or mapping it "
+                "would drop, a key that is not one character, or a column holding a space. "
+                "The previous map is unchanged.";
+        return SettingsStatus::Invalid;
+      case fcitx::PunctuationMapSaveResult::SaveFailed:
+        error = "Fcitx could not save the zh_CN punctuation map. The previous map is "
+                "unchanged, so the same change can be retried.";
+        return SettingsStatus::Error;
+      case fcitx::PunctuationMapSaveResult::UnknownLanguage:
+        error = "The Fcitx zh_CN punctuation map is not available.";
+        return SettingsStatus::Unsupported;
+    }
+    SettingsSnapshot reread;
+    if (const auto status = read_punctuation_settings_on_loop(reread, error);
+        status != SettingsStatus::Ok) {
+      return status;
+    }
+    // The save is already on disk, so the live map must report exactly those rows. This is
+    // what lets an Ok answer mean "the submitted table is stored" rather than "a call
+    // returned"; it is not a substitute for the addon's own check.
+    if (reread.values != comparable) {
+      error = "Fcitx saved the zh_CN punctuation map but reports different rows than the "
+              "ones submitted. Reopen this page to see the stored table.";
+      return SettingsStatus::Error;
+    }
+    snapshot = std::move(reread);
+    return SettingsStatus::Ok;
   }
 
   SettingsStatus read_settings_on_loop(const std::string &method, SettingsSnapshot &snapshot,

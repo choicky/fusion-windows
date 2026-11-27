@@ -12,9 +12,11 @@ Owner authorization, recorded 2026-10-20: the upstream-derived settings executab
    Linked modules: Qt6Core, Qt6Gui, Qt6Widgets, Qt6Network and Qt6DBus. The package contains their shared DLLs and the Qt Windows platform plugin, so Qt remains out of FusionHost.exe and FusionTsf.dll. The Qt open-source license options and requirements are component-specific; the package provides the upstream LGPL-3.0-only, GPL-2.0-only and GPL-3.0-only texts obtained from qtbase tag v6.8.3. The Qt installation and the upstream source-access route are listed in SOURCE-ACCESS.txt. This inventory does not assert that every Qt module is dual-licensed under all three options; the packaged build uses the LGPL shared-library route for the linked runtime libraries.
 
 4. Pinned Fcitx runtime — component licenses retained, data sources named
-   Pinned fcitx5 core and LibIME remain LGPL-2.1-or-later, and fcitx5-chinese-addons is now the
-   owner-maintained fork (choicky/fcitx5-chinese-addons, commit 2145c4b) that the Android build
-   uses, still LGPL-2.1-or-later per its file headers; its MSVC adaptation is a separate patch.
+   Pinned fcitx5 core and LibIME remain LGPL-2.1-or-later, and fcitx5-chinese-addons is the
+   owner-maintained fork (choicky/fcitx5-chinese-addons), still LGPL-2.1-or-later per its file
+   headers; its MSVC adaptation is a separate patch. The revision this package built is the one
+   package.json records as runtime["fcitx5-chinese-addons"] and the one SOURCE-ACCESS.txt links;
+   it is not duplicated here, so this notice cannot name a commit the package did not build.
    That addon redistributes two data sources, both shipped in this package and named here:
      - MoQi reverse-lookup table (gaboolic/moqima-tables, MIT): pinned by commit and SHA-256 in
        modules/pinyinhelper/moqima-gb18030.cmake, fetched at build time, installed as

@@ -22,6 +22,11 @@ public enum SettingsTarget
     /// configuration that holds presentation only (today the layout direction).
     /// </summary>
     Presentation,
+
+    /// <summary>
+    /// The official Fcitx zh_CN punctuation subconfiguration, owned by the punctuation addon.
+    /// </summary>
+    Punctuation,
 }
 
 /// <summary>
@@ -58,6 +63,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     /// value; this window only edits it through the Host.
     /// </summary>
     public const string PresentationUri = "fcitx://config/candidate-presentation";
+
+    /// <summary>
+    /// The official sub-configuration URI used by Fcitx's own controller for the punctuation
+    /// addon's zh_CN profile. The Host serves the addon's schema and values unchanged.
+    /// </summary>
+    public const string PunctuationUri =
+        "fcitx://config/addon/punctuation/punctuationmap/zh_CN";
 
     /// <summary>
     /// What the window says while a save is waiting for the Host to be free. It says what is
@@ -147,6 +159,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     private bool _isConnected;
     private string _editingMethod = "pinyin";
     private string _saveSummary = string.Empty;
+    private List<PunctuationRow>? _punctuationRows;
+    private bool _punctuationRowsDirty;
 
     public SettingsWorkspace(string endpoint)
     {
@@ -273,11 +287,15 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
 
     public SettingsSnapshot? PresentationSnapshot { get; private set; }
 
+    public SettingsSnapshot? PunctuationSnapshot { get; private set; }
+
     public SettingsDraft? PinyinDraft { get; private set; }
 
     public SettingsDraft? GlobalDraft { get; private set; }
 
     public SettingsDraft? PresentationDraft { get; private set; }
+
+    public SettingsDraft? PunctuationDraft { get; private set; }
 
     public ImListDraft? Methods { get; private set; }
 
@@ -296,6 +314,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         SettingsTarget.Shuangpin => ShuangpinSnapshot,
         SettingsTarget.Global => GlobalSnapshot,
         SettingsTarget.Presentation => PresentationSnapshot,
+        SettingsTarget.Punctuation => PunctuationSnapshot,
         _ => null,
     };
 
@@ -303,14 +322,47 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
     {
         SettingsTarget.Global => GlobalDraft,
         SettingsTarget.Presentation => PresentationDraft,
+        SettingsTarget.Punctuation => PunctuationDraft,
         SettingsTarget.Pinyin => PinyinDraft,
         SettingsTarget.Shuangpin => PinyinDraft,
         _ => null,
     };
 
+    /// <summary>
+    /// The one editable punctuation table, including rows that are not yet complete.
+    /// </summary>
+    /// <remarks>
+    /// The rows live here rather than in <c>PunctuationPage</c> so navigating away and back
+    /// rebuilds the same table. A row the addon would reject stays in this list and in the
+    /// editor; it is not put into <see cref="PunctuationDraft"/> until the whole table is
+    /// valid, and a save is refused while this list is invalid.
+    /// </remarks>
+    public IReadOnlyList<PunctuationRow> PunctuationRows
+    {
+        get
+        {
+            EnsurePunctuationRows();
+            return _punctuationRows!;
+        }
+    }
+
+    /// <summary>True when the editable table differs from the last valid draft value.</summary>
+    public bool PunctuationRowsDirty
+    {
+        get
+        {
+            EnsurePunctuationRows();
+            return _punctuationRowsDirty;
+        }
+    }
+
+    /// <summary>The current table's validation error, or null when it can be saved.</summary>
+    public string? PunctuationInvalidReason => PunctuationMap.InvalidReason(PunctuationRows);
+
     public bool HasChanges =>
         (PinyinDraft?.HasChanges ?? false) || (GlobalDraft?.HasChanges ?? false) ||
-        (PresentationDraft?.HasChanges ?? false) || (Methods?.HasChanges ?? false);
+        (PresentationDraft?.HasChanges ?? false) || (PunctuationDraft?.HasChanges ?? false) ||
+        PunctuationRowsDirty || (Methods?.HasChanges ?? false);
 
     public IReadOnlyList<string> Diagnostics => _log;
 
@@ -416,6 +468,13 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 return Fail(presentation.Status, presentation.Error);
             }
 
+            var punctuation = await _client.GetConfigAsync(PunctuationUri, cancellationToken)
+                .ConfigureAwait(true);
+            if (!punctuation.IsOk)
+            {
+                return Fail(punctuation.Status, punctuation.Error);
+            }
+
             var methods = await _client.GetImListAsync(cancellationToken).ConfigureAwait(true);
             if (!methods.IsOk)
             {
@@ -427,6 +486,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             var incarnation = pinyin.HostIncarnation;
             if (shuangpin.HostIncarnation != incarnation || global.HostIncarnation != incarnation ||
                 presentation.HostIncarnation != incarnation ||
+                punctuation.HostIncarnation != incarnation ||
                 methods.HostIncarnation != incarnation)
             {
                 Log("load rejected: replies came from different Host incarnations");
@@ -441,6 +501,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             ShuangpinSnapshot = shuangpin.Value;
             GlobalSnapshot = global.Value;
             PresentationSnapshot = presentation.Value;
+            PunctuationSnapshot = punctuation.Value;
 
             if (recreateDrafts)
             {
@@ -448,6 +509,8 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 GlobalDraft = SettingsDraft.FromSnapshot(ConfigIdentity.ForUri(GlobalUri), global.Value!);
                 PresentationDraft = SettingsDraft.FromSnapshot(
                     ConfigIdentity.ForUri(PresentationUri), presentation.Value!);
+                PunctuationDraft = SettingsDraft.FromSnapshot(
+                    ConfigIdentity.ForUri(PunctuationUri), punctuation.Value!);
                 Methods = new ImListDraft(methods.Value!);
             }
             else
@@ -458,7 +521,16 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 PinyinDraft?.RefreshBaseline(pinyin.Value!);
                 GlobalDraft?.RefreshBaseline(global.Value!);
                 PresentationDraft?.RefreshBaseline(presentation.Value!);
+                PunctuationDraft?.RefreshBaseline(punctuation.Value!);
                 MergeMethods(methods.Value!);
+            }
+
+            // A fresh load and a reload without pending edits both adopt the Host's table.
+            // A reconnect or a failed-save retry keeps a dirty (including invalid) table,
+            // because that is the user's work and the whole point of preserving the draft.
+            if (recreateDrafts || !PunctuationRowsDirty)
+            {
+                ResetPunctuationRowsFromDraft();
             }
 
             if (!ConfigIdentity.ForUri(PinyinUri).SharesStorageWith(ConfigIdentity.ForUri(ShuangpinUri)))
@@ -525,6 +597,20 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
             return false;
         }
 
+        // Punctuation is a row list, not an arbitrary option value. Routing it through the
+        // table keeps every caller on the same pending rows, including an incomplete row that
+        // is deliberately not yet in the draft.
+        if (target == SettingsTarget.Punctuation &&
+            string.Equals(optionName, PunctuationMap.Entries, StringComparison.Ordinal))
+        {
+            if (!value.IsMap)
+            {
+                Report("标点映射必须是一张表；这次修改没有写入草稿。");
+                return false;
+            }
+            return SetPunctuationRows(PunctuationMap.RowsFromOption(value));
+        }
+
         var accepted = draft.TrySet(snapshot, optionName, value);
         if (accepted)
         {
@@ -532,6 +618,37 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         }
 
         return accepted;
+    }
+
+    /// <summary>
+    /// Replaces the one editable punctuation table. An invalid table is retained and marked
+    /// dirty; it is not written to the draft, so a later save cannot submit an older valid
+    /// table in its place.
+    /// </summary>
+    public bool SetPunctuationRows(IEnumerable<PunctuationRow> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        var snapshot = PunctuationSnapshot;
+        var draft = PunctuationDraft;
+        if (IsBusy || snapshot is null || draft is null)
+        {
+            return false;
+        }
+
+        EnsurePunctuationRows();
+        var next = rows.ToList();
+        _punctuationRows = next;
+        if (PunctuationMap.InvalidReason(next) is null &&
+            !draft.TrySet(snapshot, PunctuationMap.Entries, PunctuationMap.Value(next)))
+        {
+            return false;
+        }
+
+        _punctuationRowsDirty = !RowsEqual(next, RowsFromDraft(draft));
+        Raise(nameof(PunctuationRows));
+        Raise(nameof(PunctuationRowsDirty));
+        Raise(nameof(HasChanges));
+        return true;
     }
 
     /// <summary>Edits a leaf inside a nested configuration of <paramref name="target"/>.</summary>
@@ -603,10 +720,47 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         PinyinDraft?.RevertAll();
         GlobalDraft?.RevertAll();
         PresentationDraft?.RevertAll();
+        PunctuationDraft?.RevertAll();
+        ResetPunctuationRowsFromDraft();
         Methods?.Revert();
         SaveSummary = "已放弃未保存的修改。";
         Raise(nameof(HasChanges));
     }
+
+    private void EnsurePunctuationRows()
+    {
+        if (_punctuationRows is not null)
+        {
+            return;
+        }
+
+        _punctuationRows = PunctuationDraft is null
+            ? new List<PunctuationRow>()
+            : RowsFromDraft(PunctuationDraft).ToList();
+        _punctuationRowsDirty = false;
+    }
+
+    private void ResetPunctuationRowsFromDraft()
+    {
+        if (PunctuationDraft is null)
+        {
+            _punctuationRows = null;
+            _punctuationRowsDirty = false;
+            return;
+        }
+
+        _punctuationRows = RowsFromDraft(PunctuationDraft).ToList();
+        _punctuationRowsDirty = false;
+        Raise(nameof(PunctuationRows));
+        Raise(nameof(PunctuationRowsDirty));
+    }
+
+    private static IReadOnlyList<PunctuationRow> RowsFromDraft(SettingsDraft draft) =>
+        PunctuationMap.RowsFromOption(draft.Effective(PunctuationMap.Entries));
+
+    private static bool RowsEqual(IReadOnlyList<PunctuationRow> left,
+                                  IReadOnlyList<PunctuationRow> right) =>
+        left.SequenceEqual(right);
 
     /// <summary>
     /// Puts a short message in the save bar without touching a draft. Used for outcomes that are
@@ -764,6 +918,26 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 cancellationToken).ConfigureAwait(true));
         }
 
+        if (Wants(only, SavePage.Punctuation))
+        {
+            var invalid = PunctuationInvalidReason;
+            if (invalid is not null)
+            {
+                // The visible table is authoritative. Refuse the whole punctuation page rather
+                // than submitting the last valid draft, which would silently drop the row the
+                // user is still editing.
+                Record(reports, busy, SavePage.Punctuation,
+                    new SaveOutcome($"标点映射：未保存（{invalid}）。修改已保留。", false));
+            }
+            else if (PunctuationDraft is { HasChanges: true } punctuationDraft)
+            {
+                Record(reports, busy, SavePage.Punctuation, await SaveConfigurationAsync(
+                    PunctuationUri, SettingsTarget.Punctuation, punctuationDraft.BuildChangeSet(),
+                    punctuationDraft.PendingPaths.ToHashSet(StringComparer.Ordinal), "标点映射",
+                    cancellationToken).ConfigureAwait(true));
+            }
+        }
+
         if (Wants(only, SavePage.Methods) && Methods is { HasChanges: true } methods)
         {
             Record(reports, busy, SavePage.Methods,
@@ -905,6 +1079,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 // A successful apply is authoritative for exactly what was sent.
                 draft.AdoptConfirmed(result.Value!, sentPaths);
                 SetSnapshot(target, result.Value!);
+                if (target == SettingsTarget.Punctuation)
+                {
+                    ResetPunctuationRowsFromDraft();
+                }
                 MarkConnected();
                 Log($"save {uri}: ok");
                 return new SaveOutcome($"{name}：已保存。", false);
@@ -924,6 +1102,10 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 // Adopting the reread drops exactly the edits it confirms and keeps the rest.
                 draft.AdoptConfirmed(reread.Value!);
                 SetSnapshot(target, reread.Value!);
+                if (target == SettingsTarget.Punctuation)
+                {
+                    ResetPunctuationRowsFromDraft();
+                }
                 MarkConnected();
                 Log($"save {uri}: indeterminate, reconciled from a reread");
                 return new SaveOutcome(
@@ -963,6 +1145,9 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
                 break;
             case SettingsTarget.Presentation:
                 PresentationSnapshot = snapshot;
+                break;
+            case SettingsTarget.Punctuation:
+                PunctuationSnapshot = snapshot;
                 break;
             case SettingsTarget.Global:
                 GlobalSnapshot = snapshot;
@@ -1138,6 +1323,7 @@ public sealed class SettingsWorkspace : INotifyPropertyChanged
         public const string Shuangpin = "双拼";
         public const string Global = "全局配置";
         public const string Presentation = "候选窗口";
+        public const string Punctuation = "标点映射";
         public const string Methods = "输入方式列表";
 
         /// <summary>Fields no view's schema describes. Reported once, never submitted.</summary>
